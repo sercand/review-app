@@ -15,6 +15,7 @@ use crate::auth::device_flow::{self, AuthFailure, AuthState};
 use crate::auth::session::{complete_login, handle_unauthorized, restore_token, sign_out};
 use crate::auth::store::{KeyringStore, TokenStore};
 use crate::auth::DEFAULT_CLIENT_ID;
+use crate::diff::highlight::{HighlightCache, SyntectHighlighter};
 use crate::github::client::{GithubClient, Me};
 use crate::github::error::GhError;
 use crate::model::RepoRef;
@@ -26,7 +27,9 @@ use crate::runtime::{
 use crate::state::pr_detail::PrSession;
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
+use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
+use crate::ui::widgets::diff_view::DiffAction;
 use crate::ui::widgets::toast::Toasts;
 
 /// The three screens. Settings is a modal window, not a fourth screen.
@@ -88,6 +91,8 @@ pub struct ReviewApp {
     login_form: LoginForm,
     pr_list: PrListState,
     pr_list_form: PrListForm,
+    pr_detail: PrDetailState,
+    highlight_cache: HighlightCache,
     session: Option<PrSession>,
     next_session: u64,
     toasts: Toasts,
@@ -146,6 +151,8 @@ impl ReviewApp {
             login_form: LoginForm::for_settings(&settings),
             pr_list,
             pr_list_form: PrListForm::default(),
+            pr_detail: PrDetailState::default(),
+            highlight_cache: HighlightCache::new(2048, Box::new(SyntectHighlighter::new())),
             session: None,
             next_session: 1,
             toasts: Toasts::default(),
@@ -235,6 +242,10 @@ impl ReviewApp {
     }
 
     /// Drop the loaded rows, so one account's PRs never show under another's.
+    ///
+    /// Only sign-out calls this today; the settings window (Task 53) is the
+    /// next caller, so it is kept rather than inlined.
+    #[allow(dead_code)]
     fn reset_pr_list(&mut self) {
         self.pr_list = PrListState::default();
         self.pr_list.scopes = self.settings.default_scopes.clone();
@@ -275,6 +286,10 @@ impl ReviewApp {
     }
 
     /// Sign out: clear the keychain entry and the cached account.
+    ///
+    /// Reached from the settings window in Task 53; the temporary placeholder
+    /// button it used to back is gone now that the detail screen is real.
+    #[allow(dead_code)]
     fn perform_sign_out(&mut self, now: Instant) {
         match sign_out(self.store.as_ref(), &mut self.settings) {
             Ok(()) => {
@@ -359,7 +374,7 @@ impl ReviewApp {
         match self.screen {
             ScreenKind::Login => self.render_login(ui, now),
             ScreenKind::PrList => self.render_pr_list(ui),
-            ScreenKind::PrDetail => self.render_placeholder(ui, "Pull request", now),
+            ScreenKind::PrDetail => self.render_pr_detail(ui),
         }
     }
 
@@ -418,19 +433,55 @@ impl ReviewApp {
         self.apply_login_actions(actions, &ctx, now);
     }
 
-    /// A stand-in screen until Task 23 lands.
-    fn render_placeholder(&mut self, ui: &mut egui::Ui, title: &str, now: Instant) {
-        let mut sign_out = false;
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(title);
-            ui.label("this screen is implemented in a later task");
-            ui.separator();
-            if ui.button("Sign out").clicked() {
-                sign_out = true;
+    /// Draw the PR detail screen and apply whatever the user asked for.
+    ///
+    /// Without an open session there is nothing to draw — a 401 clears it — so
+    /// the screen falls back to the list.
+    fn render_pr_detail(&mut self, ui: &mut egui::Ui) {
+        let Some(session) = &mut self.session else {
+            self.screen = ScreenKind::PrList;
+            return;
+        };
+
+        let mut diff_actions = Vec::new();
+        let actions = pr_detail::render(
+            ui,
+            session,
+            &mut self.pr_detail,
+            &mut self.highlight_cache,
+            &mut diff_actions,
+        );
+
+        self.apply_diff_actions(diff_actions);
+
+        for action in actions {
+            match action {
+                PrDetailAction::Back => self.screen = ScreenKind::PrList,
+                PrDetailAction::Refresh => {
+                    if let Some(session) = &mut self.session {
+                        for command in session.refresh() {
+                            self.worker.send(command);
+                        }
+                    }
+                }
             }
-        });
-        if sign_out {
-            self.perform_sign_out(now);
+        }
+    }
+
+    /// Fold the diff surface's actions in.
+    ///
+    /// Each of these changes state a later phase owns (viewed toggles, comment
+    /// composers, the file tree, large diffs, and context expansion); they are
+    /// recorded here rather than dropped so the wiring has one obvious home.
+    fn apply_diff_actions(&mut self, actions: Vec<DiffAction>) {
+        for action in actions {
+            match action {
+                DiffAction::ToggleViewed(_) => {}  // Phase D
+                DiffAction::StartComment(_) => {}  // Task 37
+                DiffAction::ScrollToFile(_) => {}  // Phase D (file tree)
+                DiffAction::LoadLargeDiff(_) => {} // Phase G
+                DiffAction::ExpandGap { .. } => {} // Task 45
+            }
         }
     }
 }

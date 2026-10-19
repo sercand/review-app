@@ -3,4 +3,5 @@
 //! rule).
 
 pub mod login;
+pub mod pr_detail;
 pub mod pr_list;
