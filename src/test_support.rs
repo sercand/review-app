@@ -40,6 +40,22 @@ pub fn repo() -> crate::model::RepoRef {
     crate::model::RepoRef::new("o", "r")
 }
 
+/// A [`crate::github::files::PrFile`] at `path`: modified, with a two-line
+/// patch, a blob SHA derived from the path, and two changed lines.
+pub fn file(path: &str) -> crate::github::files::PrFile {
+    crate::github::files::PrFile {
+        path: path.to_owned(),
+        previous_path: None,
+        status: crate::github::files::FileStatus::Modified,
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: Some("@@ -1 +1 @@\n-a\n+b\n".to_owned()),
+        patch_state: crate::github::files::PatchState::Present,
+        blob_sha: format!("b-{path}"),
+    }
+}
+
 /// A [`crate::model::pr::PrSummary`] in `o/r`: authored by `"a"`, not a draft,
 /// with no checks and no review decision, all timestamps equal, and no URL.
 pub fn pr_summary(number: u64, title: &str, comments: u32) -> crate::model::pr::PrSummary {
