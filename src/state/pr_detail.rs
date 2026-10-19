@@ -17,7 +17,9 @@ use crate::diff::image::{image_kind, image_sources, image_uri, ImageBlob, ImageK
 use crate::diff::options::hide_whitespace_only;
 use crate::diff::row_model::{build, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
+use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::comments::NewComment;
+use crate::github::commits::Commit;
 use crate::github::error::GhError;
 use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
@@ -130,6 +132,12 @@ pub struct PrSession {
     /// The viewer's server-side pending review and its comments, when they
     /// have one; it blocks a local submit (Phase F).
     pub server_pending: Option<(Review, Vec<ServerPendingComment>)>,
+    /// The PR's commits, once loaded, in API order (Task 50).
+    pub commits: Vec<Commit>,
+    /// The head commit's check runs, once loaded (Task 50).
+    pub check_runs: Vec<CheckRun>,
+    /// The head commit's legacy combined status, once loaded (Task 50).
+    pub combined_status: Option<CombinedStatus>,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
     /// The live pending-review draft (Phase F submits it), pinned to one
@@ -288,6 +296,9 @@ impl PrSession {
             threads: Vec::new(),
             reviews: Vec::new(),
             server_pending: None,
+            commits: Vec::new(),
+            check_runs: Vec::new(),
+            combined_status: None,
             composer: ComposerState::default(),
             pending,
             fallback: None,
@@ -347,6 +358,13 @@ impl PrSession {
             // should be there as soon as the PR opens (spec §7.2).
             Command::LoadReviews {
                 session: id,
+                repo: repo.clone(),
+                number,
+            },
+            // And the commits: the right-pane list does not wait on the head
+            // SHA the way the checks do (Task 50).
+            Command::LoadCommits {
+                session: id,
                 repo,
                 number,
             },
@@ -371,11 +389,21 @@ impl PrSession {
                 self.metadata = Some(meta.clone());
                 self.phase = LoadPhase::Files;
 
-                vec![Command::LoadPrFiles {
-                    session: self.id,
-                    repo: self.repo.clone(),
-                    number: self.number,
-                }]
+                vec![
+                    Command::LoadPrFiles {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        number: self.number,
+                    },
+                    // Checks are the one load that needs the head SHA, so
+                    // they ride out of this fold rather than `open_at`
+                    // (Task 50).
+                    Command::LoadChecks {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        sha: meta.head_sha.clone(),
+                    },
+                ]
             }
             Event::PrFilesPage {
                 session,
@@ -500,6 +528,19 @@ impl PrSession {
             } if *session == self.id => {
                 self.reviews = reviews.clone();
                 self.server_pending = server_pending.clone();
+                Vec::new()
+            }
+            Event::CommitsLoaded { session, commits } if *session == self.id => {
+                self.commits = commits.clone();
+                Vec::new()
+            }
+            Event::ChecksLoaded {
+                session,
+                runs,
+                combined,
+            } if *session == self.id => {
+                self.check_runs = runs.clone();
+                self.combined_status = Some(combined.clone());
                 Vec::new()
             }
             Event::ServerPendingResolved { session } if *session == self.id => {
@@ -629,6 +670,12 @@ impl PrSession {
         self.merge_base = None;
         self.original_diffs.clear();
         self.filtered_files.clear();
+        // The commits and checks belong to the head being re-fetched; the
+        // checks ride back in on the metadata reply, which names the new
+        // head SHA (Task 50).
+        self.commits.clear();
+        self.check_runs.clear();
+        self.combined_status = None;
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -644,6 +691,11 @@ impl PrSession {
                 number: self.number,
             },
             Command::LoadReviews {
+                session: self.id,
+                repo: self.repo.clone(),
+                number: self.number,
+            },
+            Command::LoadCommits {
                 session: self.id,
                 repo: self.repo.clone(),
                 number: self.number,
@@ -1535,7 +1587,8 @@ mod tests {
             [
                 Command::LoadPrMetadata { .. },
                 Command::LoadThreads { .. },
-                Command::LoadReviews { .. }
+                Command::LoadReviews { .. },
+                Command::LoadCommits { .. }
             ]
         ));
         let cmds = s.on_event(&Event::PrMetadataLoaded {
@@ -1559,6 +1612,87 @@ mod tests {
         assert!(matches!(s.phase, LoadPhase::Ready));
         assert_eq!(s.row_model.file_ranges.len(), 2);
         assert_eq!(s.diff_head_sha.as_deref(), Some("sha1"));
+    }
+
+    #[test]
+    fn commits_load_on_open_checks_on_metadata_and_fold_into_the_session() {
+        use crate::github::checks::{CheckRun, CombinedStatus};
+        use crate::github::commits::Commit;
+
+        let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadCommits { .. })),
+            "open asks for the commits"
+        );
+
+        let cmds = s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        assert!(
+            matches!(
+                cmds.iter().find(|c| matches!(c, Command::LoadChecks { .. })),
+                Some(Command::LoadChecks { sha, .. }) if sha == "sha1"
+            ),
+            "the checks ride out of the metadata fold with the head SHA"
+        );
+
+        let commit = Commit {
+            sha: "c1".into(),
+            message: "Fix it".into(),
+            author: "me".into(),
+            committed_at: "2026-10-01T00:00:00Z".into(),
+        };
+        s.on_event(&Event::CommitsLoaded {
+            session: SessionId(2),
+            commits: vec![commit.clone()],
+        });
+        assert!(s.commits.is_empty(), "another session's reply is dropped");
+        s.on_event(&Event::CommitsLoaded {
+            session: SessionId(1),
+            commits: vec![commit.clone()],
+        });
+        assert_eq!(s.commits, vec![commit]);
+
+        let run = CheckRun {
+            name: "build".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+            html_url: None,
+        };
+        let combined = CombinedStatus {
+            state: "success".into(),
+            total_count: 1,
+        };
+        s.on_event(&Event::ChecksLoaded {
+            session: SessionId(2),
+            runs: vec![run.clone()],
+            combined: combined.clone(),
+        });
+        assert!(
+            s.check_runs.is_empty() && s.combined_status.is_none(),
+            "another session's reply is dropped"
+        );
+        s.on_event(&Event::ChecksLoaded {
+            session: SessionId(1),
+            runs: vec![run.clone()],
+            combined: combined.clone(),
+        });
+        assert_eq!(s.check_runs, vec![run]);
+        assert_eq!(s.combined_status.as_ref(), Some(&combined));
+
+        let cmds = s.refresh();
+        assert!(
+            s.commits.is_empty() && s.check_runs.is_empty() && s.combined_status.is_none(),
+            "a refresh drops the commits and checks with the rest"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadCommits { .. })),
+            "a refresh re-requests the commits; the checks ride back in on \
+             the metadata reply that names the new head"
+        );
     }
 
     #[test]

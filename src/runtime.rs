@@ -18,8 +18,10 @@ use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
 use crate::diff::image::{ImageBlob, MAX_IMAGE_BYTES};
 use crate::diff::local::local_diff;
+use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::comments::NewComment;
+use crate::github::commits::Commit;
 use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
@@ -142,6 +144,27 @@ pub enum Command {
         repo: RepoRef,
         /// The PR number within the repository.
         number: u64,
+    },
+    /// Load a PR's commits for the right-pane list (Task 50).
+    LoadCommits {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+    },
+    /// Load one commit's check runs and combined status (Task 50).
+    ///
+    /// The session asks once the metadata names the head SHA; both endpoints
+    /// describe the same rollup, so they load as one command.
+    LoadChecks {
+        /// The session that asked for the checks.
+        session: SessionId,
+        /// The repository the commit lives in.
+        repo: RepoRef,
+        /// The commit SHA to check.
+        sha: String,
     },
     /// Submit a server-side pending review with the given verdict (spec §7.2).
     SubmitServerPending {
@@ -374,6 +397,22 @@ pub enum Event {
     ServerPendingResolved {
         /// The session that asked for the change.
         session: SessionId,
+    },
+    /// A PR's commits arrived (Task 50).
+    CommitsLoaded {
+        /// The session that asked for the commits.
+        session: SessionId,
+        /// The commits, in API order.
+        commits: Vec<Commit>,
+    },
+    /// A commit's check runs and combined status arrived (Task 50).
+    ChecksLoaded {
+        /// The session that asked for the checks.
+        session: SessionId,
+        /// The check runs, in API order.
+        runs: Vec<CheckRun>,
+        /// The legacy combined status beside them.
+        combined: CombinedStatus,
     },
     /// A review was submitted; the session clears its draft and reloads the
     /// threads and reviews so the new comments are anchored (spec §7.2).
@@ -883,6 +922,64 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 session,
                 reviews,
                 server_pending,
+            });
+        }
+        Command::LoadCommits {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.list_commits(&repo, number).await {
+                Ok(commits) => events.send(Event::CommitsLoaded { session, commits }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::LoadChecks { session, repo, sha } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // Both endpoints describe the same rollup, so one failing means
+            // the rollup would be a lie; report it like any other load.
+            let runs = match client.list_check_runs(&repo, &sha).await {
+                Ok(runs) => runs,
+                Err(error) => {
+                    events.send(Event::Failed {
+                        session: Some(session),
+                        error,
+                    });
+                    return;
+                }
+            };
+            let combined = match client.combined_status(&repo, &sha).await {
+                Ok(combined) => combined,
+                Err(error) => {
+                    events.send(Event::Failed {
+                        session: Some(session),
+                        error,
+                    });
+                    return;
+                }
+            };
+            events.send(Event::ChecksLoaded {
+                session,
+                runs,
+                combined,
             });
         }
         Command::SubmitServerPending {

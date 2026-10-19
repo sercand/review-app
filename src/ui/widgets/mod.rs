@@ -1,6 +1,8 @@
 //! Shared widgets, one module per widget.
 
+pub mod checks;
 pub mod comment_composer;
+pub mod commit_list;
 pub mod diff_view;
 pub mod file_tree;
 pub mod filter_bar;

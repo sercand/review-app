@@ -1,0 +1,56 @@
+[
+  {
+    "sha": "c0ffee0000000000000000000000000000000001",
+    "node_id": "C_c1",
+    "commit": {
+      "author": {
+        "name": "Mona Lisa",
+        "email": "mona@example.com",
+        "date": "2026-10-01T09:00:00Z"
+      },
+      "committer": {
+        "name": "Mona Lisa",
+        "email": "mona@example.com",
+        "date": "2026-10-01T09:05:00Z"
+      },
+      "message": "Fix the parser\n\nThe old parser dropped trailing rows.",
+      "tree": { "sha": "tree1", "url": "https://api.github.com/repos/o/r/git/trees/tree1" }
+    },
+    "url": "https://api.github.com/repos/o/r/commits/c0ffee0000000000000000000000000000000001",
+    "html_url": "https://github.com/o/r/commit/c0ffee0000000000000000000000000000000001",
+    "author": {
+      "login": "monalisa",
+      "id": 1,
+      "type": "User"
+    },
+    "committer": {
+      "login": "monalisa",
+      "id": 1,
+      "type": "User"
+    },
+    "parents": [{ "sha": "beef000000000000000000000000000000000000" }]
+  },
+  {
+    "sha": "c0ffee0000000000000000000000000000000002",
+    "node_id": "C_c2",
+    "commit": {
+      "author": {
+        "name": "Mona Lisa",
+        "email": "mona@example.com",
+        "date": "2026-10-02T10:00:00Z"
+      },
+      "committer": {
+        "name": "Mona Lisa",
+        "email": "mona@example.com",
+        "date": "2026-10-02T10:05:00Z"
+      },
+      "message": "Add regression tests",
+      "tree": { "sha": "tree2", "url": "https://api.github.com/repos/o/r/git/trees/tree2" }
+    },
+    "url": "https://api.github.com/repos/o/r/commits/c0ffee0000000000000000000000000000000002",
+    "html_url": "https://github.com/o/r/commit/c0ffee0000000000000000000000000000000002",
+    "author": null,
+    "committer": null,
+    "parents": [{ "sha": "c0ffee0000000000000000000000000000000001" }]
+  }
+]

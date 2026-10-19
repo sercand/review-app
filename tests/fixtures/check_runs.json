@@ -1,0 +1,21 @@
+{
+  "total_count": 2,
+  "check_runs": [
+    {
+      "id": 1,
+      "name": "build",
+      "head_sha": "c0ffee0000000000000000000000000000000001",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/o/r/actions/runs/1/job/1"
+    },
+    {
+      "id": 2,
+      "name": "test",
+      "head_sha": "c0ffee0000000000000000000000000000000001",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/o/r/actions/runs/2/job/2"
+    }
+  ]
+}

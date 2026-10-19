@@ -254,6 +254,10 @@ impl ReviewApp {
             // `apply_session_event` above; evictions are drained after the
             // detail screen paints (Task 49).
             Event::ImagesLoaded { .. } => {}
+            // The session caches the commits, check runs, and combined
+            // status through `apply_session_event` above (Task 50).
+            Event::CommitsLoaded { .. } => {}
+            Event::ChecksLoaded { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
