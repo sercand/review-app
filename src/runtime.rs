@@ -7,11 +7,16 @@
 
 use std::future::Future;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::task::JoinError;
 
+use crate::auth::device_flow::{AuthFailure, DeviceCode};
+use crate::auth::device_http::{run_device_flow, HttpDeviceFlow};
+use crate::auth::store::TokenStore;
+use crate::auth::DEFAULT_SCOPE;
+use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::error::GhError;
 
 /// Identifies one open PR's session.
@@ -29,6 +34,20 @@ pub enum Command {
     Ping(u32),
     /// Ask the worker to stop.
     Shutdown,
+    /// Start the OAuth device flow against `host` with `client_id`.
+    StartDeviceFlow {
+        /// The host to authenticate against (`github.com` or Enterprise).
+        host: String,
+        /// The public OAuth App client ID to use.
+        client_id: String,
+    },
+    /// Validate a pasted personal access token and sign in with it.
+    SubmitPat {
+        /// The host to authenticate against.
+        host: String,
+        /// The token the user pasted.
+        token: String,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -49,6 +68,17 @@ pub enum Event {
         /// The classified failure.
         error: GhError,
     },
+    /// The device flow returned a code for the user to enter.
+    DeviceCode(DeviceCode),
+    /// Sign-in succeeded and `me` was validated with `GET /user`.
+    LoggedIn {
+        /// The authenticated account.
+        me: Me,
+        /// The access token (or PAT) that produced it.
+        token: String,
+    },
+    /// Sign-in could not complete.
+    AuthFailed(AuthFailure),
 }
 
 /// Sends [`Event`]s from worker tasks to the UI thread.
@@ -179,6 +209,94 @@ fn panic_message(error: JoinError) -> String {
             Err(_) => "worker task panicked".to_owned(),
         },
     }
+}
+
+/// Shared state every executor arm needs: the HTTP client (once signed in) and
+/// the token store.
+pub struct ExecCtx {
+    /// The installed GitHub client, or `None` before sign-in.
+    pub client: RwLock<Option<GithubClient>>,
+    /// The OS keychain, shared with the UI thread.
+    pub store: Arc<dyn TokenStore>,
+}
+
+impl ExecCtx {
+    /// A context with no client installed yet.
+    pub fn new(store: Arc<dyn TokenStore>) -> ExecCtx {
+        ExecCtx {
+            client: RwLock::new(None),
+            store,
+        }
+    }
+
+    /// Install the client every later command uses.
+    pub fn install_client(&self, client: GithubClient) {
+        *self.write_client() = Some(client);
+    }
+
+    /// Forget the installed client (sign-out, and after a 401).
+    pub fn clear_client(&self) {
+        *self.write_client() = None;
+    }
+
+    /// The client lock for writing, recovered even if a holder panicked.
+    fn write_client(&self) -> std::sync::RwLockWriteGuard<'_, Option<GithubClient>> {
+        self.client
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}
+
+/// The single place where [`Command`]s become network calls.
+///
+/// Every arm reports progress and failure through `events`; nothing here
+/// touches the UI, the settings file, or drafts.
+pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
+    match cmd {
+        Command::Ping(n) => events.send(Event::Pong(n)),
+        Command::Shutdown => {}
+        Command::StartDeviceFlow { host, client_id } => {
+            let flow = HttpDeviceFlow::new(&endpoints_for(&host).web);
+            let code_events = events.clone();
+            let result = run_device_flow(&flow, &client_id, DEFAULT_SCOPE, |code| {
+                code_events.send(Event::DeviceCode(code.clone()));
+            })
+            .await;
+
+            match result {
+                Ok(token) => validate_and_sign_in(&ctx, &host, token, &events).await,
+                Err(failure) => events.send(Event::AuthFailed(failure)),
+            }
+        }
+        Command::SubmitPat { host, token } => {
+            validate_and_sign_in(&ctx, &host, token, &events).await;
+        }
+    }
+}
+
+/// Prove a fresh credential with `GET /user`, then install it and announce it.
+///
+/// The token is only stored and the client only installed after `me()` succeeds,
+/// so a bad credential leaves the app in its previous state. The UI thread still
+/// owns the settings bookkeeping ([`crate::auth::session::complete_login`]),
+/// which it performs when it receives [`Event::LoggedIn`].
+async fn validate_and_sign_in(ctx: &ExecCtx, host: &str, token: String, events: &EventSender) {
+    let client = GithubClient::new(host, &token);
+    let me = match client.me().await {
+        Ok(me) => me,
+        Err(error) => {
+            events.send(Event::AuthFailed(AuthFailure::Http(error.to_string())));
+            return;
+        }
+    };
+
+    if let Err(error) = ctx.store.set(host, &me.user.login, &token) {
+        tracing::warn!(%error, "could not store the token in the keychain");
+        events.send(Event::Toast(format!("could not save the token: {error}")));
+    }
+
+    ctx.install_client(client);
+    events.send(Event::LoggedIn { me, token });
 }
 
 #[cfg(test)]

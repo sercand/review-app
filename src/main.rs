@@ -1,3 +1,3 @@
-fn main() {
-    println!("{}", gh_review_desktop::version());
+fn main() -> eframe::Result<()> {
+    gh_review_desktop::app::run()
 }
