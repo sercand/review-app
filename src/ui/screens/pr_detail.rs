@@ -58,6 +58,9 @@ pub struct PrDetailState {
     pub diff: DiffViewState,
     /// Whether the right pane is open.
     pub right_open: bool,
+    /// The row of the hunk `n`/`p` last moved to, so the pair walks the
+    /// current file's hunks instead of jumping to one each time (Task 52).
+    pub hunk_row: Option<usize>,
     /// The `(wrap, content width)` the line heights were measured for, so a
     /// width change only re-measures when it actually matters (spec §8.4).
     pub last_layout: Option<(bool, f32)>,

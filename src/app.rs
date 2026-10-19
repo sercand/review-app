@@ -16,8 +16,10 @@ use crate::auth::session::{complete_login, handle_unauthorized, restore_token, s
 use crate::auth::store::{KeyringStore, TokenStore};
 use crate::auth::DEFAULT_CLIENT_ID;
 use crate::diff::highlight::{HighlightCache, SyntectHighlighter};
+use crate::diff::row_model::RowRef;
 use crate::github::client::{GithubClient, Me};
 use crate::github::error::GhError;
+use crate::model::comment::CommentTarget;
 use crate::model::review::ReviewEvent;
 use crate::model::RepoRef;
 use crate::persist::config_root;
@@ -26,12 +28,15 @@ use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
 };
 use crate::state::composer::{self, ComposerAction};
+use crate::state::filters;
 use crate::state::pr_detail::{start_submit, viewer_is_author, PrSession};
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
+use crate::ui::command::{self, next_index, KeyPress};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
-use crate::ui::widgets::diff_view::DiffAction;
+use crate::ui::widgets::command_palette::{self, PaletteState};
+use crate::ui::widgets::diff_view::{DiffAction, DiffMode};
 use crate::ui::widgets::review_panel::ReviewAction;
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::toast::Toasts;
@@ -108,6 +113,8 @@ pub struct ReviewApp {
     session: Option<PrSession>,
     next_session: u64,
     toasts: Toasts,
+    palette: PaletteState,
+    help_open: bool,
     settings: Settings,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
@@ -172,6 +179,8 @@ impl ReviewApp {
             session: None,
             next_session: 1,
             toasts: Toasts::default(),
+            palette: PaletteState::default(),
+            help_open: false,
             settings,
             config_dir,
             store,
@@ -794,6 +803,280 @@ impl ReviewApp {
             }
         }
     }
+
+    /// Read this frame's key presses and dispatch the ones that resolve.
+    ///
+    /// `?` arrives as `Event::Text` (it is shift + `/` on the common
+    /// layouts), so it is picked up here rather than from the key event.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context, now: Instant) {
+        // `text_edit_focused`, not the broader "anything focused": a clicked
+        // button keeps focus, and the shortcuts must survive clicking one —
+        // only *typing* must not fire them (Task 52 QA).
+        let text_focused = ctx.text_edit_focused();
+        let mut presses: Vec<KeyPress> = Vec::new();
+        ctx.input(|input| {
+            for event in &input.events {
+                match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        let name = key.name();
+                        // Letters arrive lowercase unless shifted ("V" for
+                        // Shift+V); named keys keep their egui name.
+                        let key = if name.chars().count() == 1 && !modifiers.shift {
+                            name.to_lowercase()
+                        } else {
+                            name.to_owned()
+                        };
+                        presses.push(KeyPress {
+                            key,
+                            shift: modifiers.shift,
+                            command: modifiers.command,
+                        });
+                    }
+                    egui::Event::Text(text) if text == "?" => presses.push(KeyPress {
+                        key: "?".to_owned(),
+                        shift: false,
+                        command: false,
+                    }),
+                    _ => {}
+                }
+            }
+        });
+        for press in &presses {
+            if let Some(action) = command::resolve_key(press, text_focused) {
+                self.dispatch(action, now);
+            }
+        }
+    }
+
+    /// Run one registry action against the current app state.
+    fn dispatch(&mut self, action: &'static str, now: Instant) {
+        match action {
+            "palette" => {
+                self.palette.open_now();
+                self.help_open = false;
+            }
+            "help" => self.help_open = !self.help_open,
+            "close" => self.dispatch_close(),
+            "next_file" => self.step_file(true, now),
+            "prev_file" => self.step_file(false, now),
+            "next_hunk" => self.step_hunk(true),
+            "prev_hunk" => self.step_hunk(false),
+            "toggle_viewed" => self.set_viewed_current(None, now),
+            "mark_viewed_and_next" => {
+                self.set_viewed_current(Some(true), now);
+                self.step_file(true, now);
+            }
+            "comment" => self.open_comment_on_current(),
+            "reply" => self.expand_first_thread_of_current(),
+            "toggle_side_pane" => self.pr_detail.right_open = !self.pr_detail.right_open,
+            "split" => self.pr_detail.diff.mode = DiffMode::Split,
+            "unified" => self.pr_detail.diff.mode = DiffMode::Unified,
+            // The same path the review panel's Submit button takes, author
+            // rule and all (Task 44).
+            "submit_review" => {
+                let login = self.login();
+                for command in self.apply_review_action(ReviewAction::Submit, &login, now) {
+                    self.worker.send(command);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `Esc`: dismiss the topmost surface, then back out of the detail screen.
+    fn dispatch_close(&mut self) {
+        if self.palette.open {
+            self.palette.close();
+            return;
+        }
+        if self.help_open {
+            self.help_open = false;
+            return;
+        }
+        if let Some(session) = &mut self.session {
+            if session.composer.target.is_some() {
+                composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
+                session.rebuild_rows();
+                return;
+            }
+        }
+        if self.screen == ScreenKind::PrDetail {
+            self.screen = ScreenKind::PrList;
+        }
+    }
+
+    /// `j`/`k`: move the current file to the next/previous one the filters
+    /// keep, scrolling it into view through the tree's existing `scroll_to`
+    /// path (spec §9.2).
+    fn step_file(&mut self, forward: bool, now: Instant) {
+        let next = {
+            let Some(session) = &self.session else {
+                return;
+            };
+            let order: Vec<usize> = session
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, loaded)| {
+                    filters::matches(&loaded.file, &session.filters, &session.viewed)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let current = session
+                .last_opened_file
+                .as_deref()
+                .and_then(|path| session.files.iter().position(|l| l.file.path == path));
+            next_index(&order, current, forward)
+        };
+        let Some(next) = next else { return };
+        let Some(path) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.files.get(next))
+            .map(|loaded| loaded.file.path.clone())
+        else {
+            return;
+        };
+        self.pr_detail.diff.scroll_to = Some(next as u32);
+        // The hunk cursor belongs to the file it was set in.
+        self.pr_detail.hunk_row = None;
+        if let Some(session) = &mut self.session {
+            session.last_opened_file = Some(path);
+            session.mark_session_dirty(now);
+        }
+    }
+
+    /// `n`/`p`: move to the next/previous hunk of the current file and
+    /// scroll its first row into view.
+    fn step_hunk(&mut self, forward: bool) {
+        let starts: Vec<usize> = {
+            let Some(session) = &self.session else {
+                return;
+            };
+            let Some(file) = Self::current_file(session) else {
+                return;
+            };
+            let Some(range) = session.row_model.file_ranges.get(file) else {
+                return;
+            };
+            // A hunk starts at its gap row when there is one, else at its
+            // first line row; both carry the hunk's first visible row.
+            let mut starts = Vec::new();
+            let mut last_hunk: Option<u32> = None;
+            for (index, row) in session
+                .row_model
+                .rows
+                .iter()
+                .enumerate()
+                .take(range.end)
+                .skip(range.start)
+            {
+                match row {
+                    RowRef::Gap {
+                        file: f,
+                        before_hunk,
+                    } if *f as usize == file => {
+                        starts.push(index);
+                        last_hunk = Some(*before_hunk);
+                    }
+                    RowRef::Line { file: f, hunk, .. }
+                        if *f as usize == file && last_hunk != Some(*hunk) =>
+                    {
+                        starts.push(index);
+                        last_hunk = Some(*hunk);
+                    }
+                    _ => {}
+                }
+            }
+            starts
+        };
+        let Some(target) = next_index(&starts, self.pr_detail.hunk_row, forward) else {
+            return;
+        };
+        self.pr_detail.diff.scroll_to_row = Some(target);
+        self.pr_detail.hunk_row = Some(target);
+    }
+
+    /// The file the diff is on: the last one opened, else the first file the
+    /// filters keep.
+    fn current_file(session: &PrSession) -> Option<usize> {
+        if let Some(path) = session.last_opened_file.as_deref() {
+            if let Some(index) = session.files.iter().position(|l| l.file.path == path) {
+                return Some(index);
+            }
+        }
+        session
+            .files
+            .iter()
+            .enumerate()
+            .find(|(_, loaded)| filters::matches(&loaded.file, &session.filters, &session.viewed))
+            .map(|(index, _)| index)
+    }
+
+    /// `v` / `Shift+V`: flip (or set) the current file's viewed mark.
+    fn set_viewed_current(&mut self, wanted: Option<bool>, now: Instant) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(path) = session.last_opened_file.clone() else {
+            return;
+        };
+        let Some(index) = session.files.iter().position(|l| l.file.path == path) else {
+            return;
+        };
+        let currently = session.viewed.is_viewed(&session.files[index].file);
+        session
+            .viewed
+            .set(&session.files[index].file, wanted.unwrap_or(!currently));
+        session.mark_session_dirty(now);
+    }
+
+    /// `c`: open the composer as a file-level comment on the current file.
+    fn open_comment_on_current(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some(path) = session.last_opened_file.clone() else {
+            return;
+        };
+        session.open_comment(CommentTarget::File { path });
+    }
+
+    /// `r`: expand and scroll to the first thread on the current file (or
+    /// the first thread at all), so its reply box is on screen. Focusing the
+    /// reply text edit itself would need the thread widget's id, which the
+    /// app does not have, so the reviewer clicks into it.
+    fn expand_first_thread_of_current(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let path = session.last_opened_file.clone();
+        let thread = match session
+            .threads
+            .iter()
+            .position(|t| Some(&t.path) == path.as_ref())
+        {
+            Some(index) => index,
+            None if session.threads.is_empty() => return,
+            None => 0,
+        };
+        let Some(row) = session
+            .row_model
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowRef::Thread { thread: t } if *t as usize == thread))
+        else {
+            return;
+        };
+        let id = session.threads[thread].id.clone();
+        self.pr_detail.drafts.expanded.insert(id);
+        self.pr_detail.diff.scroll_to_row = Some(row);
+    }
 }
 
 impl eframe::App for ReviewApp {
@@ -802,7 +1085,23 @@ impl eframe::App for ReviewApp {
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
+
+        // Global shortcuts run before the screens draw, so a `scroll_to` set
+        // by `j`/`k` is consumed by the diff on this very frame.
+        let ctx = ui.ctx().clone();
+        self.handle_shortcuts(&ctx, now);
         self.render_screen(ui, now);
+
+        // The palette and the help overlay float above every screen. The
+        // palette runs its selection through the same dispatch as a keybinding.
+        let entries = command::registry();
+        let mut palette_actions: Vec<&'static str> = Vec::new();
+        command_palette::render(&ctx, &mut self.palette, &entries, &mut palette_actions);
+        for action in palette_actions {
+            self.dispatch(action, now);
+        }
+        command_palette::render_help(&ctx, &mut self.help_open, &entries);
+
         self.toasts.render(ui, now);
     }
 

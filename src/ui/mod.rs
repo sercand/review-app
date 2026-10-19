@@ -3,5 +3,6 @@
 //! `egui` is used exclusively through `eframe::egui` so the versions can never
 //! drift.
 
+pub mod command;
 pub mod screens;
 pub mod widgets;
