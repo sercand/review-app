@@ -100,8 +100,14 @@ pub fn ordered_children(node: &TreeNode, order: TreeOrder) -> Vec<&TreeNode> {
     if order == TreeOrder::LargestFirst {
         children.sort_by_key(|child| {
             (
-                child.is_dir,
-                std::cmp::Reverse(child.additions + child.deletions),
+                // Directories first (stable, so their name order survives);
+                // files by churn desc (Task 17 review).
+                std::cmp::Reverse(child.is_dir),
+                if child.is_dir {
+                    std::cmp::Reverse(0u32)
+                } else {
+                    std::cmp::Reverse(child.additions + child.deletions)
+                },
             )
         });
     }

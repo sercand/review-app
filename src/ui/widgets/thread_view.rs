@@ -95,16 +95,9 @@ pub fn avatar_initials(author: &str) -> String {
 }
 
 /// The eight avatar fills (redesign mockup `.avatar`), indexed by login.
-pub const AVATAR_COLORS: [egui::Color32; 8] = [
-    egui::Color32::from_rgb(0x5b, 0x7e, 0xe5),
-    egui::Color32::from_rgb(0xc0, 0x62, 0x9b),
-    egui::Color32::from_rgb(0x3f, 0x9d, 0x8f),
-    egui::Color32::from_rgb(0xc4, 0x7a, 0x35),
-    egui::Color32::from_rgb(0x8a, 0x6b, 0xd1),
-    egui::Color32::from_rgb(0x4f, 0x97, 0xc9),
-    egui::Color32::from_rgb(0xb5, 0x53, 0x4f),
-    egui::Color32::from_rgb(0x6c, 0x9a, 0x3c),
-];
+/// The tokens live in [`crate::ui::theme`] (Task 17 review); this re-export
+/// keeps the widget's API stable.
+pub use crate::ui::theme::AVATAR_COLORS;
 
 /// The avatar fill for a login: a stable hash into [`AVATAR_COLORS`].
 pub fn avatar_color(login: &str) -> egui::Color32 {
@@ -126,7 +119,7 @@ pub fn avatar(ui: &mut egui::Ui, author: &str, size: f32) {
         egui::Align2::CENTER_CENTER,
         avatar_initials(author),
         egui::FontId::proportional(size * 0.42),
-        egui::Color32::WHITE,
+        crate::ui::theme::AVATAR_INK,
     );
 }
 

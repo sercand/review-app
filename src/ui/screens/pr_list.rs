@@ -216,7 +216,7 @@ fn handle_shortcuts(
         form.sort_open = false;
         ui.memory_mut(|mem| mem.request_focus(filter_id));
     }
-    if enter && focused != Some(filter_id) {
+    if enter && !form.repo_open && !form.sort_open && focused != Some(filter_id) {
         if let Some((repo_id, number)) = state.selected.clone() {
             if let Some(pr) = state
                 .items

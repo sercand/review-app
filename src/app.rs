@@ -1372,6 +1372,23 @@ impl ReviewApp {
         if self.screen != ScreenKind::PrDetail {
             return;
         }
+        // Popovers and the find popup own `Esc` before the screen does:
+        // `handle_shortcuts` runs before `render_screen`, so closing them
+        // here is the only path that beats `close_detail` to it (Task 17 QA).
+        if self.pr_detail.find_open || self.pr_detail.diff.find_open {
+            self.pr_detail.find_open = false;
+            self.pr_detail.diff.find_open = false;
+            self.pr_detail.diff.clear_find();
+            return;
+        }
+        if self.pr_detail.review_open {
+            self.pr_detail.review_open = false;
+            return;
+        }
+        if self.pr_detail.filter_bar.popover_open {
+            self.pr_detail.filter_bar.popover_open = false;
+            return;
+        }
         if let Some(session) = &mut self.session {
             if session.composer.target.is_some() {
                 composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
@@ -1611,11 +1628,16 @@ impl eframe::App for ReviewApp {
         // every screen. The palette runs its selection through the same
         // dispatch as a keybinding.
         let entries = command::registry();
-        let palette_files: Vec<crate::github::files::PrFile> = self
-            .session
-            .as_ref()
-            .map(|s| s.files.iter().map(|l| l.file.clone()).collect())
-            .unwrap_or_default();
+        // Cloning the session's files is only worth it while the palette is
+        // actually open (Task 17 review: no per-frame clone otherwise).
+        let palette_files: Vec<crate::github::files::PrFile> = if self.palette.open {
+            self.session
+                .as_ref()
+                .map(|s| s.files.iter().map(|l| l.file.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut palette_actions: Vec<command_palette::PaletteSelection> = Vec::new();
         command_palette::render(
             &ctx,

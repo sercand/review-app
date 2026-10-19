@@ -895,8 +895,16 @@ fn unified_word_mark(
         .as_slice();
     let me = usize::try_from(row_index).ok()?;
     for (left, right) in pair_indices(rows) {
-        let (left, right) = (left? as usize, right? as usize);
-        if left == right || left == me || right == me {
+        // An uneven run (a blank half in the pairing) has no partner here.
+        let (Some(left), Some(right)) = (left, right) else {
+            continue;
+        };
+        let (left, right) = (left as usize, right as usize);
+        if left == right {
+            continue;
+        }
+        // Only the pair that contains `me` is this line's partner pair.
+        if left != me && right != me {
             continue;
         }
         let (other_index, mark_side) = if left == me {

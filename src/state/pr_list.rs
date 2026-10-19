@@ -342,6 +342,11 @@ pub fn visible_items(state: &PrListState) -> Vec<&PrSummary> {
         Sort::Created => b.created_at.cmp(&a.created_at),
         Sort::Comments => b.comments.cmp(&a.comments),
     });
+    if state.group_by_repo {
+        // Grouping needs the repository to lead the order, or the time sort
+        // interleaves repos and the headers repeat (Task 17 review).
+        items.sort_by_key(|a| a.repo.to_string());
+    }
     items
 }
 
