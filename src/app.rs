@@ -267,6 +267,8 @@ impl ReviewApp {
         // means its first search can go out before the first frame.
         let mut pr_list = PrListState::default();
         pr_list.scopes = settings.default_scopes.clone();
+        pr_list.recent_constraints = settings.recent_constraints.clone();
+        pr_list.group_by_repo = settings.group_by_repo;
         if restored.is_some() {
             let login = account_login(&settings);
             for command in reduce(&mut pr_list, PrListMsg::Refresh, &login) {
@@ -343,14 +345,17 @@ impl ReviewApp {
                 request,
                 query,
                 page,
-            } => self.apply_pr_list(PrListMsg::PageLoaded {
-                request,
-                query,
-                page,
-            }),
+            } => self.apply_pr_list(
+                PrListMsg::PageLoaded {
+                    request,
+                    query,
+                    page,
+                },
+                now,
+            ),
             Event::PrSearchFailed { request, error } => {
                 let unauthorized = matches!(error, GhError::Unauthorized);
-                self.apply_pr_list(PrListMsg::LoadFailed { request, error });
+                self.apply_pr_list(PrListMsg::LoadFailed { request, error }, now);
                 if unauthorized {
                     // Spec §6: a 401 anywhere ends the session.
                     self.on_unauthorized(now);
@@ -413,7 +418,7 @@ impl ReviewApp {
         // Entering the list — a restored token or a fresh sign-in — starts its
         // first search.
         if self.screen == ScreenKind::PrList && previous != ScreenKind::PrList {
-            self.apply_pr_list(PrListMsg::Refresh);
+            self.apply_pr_list(PrListMsg::Refresh, now);
         }
     }
 
@@ -436,10 +441,24 @@ impl ReviewApp {
     }
 
     /// Fold one PR-list message in and send whatever commands it produced.
-    fn apply_pr_list(&mut self, msg: PrListMsg) {
+    fn apply_pr_list(&mut self, msg: PrListMsg, now: Instant) {
+        // Task 15: the list's filter choices are durable preferences.
+        let durable = matches!(
+            &msg,
+            PrListMsg::SetScopes(_) | PrListMsg::SetGroupByRepo(_) | PrListMsg::PushRecent(_)
+        );
+        match msg.clone() {
+            PrListMsg::SetScopes(scopes) => self.settings.default_scopes = scopes,
+            PrListMsg::SetGroupByRepo(group) => self.settings.group_by_repo = group,
+            PrListMsg::PushRecent(entry) => self.settings.push_recent(entry),
+            _ => {}
+        }
         let login = self.login();
         for command in reduce(&mut self.pr_list, msg, &login) {
             self.worker.send(command);
+        }
+        if durable {
+            self.save_settings(now);
         }
     }
 
@@ -449,6 +468,8 @@ impl ReviewApp {
     fn reset_pr_list(&mut self) {
         self.pr_list = PrListState::default();
         self.pr_list.scopes = self.settings.default_scopes.clone();
+        self.pr_list.recent_constraints = self.settings.recent_constraints.clone();
+        self.pr_list.group_by_repo = self.settings.group_by_repo;
         self.pr_list_form = PrListForm::default();
     }
 
@@ -723,15 +744,16 @@ impl ReviewApp {
     fn render_screen(&mut self, ui: &mut egui::Ui, now: Instant, write_blocked: Option<&str>) {
         match self.screen {
             ScreenKind::Login => self.render_login(ui, now),
-            ScreenKind::PrList => self.render_pr_list(ui),
+            ScreenKind::PrList => self.render_pr_list(ui, now),
             ScreenKind::PrDetail => self.render_pr_detail(ui, now, write_blocked),
         }
     }
 
     /// Draw the PR list and apply whatever the user asked for.
-    fn render_pr_list(&mut self, ui: &mut egui::Ui) {
+    fn render_pr_list(&mut self, ui: &mut egui::Ui, now: Instant) {
         let mut msgs = Vec::new();
         let mut actions = Vec::new();
+        let wall = crate::ui::widgets::pr_row::now_iso();
         egui::CentralPanel::default().show(ui, |ui| {
             pr_list::render(
                 ui,
@@ -739,11 +761,12 @@ impl ReviewApp {
                 &mut self.pr_list_form,
                 &mut msgs,
                 &mut actions,
+                &wall,
             );
         });
 
         for msg in msgs {
-            self.apply_pr_list(msg);
+            self.apply_pr_list(msg, now);
         }
         for action in actions {
             match action {

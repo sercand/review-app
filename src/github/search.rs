@@ -48,8 +48,40 @@ pub enum Sort {
 }
 
 impl Scope {
+    /// Every scope, in the canonical order merged rows list their scopes in.
+    pub const ALL: [Scope; 5] = [
+        Scope::Assigned,
+        Scope::Authored,
+        Scope::ReviewRequested,
+        Scope::Involves,
+        Scope::Mentions,
+    ];
+
+    /// The canonical name recorded on every row a scope's search matched
+    /// (redesign Task 15); stable across logins, unlike the qualifier.
+    pub fn name(self) -> &'static str {
+        match self {
+            Scope::Assigned => "assigned",
+            Scope::Authored => "authored",
+            Scope::ReviewRequested => "review-requested",
+            Scope::Involves => "involves",
+            Scope::Mentions => "mentions",
+        }
+    }
+
+    /// The chip label for this scope.
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Assigned => "Assigned",
+            Scope::Authored => "Authored",
+            Scope::ReviewRequested => "Review requested",
+            Scope::Involves => "Involves",
+            Scope::Mentions => "Mentions",
+        }
+    }
+
     /// The search qualifier for this scope, given the signed-in user's login.
-    fn qualifier(self, login: &str) -> String {
+    pub fn qualifier(self, login: &str) -> String {
         match self {
             Scope::Assigned => format!("assignee:{login}"),
             Scope::Authored => format!("author:{login}"),

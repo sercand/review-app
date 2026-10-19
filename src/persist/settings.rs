@@ -67,6 +67,12 @@ pub struct Settings {
     /// The code font size in points: 12, 13 or 14; anything else loads as
     /// 13 (redesign Task 14).
     pub code_font_size: f32,
+    /// The five most recent repo/org constraints applied in the PR list,
+    /// most recent first (redesign Task 15).
+    pub recent_constraints: Vec<String>,
+    /// Whether the PR list groups rows under repository headers
+    /// (redesign Task 15).
+    pub group_by_repo: bool,
 }
 
 /// The diff layout choices, remembered across PRs and restarts.
@@ -109,6 +115,8 @@ impl Default for Settings {
             },
             diff: DiffPrefs::default(),
             code_font_size: 13.0,
+            recent_constraints: Vec::new(),
+            group_by_repo: false,
         }
     }
 }
@@ -157,6 +165,12 @@ impl Settings {
         let raw = toml::to_string(self)?;
         super::write_atomic(&path, raw.as_bytes())?;
         Ok(())
+    }
+
+    /// Remember `entry` as the newest recent repo/org constraint: trimmed,
+    /// de-duplicated, most recent first, at most five (Task 15).
+    pub fn push_recent(&mut self, entry: String) {
+        crate::state::pr_list::push_recent(&mut self.recent_constraints, entry);
     }
 }
 
@@ -249,6 +263,19 @@ mod tests {
             Settings::load_or_default(dir.path()).default_scopes,
             vec![Scope::Assigned]
         );
+    }
+
+    #[test]
+    fn recent_constraints_are_most_recent_first_and_capped() {
+        let mut s = Settings::default();
+        s.push_recent("octo/repo".into());
+        s.push_recent("acme".into());
+        s.push_recent("octo/repo".into()); // moves to front, no duplicate
+        assert_eq!(s.recent_constraints[0], "octo/repo");
+        for i in 0..10 {
+            s.push_recent(format!("org{i}"));
+        }
+        assert_eq!(s.recent_constraints.len(), 5);
     }
 
     #[test]

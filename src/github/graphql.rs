@@ -218,6 +218,7 @@ fn parse_node(node: &Value) -> Option<PrSummary> {
         additions: count(node, "additions"),
         deletions: count(node, "deletions"),
         comments: count(node, "totalCommentsCount"),
+        scopes: Vec::new(),
         ci: node
             .get("commits")
             .and_then(|commits| commits.get("last"))

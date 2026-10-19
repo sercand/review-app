@@ -93,6 +93,7 @@ pub fn pr_summary(number: u64, title: &str, comments: u32) -> crate::model::pr::
         comments,
         ci: None,
         review: None,
+        scopes: Vec::new(),
         url: format!("https://github.com/o/r/pull/{number}"),
     }
 }

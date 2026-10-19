@@ -79,6 +79,10 @@ pub struct PrSummary {
     pub ci: Option<CiState>,
     /// The review decision, when GitHub reports one.
     pub review: Option<ReviewDecision>,
+    /// The canonical names of every scope whose search matched this PR
+    /// (redesign Task 15), in [`crate::github::search::Scope`] declaration
+    /// order. Stamped by the list reducer, not by the GraphQL parse.
+    pub scopes: Vec<String>,
     /// The PR's web URL.
     pub url: String,
 }
