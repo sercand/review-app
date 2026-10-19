@@ -741,6 +741,13 @@ impl ReviewApp {
                 session.insert_suggestion();
                 Vec::new()
             }
+            // The composer moves from under its line to under the file
+            // header, so the annotation has to be rebuilt (Task 47).
+            ComposerAction::ToFileLevel => {
+                composer::reduce(&mut session.composer, composer::ComposerMsg::ToFileLevel);
+                session.rebuild_rows();
+                Vec::new()
+            }
         }
     }
 }

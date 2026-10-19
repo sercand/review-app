@@ -19,13 +19,14 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::diff::annotate::rows_for_anchor;
 use crate::diff::expand::Expand;
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
 use crate::model::diff::{DiffRow, LineKind, Side};
-use crate::state::composer::ComposerAction;
+use crate::state::composer::{anchor_warning, ComposerAction};
 use crate::state::pr_detail::{LoadPhase, PrSession};
 use crate::ui::widgets::comment_composer;
 use crate::ui::widgets::markdown;
@@ -530,6 +531,7 @@ fn render_row(
         RowRef::Composer => {
             let has_open_review = !ctx.session.pending.is_empty();
             let show_side = anchor_is_context(ctx.session, ctx.session.composer.target.as_ref());
+            let warning = composer_warning(ctx.session, ctx.session.composer.target.as_ref());
             let width = ctx.full_width;
             row.col(|ui| {
                 let mut composer_actions = Vec::new();
@@ -538,6 +540,7 @@ fn render_row(
                     &mut ctx.session.composer,
                     has_open_review,
                     show_side,
+                    warning,
                     width,
                     &mut composer_actions,
                 );
@@ -546,6 +549,17 @@ fn render_row(
             blank_rest(row, mode);
         }
     }
+}
+
+/// The anchor warning for the open composer (Task 47): the rows its anchor
+/// covers, run through [`anchor_warning`]. A file target has no rows and so
+/// never warns.
+fn composer_warning(session: &PrSession, target: Option<&CommentTarget>) -> Option<&'static str> {
+    let Some(CommentTarget::Line(anchor)) = target else {
+        return None;
+    };
+    let rows = rows_for_anchor(&session.files, anchor);
+    anchor_warning(&rows.iter().collect::<Vec<_>>())
 }
 
 /// Whether the composer's anchor sits on a context row, where the side

@@ -16,13 +16,16 @@ use crate::ui::widgets::markdown;
 /// Draw the composer row.
 ///
 /// `show_side` gates the Left/Right toggle: only a single-line anchor on a
-/// context row can pick a side (spec §7.3). `width` is the diff table's
-/// width, so the text edit spans the row instead of its gutter column.
+/// context row can pick a side (spec §7.3). `warning` is the anchor warning
+/// of [`anchor_warning`]: when it applies the composer shows the banner and
+/// offers the file-level route (Task 47). `width` is the diff table's width,
+/// so the text edit spans the row instead of its gutter column.
 pub fn render_composer(
     ui: &mut egui::Ui,
     state: &mut ComposerState,
     has_open_review: bool,
     show_side: bool,
+    warning: Option<&'static str>,
     width: f32,
     actions: &mut Vec<ComposerAction>,
 ) {
@@ -34,6 +37,15 @@ pub fn render_composer(
         .show(ui, |ui| {
             if let Some(error) = &state.error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+
+            if let Some(warning) = warning {
+                ui.horizontal(|ui| {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                    if ui.button("Add as file-level comment instead").clicked() {
+                        actions.push(ComposerAction::ToFileLevel);
+                    }
+                });
             }
 
             if show_side {
@@ -120,8 +132,8 @@ mod tests {
     use crate::test_support::line_anchor;
 
     /// The widget must paint the composer for a line target — text edit,
-    /// mode buttons, preview toggle — without panicking and without
-    /// inventing actions on its own.
+    /// mode buttons, preview toggle, and the anchor-warning banner — without
+    /// panicking and without inventing actions on its own.
     #[test]
     fn render_paints_the_composer_without_actions() {
         let mut state = ComposerState::default();
@@ -136,9 +148,17 @@ mod tests {
 
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            render_composer(ui, &mut state, false, true, 600.0, &mut actions);
+            render_composer(ui, &mut state, false, true, None, 600.0, &mut actions);
             state.preview = true;
-            render_composer(ui, &mut state, true, false, 600.0, &mut actions);
+            render_composer(
+                ui,
+                &mut state,
+                true,
+                false,
+                Some("This line is outside the PR's diff; GitHub may reject the comment."),
+                600.0,
+                &mut actions,
+            );
         });
         assert!(actions.is_empty(), "an untouched composer emits no actions");
         assert_eq!(state.mode, CommentMode::Immediate);

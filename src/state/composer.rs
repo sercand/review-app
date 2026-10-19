@@ -9,7 +9,7 @@
 use crate::github::comments::NewComment;
 use crate::github::error::GhError;
 use crate::model::comment::CommentTarget;
-use crate::model::diff::Side;
+use crate::model::diff::{DiffRow, RowOrigin, Side};
 
 /// Whether a comment posts on its own or joins a pending review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -53,6 +53,10 @@ pub enum ComposerMsg {
     SetMode(CommentMode),
     /// Toggle between the text edit and the markdown preview.
     TogglePreview,
+    /// Re-anchor the open comment to the file, keeping the body: offered
+    /// when the anchored rows are expanded or local, where GitHub may
+    /// reject the line coordinates (Task 47).
+    ToFileLevel,
     /// The user dismissed the composer; forget everything.
     Cancel,
     /// The comment posted; forget everything.
@@ -75,6 +79,9 @@ pub enum ComposerAction {
     TogglePreview,
     /// Append a suggestion block for the anchored rows.
     InsertSuggestion,
+    /// Re-anchor the comment to the file (Task 47): offered when the
+    /// anchored rows are expanded or local and GitHub may reject them.
+    ToFileLevel,
 }
 
 /// Whether the composer stays open after a failed post, and what it offers.
@@ -165,8 +172,36 @@ pub fn reduce(state: &mut ComposerState, msg: ComposerMsg) {
             state.mode = mode;
         }
         ComposerMsg::TogglePreview => state.preview = !state.preview,
+        ComposerMsg::ToFileLevel => {
+            // The coordinates are what GitHub may reject; the path, body,
+            // and commit survive and the comment becomes file-level — which
+            // can never be pending (spec §7.1).
+            if let Some(CommentTarget::Line(anchor)) = state.target.take() {
+                state.target = Some(CommentTarget::File { path: anchor.path });
+                state.mode = CommentMode::Immediate;
+            }
+        }
         ComposerMsg::Cancel | ComposerMsg::Submitted => *state = ComposerState::default(),
     }
+}
+
+/// The warning to show when the composer's anchor covers rows GitHub's own
+/// patch does not contain (Task 47).
+///
+/// Expanded rows live outside the PR's diff and local rows come from a diff
+/// the app computed, so in both cases GitHub may place the comment
+/// differently or reject it outright. An expanded row in the anchor wins the
+/// message over a local one: it is the stricter claim.
+pub fn anchor_warning(rows: &[&DiffRow]) -> Option<&'static str> {
+    if rows.iter().any(|row| row.origin == RowOrigin::Expanded) {
+        return Some("This line is outside the PR's diff; GitHub may reject the comment.");
+    }
+    if rows.iter().any(|row| row.origin == RowOrigin::Local) {
+        return Some(
+            "This diff was computed locally; GitHub may place or reject the comment differently.",
+        );
+    }
+    None
 }
 
 /// Whether the composer has enough to post: a target and a non-blank body.
@@ -201,7 +236,60 @@ pub fn mode_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::line_anchor;
+    use crate::model::diff::RowOrigin;
+    use crate::test_support::{line_anchor, rows_from};
+
+    #[test]
+    fn warns_only_for_non_patch_rows() {
+        let mut rows = rows_from("@@ -1,2 +1,2 @@\n a\n-b\n+c\n");
+        assert_eq!(anchor_warning(&rows.iter().collect::<Vec<_>>()), None);
+        rows[0].origin = RowOrigin::Expanded;
+        assert!(anchor_warning(&[&rows[0]]).unwrap().contains("outside"));
+        rows[2].origin = RowOrigin::Local;
+        assert!(anchor_warning(&[&rows[2]]).unwrap().contains("locally"));
+    }
+
+    #[test]
+    fn expanded_rows_outrank_local_rows_in_one_anchor() {
+        let mut rows = rows_from("@@ -1,2 +1,2 @@\n a\n-b\n+c\n");
+        rows[0].origin = RowOrigin::Local;
+        rows[1].origin = RowOrigin::Expanded;
+        assert!(
+            anchor_warning(&[&rows[0], &rows[1]])
+                .unwrap()
+                .contains("outside"),
+            "an expanded row in the anchor wins over a local one"
+        );
+    }
+
+    #[test]
+    fn to_file_level_keeps_the_text_and_drops_the_coordinates() {
+        let mut s = ComposerState::default();
+        reduce(
+            &mut s,
+            ComposerMsg::OpenFor {
+                target: CommentTarget::Line(line_anchor("a.rs", 3)),
+                has_open_review: true,
+            },
+        );
+        reduce(&mut s, ComposerMsg::SetBody("anchored text".into()));
+        assert_eq!(s.mode, CommentMode::Pending);
+
+        reduce(&mut s, ComposerMsg::ToFileLevel);
+        assert_eq!(
+            s.target,
+            Some(CommentTarget::File {
+                path: "a.rs".into()
+            }),
+            "the line coordinates are dropped, the path stays"
+        );
+        assert_eq!(
+            s.mode,
+            CommentMode::Immediate,
+            "file-level is never pending"
+        );
+        assert_eq!(s.body, "anchored text", "the reviewer's text survives");
+    }
 
     #[test]
     fn modes_and_buttons_follow_github() {
