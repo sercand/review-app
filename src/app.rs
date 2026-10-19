@@ -72,6 +72,10 @@ pub fn route(current: ScreenKind, event: &Event) -> ScreenKind {
             error: GhError::Unauthorized,
             ..
         } => ScreenKind::Login,
+        Event::CommentFailed {
+            error: GhError::Unauthorized,
+            ..
+        } => ScreenKind::Login,
         Event::LoggedIn { .. } => ScreenKind::PrList,
         _ => current,
     }
@@ -216,7 +220,14 @@ impl ReviewApp {
             Event::ThreadResolved { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
-            Event::CommentFailed { error, .. } => self.toasts.push(error.to_string(), now),
+            Event::CommentFailed { error, .. } => {
+                let unauthorized = matches!(error, GhError::Unauthorized);
+                self.toasts.push(error.to_string(), now);
+                if unauthorized {
+                    // Spec §6: a 401 anywhere ends the session.
+                    self.on_unauthorized(now);
+                }
+            }
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
@@ -695,6 +706,26 @@ mod tests {
         assert!(matches!(
             route(ScreenKind::PrList, &search_failed),
             ScreenKind::PrList
+        ));
+
+        // A 401 from a mutation ends the session too (spec §6).
+        let comment_unauthorized = Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Unauthorized,
+        };
+        assert!(matches!(
+            route(ScreenKind::PrDetail, &comment_unauthorized),
+            ScreenKind::Login
+        ));
+        let comment_failed = Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Server(500),
+        };
+        assert!(matches!(
+            route(ScreenKind::PrDetail, &comment_failed),
+            ScreenKind::PrDetail
         ));
     }
 

@@ -281,8 +281,9 @@ impl PrSession {
                 // A full thread list replaces everything it should contain,
                 // including any optimistic placeholder an in-flight post
                 // pushed; that post's result event then finds nothing to
-                // touch and is ignored.
-                self.optimistic = None;
+                // touch and is ignored, so its text goes back to the
+                // composer here rather than being lost with the placeholder.
+                self.restore_optimistic_to_composer();
                 self.rebuild_rows();
                 Vec::new()
             }
@@ -386,14 +387,16 @@ impl PrSession {
     /// against a new head; `diff_head_sha` is kept so the metadata reply can
     /// detect that the head moved. Threads are dropped and re-requested for
     /// the same reason: a rendered thread must never stay anchored to the old
-    /// head. The composer keeps its text — a post in flight or being retried
-    /// is the reviewer's, not the cache's.
+    /// head. An immediate post still in flight loses its placeholder, but
+    /// [`Self::restore_optimistic_to_composer`] returns its text to the
+    /// composer first — a post in flight or being retried is the reviewer's,
+    /// not the cache's (spec §7.1).
     pub fn refresh(&mut self) -> Vec<Command> {
         self.head_moved = false;
         self.files.clear();
         self.row_model = build(&[]);
         self.threads.clear();
-        self.optimistic = None;
+        self.restore_optimistic_to_composer();
         self.fallback = None;
         self.phase = LoadPhase::Header;
         self.error = None;
@@ -410,6 +413,23 @@ impl PrSession {
                 number: self.number,
             },
         ]
+    }
+
+    /// Return an in-flight immediate post's text and anchor to the composer
+    /// and release the parked post, so a refresh or a full thread reload can
+    /// never lose what the reviewer wrote (spec §7.1: the text is kept until
+    /// a post succeeds). A composer the reviewer has typed into again is
+    /// left alone; the parked post is released either way, since its
+    /// placeholder thread is gone and its result event has nothing to roll
+    /// back.
+    fn restore_optimistic_to_composer(&mut self) {
+        if let Some(post) = self.optimistic.take() {
+            if self.composer.body.is_empty() {
+                self.composer.target = Some(post.target);
+                self.composer.body = post.body;
+                self.composer.mode = CommentMode::Immediate;
+            }
+        }
     }
 
     /// Re-derive the row model from the files plus the current threads,
@@ -1038,6 +1058,54 @@ mod tests {
             Some(CommentTarget::Line(line_anchor("a.rs", 1)))
         );
         assert!(s.composer.error.is_some(), "the failure is shown");
+    }
+
+    #[test]
+    fn a_refresh_during_an_immediate_post_returns_the_text_to_the_composer() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "words at risk");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+        assert!(
+            s.composer.body.is_empty(),
+            "submitting clears the composer and parks the text"
+        );
+
+        s.refresh();
+        assert_eq!(
+            s.composer.body, "words at risk",
+            "a refresh must not swallow the in-flight text"
+        );
+
+        // The late failure for the parked post finds the text already back
+        // in the composer and must not lose it (spec §7.1).
+        s.on_event(&Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Server(500),
+        });
+        assert_eq!(s.composer.body, "words at risk");
+        assert_eq!(
+            s.composer.target,
+            Some(CommentTarget::Line(line_anchor("a.rs", 1))),
+            "the anchor comes back with the text"
+        );
+    }
+
+    #[test]
+    fn threads_loaded_during_an_immediate_post_returns_the_text_to_the_composer() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "still mine");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+
+        s.on_event(&Event::ThreadsLoaded {
+            session: SessionId(1),
+            threads: vec![anchored_thread("PRRT_1")],
+        });
+        assert_eq!(
+            s.composer.body, "still mine",
+            "a full thread reload must not swallow the in-flight text"
+        );
+        assert!(s.optimistic.is_none(), "the parked post is released");
     }
 
     #[test]

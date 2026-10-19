@@ -153,17 +153,24 @@ fn render_expanded(
     drafts: &mut CommentDrafts,
     actions: &mut Vec<ThreadAction>,
 ) {
+    // Reply and resolve address the thread by its GraphQL node id, and an
+    // optimistic thread's id is local until a refresh confirms it, so both
+    // controls stay hidden until then (the prefix matches `optimistic_thread`
+    // in `state::pr_detail`).
+    let confirmed = !thread.id.starts_with("optimistic-");
     ui.horizontal(|ui| {
-        let label = if thread.is_resolved {
-            "Unresolve"
-        } else {
-            "Resolve"
-        };
-        if ui.button(label).clicked() {
-            actions.push(ThreadAction::ToggleResolved {
-                thread_id: thread.id.clone(),
-                resolved: !thread.is_resolved,
-            });
+        if confirmed {
+            let label = if thread.is_resolved {
+                "Unresolve"
+            } else {
+                "Resolve"
+            };
+            if ui.button(label).clicked() {
+                actions.push(ThreadAction::ToggleResolved {
+                    thread_id: thread.id.clone(),
+                    resolved: !thread.is_resolved,
+                });
+            }
         }
         if thread.is_outdated {
             ui.label(egui::RichText::new("outdated").weak());
@@ -202,8 +209,13 @@ fn render_expanded(
         ui.add_space(4.0);
     }
 
-    // A reply anchors to the root comment's database id; an optimistic
-    // thread has one, so its reply box works too.
+    // A reply anchors to the root comment's database id and carries the
+    // thread's GraphQL node id; an optimistic thread's id is synthetic until
+    // a refresh confirms it, so its reply box and resolve control stay
+    // hidden until then.
+    if !confirmed {
+        return;
+    }
     let Some(root_comment_id) = thread.root_comment_id() else {
         return;
     };
@@ -325,6 +337,35 @@ mod tests {
         assert!(
             drafts.replies.contains_key("T"),
             "the reply box opens a draft slot"
+        );
+    }
+
+    /// An optimistic thread's id is synthetic until a refresh confirms it,
+    /// so it must show no reply box and no resolve control.
+    #[test]
+    fn an_optimistic_thread_hides_reply_and_resolve() {
+        let t = ReviewThread {
+            id: "optimistic-1".into(),
+            comments: vec![ThreadComment {
+                database_id: 1,
+                author: "me".into(),
+                avatar_url: None,
+                body: "in flight".into(),
+                created_at: String::new(),
+            }],
+            ..thread("a.rs", Some(1), Side::Right, SubjectType::Line)
+        };
+        let vm = thread_vm(&t);
+
+        let mut drafts = CommentDrafts::default();
+        let mut actions = Vec::new();
+        egui::__run_test_ui(|ui| {
+            render_thread(ui, &t, &vm, false, &mut drafts, &mut actions);
+        });
+        assert!(actions.is_empty(), "an untouched thread emits no actions");
+        assert!(
+            !drafts.replies.contains_key("optimistic-1"),
+            "an optimistic thread gets no reply box until a refresh confirms it"
         );
     }
 }
