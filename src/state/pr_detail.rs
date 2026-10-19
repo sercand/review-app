@@ -553,6 +553,12 @@ impl PrSession {
                 if let Some(loaded) = self.files.get_mut(*file as usize) {
                     loaded.diff = Some(diff.clone());
                 }
+                // The fresh diff has never seen the whitespace filter, so
+                // any filtered mark on the file is a lie now; drop it as
+                // `apply_expand` does, and the rebuild below re-filters
+                // the new diff (stashing its original) while the option
+                // is on.
+                self.filtered_files.remove(file);
                 self.rebuild_rows();
                 Vec::new()
             }
@@ -838,7 +844,13 @@ impl PrSession {
         self.hide_whitespace = hide;
         if !hide {
             for (index, diff) in std::mem::take(&mut self.original_diffs) {
-                if let Some(loaded) = self.files.get_mut(index as usize) {
+                if self.rendered_svg.contains(&index) {
+                    // The file shows the rendered viewer, not text rows:
+                    // the original belongs to the stash "Text" restores
+                    // from, so the filtered copy in it is replaced rather
+                    // than a diff installed under the viewer.
+                    self.svg_diffs.insert(index, diff);
+                } else if let Some(loaded) = self.files.get_mut(index as usize) {
                     loaded.diff = Some(diff);
                 }
             }
@@ -860,12 +872,16 @@ impl PrSession {
     fn filter_whitespace(&mut self) {
         for index in 0..self.files.len() {
             let file = index as u32;
-            if !self.filtered_files.insert(file) {
+            if self.filtered_files.contains(&file) {
                 continue;
             }
+            // Only files that actually have a diff are marked: a diff-less
+            // file (too-large, binary) has nothing to filter, and marking
+            // it would hide it from this pass once its diff does arrive.
             let Some(diff) = self.files[index].diff.clone() else {
                 continue;
             };
+            self.filtered_files.insert(file);
             let filtered = hide_whitespace_only(&diff);
             if filtered != diff {
                 self.original_diffs.entry(file).or_insert(diff);
@@ -933,11 +949,21 @@ impl PrSession {
     /// restores exactly what was there.
     pub fn toggle_rendered_svg(&mut self, file: u32) {
         if self.rendered_svg.remove(&file) {
-            if let Some(diff) = self.svg_diffs.remove(&file) {
+            // Prefer the stashed original while the option is off: the
+            // svg stash may hold a diff filtered while it was on, and a
+            // filtered diff must never install with the option unchecked.
+            let stash = self.svg_diffs.remove(&file);
+            let restored = if self.hide_whitespace {
+                stash
+            } else {
+                self.original_diffs.remove(&file).or(stash)
+            };
+            if let Some(diff) = restored {
                 if let Some(loaded) = self.files.get_mut(file as usize) {
                     loaded.diff = Some(diff);
                 }
-                // The restored diff has never seen the whitespace filter.
+                // The restored diff may predate a filter pass the file is
+                // still marked for; let the next rebuild re-filter it.
                 self.filtered_files.remove(&file);
             }
         } else {
@@ -2554,5 +2580,105 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(r, RowRef::Line { .. })));
+    }
+
+    /// A patch with one whitespace-only hunk and one real hunk, so the
+    /// filtered and original forms differ and either can be told apart.
+    const WS_AND_REAL: &str =
+        "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n@@ -4 +4 @@\n-let y = 1;\n+let y = 2;\n";
+
+    #[test]
+    fn hide_whitespace_off_under_a_rendered_svg_restores_the_original_to_text() {
+        use crate::diff::parse::parse_patch;
+
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        let original = FileDiff {
+            hunks: parse_patch(WS_AND_REAL).unwrap(),
+        };
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("x.svg", WS_AND_REAL)],
+            done: true,
+        });
+
+        // Hide on: the whitespace-only hunk is filtered out and the
+        // original stashed.
+        s.toggle_hide_whitespace();
+        assert_eq!(s.files[0].diff.as_ref().unwrap().hunks.len(), 1);
+
+        // Rendered: the filtered diff moves to the svg stash.
+        s.toggle_rendered_svg(0);
+        assert!(s.files[0].diff.is_none());
+
+        // Hide off while rendered: the original belongs to the stash the
+        // "Text" switch restores from, never to the loaded diff — text
+        // rows must not reappear under a selected "Rendered" label.
+        s.toggle_hide_whitespace();
+        assert!(!s.hide_whitespace);
+        assert!(
+            s.files[0].diff.is_none(),
+            "the rendered view keeps the viewer: no diff is installed under it"
+        );
+        assert!(s.row_model.rows.contains(&RowRef::Placeholder { file: 0 }));
+        assert!(
+            !s.row_model
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowRef::Line { .. })),
+            "no text rows while 'Rendered' is selected"
+        );
+
+        // Back to text: the unfiltered original is installed, not the
+        // stale filtered copy.
+        s.toggle_rendered_svg(0);
+        assert_eq!(
+            s.files[0].diff.as_ref().unwrap(),
+            &original,
+            "switching back to 'Text' installs the unfiltered original"
+        );
+    }
+
+    #[test]
+    fn a_local_diff_that_arrives_while_hide_whitespace_is_on_is_filtered() {
+        use crate::diff::parse::parse_patch;
+        use crate::github::files::PatchState;
+
+        let (mut s, _dir) = loaded_session();
+        let mut huge = loaded("huge.json", "@@ -1 +1 @@\n-a\n+b\n");
+        huge.file.patch = None;
+        huge.file.patch_state = PatchState::TooLarge;
+        huge.diff = None;
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![huge],
+            done: true,
+        });
+
+        s.set_hide_whitespace(true);
+
+        s.on_event(&Event::LocalDiffReady {
+            session: SessionId(1),
+            file: 1,
+            diff: FileDiff {
+                hunks: parse_patch(WS_AND_REAL).unwrap(),
+            },
+            merge_base: "mb".into(),
+        });
+        assert_eq!(
+            s.files[1].diff.as_ref().unwrap().hunks.len(),
+            1,
+            "the fresh diff is filtered on arrival: its whitespace-only hunk is hidden"
+        );
+
+        s.set_hide_whitespace(false);
+        assert_eq!(
+            s.files[1].diff.as_ref().unwrap().hunks.len(),
+            2,
+            "turning the option off restores the fresh diff's whitespace hunk too"
+        );
     }
 }
