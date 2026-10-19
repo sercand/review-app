@@ -8,7 +8,7 @@
 //! [`crate::diff::highlight`].
 //!
 //! Everything the widget decides is a pure function ([`row_height`],
-//! [`split_pairs`], [`placeholder_text`], [`header_buttons`]) so it can be
+//! [`split_pairs`], [`placeholder_text`]) so it can be
 //! tested without a window; [`render`] only turns those decisions into
 //! widgets.
 
@@ -22,7 +22,7 @@ use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
 use crate::diff::options::{find_matches, next_match, prev_match};
 use crate::diff::row_model::{display_text, pair_indices, RowRef, HEADER_H, ROW_H};
 use crate::diff::word::word_diff;
-use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
+use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
 use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
@@ -48,6 +48,9 @@ pub struct DiffViewState {
     pub wrap: bool,
     /// The find box's text (Task 48).
     pub find_query: String,
+    /// Whether the find box is open; the header bar's search button opens
+    /// it and `Esc` closes it (Task 7).
+    pub find_open: bool,
     /// The query [`Self::find_matches`] was computed for, so an edited query
     /// jumps to its first match instead of advancing past it.
     pub find_applied: String,
@@ -71,6 +74,7 @@ impl Default for DiffViewState {
         DiffViewState {
             wrap: false,
             find_query: String::new(),
+            find_open: false,
             find_applied: String::new(),
             find_matches: Vec::new(),
             find_current: None,
@@ -203,37 +207,6 @@ pub fn placeholder_text(f: &PrFile) -> &'static str {
     }
 }
 
-/// One control in a file's header.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeaderButton {
-    /// Copy the file's path.
-    CopyPath,
-    /// Open the file in the browser.
-    OpenInBrowser,
-    /// Start a file-level comment.
-    CommentOnFile,
-    /// The viewed checkbox.
-    Viewed,
-}
-
-/// The header controls a file offers.
-///
-/// Every file — binary and too-large included — offers `CommentOnFile`; for a
-/// binary file it is the only way to comment at all (spec §7.5). The viewed
-/// checkbox is keyed by the blob SHA (spec §10.3), so a file GitHub gave no SHA
-/// for cannot be marked viewed.
-pub fn header_buttons(f: &PrFile) -> Vec<HeaderButton> {
-    let mut buttons = vec![
-        HeaderButton::CopyPath,
-        HeaderButton::OpenInBrowser,
-        HeaderButton::CommentOnFile,
-    ];
-    if !f.blob_sha.is_empty() {
-        buttons.push(HeaderButton::Viewed);
-    }
-    buttons
-}
-
 /// Resolve a line row to its parsed [`DiffRow`].
 pub fn line_at(session: &PrSession, file: u32, hunk: u32, row: u32) -> Option<&DiffRow> {
     session
@@ -250,7 +223,10 @@ pub fn line_at(session: &PrSession, file: u32, hunk: u32, row: u32) -> Option<&D
 /// Draw the whole diff surface.
 ///
 /// Only the rows the table actually paints are resolved and highlighted, so a
-/// 50 000-line PR costs the same per frame as a small one.
+/// 50 000-line PR costs the same per frame as a small one. The layout
+/// controls live in the file header bar above (see
+/// [`crate::ui::widgets::file_header`]); the find box floats over the surface
+/// while [`DiffViewState::find_open`].
 pub fn render(
     ui: &mut egui::Ui,
     session: &mut PrSession,
@@ -266,8 +242,6 @@ pub fn render(
         strong: ui.visuals().strong_text_color(),
         weak: ui.visuals().weak_text_color(),
     };
-
-    render_toolbar(ui, session, state, actions);
 
     // Spec §7.5: GitHub's files API returns at most 3000 files per PR and
     // says nothing when it truncates; the session flags the cap and this
@@ -285,6 +259,7 @@ pub fn render(
 
     if session.row_model.rows.is_empty() {
         render_status(ui, session);
+        render_find_box(ui, state, session);
         return;
     }
 
@@ -353,6 +328,53 @@ pub fn render(
             render_row(&mut row, &reference, &mut ctx, cache, drafts, actions);
         });
     });
+
+    render_find_box(ui, state, session);
+}
+
+/// The find box, floated over the top-right of the surface while open
+/// (Task 48, relocated by Task 7's header bar). Enter walks the matches.
+fn render_find_box(ui: &mut egui::Ui, state: &mut DiffViewState, session: &PrSession) {
+    if !state.find_open {
+        return;
+    }
+    egui::Area::new(egui::Id::unique("gh-review-diff-find"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 6.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let find = egui::TextEdit::singleline(&mut state.find_query)
+                        .hint_text("Find in file")
+                        .desired_width(180.0);
+                    let response = ui.add(find);
+                    response.request_focus();
+                    let returned =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if returned
+                        || !state.find_applied.is_empty() && state.find_applied != state.find_query
+                    {
+                        let backwards = ui.input(|i| i.modifiers.shift);
+                        search_diff(session, state, backwards);
+                    }
+                    if !state.find_query.is_empty() && state.find_applied == state.find_query {
+                        if state.find_matches.is_empty() {
+                            ui.weak("no matches");
+                        } else if let Some(current) = state.find_current {
+                            let position = state
+                                .find_matches
+                                .iter()
+                                .position(|m| *m == current)
+                                .unwrap_or(0);
+                            ui.weak(format!("{} of {}", position + 1, state.find_matches.len()));
+                        }
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        state.find_open = false;
+                        state.clear_find();
+                    }
+                });
+            });
+        });
 }
 
 /// The theme- and font-derived values every row needs.
@@ -402,14 +424,10 @@ fn render_row(
 ) {
     let mode = ctx.mode;
     match reference {
-        RowRef::FileHeader { file } => {
-            let index = *file;
-            row.col(|ui| {
-                if let Some(loaded) = ctx.session.files.get(index as usize) {
-                    render_file_header(ui, index, loaded, ctx.session, ctx.style, actions);
-                }
-            });
-            blank_rest(row, mode);
+        RowRef::FileHeader { .. } => {
+            // The file header bar above the surface carries all of this;
+            // the row stays in the model only as the annotate anchor.
+            blank_all(row, mode);
         }
         RowRef::Placeholder { file } => {
             let index = *file;
@@ -1013,79 +1031,6 @@ pub(crate) fn layout_job(
     job
 }
 
-/// The file header row: path, counts, and [`header_buttons`].
-fn render_file_header(
-    ui: &mut egui::Ui,
-    file: u32,
-    loaded: &LoadedFile,
-    session: &PrSession,
-    style: &RowStyle,
-    actions: &mut Vec<DiffAction>,
-) {
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(display_path(&loaded.file))
-                .strong()
-                .font(style.font_id.clone()),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "+{} −{}",
-                loaded.file.additions, loaded.file.deletions
-            ))
-            .color(style.weak),
-        );
-
-        for button in header_buttons(&loaded.file) {
-            match button {
-                HeaderButton::CopyPath => {
-                    if ui.button("Copy path").clicked() {
-                        ui.ctx().copy_text(loaded.file.path.clone());
-                    }
-                }
-                HeaderButton::OpenInBrowser => {
-                    let url = session
-                        .metadata
-                        .as_ref()
-                        .map(|metadata| format!("{}/files", metadata.html_url));
-                    if let Some(url) = url {
-                        if ui.button("Open in browser").clicked() {
-                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                        }
-                    }
-                }
-                HeaderButton::CommentOnFile => {
-                    if ui.button("Comment on file").clicked() {
-                        actions.push(DiffAction::StartComment(CommentTarget::File {
-                            path: anchor_path(&loaded.file).to_owned(),
-                        }));
-                    }
-                }
-                HeaderButton::Viewed => {
-                    // The real viewed state lands in Phase D; the checkbox
-                    // reports the toggle as an action either way.
-                    let mut viewed = false;
-                    if ui.checkbox(&mut viewed, "Viewed").clicked() {
-                        actions.push(DiffAction::ToggleViewed(file));
-                    }
-                }
-            }
-        }
-
-        // An SVG has a text patch, so the reviewer picks what the body
-        // shows: the diff lines or the rendered viewer (Task 49).
-        if image_kind(&loaded.file.path) == Some(ImageKind::Svg) {
-            let rendered = session.rendered_svg.contains(&file);
-            if ui.selectable_label(!rendered, "Text").clicked() && rendered {
-                actions.push(DiffAction::ToggleRendered(file));
-            }
-            if ui.selectable_label(rendered, "Rendered").clicked() && !rendered {
-                actions.push(DiffAction::ToggleRendered(file));
-            }
-        }
-    });
-}
-
 /// What a placeholder row should draw for an image file (Task 49).
 enum ImageSlot {
     /// Not an image viewer: the plain placeholder.
@@ -1146,65 +1091,6 @@ fn render_placeholder(
             actions.push(DiffAction::StartComment(CommentTarget::File {
                 path: anchor_path(&loaded.file).to_owned(),
             }));
-        }
-    });
-}
-
-/// The unified/split, wrap, hide-whitespace, and find controls above the
-/// surface (Task 48).
-fn render_toolbar(
-    ui: &mut egui::Ui,
-    session: &PrSession,
-    state: &mut DiffViewState,
-    actions: &mut Vec<DiffAction>,
-) {
-    ui.horizontal(|ui| {
-        if ui
-            .selectable_label(session.mode == DiffMode::Unified, "Unified")
-            .clicked()
-        {
-            actions.push(DiffAction::SetMode(DiffMode::Unified));
-        }
-        if ui
-            .selectable_label(session.mode == DiffMode::Split, "Split")
-            .clicked()
-        {
-            actions.push(DiffAction::SetMode(DiffMode::Split));
-        }
-        ui.checkbox(&mut state.wrap, "Wrap");
-
-        // The option lives on the session because hiding rebuilds the rows;
-        // the checkbox only reports the click.
-        let mut hide = session.hide_whitespace;
-        if ui
-            .checkbox(&mut hide, "Hide whitespace")
-            .on_hover_text("hide hunks whose changes are only whitespace")
-            .clicked()
-        {
-            actions.push(DiffAction::ToggleHideWhitespace);
-        }
-
-        ui.separator();
-        let find = egui::TextEdit::singleline(&mut state.find_query)
-            .hint_text("Find in diff")
-            .desired_width(160.0);
-        let response = ui.add(find);
-        let returned = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if returned {
-            let backwards = ui.input(|i| i.modifiers.shift);
-            search_diff(session, state, backwards);
-        }
-        if !state.find_query.is_empty() && state.find_applied == state.find_query {
-            if state.find_matches.is_empty() {
-                ui.weak("no matches");
-            } else if let Some(current) = state.find_current {
-                let position = state
-                    .find_matches
-                    .iter()
-                    .position(|m| *m == current)
-                    .unwrap_or(0);
-                ui.weak(format!("{} of {}", position + 1, state.find_matches.len()));
-            }
         }
     });
 }
@@ -1298,8 +1184,8 @@ fn blank_all(row: &mut egui_extras::TableRow<'_, '_>, mode: DiffMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::files::{PatchState, PrFile};
-    use crate::test_support::{file, line_anchor, rows_from};
+    use crate::github::files::PatchState;
+    use crate::test_support::{line_anchor, rows_from};
 
     #[test]
     fn layout_job_marks_exactly_the_changed_bytes() {
@@ -1361,19 +1247,6 @@ mod tests {
     fn wrapped_rows_measure_taller() {
         let long = "x".repeat(400);
         assert!(row_height(true, &long, 8.0, 600.0) > row_height(false, &long, 8.0, 600.0));
-    }
-
-    #[test]
-    fn every_header_can_start_a_file_comment() {
-        let png = PrFile {
-            patch: None,
-            patch_state: PatchState::Binary,
-            changes: 0,
-            ..file("assets/logo.png")
-        };
-        let text = file("src/a.rs");
-        assert!(header_buttons(&png).contains(&HeaderButton::CommentOnFile));
-        assert!(header_buttons(&text).contains(&HeaderButton::CommentOnFile));
     }
 
     /// A loaded session with two text files and both placeholder kinds.

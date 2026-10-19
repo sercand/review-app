@@ -9,6 +9,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::github::search::Scope;
+use crate::model::diff::DiffMode;
 use crate::ui::theme::Theme;
 
 /// The cached identity of the signed-in account.
@@ -59,6 +60,30 @@ pub struct Settings {
     pub theme: Theme,
     /// The pane sizes and open/closed state, defaulted the same way.
     pub layout: Layout,
+    /// The diff layout choices, defaulted the same way.
+    pub diff: DiffPrefs,
+}
+
+/// The diff layout choices, remembered across PRs and restarts.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiffPrefs {
+    /// Unified or split.
+    pub mode: DiffMode,
+    /// Whether long lines wrap.
+    pub wrap: bool,
+    /// Whether whitespace-only changes are hidden.
+    pub hide_whitespace: bool,
+}
+
+impl Default for DiffPrefs {
+    fn default() -> DiffPrefs {
+        DiffPrefs {
+            mode: DiffMode::Split,
+            wrap: true,
+            hide_whitespace: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -76,6 +101,7 @@ impl Default for Settings {
                 right_pane: 320.0,
                 right_open: false,
             },
+            diff: DiffPrefs::default(),
         }
     }
 }
@@ -124,6 +150,24 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::test_support::tempdir;
+
+    #[test]
+    fn diff_prefs_default_to_split_and_round_trip() {
+        assert_eq!(Settings::default().diff.mode, DiffMode::Split);
+        assert!(Settings::default().diff.wrap);
+        let dir = tempdir();
+        let mut s = Settings::default();
+        s.diff.mode = DiffMode::Unified;
+        s.diff.wrap = false;
+        s.save(dir.path()).unwrap();
+        let r = Settings::load_or_default(dir.path());
+        assert_eq!((r.diff.mode, r.diff.wrap), (DiffMode::Unified, false));
+        std::fs::write(dir.path().join("settings.toml"), "host = \"github.com\"\n").unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).diff.mode,
+            DiffMode::Split
+        ); // older file
+    }
 
     #[test]
     fn settings_default_round_trip_and_partial_files() {

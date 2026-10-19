@@ -20,6 +20,7 @@ use crate::state::folder_viewed::toggle_folder_viewed;
 use crate::state::pr_detail::{head_moved_since_pin, viewer_is_author, PrSession};
 use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
+use crate::ui::widgets::file_header::{self, FileHeaderAction, FooterAction as FileFooterAction};
 use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
 use crate::ui::widgets::filter_bar;
 use crate::ui::widgets::metadata_panel;
@@ -36,7 +37,7 @@ const RIGHT_W: f32 = 320.0;
 const REVIEW_H: f32 = 220.0;
 
 /// What the user asked of the detail screen beyond the diff.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PrDetailAction {
     /// Leave the PR and go back to the list.
     Back,
@@ -51,6 +52,10 @@ pub enum PrDetailAction {
     Review(ReviewAction),
     /// Open the settings window (Task 53).
     OpenSettings,
+    /// A control in the file header bar (Task 7).
+    FileHeader(FileHeaderAction),
+    /// A control in the file footer bar (Task 7).
+    FileFooter(FileFooterAction),
 }
 
 /// The screen's own layout state, owned across frames by the app.
@@ -75,6 +80,9 @@ pub struct PrDetailState {
     pub last_layout: Option<(bool, f32)>,
     /// Reply texts and manually expanded threads, by thread node id.
     pub drafts: CommentDrafts,
+    /// The header bar's find button was clicked: the diff shows its find
+    /// box on the next frame and clears this (Task 7).
+    pub find_open: bool,
 }
 
 impl Default for PrDetailState {
@@ -87,6 +95,7 @@ impl Default for PrDetailState {
             right_pane: RIGHT_W,
             last_layout: None,
             drafts: CommentDrafts::default(),
+            find_open: false,
         }
     }
 }
@@ -188,7 +197,56 @@ pub fn render(
     actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
 
     egui::CentralPanel::default().show(ui, |ui| {
+        // The centre column: the file header bar on top, the diff between,
+        // and the footer navigation under it (redesign mockup).
+        let current = session.current_file().map(|(index, _)| index);
+        if let Some(index) = current {
+            let vm = file_header::file_header_vm(
+                &pr_files[index],
+                session.viewed.is_viewed(&pr_files[index]),
+            );
+            let rendered = session.rendered_svg.contains(&(index as u32));
+            let mut header_actions = Vec::new();
+            egui::Panel::top("file-header-bar")
+                .exact_size(file_header::HEADER_BAR_H)
+                .show(ui, |ui| {
+                    file_header::render_header(
+                        ui,
+                        &vm,
+                        &file_header::HeaderSettings {
+                            mode: session.mode,
+                            wrap: state.diff.wrap,
+                            hide_ws: session.hide_whitespace,
+                            rendered,
+                            image_mode: state.diff.image_mode,
+                        },
+                        &mut header_actions,
+                    );
+                });
+            actions.extend(header_actions.into_iter().map(PrDetailAction::FileHeader));
+
+            let order: Vec<u32> = session
+                .file_order()
+                .into_iter()
+                .map(|index| index as u32)
+                .collect();
+            let footer = file_header::footer_vm(&order, Some(index as u32), &pr_files);
+            let mut footer_actions = Vec::new();
+            egui::Panel::bottom("file-footer-bar")
+                .exact_size(file_header::FOOTER_BAR_H)
+                .show(ui, |ui| {
+                    file_header::render_footer(ui, &footer, &mut footer_actions);
+                });
+            actions.extend(footer_actions.into_iter().map(PrDetailAction::FileFooter));
+        }
+
         recompute_line_heights(ui, session, state);
+        // The header bar's search button opens the find box for one frame's
+        // hand-off: the surface owns it from there.
+        if state.find_open {
+            state.find_open = false;
+            state.diff.find_open = true;
+        }
         diff_view::render(
             ui,
             session,

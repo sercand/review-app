@@ -37,7 +37,8 @@ use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
 use crate::ui::theme;
 use crate::ui::widgets::command_palette::{self, PaletteState};
-use crate::ui::widgets::diff_view::{DiffAction, DiffMode};
+use crate::ui::widgets::diff_view::{DiffAction, DiffMode, DiffViewState};
+use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFooterAction};
 use crate::ui::widgets::review_panel::ReviewAction;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
@@ -597,6 +598,22 @@ impl ReviewApp {
     fn sync_layout(&mut self, now: Instant) {
         if self.screen == ScreenKind::PrDetail {
             let mut dirty = false;
+            // The diff layout choices are global preferences: mirror them
+            // out of the live session and state (Task 7).
+            if let Some(session) = &self.session {
+                if session.mode != self.settings.diff.mode {
+                    self.settings.diff.mode = session.mode;
+                    dirty = true;
+                }
+                if session.hide_whitespace != self.settings.diff.hide_whitespace {
+                    self.settings.diff.hide_whitespace = session.hide_whitespace;
+                    dirty = true;
+                }
+            }
+            if self.pr_detail.diff.wrap != self.settings.diff.wrap {
+                self.settings.diff.wrap = self.pr_detail.diff.wrap;
+                dirty = true;
+            }
             let left = self.pr_detail.left_pane;
             if (left - self.settings.layout.left_pane).abs() > 0.5 {
                 self.settings.layout.left_pane = left;
@@ -725,13 +742,22 @@ impl ReviewApp {
         let id = SessionId(self.next_session);
         self.next_session += 1;
 
-        let (session, commands) = PrSession::open(id, self.settings.host.clone(), repo, number);
+        let (mut session, commands) = PrSession::open(id, self.settings.host.clone(), repo, number);
+        // The diff layout is a global preference (Task 7): every PR opens
+        // the way the reviewer left the last one.
+        let prefs = self.settings.diff;
+        session.mode = prefs.mode;
+        session.set_hide_whitespace(prefs.hide_whitespace);
         self.session = Some(session);
         // The detail screen's per-PR state — the diff layout, reply drafts,
         // and expanded threads — belongs to the PR being left, not this one.
         // The pane geometry is the user's global layout, restored from
         // settings (Task 53).
         self.pr_detail = PrDetailState {
+            diff: DiffViewState {
+                wrap: prefs.wrap,
+                ..DiffViewState::default()
+            },
             left_pane: self.settings.layout.left_pane,
             right_pane: self.settings.layout.right_pane,
             right_open: self.settings.layout.right_open,
@@ -822,6 +848,17 @@ impl ReviewApp {
                     }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),
+                PrDetailAction::FileHeader(action) => {
+                    self.apply_file_header_action(action, ui.ctx(), now);
+                }
+                PrDetailAction::FileFooter(action) => match action {
+                    FileFooterAction::Prev => self.step_file(false, now),
+                    FileFooterAction::Next => self.step_file(true, now),
+                    FileFooterAction::ViewedAndNext => {
+                        self.set_viewed_current(Some(true), now);
+                        self.step_file(true, now);
+                    }
+                },
             }
         }
     }
@@ -1224,6 +1261,72 @@ impl ReviewApp {
             }
         }
         self.close_detail();
+    }
+
+    /// Fold the file header bar's actions in (Task 7): the file-level ones
+    /// act on the current file, the layout ones ride the same paths the
+    /// keyboard shortcuts take.
+    fn apply_file_header_action(
+        &mut self,
+        action: FileHeaderAction,
+        ctx: &egui::Context,
+        now: Instant,
+    ) {
+        let path = self
+            .session
+            .as_ref()
+            .and_then(|session| session.current_file())
+            .map(|(_, loaded)| loaded.file.path.clone());
+        match action {
+            FileHeaderAction::CopyPath => {
+                if let Some(path) = path {
+                    ctx.copy_text(path);
+                }
+            }
+            FileHeaderAction::OpenInBrowser => {
+                if let Some(url) = self
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.metadata.as_ref())
+                    .map(|metadata| format!("{}/files", metadata.html_url))
+                {
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+            FileHeaderAction::CommentOnFile => {
+                if let (Some(session), Some(path)) = (&mut self.session, path) {
+                    session.open_comment(CommentTarget::File { path });
+                }
+            }
+            FileHeaderAction::ToggleViewed => self.set_viewed_current(None, now),
+            FileHeaderAction::SetMode(mode) => {
+                if let Some(session) = &mut self.session {
+                    session.set_mode(mode);
+                }
+                self.pr_detail.diff.clear_find();
+                self.pr_detail.last_layout = None;
+            }
+            FileHeaderAction::ToggleWrap => {
+                self.pr_detail.diff.wrap = !self.pr_detail.diff.wrap;
+                // The wrap width changed, so every measured height is stale.
+                self.pr_detail.last_layout = None;
+            }
+            FileHeaderAction::ToggleHideWhitespace => {
+                if let Some(session) = &mut self.session {
+                    session.toggle_hide_whitespace();
+                }
+                self.pr_detail.diff.clear_find();
+            }
+            FileHeaderAction::OpenFind => self.pr_detail.find_open = true,
+            FileHeaderAction::SetImageMode(mode) => self.pr_detail.diff.image_mode = mode,
+            FileHeaderAction::ToggleRendered => {
+                if let Some(session) = &mut self.session {
+                    if let Some(index) = session.current_file().map(|(index, _)| index as u32) {
+                        session.toggle_rendered_svg(index);
+                    }
+                }
+            }
+        }
     }
 
     /// `j`/`k`: move the diff to the next/previous visible file in display
