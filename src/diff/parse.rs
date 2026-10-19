@@ -33,7 +33,7 @@ pub fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ParseError> {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
 
         if let Some(rest) = line.strip_prefix("@@") {
-            let (old_start, new_start) = parse_hunk_header(rest)?;
+            let (old_start, new_start, section) = parse_hunk_header(rest)?;
             if let Some(hunk) = current.take() {
                 hunks.push(hunk);
             }
@@ -42,6 +42,7 @@ pub fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ParseError> {
             current = Some(Hunk {
                 old_start,
                 new_start,
+                section,
                 rows: Vec::new(),
             });
             continue;
@@ -120,14 +121,14 @@ pub fn row_anchor(row: &DiffRow) -> Option<(Side, u32)> {
     }
 }
 
-/// Parse the part of a hunk header after `@@`, returning the two start lines.
-fn parse_hunk_header(rest: &str) -> Result<(u32, u32), ParseError> {
+/// Parse the part of a hunk header after `@@`, returning the two start lines
+/// and the section heading (empty when the header carries none).
+fn parse_hunk_header(rest: &str) -> Result<(u32, u32, String), ParseError> {
     let malformed = || ParseError(format!("@@{rest}"));
 
-    let ranges = rest
+    let (ranges, section) = rest
         .strip_prefix(' ')
         .and_then(|rest| rest.split_once(" @@"))
-        .map(|(ranges, _section)| ranges)
         .ok_or_else(malformed)?;
 
     let (old, new) = ranges.split_once(' ').ok_or_else(malformed)?;
@@ -140,7 +141,7 @@ fn parse_hunk_header(rest: &str) -> Result<(u32, u32), ParseError> {
         .and_then(parse_hunk_start)
         .ok_or_else(malformed)?;
 
-    Ok((old_start, new_start))
+    Ok((old_start, new_start, section.trim().to_owned()))
 }
 
 /// The start line of a `start[,len]` range field; the count is not needed.
@@ -152,6 +153,14 @@ fn parse_hunk_start(range: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::model::diff::{LineKind, Side};
+
+    #[test]
+    fn keeps_the_section_heading() {
+        let hunks = parse_patch("@@ -1,3 +1,3 @@ fn main()\n ctx\n").unwrap();
+        assert_eq!(hunks[0].section, "fn main()");
+        let bare = parse_patch("@@ -1 +1 @@\n ctx\n").unwrap();
+        assert_eq!(bare[0].section, "");
+    }
 
     #[test]
     fn numbers_rows_like_github() {

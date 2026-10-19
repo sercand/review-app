@@ -15,18 +15,19 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::diff::annotate::rows_for_anchor;
-use crate::diff::expand::Expand;
+use crate::diff::annotate::{row_coordinate, rows_for_anchor};
+use crate::diff::expand::{gaps, Expand};
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
 use crate::diff::options::{find_matches, next_match, prev_match};
-use crate::diff::row_model::{display_text, pair_indices, RowRef, HEADER_H, ROW_H};
+use crate::diff::row_model::{display_text, pair_indices, RowModel, RowRef, HEADER_H, ROW_H};
 use crate::diff::word::word_diff;
 use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
-use crate::model::comment::CommentTarget;
+use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
 use crate::state::pr_detail::{LoadPhase, PrSession, GITHUB_FILE_CAP};
+use crate::ui::icons::{CHEVRONS_DOWN, CHEVRONS_UP, PLUS, UNFOLD_VERTICAL};
 use crate::ui::theme::palette_of;
 use crate::ui::widgets::comment_composer;
 use crate::ui::widgets::image_diff;
@@ -413,6 +414,63 @@ fn column_count(mode: DiffMode) -> usize {
     }
 }
 
+/// One context-expansion button on a hunk's header bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapButton {
+    /// Reveal the `n` hidden lines adjacent to the hunk below the gap.
+    Up(u32),
+    /// Reveal the `n` hidden lines adjacent to the hunk above the gap.
+    Down(u32),
+    /// Reveal the whole gap.
+    All(u32),
+}
+
+/// The expansion buttons for a gap of `hidden` lines (mockup: twenty at a
+/// time, plus "All" once that is more than one click's worth). A tail gap
+/// reveals downward from the hunk above it.
+pub fn gap_buttons(hidden: u32, tail: bool) -> Vec<GapButton> {
+    if hidden == 0 {
+        return Vec::new();
+    }
+    if tail {
+        let mut out = vec![GapButton::Down(hidden.min(20))];
+        if hidden > 20 {
+            out.push(GapButton::All(hidden));
+        }
+        out
+    } else {
+        let mut out = vec![GapButton::Up(hidden.min(20))];
+        if hidden > 20 {
+            out.push(GapButton::All(hidden));
+        }
+        out
+    }
+}
+
+/// The comment target for one side of the table row at `index`, or `None`
+/// when that side has no line (a header, a gap, a blank half of a pair).
+pub fn comment_anchor(
+    model: &RowModel,
+    files: &[LoadedFile],
+    index: usize,
+    side: Side,
+) -> Option<CommentTarget> {
+    let reference = model.rows.get(index)?;
+    let line = row_coordinate(files, reference, side)?;
+    let file = match reference {
+        RowRef::Line { file, .. } | RowRef::Pair { file, .. } => *file,
+        _ => return None,
+    };
+    let loaded = files.get(file as usize)?;
+    Some(CommentTarget::Line(Anchor {
+        path: anchor_path(&loaded.file).to_owned(),
+        side,
+        line,
+        start_line: None,
+        start_side: None,
+    }))
+}
+
 /// Render one row of the surface.
 fn render_row(
     row: &mut egui_extras::TableRow<'_, '_>,
@@ -502,30 +560,27 @@ fn render_row(
                 }
             }
         }
-        RowRef::Gap { file, before_hunk } => {
-            let (file, before_hunk) = (*file, *before_hunk);
+        RowRef::HunkHeader { file, hunk } => {
+            let (file, hunk) = (*file, *hunk);
             row.col(|ui| {
-                ui.horizontal(|ui| {
-                    for (label, how) in [
-                        ("↑ 20", Expand::Up(20)),
-                        ("↓ 20", Expand::Down(20)),
-                        ("all", Expand::All),
-                    ] {
-                        if ui
-                            .button(label)
-                            .on_hover_text("show the lines GitHub omitted here")
-                            .clicked()
-                        {
-                            actions.push(DiffAction::ExpandGap {
-                                file,
-                                before_hunk,
-                                how,
-                            });
-                        }
-                    }
-                });
+                let palette = palette_of(ui);
+                let cell = ui.max_rect();
+                // The bar spans every column: draw it from the first cell
+                // across the table's full width, in a scope whose max rect
+                // (and so clip rect) is the whole bar.
+                let bar =
+                    egui::Rect::from_min_size(cell.min, egui::vec2(ctx.full_width, cell.height()));
+                ui.painter().rect_filled(bar, 0.0, palette.hunk_bg);
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(bar)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| render_hunk_bar(ui, ctx.session, file, hunk, actions),
+                );
             });
-            blank_rest(row, mode);
+            for _ in 1..column_count(mode) {
+                row.col(|_ui| {});
+            }
         }
         RowRef::Line {
             file,
@@ -550,7 +605,11 @@ fn render_row(
             // Unified word marks: the row's partner in the removed/added run
             // it belongs to, paired the same way split mode pairs them.
             let mark = unified_word_mark(ctx.session, *file, *hunk, *row_index);
-            render_line_cells(row, diff_row, &text, spans, mark, ctx);
+            let mut sink = LineSink {
+                index: row.index(),
+                actions,
+            };
+            render_line_cells(row, diff_row, &text, spans, mark, &mut sink, ctx);
         }
         RowRef::Pair {
             file,
@@ -587,44 +646,69 @@ fn render_row(
                 (Some(left), Some(right)) => word_diff(left, right),
                 _ => None,
             };
+            let index = row.index();
 
             row.col(|ui| {
-                number_cell(
+                if let Some(target) = number_cell(
                     ui,
                     left_row.and_then(|row| row.old_no),
                     cell_kind(left_row),
                     None,
                     ctx,
-                )
+                    Some(CellComment {
+                        index,
+                        side: Side::Left,
+                    }),
+                ) {
+                    actions.push(DiffAction::StartComment(target));
+                }
             });
             row.col(|ui| {
-                code_cell(
+                if let Some(target) = code_cell(
                     ui,
                     left_text.as_deref(),
                     &left_spans,
                     marks.as_ref().map(|(left, _)| left.clone()),
                     cell_kind(left_row),
                     ctx,
-                )
+                    Some(CellComment {
+                        index,
+                        side: Side::Left,
+                    }),
+                ) {
+                    actions.push(DiffAction::StartComment(target));
+                }
             });
             row.col(|ui| {
-                number_cell(
+                if let Some(target) = number_cell(
                     ui,
                     right_row.and_then(|row| row.new_no),
                     cell_kind(right_row),
                     Some(true),
                     ctx,
-                )
+                    Some(CellComment {
+                        index,
+                        side: Side::Right,
+                    }),
+                ) {
+                    actions.push(DiffAction::StartComment(target));
+                }
             });
             row.col(|ui| {
-                code_cell(
+                if let Some(target) = code_cell(
                     ui,
                     right_text.as_deref(),
                     &right_spans,
                     marks.as_ref().map(|(_, right)| right.clone()),
                     cell_kind(right_row),
                     ctx,
-                )
+                    Some(CellComment {
+                        index,
+                        side: Side::Right,
+                    }),
+                ) {
+                    actions.push(DiffAction::StartComment(target));
+                }
             });
         }
         RowRef::Thread { thread } => {
@@ -801,6 +885,13 @@ fn unified_word_mark(
     None
 }
 
+/// Where a line row's clicks go: its table row and the surface's action
+/// queue.
+struct LineSink<'a> {
+    index: usize,
+    actions: &'a mut Vec<DiffAction>,
+}
+
 /// Draw one line row, placing it in the columns `mode` expects.
 fn render_line_cells(
     row: &mut egui_extras::TableRow<'_, '_>,
@@ -808,15 +899,65 @@ fn render_line_cells(
     text: &str,
     spans: &[HighlightSpan],
     mark: Option<std::ops::Range<usize>>,
+    sink: &mut LineSink<'_>,
     ctx: &RowCtx<'_>,
 ) {
     let mode = ctx.mode;
     let kind = cell_kind(Some(diff_row));
+    // A unified row's comment side: a removed line only exists on the left.
+    let unified_side = if diff_row.kind == LineKind::Removed {
+        Side::Left
+    } else {
+        Side::Right
+    };
     match mode {
         DiffMode::Unified => {
-            row.col(|ui| number_cell(ui, diff_row.old_no, kind, None, ctx));
-            row.col(|ui| number_cell(ui, diff_row.new_no, kind, None, ctx));
-            row.col(|ui| code_cell(ui, Some(text), spans, mark, kind, ctx));
+            row.col(|ui| {
+                if let Some(target) = number_cell(
+                    ui,
+                    diff_row.old_no,
+                    kind,
+                    None,
+                    ctx,
+                    Some(CellComment {
+                        index: sink.index,
+                        side: unified_side,
+                    }),
+                ) {
+                    sink.actions.push(DiffAction::StartComment(target));
+                }
+            });
+            row.col(|ui| {
+                if let Some(target) = number_cell(
+                    ui,
+                    diff_row.new_no,
+                    kind,
+                    None,
+                    ctx,
+                    Some(CellComment {
+                        index: sink.index,
+                        side: unified_side,
+                    }),
+                ) {
+                    sink.actions.push(DiffAction::StartComment(target));
+                }
+            });
+            row.col(|ui| {
+                if let Some(target) = code_cell(
+                    ui,
+                    Some(text),
+                    spans,
+                    mark,
+                    kind,
+                    ctx,
+                    Some(CellComment {
+                        index: sink.index,
+                        side: unified_side,
+                    }),
+                ) {
+                    sink.actions.push(DiffAction::StartComment(target));
+                }
+            });
         }
         DiffMode::Split => {
             // Split rows are `RowRef::Pair`s; a `Line` row only reaches split
@@ -826,37 +967,100 @@ fn render_line_cells(
             let on_right = diff_row.kind != LineKind::Removed;
             row.col(|ui| {
                 if on_left {
-                    number_cell(ui, diff_row.old_no, kind, None, ctx);
+                    number_cell(
+                        ui,
+                        diff_row.old_no,
+                        kind,
+                        None,
+                        ctx,
+                        Some(CellComment {
+                            index: sink.index,
+                            side: Side::Left,
+                        }),
+                    );
                 }
             });
             row.col(|ui| {
                 if on_left {
-                    code_cell(ui, Some(text), spans, mark.clone(), kind, ctx);
+                    code_cell(
+                        ui,
+                        Some(text),
+                        spans,
+                        mark.clone(),
+                        kind,
+                        ctx,
+                        Some(CellComment {
+                            index: sink.index,
+                            side: Side::Left,
+                        }),
+                    );
                 }
             });
             row.col(|ui| {
                 if on_right {
-                    number_cell(ui, diff_row.new_no, kind, Some(true), ctx);
+                    number_cell(
+                        ui,
+                        diff_row.new_no,
+                        kind,
+                        Some(true),
+                        ctx,
+                        Some(CellComment {
+                            index: sink.index,
+                            side: Side::Right,
+                        }),
+                    );
                 }
             });
             row.col(|ui| {
                 if on_right {
-                    code_cell(ui, Some(text), spans, mark.clone(), kind, ctx);
+                    code_cell(
+                        ui,
+                        Some(text),
+                        spans,
+                        mark.clone(),
+                        kind,
+                        ctx,
+                        Some(CellComment {
+                            index: sink.index,
+                            side: Side::Right,
+                        }),
+                    );
                 }
             });
         }
     }
 }
 
-/// One gutter cell: the line number over the kind's background.
+/// One line row's comment affordance: which table row and side the cell
+/// belongs to, and where clicking pushes the resulting action.
+/// The per-row half a cell belongs to. A cell whose side has a line returns
+/// its comment target when the reviewer clicks it; the caller turns that
+/// into a [`DiffAction`].
+#[derive(Clone, Copy)]
+struct CellComment {
+    index: usize,
+    side: Side,
+}
+
+impl CellComment {
+    /// The cell's comment target, `None` when this side has no line.
+    fn target(self, session: &PrSession) -> Option<CommentTarget> {
+        comment_anchor(&session.row_model, &session.files, self.index, self.side)
+    }
+}
+
+/// One gutter cell: the line number over the kind's background. A number is
+/// clickable: it opens the composer on that line (spec §7.3).
 fn number_cell(
     ui: &mut egui::Ui,
     number: Option<u32>,
     kind: CellKind,
     divider: Option<bool>,
     ctx: &RowCtx<'_>,
-) {
+    comment: Option<CellComment>,
+) -> Option<CommentTarget> {
     let palette = palette_of(ui);
+    let target = comment.and_then(|c| c.target(ctx.session));
     let bg = match kind {
         CellKind::Context => None,
         CellKind::Removed => Some(palette.del_gutter),
@@ -867,6 +1071,15 @@ fn number_cell(
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
+    if ctx
+        .session
+        .composer
+        .target
+        .as_ref()
+        .is_some_and(|open| target.as_ref() == Some(open))
+    {
+        ui.painter().rect_filled(rect, 0.0, palette.accent_soft);
+    }
     if divider == Some(true) {
         ui.painter()
             .line_segment([rect.left_top(), rect.left_bottom()], (1.0, palette.line));
@@ -876,15 +1089,28 @@ fn number_cell(
         CellKind::Missing => palette.faint,
         _ => style_weak(ctx),
     };
-    ui.label(
+    let label = egui::Label::new(
         egui::RichText::new(text)
             .font(ctx.style.font_id.clone())
             .color(color),
-    );
+    )
+    .selectable(false);
+    let response = match (&comment, &target) {
+        (Some(_), Some(_)) => ui.add(label.sense(egui::Sense::click())),
+        _ => ui.add(label),
+    };
+    if target.is_some() {
+        response.clone().on_hover_text("Comment on line");
+    }
+    if response.clicked() {
+        return target;
+    }
+    None
 }
 
 /// One code cell: background fill, sign glyph, and the highlighted text with
-/// its word-diff mark. A missing side is just the filler.
+/// its word-diff mark. A missing side is just the filler. Hovering a cell
+/// with a line reveals the accent plus button that opens the composer.
 fn code_cell(
     ui: &mut egui::Ui,
     text: Option<&str>,
@@ -892,8 +1118,10 @@ fn code_cell(
     mark: Option<std::ops::Range<usize>>,
     kind: CellKind,
     ctx: &RowCtx<'_>,
-) {
+    comment: Option<CellComment>,
+) -> Option<CommentTarget> {
     let palette = palette_of(ui);
+    let target = comment.and_then(|c| c.target(ctx.session));
     let bg = match kind {
         CellKind::Context => None,
         CellKind::Removed => Some(palette.del_bg),
@@ -904,9 +1132,45 @@ fn code_cell(
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
-    let Some(text) = text else {
-        return;
-    };
+    if ctx
+        .session
+        .composer
+        .target
+        .as_ref()
+        .is_some_and(|open| target.as_ref() == Some(open))
+    {
+        ui.painter().rect_filled(rect, 0.0, palette.accent_soft);
+    }
+    let text = text?;
+
+    // The hover plus button: only while the pointer is over the cell, so
+    // idle rows allocate nothing.
+    let hovered = ui
+        .input(|i| i.pointer.hover_pos())
+        .is_some_and(|p| rect.contains(p));
+    if hovered {
+        if let Some(target) = target.clone() {
+            let plus = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::vec2(18.0, 18.0),
+            );
+            let galley = ui.painter().layout_no_wrap(
+                PLUS.to_string(),
+                egui::FontId::proportional(12.0),
+                palette.accent,
+            );
+            let response = ui.put(
+                plus,
+                egui::Label::new(galley)
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            );
+            if response.clicked() {
+                return Some(target);
+            }
+            response.on_hover_text("Comment on line");
+        }
+    }
 
     let (sign, sign_color) = match kind {
         CellKind::Removed => ("−", palette.bad),
@@ -931,6 +1195,98 @@ fn code_cell(
         };
         add_line_marked(ui, text, spans, mark, mark_bg, ctx);
     });
+    None
+}
+
+/// Draw one hunk's header bar: the expansion buttons for the gap above it,
+/// then the `@@` line in faint mono (mockup `.hunk`).
+fn render_hunk_bar(
+    ui: &mut egui::Ui,
+    session: &PrSession,
+    file: u32,
+    hunk: u32,
+    actions: &mut Vec<DiffAction>,
+) {
+    let palette = palette_of(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let diff = session
+            .files
+            .get(file as usize)
+            .and_then(|l| l.diff.as_ref());
+        let Some(diff) = diff else { return };
+        // The gap directly above this hunk, if GitHub omitted context there.
+        let hidden = gaps(diff, u32::MAX)
+            .into_iter()
+            .find(|gap| gap.before_hunk == hunk)
+            .map(|gap| gap.new_end - gap.new_start + 1)
+            .unwrap_or(0);
+        for button in gap_buttons(hidden, false) {
+            let (icon, label, how) = match button {
+                GapButton::Up(n) => (CHEVRONS_UP, n.to_string(), Expand::Up(n)),
+                GapButton::Down(n) => (CHEVRONS_DOWN, n.to_string(), Expand::Down(n)),
+                GapButton::All(n) => (UNFOLD_VERTICAL, format!("All {n} lines"), Expand::All),
+            };
+            let response = ui.add(
+                egui::Button::new(
+                    egui::RichText::new(format!("{icon} {label}"))
+                        .small()
+                        .color(palette.accent),
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .corner_radius(4.0)
+                .min_size(egui::vec2(0.0, 22.0)),
+            );
+            if response.hovered() {
+                ui.painter()
+                    .rect_filled(response.rect, 4.0, palette.accent_soft);
+            }
+            if response.clicked() {
+                actions.push(DiffAction::ExpandGap {
+                    file,
+                    before_hunk: hunk,
+                    how,
+                });
+            }
+        }
+        if let Some(hunk_data) = diff.hunks.get(hunk as usize) {
+            let (old_len, new_len) = hunk_lengths(hunk_data);
+            let mut text = format!(
+                "@@ -{},{} +{},{} @@",
+                hunk_data.old_start, old_len, hunk_data.new_start, new_len
+            );
+            if !hunk_data.section.is_empty() {
+                text.push(' ');
+                text.push_str(&hunk_data.section);
+            }
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .monospace()
+                        .small()
+                        .color(palette.faint),
+                )
+                .selectable(false)
+                .truncate(),
+            );
+        }
+    });
+}
+
+/// A hunk's row counts per side, as the `@@ -a,b +c,d @@` header shows them.
+fn hunk_lengths(hunk: &crate::model::diff::Hunk) -> (u32, u32) {
+    let mut old = 0;
+    let mut new = 0;
+    for row in &hunk.rows {
+        if row.old_no.is_some() {
+            old += 1;
+        }
+        if row.new_no.is_some() {
+            new += 1;
+        }
+    }
+    (old, new)
 }
 
 /// The weak text colour, for gutters and context signs.
@@ -1184,8 +1540,49 @@ fn blank_all(row: &mut egui_extras::TableRow<'_, '_>, mode: DiffMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::row_model::build_one;
     use crate::github::files::PatchState;
-    use crate::test_support::{line_anchor, rows_from};
+    use crate::test_support::{line_anchor, loaded, rows_from};
+
+    #[test]
+    fn gap_buttons_offer_twenty_then_all() {
+        assert_eq!(gap_buttons(0, false), vec![]);
+        assert_eq!(gap_buttons(3, false), vec![GapButton::Up(3)]);
+        assert_eq!(
+            gap_buttons(60, false),
+            vec![GapButton::Up(20), GapButton::All(60)]
+        );
+        assert_eq!(
+            gap_buttons(60, true),
+            vec![GapButton::Down(20), GapButton::All(60)]
+        );
+        assert_eq!(gap_buttons(5, true), vec![GapButton::Down(5)]);
+    }
+
+    #[test]
+    fn comment_button_anchor_uses_row_coordinate() {
+        let files = vec![loaded(
+            "src/a.rs",
+            "@@ -1,4 +1,5 @@ fn main\n a\n b\n-b\n+B\n c\n",
+        )];
+        let model = build_one(&files, Some(0), DiffMode::Unified);
+        // 0 = file header, 1 = hunk bar, 2 = " a", 3 = " b", 4 = "-b",
+        // 5 = "+B", 6 = " c".
+        let added = comment_anchor(&model, &files, 5, Side::Right).expect("the added row");
+        assert_eq!(added, CommentTarget::Line(line_anchor("src/a.rs", 3)));
+        let removed = comment_anchor(&model, &files, 4, Side::Left).expect("the removed row");
+        match removed {
+            CommentTarget::Line(a) => {
+                assert_eq!(
+                    (a.path.as_str(), a.side, a.line),
+                    ("src/a.rs", Side::Left, 3)
+                );
+            }
+            other => panic!("expected a line target, got {other:?}"),
+        }
+        assert!(comment_anchor(&model, &files, 0, Side::Right).is_none());
+        assert!(comment_anchor(&model, &files, 1, Side::Right).is_none());
+    }
 
     #[test]
     fn layout_job_marks_exactly_the_changed_bytes() {

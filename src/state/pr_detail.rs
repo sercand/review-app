@@ -2661,10 +2661,10 @@ mod tests {
             done: true,
         });
         s.select_file(1);
-        assert!(s.row_model.rows.contains(&RowRef::Gap {
-            file: 1,
-            before_hunk: 0
-        }));
+        assert!(s
+            .row_model
+            .rows
+            .contains(&RowRef::HunkHeader { file: 1, hunk: 0 }));
 
         let cmds = s.expand_gap(1, 0, Expand::All);
         assert!(
@@ -2703,12 +2703,10 @@ mod tests {
             (Some(1), Some(1), "l1"),
             "expanded rows carry exact coordinates"
         );
-        assert!(
-            !s.row_model.rows.contains(&RowRef::Gap {
-                file: 1,
-                before_hunk: 0
-            }),
-            "a fully expanded gap is gone"
+        assert_eq!(
+            s.files[1].diff.as_ref().unwrap().hunks[0].new_start,
+            1,
+            "a fully expanded gap is gone: the hunk now starts at line 1"
         );
 
         // The blob is cached: a later expansion applies without a command.
@@ -2782,11 +2780,9 @@ mod tests {
             file: 1,
             text: "l1\nl2\nl3\nb\n c\n".into(),
         });
-        assert!(
-            !s.row_model.rows.contains(&RowRef::Gap {
-                file: 1,
-                before_hunk: 0
-            }),
+        assert_eq!(
+            s.files[1].diff.as_ref().unwrap().hunks[0].new_start,
+            1,
             "the queued request stayed 'all': the whole gap is revealed"
         );
     }

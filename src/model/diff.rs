@@ -72,6 +72,9 @@ pub struct Hunk {
     pub old_start: u32,
     /// The new-side line number the hunk starts at.
     pub new_start: u32,
+    /// The section heading after the second `@@`, empty when the patch
+    /// carries none (spec §8.2).
+    pub section: String,
     /// The hunk's rows, in order.
     pub rows: Vec<DiffRow>,
 }

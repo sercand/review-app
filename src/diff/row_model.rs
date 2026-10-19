@@ -19,6 +19,9 @@ pub const HEADER_H: f32 = 30.0;
 /// The default height of an unwrapped diff line row.
 pub const ROW_H: f32 = 20.0;
 
+/// The height of a hunk's header bar (redesign Task 8).
+pub const HUNK_H: f32 = 28.0;
+
 /// A line's displayed text is truncated at this many characters (spec §8.4).
 pub const MAX_DISPLAY_CHARS: usize = 10_000;
 
@@ -63,12 +66,14 @@ pub enum RowRef {
         /// The index of the new-side row in the hunk, when it has one.
         right: Option<u32>,
     },
-    /// Expandable context before one hunk (Task 45).
-    Gap {
+    /// A hunk's header bar (redesign Task 8): the `@@` line, plus the
+    /// context-expansion buttons for the gap above the hunk when there is
+    /// one — the mockup's single `.hunk` bar.
+    HunkHeader {
         /// The index of the file in `PrSession::files`.
         file: u32,
-        /// The hunk the omitted context precedes.
-        before_hunk: u32,
+        /// The index of the hunk in the file's diff.
+        hunk: u32,
     },
     /// An existing comment thread, inserted by Task 37.
     Thread {
@@ -164,9 +169,8 @@ impl RowModel {
 
 /// Build the row list for `files`, in unified layout.
 ///
-/// Per file: a header, then either the placeholder (GitHub sent no diff) or the
-/// hunks' lines, each preceded by a [`RowRef::Gap`] when the hunk does not
-/// start at line 1.
+/// Per file: a header, then either the placeholder (GitHub sent no diff) or,
+/// per hunk, a [`RowRef::HunkHeader`] bar followed by the hunk's lines.
 pub fn build(files: &[LoadedFile]) -> RowModel {
     let mut model = RowModel {
         rows: Vec::new(),
@@ -210,7 +214,7 @@ pub fn build_one(files: &[LoadedFile], selected: Option<usize>, mode: DiffMode) 
     model
 }
 
-/// Append one file's rows: header, then placeholder or hunk lines.
+/// Append one file's rows: header, then placeholder or hunk bars and lines.
 fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile, mode: DiffMode) {
     model.push(RowRef::FileHeader { file }, HEADER_H);
     match &loaded.diff {
@@ -218,15 +222,13 @@ fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile, mode: DiffMod
         Some(diff) => {
             for (hunk_idx, hunk) in diff.hunks.iter().enumerate() {
                 let hunk_idx = hunk_idx as u32;
-                if hunk.old_start != 1 {
-                    model.push(
-                        RowRef::Gap {
-                            file,
-                            before_hunk: hunk_idx,
-                        },
-                        ROW_H,
-                    );
-                }
+                model.push(
+                    RowRef::HunkHeader {
+                        file,
+                        hunk: hunk_idx,
+                    },
+                    HUNK_H,
+                );
                 match mode {
                     DiffMode::Unified => {
                         for row_idx in 0..hunk.rows.len() {
@@ -347,7 +349,7 @@ mod tests {
         );
         assert!(m.rows[m.file_ranges[1].clone()].iter().all(|r| match r {
             RowRef::FileHeader { file } | RowRef::Line { file, .. } => *file == 1,
-            RowRef::Gap { file, .. } => *file == 1,
+            RowRef::HunkHeader { file, .. } => *file == 1,
             other => panic!("unexpected row {other:?}"),
         }));
     }
@@ -389,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_ranges_placeholders_and_gaps() {
+    fn builds_ranges_placeholders_and_hunk_headers() {
         let mut bin = loaded("logo.png", "@@ -1 +1 @@\n-a\n+b\n");
         bin.diff = None;
         let m = build(&[loaded("src/a.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n"), bin]);
@@ -397,13 +399,10 @@ mod tests {
             m.rows[..2],
             [
                 RowRef::FileHeader { file: 0 },
-                RowRef::Gap {
-                    file: 0,
-                    before_hunk: 0
-                }
+                RowRef::HunkHeader { file: 0, hunk: 0 }
             ]
         );
-        assert_eq!(m.file_ranges[0], 0..5); // header + gap + 3 lines
+        assert_eq!(m.file_ranges[0], 0..5); // header + hunk bar + 3 lines
         assert_eq!(
             m.rows[m.file_ranges[1].start + 1],
             RowRef::Placeholder { file: 1 }

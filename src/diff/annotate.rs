@@ -235,7 +235,7 @@ fn find_line(
 /// Resolve a [`RowRef::Line`]'s (or a [`RowRef::Pair`]'s side) coordinate on
 /// `side`. A pair answers from the row its `side` points at: the left row
 /// for `Left`, the right row for `Right`.
-fn row_coordinate(files: &[LoadedFile], row: &RowRef, side: Side) -> Option<u32> {
+pub(crate) fn row_coordinate(files: &[LoadedFile], row: &RowRef, side: Side) -> Option<u32> {
     let (file, hunk, index) = match row {
         RowRef::Line { file, hunk, row } => (*file, *hunk, *row),
         RowRef::Pair {
@@ -285,10 +285,10 @@ mod tests {
             row: RowRef::Thread { thread: 0 },
         };
         let out = annotate(&base, &files, &[item]);
-        // Row 0 is the file header; the pair holding new line 1 leads the
-        // file, and the thread lands right after it.
-        assert!(matches!(out.rows[1], RowRef::Pair { right: Some(1), .. }));
-        assert_eq!(out.rows[2], RowRef::Thread { thread: 0 });
+        // Row 0 is the file header and row 1 the hunk bar; the pair holding
+        // new line 1 follows, and the thread lands right after it.
+        assert!(matches!(out.rows[2], RowRef::Pair { right: Some(1), .. }));
+        assert_eq!(out.rows[3], RowRef::Thread { thread: 0 });
     }
 
     #[test]

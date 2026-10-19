@@ -1362,8 +1362,8 @@ impl ReviewApp {
             let Some(range) = session.row_model.file_ranges.get(file) else {
                 return;
             };
-            // A hunk starts at its gap row when there is one, else at its
-            // first line row; both carry the hunk's first visible row.
+            // Every hunk now has a header bar: that bar is the hunk's first
+            // visible row.
             let mut starts = Vec::new();
             let mut last_hunk: Option<u32> = None;
             for (index, row) in session
@@ -1375,12 +1375,9 @@ impl ReviewApp {
                 .skip(range.start)
             {
                 match row {
-                    RowRef::Gap {
-                        file: f,
-                        before_hunk,
-                    } if *f as usize == file => {
+                    RowRef::HunkHeader { file: f, hunk } if *f as usize == file => {
                         starts.push(index);
-                        last_hunk = Some(*before_hunk);
+                        last_hunk = Some(*hunk);
                     }
                     RowRef::Line { file: f, hunk, .. }
                         if *f as usize == file && last_hunk != Some(*hunk) =>

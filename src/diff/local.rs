@@ -74,6 +74,7 @@ pub fn local_diff(old: &str, new: &str, context: usize) -> FileDiff {
         hunks.push(Hunk {
             old_start,
             new_start,
+            section: String::new(),
             rows,
         });
     }

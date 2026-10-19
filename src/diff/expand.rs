@@ -130,6 +130,7 @@ pub fn expand(diff: &FileDiff, head_lines: &[&str], gap: Gap, how: Expand) -> Fi
             Hunk {
                 old_start: first_old.unwrap_or(1),
                 new_start: from,
+                section: String::new(),
                 rows,
             },
         ),
@@ -150,6 +151,7 @@ pub fn expand(diff: &FileDiff, head_lines: &[&str], gap: Gap, how: Expand) -> Fi
                 out.hunks.push(Hunk {
                     old_start: first_old.unwrap_or(1),
                     new_start: from,
+                    section: String::new(),
                     rows,
                 });
             }
