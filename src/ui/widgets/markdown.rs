@@ -36,7 +36,7 @@ pub enum MdBlock {
         /// Whether this is a review suggestion.
         suggestion: bool,
     },
-    /// A list; nested lists are flattened into the parent's items.
+    /// A list; a nested list's text is flattened into its parent item.
     List(Vec<String>),
     /// A block quote; nested quotes and their paragraphs merge into one.
     Quote(String),
@@ -171,7 +171,10 @@ struct Builder {
     quote: String,
     list_depth: usize,
     items: Vec<String>,
-    item: Option<String>,
+    /// Open list items, outermost first; text goes to the innermost one.
+    open_items: Vec<String>,
+    /// Items of a list inside a quote, flushed after the enclosing `Quote`.
+    quote_items: Vec<String>,
     code: Option<CodeAcc>,
     image: Option<ImageAcc>,
     cell: Option<String>,
@@ -200,7 +203,7 @@ impl Builder {
             code.text.push_str(s);
         } else if let Some(cell) = self.cell.as_mut() {
             cell.push_str(s);
-        } else if let Some(item) = self.item.as_mut() {
+        } else if let Some(item) = self.open_items.last_mut() {
             item.push_str(s);
         } else if self.quote_depth > 0 {
             self.quote.push_str(s);
@@ -225,7 +228,7 @@ impl Builder {
                 });
             }
             Tag::List(_) => self.list_depth += 1,
-            Tag::Item => self.item = Some(String::new()),
+            Tag::Item => self.open_items.push(String::new()),
             Tag::BlockQuote(_) => self.quote_depth += 1,
             Tag::Image { dest_url, .. } => {
                 self.image = Some(ImageAcc {
@@ -260,15 +263,35 @@ impl Builder {
                 }
             }
             TagEnd::Item => {
-                if let Some(item) = self.item.take() {
-                    self.items.push(item.trim().to_owned());
+                if let Some(item) = self.open_items.pop() {
+                    let text = item.trim().to_owned();
+                    match self.open_items.last_mut() {
+                        // A nested item is flattened into its parent so the
+                        // parent's own text is never lost.
+                        Some(parent) => {
+                            if !text.is_empty() {
+                                if !parent.trim().is_empty() {
+                                    parent.push_str("; ");
+                                }
+                                parent.push_str(&text);
+                            }
+                        }
+                        // The outermost item completes the visible item.
+                        None => self.items.push(text),
+                    }
                 }
             }
             TagEnd::List(_) => {
                 self.list_depth = self.list_depth.saturating_sub(1);
                 if self.list_depth == 0 && !self.items.is_empty() {
-                    self.blocks
-                        .push(MdBlock::List(std::mem::take(&mut self.items)));
+                    let items = std::mem::take(&mut self.items);
+                    if self.quote_depth > 0 {
+                        // Inside a quote: hold the list until the quote
+                        // closes so the blocks keep their source order.
+                        self.quote_items.extend(items);
+                    } else {
+                        self.blocks.push(MdBlock::List(items));
+                    }
                 }
             }
             TagEnd::BlockQuote(_) => {
@@ -277,6 +300,10 @@ impl Builder {
                     let text = std::mem::take(&mut self.quote);
                     if !text.is_empty() {
                         self.blocks.push(MdBlock::Quote(text));
+                    }
+                    if !self.quote_items.is_empty() {
+                        self.blocks
+                            .push(MdBlock::List(std::mem::take(&mut self.quote_items)));
                     }
                 }
             }
@@ -374,5 +401,42 @@ mod tests {
             .blocks
             .iter()
             .any(|b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi"))));
+        // Inline HTML is dropped too: the tag markup must not survive.
+        let doc = to_doc("hi <b>there</b>");
+        assert!(doc
+            .blocks
+            .iter()
+            .any(|b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi") && !p.contains("<b>"))));
+    }
+
+    #[test]
+    fn nested_list_keeps_parent_text() {
+        let doc = to_doc("- outer\n  - inner\n- next");
+        let MdBlock::List(items) = &doc.blocks[0] else {
+            panic!("expected a list, got {:?}", doc.blocks);
+        };
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert!(items[0].contains("outer"), "{items:?}");
+        assert!(items[0].contains("inner"), "{items:?}");
+        assert_eq!(items[1], "next");
+    }
+
+    #[test]
+    fn list_in_quote_flushes_after_the_quote() {
+        // The quote's text comes first in the source, so it must come first
+        // in the blocks too.
+        let doc = to_doc("> intro\n>\n> - a");
+        assert_eq!(
+            doc.blocks,
+            vec![
+                MdBlock::Quote("intro".into()),
+                MdBlock::List(vec!["a".into()]),
+            ]
+        );
+        // A list-only quote still produces just the list.
+        assert_eq!(
+            to_doc("> - a").blocks,
+            vec![MdBlock::List(vec!["a".into()])]
+        );
     }
 }

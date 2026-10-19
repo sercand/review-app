@@ -173,6 +173,67 @@ mod tests {
     }
 
     #[test]
+    fn set_side_only_moves_single_line_anchors() {
+        use crate::model::comment::Anchor;
+
+        // A range anchor keeps its side: `start_side` must keep equalling
+        // `side`, so SetSide is ignored (spec §7.3).
+        let mut s = ComposerState::default();
+        reduce(
+            &mut s,
+            ComposerMsg::OpenFor {
+                target: CommentTarget::Line(Anchor {
+                    path: "a.rs".into(),
+                    side: Side::Right,
+                    line: 14,
+                    start_line: Some(10),
+                    start_side: Some(Side::Right),
+                }),
+                has_open_review: false,
+            },
+        );
+        reduce(&mut s, ComposerMsg::SetSide(Side::Left));
+        let CommentTarget::Line(anchor) = s.target.as_ref().unwrap() else {
+            panic!("expected the line anchor to remain");
+        };
+        assert_eq!(anchor.side, Side::Right);
+
+        // A file target has no side at all, and SetSide changes nothing.
+        let mut s = ComposerState::default();
+        reduce(
+            &mut s,
+            ComposerMsg::OpenFor {
+                target: CommentTarget::File {
+                    path: "a.rs".into(),
+                },
+                has_open_review: false,
+            },
+        );
+        reduce(&mut s, ComposerMsg::SetSide(Side::Left));
+        assert_eq!(
+            s.target,
+            Some(CommentTarget::File {
+                path: "a.rs".into()
+            })
+        );
+
+        // A single-line anchor does move, so the rule above is the exception.
+        let mut s = ComposerState::default();
+        reduce(
+            &mut s,
+            ComposerMsg::OpenFor {
+                target: CommentTarget::Line(line_anchor("a.rs", 1)),
+                has_open_review: false,
+            },
+        );
+        reduce(&mut s, ComposerMsg::SetSide(Side::Left));
+        let CommentTarget::Line(anchor) = s.target.as_ref().unwrap() else {
+            panic!("expected the line anchor to remain");
+        };
+        assert_eq!(anchor.side, Side::Left);
+    }
+
+    #[test]
     fn composer_requires_body_and_target() {
         let mut s = ComposerState::default();
         reduce(&mut s, ComposerMsg::SetBody("x".into()));
