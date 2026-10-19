@@ -27,8 +27,8 @@ use crate::ui::widgets::metadata_panel;
 use crate::ui::widgets::review_panel::{self, ReviewAction};
 use crate::ui::widgets::thread_view::CommentDrafts;
 
-/// The width the left pane starts at.
-const LEFT_W: f32 = 240.0;
+/// The width the left pane starts at (mockup 02).
+const LEFT_W: f32 = 300.0;
 
 /// The width the right pane starts at, when open.
 const RIGHT_W: f32 = 320.0;
@@ -139,7 +139,7 @@ pub fn render(
         });
     // The panel's response carries its outer rect — the same measure
     // `default_size` consumes — so the saved width restores exactly (Task 53).
-    state.left_pane = left.response.rect.width();
+    state.left_pane = left.response.rect.width().clamp(220.0, 560.0);
 
     // Fold the tree's actions in before the diff draws, so selecting a file
     // rebuilds the rows for this very frame.
@@ -306,6 +306,7 @@ fn render_files_pane(
     // resolved against the full list so a row's `file_index` stays valid.
     let include = |f: &PrFile| matches(f, &session.filters, &session.viewed);
     let tree = build_tree(pr_files, &include);
+    let counts = crate::state::pr_detail::comment_counts(&session.threads, &session.pending);
     let rows = flatten_visible(
         &tree,
         &session.collapsed_dirs,
@@ -313,12 +314,12 @@ fn render_files_pane(
         &session.filters,
         &session.viewed,
         session.last_opened_file.as_deref(),
+        &counts,
+        session.tree_order,
     );
 
-    let (viewed_filtered, total_filtered, additions, deletions) =
+    let (viewed_filtered, total_filtered, _additions, _deletions) =
         filtered_progress(pr_files, &session.filters, &session.viewed);
-    render_file_summary(ui, pr_files.len(), total_filtered, additions, deletions);
-    render_invalidated_hint(ui, session.viewed.invalidated_count(pr_files));
 
     let progress = (
         viewed_filtered,
@@ -326,35 +327,14 @@ fn render_files_pane(
         session.viewed.viewed_count(pr_files),
         pr_files.len(),
     );
-    file_tree::render(ui, &rows, &mut session.filters, progress, tree_actions);
-}
-
-/// The `N files, +X −Y` summary for the filtered set (spec §9.1).
-fn render_file_summary(
-    ui: &mut egui::Ui,
-    total: usize,
-    filtered: usize,
-    additions: u32,
-    deletions: u32,
-) {
-    let suffix = if filtered == total {
-        String::new()
-    } else {
-        format!(" ({filtered} shown)")
-    };
-    ui.weak(format!("{total} files, +{additions} −{deletions}{suffix}"));
-}
-
-/// The "N files you had viewed changed since" hint, when any mark was
-/// invalidated by a push (spec §10.3).
-fn render_invalidated_hint(ui: &mut egui::Ui, invalidated: usize) {
-    if invalidated == 0 {
-        return;
-    }
-    let color = ui.visuals().warn_fg_color;
-    ui.colored_label(
-        color,
-        format!("{invalidated} files you had viewed changed since"),
+    file_tree::render(
+        ui,
+        &rows,
+        &mut session.filters,
+        session.tree_order,
+        progress,
+        session.viewed.invalidated_count(pr_files),
+        tree_actions,
     );
 }
 
@@ -409,8 +389,37 @@ fn apply_tree_action(
                 session.select_file(index);
             }
         }
+        TreeAction::CollapseAll => {
+            if session.collapsed_dirs.is_empty() {
+                let mut paths = Vec::new();
+                collect_dir_paths(&build_tree(pr_files, &|_| true), &mut paths);
+                session.collapsed_dirs.extend(paths);
+            } else {
+                session.collapsed_dirs.clear();
+            }
+        }
+        TreeAction::ToggleOrder => {
+            session.tree_order = match session.tree_order {
+                crate::state::filters::TreeOrder::Path => {
+                    crate::state::filters::TreeOrder::LargestFirst
+                }
+                crate::state::filters::TreeOrder::LargestFirst => {
+                    crate::state::filters::TreeOrder::Path
+                }
+            };
+        }
     }
     session.mark_session_dirty(now);
+}
+
+/// Every directory path in `node`'s subtree, root excluded.
+fn collect_dir_paths(node: &crate::model::tree::TreeNode, out: &mut Vec<String>) {
+    for child in &node.children {
+        if child.is_dir {
+            out.push(child.path.clone());
+            collect_dir_paths(child, out);
+        }
+    }
 }
 
 /// The top bar: back, `repo#number`, title, refresh, and the right-pane toggle.

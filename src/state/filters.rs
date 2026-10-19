@@ -82,22 +82,53 @@ pub fn apply<'a>(
         .collect()
 }
 
+/// How the file tree and `j`/`k` order files within each folder (Task 11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TreeOrder {
+    /// Alphabetical, the tree's natural order.
+    #[default]
+    Path,
+    /// Files by `additions + deletions`, largest first; directories keep
+    /// their path order.
+    LargestFirst,
+}
+
+/// `node`'s children as the tree should show them under `order`. A stable
+/// sort keeps directories first and in name order either way.
+pub fn ordered_children(node: &TreeNode, order: TreeOrder) -> Vec<&TreeNode> {
+    let mut children: Vec<&TreeNode> = node.children.iter().collect();
+    if order == TreeOrder::LargestFirst {
+        children.sort_by_key(|child| {
+            (
+                child.is_dir,
+                std::cmp::Reverse(child.additions + child.deletions),
+            )
+        });
+    }
+    children
+}
+
 /// The indices of the visible files in **display order**: the same
-/// folders-first, alphabetical order the file tree shows, so `j`/`k`, the
+/// folders-first order the file tree shows (per `order`), so `j`/`k`, the
 /// initial selection, and "next unviewed" all follow what the reviewer sees.
-pub fn file_order(files: &[PrFile], filters: &FilterState, viewed: &ViewedSet) -> Vec<usize> {
+pub fn file_order(
+    files: &[PrFile],
+    filters: &FilterState,
+    viewed: &ViewedSet,
+    order: TreeOrder,
+) -> Vec<usize> {
     let root = build_tree(files, &|f| matches(f, filters, viewed));
     let mut out = Vec::new();
-    collect_file_indices(&root, &mut out);
+    collect_file_indices(&root, order, &mut out);
     out
 }
 
 /// Depth-first collect of `node`'s file indices, in the tree's display order.
-fn collect_file_indices(node: &TreeNode, out: &mut Vec<usize>) {
-    for child in &node.children {
+fn collect_file_indices(node: &TreeNode, order: TreeOrder, out: &mut Vec<usize>) {
+    for child in ordered_children(node, order) {
         match child.file_index {
             Some(index) => out.push(index),
-            None => collect_file_indices(child, out),
+            None => collect_file_indices(child, order, out),
         }
     }
 }
@@ -146,14 +177,14 @@ mod tests {
         let none = ViewedSet::default();
         // Folders precede root files; inside `src`, `a.rs` precedes `b.rs`.
         assert_eq!(
-            file_order(&files, &FilterState::default(), &none),
+            file_order(&files, &FilterState::default(), &none, TreeOrder::Path),
             vec![1, 0, 2]
         );
         let f = FilterState {
             path_query: "src".into(),
             ..FilterState::default()
         };
-        assert_eq!(file_order(&files, &f, &none), vec![1, 0]);
+        assert_eq!(file_order(&files, &f, &none, TreeOrder::Path), vec![1, 0]);
     }
 
     #[test]

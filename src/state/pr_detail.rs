@@ -135,6 +135,8 @@ pub struct PrSession {
     pub viewed: ViewedSet,
     /// What the file tree is filtering the file list by.
     pub filters: FilterState,
+    /// How the file tree and `j`/`k` order files within each folder (Task 11).
+    pub tree_order: crate::state::filters::TreeOrder,
     /// The PR's review threads, once loaded (spec §7.4).
     pub threads: Vec<ReviewThread>,
     /// The PR's reviews, once loaded, in API order (spec §7.2).
@@ -309,6 +311,7 @@ impl PrSession {
             files_truncated: false,
             viewed,
             filters: FilterState::default(),
+            tree_order: crate::state::filters::TreeOrder::default(),
             threads: Vec::new(),
             reviews: Vec::new(),
             server_pending: None,
@@ -781,7 +784,7 @@ impl PrSession {
             .iter()
             .map(|loaded| loaded.file.clone())
             .collect();
-        crate::state::filters::file_order(&prs, &self.filters, &self.viewed)
+        crate::state::filters::file_order(&prs, &self.filters, &self.viewed, self.tree_order)
     }
 
     /// The file the diff shows: `last_opened_file` while it is visible,
@@ -1716,6 +1719,24 @@ fn optimistic_thread(target: &CommentTarget, id: u64, body: &str, author: &str) 
     }
 }
 
+/// Per-file `(unresolved threads, local pending comments)` for the tree's
+/// right cluster (Task 11). Files with neither are absent from the map.
+pub fn comment_counts(
+    threads: &[ReviewThread],
+    pending: &crate::model::review::PendingReview,
+) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut counts: std::collections::HashMap<String, (u32, u32)> = Default::default();
+    for thread in threads {
+        if !thread.is_resolved {
+            counts.entry(thread.path.clone()).or_default().0 += 1;
+        }
+    }
+    for comment in &pending.comments {
+        counts.entry(comment.anchor.path.clone()).or_default().1 += 1;
+    }
+    counts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2029,6 +2050,51 @@ mod tests {
             threads: vec![thread()],
         });
         assert_eq!(s.threads.len(), 1);
+    }
+
+    #[test]
+    fn comment_counts_cover_unresolved_threads_and_pending() {
+        use crate::model::review::{PendingComment, PendingReview};
+        use crate::model::thread::{ReviewThread, SubjectType};
+        use crate::test_support::line_anchor;
+
+        let thread = |path: &str, resolved: bool| ReviewThread {
+            id: "PRRT_1".into(),
+            is_resolved: resolved,
+            is_outdated: false,
+            path: path.into(),
+            line: Some(1),
+            start_line: None,
+            side: None,
+            subject_type: SubjectType::Line,
+            comments: Vec::new(),
+        };
+        let pending = PendingReview {
+            comments: vec![
+                PendingComment {
+                    local_id: 1,
+                    anchor: line_anchor("a.rs", 3),
+                    body: "x".into(),
+                },
+                PendingComment {
+                    local_id: 2,
+                    anchor: line_anchor("b.rs", 4),
+                    body: "y".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let counts = comment_counts(
+            &[
+                thread("a.rs", false),
+                thread("a.rs", true),
+                thread("b.rs", false),
+            ],
+            &pending,
+        );
+        assert_eq!(counts.get("a.rs"), Some(&(1, 1)));
+        assert_eq!(counts.get("b.rs"), Some(&(1, 1)));
+        assert_eq!(counts.get("c.rs"), None);
     }
 
     #[test]

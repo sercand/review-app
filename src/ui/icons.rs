@@ -42,6 +42,7 @@ pub const EYE: char = '\u{e0be}';
 pub const EYE_OFF: char = '\u{e0bf}';
 pub const FILE_DIFF: char = '\u{e319}';
 pub const FILE_TEXT: char = '\u{e0d0}';
+pub const FOLDER: char = '\u{e0dc}';
 pub const GIT_COMMIT_HORIZONTAL: char = '\u{e0e6}';
 pub const GIT_PULL_REQUEST: char = '\u{e0e8}';
 pub const GIT_PULL_REQUEST_DRAFT: char = '\u{e35e}';
