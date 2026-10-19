@@ -15,7 +15,7 @@ use crate::diff::row_model::{display_text, RowRef, ROW_H};
 use crate::github::client::endpoints_for;
 use crate::github::files::PrFile;
 use crate::model::tree::build_tree;
-use crate::state::filters::{available_extensions, matches, without_hide_viewed, FilterState};
+use crate::state::filters::{matches, without_hide_viewed, FilterState};
 use crate::state::folder_viewed::toggle_folder_viewed;
 use crate::state::pr_detail::{head_moved_since_pin, viewer_is_author, PrSession};
 use crate::state::viewed::ViewedSet;
@@ -83,6 +83,8 @@ pub struct PrDetailState {
     /// The header bar's find button was clicked: the diff shows its find
     /// box on the next frame and clears this (Task 7).
     pub find_open: bool,
+    /// The filter combobox's popover and file-type search text (Task 10).
+    pub filter_bar: filter_bar::FilterBarState,
 }
 
 impl Default for PrDetailState {
@@ -96,6 +98,7 @@ impl Default for PrDetailState {
             last_layout: None,
             drafts: CommentDrafts::default(),
             find_open: false,
+            filter_bar: filter_bar::FilterBarState::default(),
         }
     }
 }
@@ -132,7 +135,7 @@ pub fn render(
         .resizable(true)
         .default_size(state.left_pane)
         .show(ui, |ui| {
-            render_files_pane(ui, session, &pr_files, &mut tree_actions);
+            render_files_pane(ui, session, state, &pr_files, &mut tree_actions);
         });
     // The panel's response carries its outer rect — the same measure
     // `default_size` consumes — so the saved width restores exactly (Task 53).
@@ -288,10 +291,16 @@ pub fn render(
 fn render_files_pane(
     ui: &mut egui::Ui,
     session: &mut PrSession,
+    state: &mut PrDetailState,
     pr_files: &[PrFile],
     tree_actions: &mut Vec<TreeAction>,
 ) {
-    filter_bar::render(ui, &mut session.filters, &available_extensions(pr_files));
+    filter_bar::render(
+        ui,
+        &mut session.filters,
+        &filter_bar::ext_options(pr_files),
+        &mut state.filter_bar,
+    );
 
     // The tree covers exactly the files the filters keep, but its rows are
     // resolved against the full list so a row's `file_index` stays valid.

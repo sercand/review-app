@@ -221,7 +221,7 @@ fn render_row(ui: &mut egui::Ui, row: &TreeRowVm, actions: &mut Vec<TreeAction>)
 mod tests {
     use super::*;
     use crate::model::tree::build_tree;
-    use crate::state::filters::{available_extensions, FilterState};
+    use crate::state::filters::FilterState;
     use crate::state::viewed::ViewedSet;
     use crate::test_support::files_at;
     use crate::ui::widgets::filter_bar;
@@ -258,8 +258,9 @@ mod tests {
         assert!(!rows.is_empty());
 
         let mut actions = Vec::new();
+        let mut bar = filter_bar::FilterBarState::default();
         egui::__run_test_ui(|ui| {
-            filter_bar::render(ui, &mut filters, &available_extensions(&files));
+            filter_bar::render(ui, &mut filters, &filter_bar::ext_options(&files), &mut bar);
             render(
                 ui,
                 &rows,
