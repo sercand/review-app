@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use eframe::egui;
 
@@ -122,6 +122,55 @@ fn action_allowed(action: &str, screen: ScreenKind) -> bool {
     }
 }
 
+/// Whether a PR-scoped 404 means the *open* session is dead and must close
+/// (spec §13: "PR/repo gone or inaccessible; close the session with a
+/// toast"). A 404 for a session the app no longer holds — or one that was
+/// never PR-scoped — closes nothing.
+fn pr_is_gone(event: &Event, open: Option<SessionId>) -> bool {
+    match event {
+        Event::Failed {
+            session: Some(session),
+            error: GhError::NotFound,
+        } => Some(*session) == open,
+        _ => false,
+    }
+}
+
+/// The write-blocked state for one frame (spec §13: "disable write actions
+/// until reset"): `Some(label)` while a rate limit's reset is still in the
+/// future — the label is the button tooltip — and `None` once it has passed,
+/// which also clears the flag for good.
+fn write_blocked_label(
+    until: Option<SystemTime>,
+    now: SystemTime,
+) -> (Option<String>, Option<SystemTime>) {
+    let Some(reset_at) = until else {
+        return (None, None);
+    };
+    match reset_at.duration_since(now) {
+        Ok(remaining) => (
+            Some(format!(
+                "GitHub is rate-limiting writes — try again in ~{}s",
+                remaining.as_secs()
+            )),
+            until,
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// The error an event carries, if it carries one. Every such event toasts
+/// it, so this is where the app notices a write-blocking failure.
+fn event_error(event: &Event) -> Option<&GhError> {
+    match event {
+        Event::Failed { error, .. }
+        | Event::PrSearchFailed { error, .. }
+        | Event::CommentFailed { error, .. }
+        | Event::ReviewSubmitFailed { error, .. } => Some(error),
+        _ => None,
+    }
+}
+
 /// The login of the cached account, or the empty string when signed out.
 fn account_login(settings: &Settings) -> String {
     settings
@@ -149,6 +198,11 @@ pub struct ReviewApp {
     settings_writer: DebouncedWriter,
     applied_theme: Option<egui::Theme>,
     settings: Settings,
+    /// Spec §13: while this instant is in the future, GitHub is rate-limiting
+    /// the account and the write surfaces (review-panel and composer Submit)
+    /// are disabled. Set when a `RateLimited` error surfaces, cleared once
+    /// the instant passes (checked every frame).
+    write_blocked_until: Option<SystemTime>,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
     exec: Arc<ExecCtx>,
@@ -218,6 +272,7 @@ impl ReviewApp {
             settings_writer: DebouncedWriter::default(),
             applied_theme: None,
             settings,
+            write_blocked_until: None,
             config_dir,
             store,
             exec,
@@ -231,6 +286,12 @@ impl ReviewApp {
         let previous = self.screen;
         self.screen = route(self.screen, &event);
         self.apply_session_event(&event);
+        // Spec §13: a 404 on the open PR means it is gone or inaccessible;
+        // the toast below is the notice and the session closes with it.
+        let pr_gone = pr_is_gone(&event, self.session.as_ref().map(|session| session.id));
+        if let Some(error) = event_error(&event) {
+            self.note_write_blocked(error);
+        }
 
         match event {
             Event::Pong(_) => {}
@@ -246,7 +307,19 @@ impl ReviewApp {
                 error: GhError::Unauthorized,
                 ..
             } => self.on_unauthorized(now),
-            Event::Failed { error, .. } => self.toasts.push(error.to_string(), now),
+            Event::Failed { error, .. } => {
+                self.toasts.push(error.to_string(), now);
+                if pr_gone {
+                    // Spec §13: the PR is gone; flush what the session still
+                    // owes, drop it, and fall back to the list rather than
+                    // leave the screen open on a dead PR.
+                    self.flush_session();
+                    self.session = None;
+                    if self.screen == ScreenKind::PrDetail {
+                        self.screen = ScreenKind::PrList;
+                    }
+                }
+            }
             Event::PrSearchPage {
                 request,
                 query,
@@ -366,6 +439,22 @@ impl ReviewApp {
     fn flush_session(&mut self) {
         if let Some(session) = &mut self.session {
             session.flush_session();
+        }
+    }
+
+    /// Spec §13: a rate limit names the instant writes may resume; remember
+    /// it so the write surfaces disable themselves. A rate limit without a
+    /// reset instant blocks nothing (there is no window to count down), and
+    /// a 401 ends the session through the auth path instead of a timer.
+    fn note_write_blocked(&mut self, error: &GhError) {
+        if !error.is_write_blocking() {
+            return;
+        }
+        if let GhError::RateLimited {
+            reset_at: Some(reset_at),
+        } = error
+        {
+            self.write_blocked_until = Some(*reset_at);
         }
     }
 
@@ -573,11 +662,14 @@ impl ReviewApp {
     }
 
     /// Draw the current screen.
-    fn render_screen(&mut self, ui: &mut egui::Ui, now: Instant) {
+    ///
+    /// `write_blocked` is the rate-limit tooltip (spec §13): `Some` while
+    /// writes are disabled, and only the detail screen has write surfaces.
+    fn render_screen(&mut self, ui: &mut egui::Ui, now: Instant, write_blocked: Option<&str>) {
         match self.screen {
             ScreenKind::Login => self.render_login(ui, now),
             ScreenKind::PrList => self.render_pr_list(ui),
-            ScreenKind::PrDetail => self.render_pr_detail(ui, now),
+            ScreenKind::PrDetail => self.render_pr_detail(ui, now, write_blocked),
         }
     }
 
@@ -654,7 +746,7 @@ impl ReviewApp {
     ///
     /// Without an open session there is nothing to draw — a 401 clears it — so
     /// the screen falls back to the list.
-    fn render_pr_detail(&mut self, ui: &mut egui::Ui, now: Instant) {
+    fn render_pr_detail(&mut self, ui: &mut egui::Ui, now: Instant, write_blocked: Option<&str>) {
         let login = self.login();
         let Some(session) = &mut self.session else {
             self.screen = ScreenKind::PrList;
@@ -676,6 +768,7 @@ impl ReviewApp {
             &mut self.highlight_cache,
             &mut diff_actions,
             &login,
+            write_blocked,
         );
 
         self.apply_diff_actions(diff_actions, ui.ctx(), now);
@@ -733,6 +826,12 @@ impl ReviewApp {
         login: &str,
         now: Instant,
     ) -> Vec<Command> {
+        // Spec §13: the panel and composer disable Submit while a rate
+        // limit is in force; this is the same gate for the keyboard and
+        // palette paths, which bypass the buttons.
+        let write_blocked = self
+            .write_blocked_until
+            .is_some_and(|until| until > SystemTime::now());
         let Some(session) = &mut self.session else {
             return Vec::new();
         };
@@ -758,6 +857,12 @@ impl ReviewApp {
                 Vec::new()
             }
             ReviewAction::Submit => {
+                // Spec §13: the panel and composer disable Submit while a
+                // rate limit is in force; this is the same gate for the
+                // keyboard and palette paths, which bypass the buttons.
+                if write_blocked {
+                    return Vec::new();
+                }
                 if viewer_is_author(session, login)
                     && matches!(
                         session.pending.event,
@@ -912,11 +1017,22 @@ impl ReviewApp {
         login: &str,
         now: Instant,
     ) -> Vec<Command> {
+        // Spec §13: same rate-limit gate as the review panel; the
+        // composer's buttons are disabled while this holds, and this
+        // is the choke point behind them.
+        let write_blocked = self
+            .write_blocked_until
+            .is_some_and(|until| until > SystemTime::now());
         let Some(session) = &mut self.session else {
             return Vec::new();
         };
         match action {
-            ComposerAction::Submit(mode) => session.submit_comment(mode, login, now),
+            ComposerAction::Submit(mode) => {
+                if write_blocked {
+                    return Vec::new();
+                }
+                session.submit_comment(mode, login, now)
+            }
             ComposerAction::Cancel => {
                 composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
                 session.rebuild_rows();
@@ -1250,13 +1366,20 @@ impl eframe::App for ReviewApp {
             self.handle_event(event, now);
         }
 
+        // Spec §13: the rate-limit window is over once its reset instant
+        // passes; check every frame so the write surfaces wake up on their
+        // own.
+        let (write_blocked, until) =
+            write_blocked_label(self.write_blocked_until, SystemTime::now());
+        self.write_blocked_until = until;
+
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
 
         // Global shortcuts run before the screens draw, so a `scroll_to` set
         // by `j`/`k` is consumed by the diff on this very frame.
         self.handle_shortcuts(&ctx, now);
-        self.render_screen(ui, now);
+        self.render_screen(ui, now, write_blocked.as_deref());
         self.sync_layout(now);
 
         // The palette, the settings window, and the help overlay float above
@@ -1480,5 +1603,61 @@ mod tests {
         // The other always-resolving keys must survive text focus.
         assert!(global_key_allowed("palette", true));
         assert!(global_key_allowed("close", true));
+    }
+
+    #[test]
+    fn a_pr_scoped_404_closes_the_open_session() {
+        let open = Some(SessionId(1));
+        let gone = Event::Failed {
+            session: Some(SessionId(1)),
+            error: GhError::NotFound,
+        };
+        assert!(pr_is_gone(&gone, open), "the open PR is gone (spec §13)");
+
+        // A stale 404 for a session the app already replaced closes
+        // nothing, and neither does one that was never PR-scoped.
+        let stale = Event::Failed {
+            session: Some(SessionId(2)),
+            error: GhError::NotFound,
+        };
+        assert!(!pr_is_gone(&stale, open));
+        let unscoped = Event::Failed {
+            session: None,
+            error: GhError::NotFound,
+        };
+        assert!(!pr_is_gone(&unscoped, open));
+        assert!(!pr_is_gone(&unscoped, None));
+
+        // Other failures keep the session open (the toast is their face).
+        let server = Event::Failed {
+            session: Some(SessionId(1)),
+            error: GhError::Server(500),
+        };
+        assert!(!pr_is_gone(&server, open));
+        // And the auth path owns the 401, not this rule.
+        let unauthorized = Event::Failed {
+            session: Some(SessionId(1)),
+            error: GhError::Unauthorized,
+        };
+        assert!(!pr_is_gone(&unauthorized, open));
+    }
+
+    #[test]
+    fn the_write_block_lives_until_its_reset_instant() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let until = now + std::time::Duration::from_secs(42);
+        let (label, kept) = write_blocked_label(Some(until), now);
+        let label = label.expect("a reset ahead of now blocks writes");
+        assert!(label.contains("~42s"), "{label}");
+        assert_eq!(kept, Some(until), "the window survives the frame");
+
+        // Once the instant passes the flag clears for good, and an unset
+        // window blocks nothing.
+        let past = now + std::time::Duration::from_secs(1);
+        let (label, kept) =
+            write_blocked_label(Some(past), now + std::time::Duration::from_secs(2));
+        assert!(label.is_none() && kept.is_none(), "the reset has passed");
+        let (label, kept) = write_blocked_label(None, now);
+        assert!(label.is_none() && kept.is_none(), "no window, no block");
     }
 }

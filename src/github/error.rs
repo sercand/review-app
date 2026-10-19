@@ -11,10 +11,13 @@ pub enum GhError {
     #[error("authentication required (HTTP 401)")]
     Unauthorized,
     /// The account is out of quota (primary) or being throttled (secondary).
-    #[error("rate limited by GitHub")]
+    /// The Display names the reset instant when GitHub sent one (spec §13).
+    #[error("rate limited by GitHub{}", rate_limit_suffix(*.reset_at))]
     RateLimited { reset_at: Option<SystemTime> },
     /// A 403 that asks the user to authorize the OAuth app for a SAML org.
-    #[error("SSO authorization required")]
+    /// The Display names the authorization URL when the header carried one
+    /// (spec §13).
+    #[error("SSO authorization required{}", .url.as_ref().map(|url| format!(" — authorize at {url}")).unwrap_or_default())]
     SsoRequired { url: Option<String> },
     /// Any other 403, carrying GitHub's `message`.
     #[error("{0}")]
@@ -128,6 +131,18 @@ fn classify_throttled(meta: &ResponseMeta, body: &str, now: SystemTime) -> GhErr
     }
 
     GhError::Forbidden(message_or_body(body))
+}
+
+/// The rate-limit Display's countdown suffix: the seconds until GitHub's
+/// reset, when one is known and still ahead of us (spec §13). Empty when
+/// the reset is unknown or already past — the toast must not promise a
+/// countdown to the past.
+fn rate_limit_suffix(reset_at: Option<SystemTime>) -> String {
+    let remaining = reset_at.and_then(|reset_at| reset_at.duration_since(SystemTime::now()).ok());
+    match remaining {
+        Some(remaining) => format!(" — resets in ~{}s", remaining.as_secs()),
+        None => String::new(),
+    }
 }
 
 /// Pull `url=` out of an `x-github-sso` header value.
@@ -268,5 +283,49 @@ mod tests {
         assert!(GhError::Server(502).is_retryable_read());
         assert!(!GhError::Validation(String::new()).is_retryable_read());
         assert!(GhError::Unauthorized.is_write_blocking());
+    }
+
+    #[test]
+    fn rate_limited_display_names_the_reset_countdown() {
+        let soon = GhError::RateLimited {
+            reset_at: Some(SystemTime::now() + Duration::from_secs(60)),
+        };
+        let text = soon.to_string();
+        assert!(text.starts_with("rate limited by GitHub"), "{text}");
+        // The countdown is computed against the wall clock, so accept the
+        // one-second boundary rather than race it.
+        assert!(
+            text.contains("resets in ~59s") || text.contains("resets in ~60s"),
+            "{text}"
+        );
+
+        // No reset instant, no countdown; a reset already past is no
+        // countdown either.
+        assert_eq!(
+            GhError::RateLimited { reset_at: None }.to_string(),
+            "rate limited by GitHub"
+        );
+        assert_eq!(
+            GhError::RateLimited {
+                reset_at: Some(SystemTime::now() - Duration::from_secs(5)),
+            }
+            .to_string(),
+            "rate limited by GitHub"
+        );
+    }
+
+    #[test]
+    fn sso_display_names_the_authorization_url() {
+        assert_eq!(
+            GhError::SsoRequired {
+                url: Some("https://github.com/orgs/acme/sso".into()),
+            }
+            .to_string(),
+            "SSO authorization required — authorize at https://github.com/orgs/acme/sso"
+        );
+        assert_eq!(
+            GhError::SsoRequired { url: None }.to_string(),
+            "SSO authorization required"
+        );
     }
 }

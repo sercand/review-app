@@ -13,22 +13,43 @@ use crate::model::diff::Side;
 use crate::state::composer::{can_submit, mode_buttons, ComposerAction, ComposerState};
 use crate::ui::widgets::markdown;
 
+/// The per-frame context the composer draws with. Bundled so
+/// [`render_composer`] stays within clippy's argument budget (the same
+/// pattern as `diff_view`'s `RowCtx`).
+pub struct ComposerInputs<'a> {
+    /// Whether the draft review already has comments: it names the mode
+    /// buttons (spec §7.1).
+    pub has_open_review: bool,
+    /// Whether the anchor is a context row, where the side toggle is
+    /// meaningful (spec §7.3).
+    pub show_side: bool,
+    /// The anchor warning of [`anchor_warning`], when one applies
+    /// (Task 47).
+    pub warning: Option<&'static str>,
+    /// The width the text edit spans — the diff table's width, so the
+    /// composer crosses its gutter column.
+    pub width: f32,
+    /// The rate-limit tooltip (spec §13): `Some` while writes are disabled
+    /// keeps the Submit (and Retry) buttons off.
+    pub write_blocked: Option<&'a str>,
+}
+
 /// Draw the composer row.
 ///
-/// `show_side` gates the Left/Right toggle: only a single-line anchor on a
-/// context row can pick a side (spec §7.3). `warning` is the anchor warning
-/// of [`anchor_warning`]: when it applies the composer shows the banner and
-/// offers the file-level route (Task 47). `width` is the diff table's width,
-/// so the text edit spans the row instead of its gutter column.
+/// See [`ComposerInputs`] for what the context fields mean.
 pub fn render_composer(
     ui: &mut egui::Ui,
     state: &mut ComposerState,
-    has_open_review: bool,
-    show_side: bool,
-    warning: Option<&'static str>,
-    width: f32,
+    inputs: ComposerInputs<'_>,
     actions: &mut Vec<ComposerAction>,
 ) {
+    let ComposerInputs {
+        has_open_review,
+        show_side,
+        warning,
+        width,
+        write_blocked,
+    } = inputs;
     egui::Frame::new()
         .inner_margin(8.0)
         .corner_radius(6.0)
@@ -87,16 +108,32 @@ pub fn render_composer(
                 }
                 // A retryable failure (Task 38) leaves the text in place;
                 // this is the manual retry button, never an automatic one.
-                if state.error.is_some() && can_submit(state) && ui.button("Retry").clicked() {
-                    actions.push(ComposerAction::Submit(state.mode));
+                // A retry is a write, so the rate-limit gate holds it too.
+                if state.error.is_some() && can_submit(state) {
+                    let retry = ui.add_enabled(write_blocked.is_none(), egui::Button::new("Retry"));
+                    let clicked = retry.clicked();
+                    if let Some(reason) = write_blocked {
+                        retry.on_disabled_hover_text(reason);
+                    }
+                    if clicked {
+                        actions.push(ComposerAction::Submit(state.mode));
+                    }
                 }
             });
 
             ui.horizontal(|ui| {
                 if let Some(target) = &state.target {
-                    ui.add_enabled_ui(can_submit(state), |ui| {
+                    // The mode buttons are the submit buttons (spec §7.1);
+                    // a rate limit disables them until its reset (spec §13).
+                    let enabled = can_submit(state) && write_blocked.is_none();
+                    ui.add_enabled_ui(enabled, |ui| {
                         for (label, mode) in mode_buttons(target, has_open_review) {
-                            if ui.button(label).clicked() {
+                            let button = ui.button(label);
+                            let clicked = button.clicked();
+                            if let Some(reason) = write_blocked {
+                                button.on_disabled_hover_text(reason);
+                            }
+                            if clicked {
                                 actions.push(ComposerAction::Submit(mode));
                             }
                         }
@@ -148,15 +185,31 @@ mod tests {
 
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            render_composer(ui, &mut state, false, true, None, 600.0, &mut actions);
+            render_composer(
+                ui,
+                &mut state,
+                ComposerInputs {
+                    has_open_review: false,
+                    show_side: true,
+                    warning: None,
+                    width: 600.0,
+                    write_blocked: None,
+                },
+                &mut actions,
+            );
             state.preview = true;
             render_composer(
                 ui,
                 &mut state,
-                true,
-                false,
-                Some("This line is outside the PR's diff; GitHub may reject the comment."),
-                600.0,
+                ComposerInputs {
+                    has_open_review: true,
+                    show_side: false,
+                    warning: Some(
+                        "This line is outside the PR's diff; GitHub may reject the comment.",
+                    ),
+                    width: 600.0,
+                    write_blocked: Some("GitHub is rate-limiting writes — try again in ~30s"),
+                },
                 &mut actions,
             );
         });

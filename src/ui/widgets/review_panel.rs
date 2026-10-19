@@ -32,6 +32,9 @@ pub struct PanelInputs<'a> {
     pub server_pending: bool,
     /// Whether the head moved since the draft pinned its commit.
     pub head_moved_since_pin: bool,
+    /// Why a rate limit blocks writes right now, when one does (spec §13):
+    /// the label doubles as the Submit tooltip.
+    pub write_blocked: Option<String>,
 }
 
 /// What the panel may offer this frame.
@@ -48,13 +51,17 @@ pub struct ReviewPanelVm {
     pub blocked_reason: Option<&'static str>,
     /// The pinned-commit banner, when the head moved under the draft.
     pub banner: Option<String>,
+    /// The rate-limit tooltip on the disabled Submit, when writes are
+    /// blocked (spec §13).
+    pub write_blocked: Option<String>,
 }
 
 /// Decide what the panel may offer (spec §7.2, Review Focus #6 and #7).
 ///
 /// GitHub's rules: `REQUEST_CHANGES` needs a body, `COMMENT` needs a body or
 /// a comment, `APPROVE` needs nothing; the PR author may not pick the latter
-/// two; a server-side pending review blocks the local submit entirely.
+/// two; a server-side pending review blocks the local submit entirely; a
+/// rate limit blocks every write until its reset (spec §13).
 pub fn review_panel_vm(i: &PanelInputs) -> ReviewPanelVm {
     let has_body = !i.pending.body.trim().is_empty();
     let event_ok = match i.pending.event {
@@ -75,9 +82,10 @@ pub fn review_panel_vm(i: &PanelInputs) -> ReviewPanelVm {
         pending_count: i.pending.comments.len(),
         can_approve: !i.viewer_is_author,
         can_request_changes: !i.viewer_is_author,
-        submit_enabled: blocked_reason.is_none() && event_ok,
+        submit_enabled: blocked_reason.is_none() && event_ok && i.write_blocked.is_none(),
         blocked_reason,
         banner,
+        write_blocked: i.write_blocked.clone(),
     }
 }
 
@@ -292,9 +300,12 @@ pub fn render(
                 if submit.clicked() {
                     actions.push(ReviewAction::Submit);
                 }
-                submit.on_disabled_hover_text(
-                    "a comment needs a body or a comment, request changes needs a body",
-                );
+                match &vm.write_blocked {
+                    Some(reason) => submit.on_disabled_hover_text(reason),
+                    None => submit.on_disabled_hover_text(
+                        "a comment needs a body or a comment, request changes needs a body",
+                    ),
+                };
                 if ui.button("Discard").clicked() {
                     set_confirm_discard(ui, true);
                 }
@@ -426,6 +437,7 @@ mod tests {
             viewer_is_author: false,
             server_pending: false,
             head_moved_since_pin: false,
+            write_blocked: None,
         }
     }
 
@@ -465,6 +477,28 @@ mod tests {
             ..inputs(&p)
         });
         assert!(!vm.submit_enabled && vm.blocked_reason.is_some());
+    }
+
+    #[test]
+    fn a_rate_limit_blocks_submit_and_carries_its_tooltip() {
+        // APPROVE needs nothing, so the rate limit is the only blocker here
+        // (spec §13: disable write actions until reset).
+        let mut p = PendingReview::default();
+        p.set_event(ReviewEvent::Approve);
+        let vm = review_panel_vm(&PanelInputs {
+            write_blocked: Some("GitHub is rate-limiting writes — try again in ~30s".into()),
+            ..inputs(&p)
+        });
+        assert!(!vm.submit_enabled, "no write may go out mid-limit");
+        assert_eq!(
+            vm.write_blocked.as_deref(),
+            Some("GitHub is rate-limiting writes — try again in ~30s")
+        );
+        let vm = review_panel_vm(&inputs(&p));
+        assert!(
+            vm.submit_enabled && vm.write_blocked.is_none(),
+            "past the reset, Submit is live again"
+        );
     }
 
     #[test]

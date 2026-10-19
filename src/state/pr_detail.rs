@@ -67,6 +67,11 @@ pub struct FallbackPrompt {
 /// loaded file is evicted past it (Task 49).
 const MAX_IMAGE_CACHE_BYTES: u64 = 200 * 1024 * 1024;
 
+/// The most files GitHub's files API ever returns for one PR (spec §7.5):
+/// a load that reaches the cap is silently missing the rest of the diff,
+/// so the session flags it and the diff view banners it.
+pub const GITHUB_FILE_CAP: usize = 3000;
+
 /// One file's loaded image sides and the bytes they cost the cache.
 #[derive(Debug)]
 pub struct ImageEntry {
@@ -122,6 +127,10 @@ pub struct PrSession {
     pub error: Option<GhError>,
     /// Whether the head moved since the diff on screen was loaded.
     pub head_moved: bool,
+    /// Whether the file load reached [`GITHUB_FILE_CAP`]: GitHub's files
+    /// API returns at most that many files for one PR, so the diff on
+    /// screen is silently incomplete (spec §7.5).
+    pub files_truncated: bool,
     /// Which files the reviewer has marked viewed, keyed by blob SHA.
     pub viewed: ViewedSet,
     /// What the file tree is filtering the file list by.
@@ -295,6 +304,7 @@ impl PrSession {
             phase: LoadPhase::Header,
             error: None,
             head_moved: false,
+            files_truncated: false,
             viewed,
             filters: FilterState::default(),
             threads: Vec::new(),
@@ -423,6 +433,13 @@ impl PrSession {
                 done,
             } if *session == self.id => {
                 self.files.extend(files.iter().cloned());
+                // GitHub's files API returns at most 3000 files for one PR
+                // and says nothing when it truncates; reaching the cap is
+                // the only signal the diff on screen is incomplete
+                // (spec §7.5).
+                if self.files.len() >= GITHUB_FILE_CAP {
+                    self.files_truncated = true;
+                }
                 self.rebuild_rows();
 
                 if *done {
@@ -675,6 +692,9 @@ impl PrSession {
         self.rendered_svg.clear();
         self.svg_diffs.clear();
         self.files.clear();
+        // The truncation verdict belongs to the load being dropped; the
+        // reload sets it again only if it hits the cap too (spec §7.5).
+        self.files_truncated = false;
         self.row_model = build(&[]);
         self.threads.clear();
         self.restore_optimistic_to_composer();
@@ -1459,10 +1479,13 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
     let inputs = PanelInputs {
         pending: &session.pending,
         // The caller gates the verdict buttons on the author rule; GitHub
-        // rejects a verdict the author may not pick.
+        // rejects a verdict the author may not pick. The app gates writes
+        // on the rate-limit window before calling this (spec §13), so the
+        // draft's own rules are all that is left to check here.
         viewer_is_author: false,
         server_pending: session.server_pending.is_some(),
         head_moved_since_pin: head_moved_since_pin(session),
+        write_blocked: None,
     };
     if !review_panel_vm(&inputs).submit_enabled {
         return None;
@@ -1636,6 +1659,39 @@ mod tests {
         assert!(matches!(s.phase, LoadPhase::Ready));
         assert_eq!(s.row_model.file_ranges.len(), 2);
         assert_eq!(s.diff_head_sha.as_deref(), Some("sha1"));
+    }
+
+    #[test]
+    fn reaching_the_file_cap_flags_the_diff_as_truncated() {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        assert!(!s.files_truncated, "a fresh session has loaded nothing");
+
+        // One short of the cap: GitHub returned everything there was.
+        let almost: Vec<_> = (0..GITHUB_FILE_CAP - 1)
+            .map(|i| loaded(&format!("f{i}.rs"), "@@ -1 +1 @@\n-a\n+b\n"))
+            .collect();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: almost,
+            done: false,
+        });
+        assert!(!s.files_truncated, "one short of the cap is a full diff");
+
+        // Reaching it means the rest of the PR was silently withheld.
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("last.rs", "@@ -1 +1 @@\n-a\n+b\n")],
+            done: true,
+        });
+        assert!(s.files_truncated, "the cap means the diff is incomplete");
+
+        // A refresh re-loads from scratch; the flag waits for the reload.
+        s.refresh();
+        assert!(!s.files_truncated, "a refresh clears the flag");
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, Pr
 use crate::model::comment::CommentTarget;
 use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
-use crate::state::pr_detail::{LoadPhase, PrSession};
+use crate::state::pr_detail::{LoadPhase, PrSession, GITHUB_FILE_CAP};
 use crate::ui::widgets::comment_composer;
 use crate::ui::widgets::image_diff;
 use crate::ui::widgets::markdown;
@@ -328,6 +328,7 @@ pub fn render(
     cache: &mut HighlightCache,
     drafts: &mut CommentDrafts,
     actions: &mut Vec<DiffAction>,
+    write_blocked: Option<&str>,
 ) {
     let style = RowStyle {
         font_id: egui::TextStyle::Monospace.resolve(ui.style()),
@@ -337,6 +338,20 @@ pub fn render(
     };
 
     render_toolbar(ui, session, state, actions);
+
+    // Spec §7.5: GitHub's files API returns at most 3000 files per PR and
+    // says nothing when it truncates; the session flags the cap and this
+    // banner keeps the reason on screen while any of the diff shows.
+    if session.files_truncated {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "GitHub only provides the diff for the first {} files — use \
+                 'Open in browser' to see the rest.",
+                GITHUB_FILE_CAP
+            ),
+        );
+    }
 
     if session.row_model.rows.is_empty() {
         render_status(ui, session);
@@ -400,6 +415,7 @@ pub fn render(
         full_width,
         state,
         style: &style,
+        write_blocked,
     };
     // The heights are taken out first: the row closure reaches back into the
     // session mutably to draw composer and thread rows.
@@ -454,6 +470,9 @@ struct RowCtx<'a> {
     /// The surface's own state, which the image viewer drives (Task 49).
     state: &'a mut DiffViewState,
     style: &'a RowStyle,
+    /// The rate-limit tooltip for the composer's Submit buttons (spec §13):
+    /// `Some` while writes are disabled.
+    write_blocked: Option<&'a str>,
 }
 
 /// How many columns `mode` lays out.
@@ -659,10 +678,13 @@ fn render_row(
                 comment_composer::render_composer(
                     ui,
                     &mut ctx.session.composer,
-                    has_open_review,
-                    show_side,
-                    warning,
-                    width,
+                    comment_composer::ComposerInputs {
+                        has_open_review,
+                        show_side,
+                        warning,
+                        width,
+                        write_blocked: ctx.write_blocked,
+                    },
                     &mut composer_actions,
                 );
                 actions.extend(composer_actions.into_iter().map(DiffAction::Composer));
@@ -1270,6 +1292,7 @@ mod tests {
                         &mut cache,
                         &mut drafts,
                         &mut actions,
+                        None,
                     );
                 });
                 assert!(

@@ -95,7 +95,9 @@ impl Default for PrDetailState {
 ///
 /// The diff's own actions are pushed onto `diff_actions` for the app to fold
 /// in; the screen's actions are returned. `login` is the signed-in user, so
-/// the review panel can apply the author rule.
+/// the review panel can apply the author rule. `write_blocked` is the
+/// rate-limit tooltip (spec §13): `Some` while writes are disabled, gating
+/// the review-panel and composer Submit buttons.
 pub fn render(
     ui: &mut egui::Ui,
     session: &mut PrSession,
@@ -103,6 +105,7 @@ pub fn render(
     cache: &mut HighlightCache,
     diff_actions: &mut Vec<DiffAction>,
     login: &str,
+    write_blocked: Option<&str>,
 ) -> Vec<PrDetailAction> {
     let mut actions = Vec::new();
     let mut tree_actions = Vec::new();
@@ -176,6 +179,7 @@ pub fn render(
                 viewer_is_author: viewer_is_author(session, login),
                 server_pending: session.server_pending.is_some(),
                 head_moved_since_pin: head_moved_since_pin(session),
+                write_blocked: write_blocked.map(str::to_owned),
             };
             let vm = review_panel::review_panel_vm(&inputs);
             let past = review_panel::reviews_vm(&session.reviews);
@@ -192,6 +196,7 @@ pub fn render(
             cache,
             &mut state.drafts,
             diff_actions,
+            write_blocked,
         );
     });
 
@@ -466,6 +471,7 @@ mod tests {
                 &mut cache,
                 &mut diff_actions,
                 "me",
+                None,
             );
         });
 
@@ -515,6 +521,7 @@ mod tests {
                 &mut cache,
                 &mut diff_actions,
                 "me",
+                None,
             );
         });
         assert!(
