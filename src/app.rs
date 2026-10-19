@@ -22,7 +22,9 @@ use crate::persist::settings::Settings;
 use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, Worker,
 };
+use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
+use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
 use crate::ui::widgets::toast::Toasts;
 
 /// The three screens. Settings is a modal window, not a fourth screen.
@@ -59,9 +61,22 @@ pub fn route(current: ScreenKind, event: &Event) -> ScreenKind {
             error: GhError::Unauthorized,
             ..
         } => ScreenKind::Login,
+        Event::PrSearchFailed {
+            error: GhError::Unauthorized,
+            ..
+        } => ScreenKind::Login,
         Event::LoggedIn { .. } => ScreenKind::PrList,
         _ => current,
     }
+}
+
+/// The login of the cached account, or the empty string when signed out.
+fn account_login(settings: &Settings) -> String {
+    settings
+        .account
+        .as_ref()
+        .map(|account| account.login.clone())
+        .unwrap_or_default()
 }
 
 /// The root app: owns settings, the worker bridge, and every piece of UI state.
@@ -69,6 +84,8 @@ pub struct ReviewApp {
     screen: ScreenKind,
     auth_state: AuthState,
     login_form: LoginForm,
+    pr_list: PrListState,
+    pr_list_form: PrListForm,
     toasts: Toasts,
     settings: Settings,
     config_dir: PathBuf,
@@ -108,10 +125,23 @@ impl ReviewApp {
             async move { execute(ctx, command, events).await }
         });
 
+        // The list starts on the saved default scopes, and a restored token
+        // means its first search can go out before the first frame.
+        let mut pr_list = PrListState::default();
+        pr_list.scopes = settings.default_scopes.clone();
+        if restored.is_some() {
+            let login = account_login(&settings);
+            for command in reduce(&mut pr_list, PrListMsg::Refresh, &login) {
+                worker.send(command);
+            }
+        }
+
         ReviewApp {
             screen: initial_screen(restored.is_some()),
             auth_state: AuthState::Idle,
             login_form: LoginForm::for_settings(&settings),
+            pr_list,
+            pr_list_form: PrListForm::default(),
             toasts: Toasts::default(),
             settings,
             config_dir,
@@ -124,6 +154,7 @@ impl ReviewApp {
 
     /// Apply one event to the app state.
     fn handle_event(&mut self, event: Event, now: Instant) {
+        let previous = self.screen;
         self.screen = route(self.screen, &event);
 
         match event {
@@ -141,9 +172,50 @@ impl ReviewApp {
                 ..
             } => self.on_unauthorized(now),
             Event::Failed { error, .. } => self.toasts.push(error.to_string(), now),
-            // These are folded into the PR list reducer in Task 14.
-            Event::PrSearchPage { .. } | Event::PrSearchFailed { .. } => {}
+            Event::PrSearchPage {
+                request,
+                query,
+                page,
+            } => self.apply_pr_list(PrListMsg::PageLoaded {
+                request,
+                query,
+                page,
+            }),
+            Event::PrSearchFailed { request, error } => {
+                let unauthorized = matches!(error, GhError::Unauthorized);
+                self.apply_pr_list(PrListMsg::LoadFailed { request, error });
+                if unauthorized {
+                    // Spec §6: a 401 anywhere ends the session.
+                    self.on_unauthorized(now);
+                }
+            }
         }
+
+        // Entering the list — a restored token or a fresh sign-in — starts its
+        // first search.
+        if self.screen == ScreenKind::PrList && previous != ScreenKind::PrList {
+            self.apply_pr_list(PrListMsg::Refresh);
+        }
+    }
+
+    /// The signed-in login, or the empty string before sign-in.
+    fn login(&self) -> String {
+        account_login(&self.settings)
+    }
+
+    /// Fold one PR-list message in and send whatever commands it produced.
+    fn apply_pr_list(&mut self, msg: PrListMsg) {
+        let login = self.login();
+        for command in reduce(&mut self.pr_list, msg, &login) {
+            self.worker.send(command);
+        }
+    }
+
+    /// Drop the loaded rows, so one account's PRs never show under another's.
+    fn reset_pr_list(&mut self) {
+        self.pr_list = PrListState::default();
+        self.pr_list.scopes = self.settings.default_scopes.clone();
+        self.pr_list_form = PrListForm::default();
     }
 
     /// Store the token and cache the account for the next launch.
@@ -186,6 +258,7 @@ impl ReviewApp {
                 self.save_settings(now);
                 self.auth_state = AuthState::Idle;
                 self.screen = ScreenKind::Login;
+                self.reset_pr_list();
                 self.toasts.push("signed out".to_owned(), now);
             }
             Err(error) => {
@@ -260,8 +333,38 @@ impl ReviewApp {
     fn render_screen(&mut self, ui: &mut egui::Ui, now: Instant) {
         match self.screen {
             ScreenKind::Login => self.render_login(ui, now),
-            ScreenKind::PrList => self.render_placeholder(ui, "Pull requests", now),
+            ScreenKind::PrList => self.render_pr_list(ui),
             ScreenKind::PrDetail => self.render_placeholder(ui, "Pull request", now),
+        }
+    }
+
+    /// Draw the PR list and apply whatever the user asked for.
+    fn render_pr_list(&mut self, ui: &mut egui::Ui) {
+        let mut msgs = Vec::new();
+        let mut actions = Vec::new();
+        egui::CentralPanel::default().show(ui, |ui| {
+            pr_list::render(
+                ui,
+                &mut self.pr_list,
+                &mut self.pr_list_form,
+                &mut msgs,
+                &mut actions,
+            );
+        });
+
+        for msg in msgs {
+            self.apply_pr_list(msg);
+        }
+        for action in actions {
+            match action {
+                PrListAction::LoadMore => {
+                    for command in load_more(&self.pr_list) {
+                        self.worker.send(command);
+                    }
+                }
+                // Opening a PR is wired into the PR session in Task 22.
+                PrListAction::Open { .. } => {}
+            }
         }
     }
 
@@ -277,7 +380,7 @@ impl ReviewApp {
         self.apply_login_actions(actions, &ctx, now);
     }
 
-    /// A stand-in screen until Tasks 14 and 23 land.
+    /// A stand-in screen until Task 23 lands.
     fn render_placeholder(&mut self, ui: &mut egui::Ui, title: &str, now: Instant) {
         let mut sign_out = false;
         egui::CentralPanel::default().show(ui, |ui| {
@@ -364,6 +467,24 @@ mod tests {
         assert!(matches!(
             route(ScreenKind::PrDetail, &other),
             ScreenKind::PrDetail
+        ));
+
+        // A 401 from a PR search ends the session too (spec §6).
+        let search_unauthorized = Event::PrSearchFailed {
+            request: 1,
+            error: GhError::Unauthorized,
+        };
+        assert!(matches!(
+            route(ScreenKind::PrList, &search_unauthorized),
+            ScreenKind::Login
+        ));
+        let search_failed = Event::PrSearchFailed {
+            request: 1,
+            error: GhError::NotFound,
+        };
+        assert!(matches!(
+            route(ScreenKind::PrList, &search_failed),
+            ScreenKind::PrList
         ));
     }
 
