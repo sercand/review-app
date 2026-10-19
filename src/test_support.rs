@@ -56,6 +56,27 @@ pub fn file(path: &str) -> crate::github::files::PrFile {
     }
 }
 
+/// One [`crate::github::files::PrFile`] per path, from [`file`].
+pub fn files_at(paths: &[&str]) -> Vec<crate::github::files::PrFile> {
+    paths.iter().map(|path| file(path)).collect()
+}
+
+/// A whole path tree over `paths`, with every file included.
+pub fn tree_at(paths: &[&str]) -> crate::model::tree::TreeNode {
+    crate::model::tree::build_tree(&files_at(paths), &|_| true)
+}
+
+/// The node at `path` anywhere in `root`'s subtree, or `None`.
+pub fn find<'a>(
+    root: &'a crate::model::tree::TreeNode,
+    path: &str,
+) -> Option<&'a crate::model::tree::TreeNode> {
+    if root.path == path {
+        return Some(root);
+    }
+    root.children.iter().find_map(|child| find(child, path))
+}
+
 /// A [`crate::model::pr::PrSummary`] in `o/r`: authored by `"a"`, not a draft,
 /// with no checks and no review decision, all timestamps equal, and no URL.
 pub fn pr_summary(number: u64, title: &str, comments: u32) -> crate::model::pr::PrSummary {
