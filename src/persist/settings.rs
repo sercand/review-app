@@ -64,6 +64,9 @@ pub struct Settings {
     pub layout: Layout,
     /// The diff layout choices, defaulted the same way.
     pub diff: DiffPrefs,
+    /// The code font size in points: 12, 13 or 14; anything else loads as
+    /// 13 (redesign Task 14).
+    pub code_font_size: f32,
 }
 
 /// The diff layout choices, remembered across PRs and restarts.
@@ -105,6 +108,7 @@ impl Default for Settings {
                 details_tab: crate::ui::widgets::metadata_panel::DetailsTab::default(),
             },
             diff: DiffPrefs::default(),
+            code_font_size: 13.0,
         }
     }
 }
@@ -131,8 +135,15 @@ impl Settings {
             }
         };
 
-        match toml::from_str(&raw) {
-            Ok(settings) => settings,
+        match toml::from_str::<Settings>(&raw) {
+            Ok(mut settings) => {
+                // Only the offered sizes are valid; anything else (an old
+                // file, a hand edit) loads as the default (Task 14).
+                if ![12.0, 13.0, 14.0].contains(&settings.code_font_size) {
+                    settings.code_font_size = 13.0;
+                }
+                settings
+            }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "could not parse settings; using defaults");
                 Settings::default()
@@ -153,6 +164,15 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::test_support::tempdir;
+
+    #[test]
+    fn code_font_size_is_clamped_to_the_offered_sizes() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("settings.toml"), "code_font_size = 30.0\n").unwrap();
+        assert_eq!(Settings::load_or_default(dir.path()).code_font_size, 13.0);
+        std::fs::write(dir.path().join("settings.toml"), "code_font_size = 14.0\n").unwrap();
+        assert_eq!(Settings::load_or_default(dir.path()).code_font_size, 14.0);
+    }
 
     #[test]
     fn details_tab_round_trips() {

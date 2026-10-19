@@ -6,6 +6,8 @@
 //! [`KeyPress`] into an action id, and [`next_index`] does the clamping both
 //! file (`j`/`k`) and hunk (`n`/`p`) navigation share. `app.rs` owns dispatch.
 
+use crate::github::files::PrFile;
+
 /// One dispatchable command, as the palette lists it and the help overlay
 /// documents it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +112,61 @@ pub fn registry() -> Vec<ActionEntry> {
 /// finds "Toggle viewed". Results rank by the position of the first matched
 /// character (earlier is better), then by label length (shorter is better);
 /// an empty query keeps the registry's own order.
+/// One palette row: a command, or a file to jump to (Task 14).
+#[derive(Debug, PartialEq)]
+pub enum PaletteEntry<'a> {
+    /// A registry command.
+    Action(&'a ActionEntry),
+    /// A file in the open PR; `index` is its index in the session's files.
+    File {
+        /// The file's index in `PrSession::files`.
+        index: u32,
+        /// The full path, for the row's label and icon.
+        path: String,
+    },
+}
+
+/// Whether `haystack` contains `needle` as a case-insensitive subsequence.
+pub fn fuzzy_hit(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let hay = haystack.to_lowercase();
+    let needle = needle.to_lowercase();
+    let mut cursor = 0usize;
+    for ch in needle.chars() {
+        match hay[cursor..].find(ch) {
+            Some(at) => cursor += at + ch.len_utf8(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The palette's rows: fuzzy-matched actions first, then fuzzy-matched
+/// files by path (Task 14). Files only arrive while a PR is open.
+pub fn palette_entries<'a>(
+    actions: &'a [ActionEntry],
+    files: &[PrFile],
+    query: &str,
+) -> Vec<PaletteEntry<'a>> {
+    let mut out: Vec<PaletteEntry> = fuzzy_filter(actions, query)
+        .into_iter()
+        .map(PaletteEntry::Action)
+        .collect();
+    out.extend(
+        files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| fuzzy_hit(&file.path, query))
+            .map(|(index, file)| PaletteEntry::File {
+                index: index as u32,
+                path: file.path.clone(),
+            }),
+    );
+    out
+}
+
 pub fn fuzzy_filter<'a>(entries: &'a [ActionEntry], query: &str) -> Vec<&'a ActionEntry> {
     if query.is_empty() {
         return entries.iter().collect();
@@ -242,6 +299,24 @@ mod tests {
             shift: false,
             command: false,
         }
+    }
+
+    #[test]
+    fn palette_lists_actions_then_files() {
+        use crate::test_support::files_at;
+        let actions = registry();
+        let files = files_at(&[
+            "src/lib/data-tools/push.ts",
+            "src/lib/notifications/schema.ts",
+        ]);
+        let e = palette_entries(&actions, &files, "push");
+        assert!(matches!(
+            e.last(),
+            Some(PaletteEntry::File { index: 0, .. })
+        ));
+        assert!(palette_entries(&actions, &[], "split")
+            .iter()
+            .all(|x| matches!(x, PaletteEntry::Action(_))));
     }
 
     #[test]

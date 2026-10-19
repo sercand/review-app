@@ -207,7 +207,7 @@ pub fn visuals(p: &Palette, dark: bool) -> egui::Visuals {
 }
 
 /// The shared `egui::Style`: mockup spacing and text sizes.
-pub fn style(mut base: egui::Style) -> egui::Style {
+pub fn style(mut base: egui::Style, code_font_size: f32) -> egui::Style {
     base.spacing.item_spacing = egui::vec2(6.0, 4.0);
     base.spacing.button_padding = egui::vec2(10.0, 4.0);
     base.spacing.interact_size.y = 28.0;
@@ -217,8 +217,10 @@ pub fn style(mut base: egui::Style) -> egui::Style {
         .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
     base.text_styles
         .insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
-    base.text_styles
-        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.5));
+    base.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::monospace(code_font_size),
+    );
     base.text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(15.0));
     base
@@ -312,5 +314,12 @@ mod tests {
         assert_eq!(v.selection.bg_fill, DARK.accent_soft);
         assert_eq!(v.hyperlink_color, DARK.accent);
         assert!(!visuals(&LIGHT, false).dark_mode);
+    }
+
+    #[test]
+    fn style_uses_the_code_font_size() {
+        let s = style(egui::Style::default(), 14.0);
+        assert_eq!(s.text_styles[&egui::TextStyle::Monospace].size, 14.0);
+        assert_eq!(s.text_styles[&egui::TextStyle::Body].size, 13.0);
     }
 }

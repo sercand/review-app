@@ -225,13 +225,19 @@ impl ReviewApp {
             .set_visuals_of(egui::Theme::Dark, theme::visuals(&theme::DARK, true));
         cc.egui_ctx
             .set_visuals_of(egui::Theme::Light, theme::visuals(&theme::LIGHT, false));
-        cc.egui_ctx
-            .set_style_of(egui::Theme::Dark, theme::style(egui::Style::default()));
-        cc.egui_ctx
-            .set_style_of(egui::Theme::Light, theme::style(egui::Style::default()));
 
         let config_dir = config_root();
         let settings = Settings::load_or_default(&config_dir);
+        // The styles carry the user's code font size, so they register once
+        // the settings are in hand (Task 14).
+        cc.egui_ctx.set_style_of(
+            egui::Theme::Dark,
+            theme::style(egui::Style::default(), settings.code_font_size),
+        );
+        cc.egui_ctx.set_style_of(
+            egui::Theme::Light,
+            theme::style(egui::Style::default(), settings.code_font_size),
+        );
         let store: Arc<dyn TokenStore> = Arc::new(KeyringStore);
 
         let restored = match restore_token(store.as_ref(), &settings) {
@@ -552,12 +558,27 @@ impl ReviewApp {
     /// Fold the settings window's actions in: Save persists (and a host
     /// change ends the session, since the stored token belongs to the old
     /// host), and Sign out rides the existing sign-out flow (RULING R10).
-    fn apply_settings_actions(&mut self, actions: Vec<SettingsAction>, now: Instant) {
+    fn apply_settings_actions(
+        &mut self,
+        actions: Vec<SettingsAction>,
+        ctx: &egui::Context,
+        now: Instant,
+    ) {
         for action in actions {
             match action {
                 SettingsAction::Apply(vm) => {
                     let host_changed = vm.apply(&mut self.settings);
                     self.save_settings(now);
+                    // The code font size lives in the styles; re-register
+                    // both so the next frame picks it up (Task 14).
+                    ctx.set_style_of(
+                        egui::Theme::Dark,
+                        theme::style(egui::Style::default(), self.settings.code_font_size),
+                    );
+                    ctx.set_style_of(
+                        egui::Theme::Light,
+                        theme::style(egui::Style::default(), self.settings.code_font_size),
+                    );
                     if host_changed {
                         self.exec.clear_client();
                         self.flush_session();
@@ -1547,20 +1568,46 @@ impl eframe::App for ReviewApp {
         // every screen. The palette runs its selection through the same
         // dispatch as a keybinding.
         let entries = command::registry();
-        let mut palette_actions: Vec<&'static str> = Vec::new();
-        command_palette::render(&ctx, &mut self.palette, &entries, &mut palette_actions);
-        for action in palette_actions {
-            self.dispatch(action, now);
+        let palette_files: Vec<crate::github::files::PrFile> = self
+            .session
+            .as_ref()
+            .map(|s| s.files.iter().map(|l| l.file.clone()).collect())
+            .unwrap_or_default();
+        let mut palette_actions: Vec<command_palette::PaletteSelection> = Vec::new();
+        command_palette::render(
+            &ctx,
+            &mut self.palette,
+            &entries,
+            &palette_files,
+            &mut palette_actions,
+        );
+        for selection in palette_actions {
+            match selection {
+                command_palette::PaletteSelection::Action(action) => self.dispatch(action, now),
+                command_palette::PaletteSelection::File(index) => {
+                    if let Some(session) = &mut self.session {
+                        session.select_file(index as usize);
+                    }
+                }
+            }
         }
         let mut settings_actions = Vec::new();
-        let signed_in = self.settings.account.is_some();
+        let account = self
+            .settings
+            .account
+            .as_ref()
+            .map(|account| settings_window::AccountInfo {
+                login: &account.login,
+                host: &self.settings.host,
+                scopes: &account.scopes,
+            });
         settings_window::render(
             &ctx,
             &mut self.settings_window,
-            signed_in,
+            account,
             &mut settings_actions,
         );
-        self.apply_settings_actions(settings_actions, now);
+        self.apply_settings_actions(settings_actions, &ctx, now);
         command_palette::render_help(&ctx, &mut self.help_open, &entries);
 
         self.toasts.render(ui, now);
