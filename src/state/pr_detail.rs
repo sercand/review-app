@@ -19,6 +19,7 @@ use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
 use crate::model::comment::CommentTarget;
+use crate::model::review::{PendingError, PendingReview};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
 use crate::persist::session::{self, DebouncedWriter, SessionFile};
@@ -41,18 +42,6 @@ pub enum LoadPhase {
     Ready,
     /// Loading stopped on an error.
     Failed,
-}
-
-/// A comment held for the pending review (Phase F submits it): local only,
-/// anchored where it was written, rendered as a `Pending` row (spec §7.2).
-#[derive(Clone, Debug, PartialEq)]
-pub struct PendingComment {
-    /// The session-allocated id, echoed by the row and never 0.
-    pub local_id: u64,
-    /// What the comment is attached to.
-    pub target: CommentTarget,
-    /// The comment body.
-    pub body: String,
 }
 
 /// A 422 on a line anchor: GitHub's message and the same comment re-anchored
@@ -117,8 +106,9 @@ pub struct PrSession {
     pub threads: Vec<ReviewThread>,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
-    /// Comments held for the pending review, in the order they were added.
-    pub pending: Vec<PendingComment>,
+    /// The live pending-review draft (Phase F submits it), pinned to one
+    /// commit while it has comments (spec §7.2).
+    pub pending: PendingReview,
     /// A line post rejected with a 422, awaiting the reviewer's decision
     /// on the file-level fallback.
     pub fallback: Option<FallbackPrompt>,
@@ -201,7 +191,7 @@ impl PrSession {
             filters: FilterState::default(),
             threads: Vec::new(),
             composer: ComposerState::default(),
-            pending: Vec::new(),
+            pending: PendingReview::default(),
             fallback: None,
             next_optimistic_id: 1,
             optimistic: None,
@@ -473,11 +463,14 @@ impl PrSession {
                 items.push(item);
             }
         }
-        for pending in &self.pending {
-            if let Some(file) = self.file_of(&pending.target) {
+        for pending in &self.pending.comments {
+            if let Some(file) = self.file_at(&pending.anchor.path) {
                 items.push(InlineItem {
                     file,
-                    placement: target_placement(&pending.target),
+                    placement: Placement::AfterLine {
+                        side: pending.anchor.side,
+                        line: pending.anchor.line,
+                    },
                     row: RowRef::Pending {
                         local_id: pending.local_id,
                     },
@@ -502,6 +495,11 @@ impl PrSession {
             CommentTarget::Line(anchor) => anchor.path.as_str(),
             CommentTarget::File { path } => path,
         };
+        self.file_at(path)
+    }
+
+    /// The index of the file at `path`, when the loaded diff has one.
+    fn file_at(&self, path: &str) -> Option<u32> {
         self.files
             .iter()
             .position(|l| l.file.path == path)
@@ -546,15 +544,30 @@ impl PrSession {
         let body = self.composer.body.clone();
 
         if mode == CommentMode::Pending {
-            let local_id = self.allocate_id();
-            self.pending.push(PendingComment {
-                local_id,
-                target,
-                body,
-            });
-            composer::reduce(&mut self.composer, ComposerMsg::Cancel);
-            self.rebuild_rows();
-            self.mark_session_dirty(now);
+            // A file-level target was forced to Immediate above, so a pending
+            // comment always has a line anchor (spec §7.3).
+            let CommentTarget::Line(anchor) = target else {
+                return Vec::new();
+            };
+            let Some(commit_id) = self.diff_head_sha.clone() else {
+                self.composer.error = Some("the diff is still loading".to_owned());
+                return Vec::new();
+            };
+            match self.pending.add(anchor, body.clone(), &commit_id) {
+                Ok(_) => {
+                    composer::reduce(&mut self.composer, ComposerMsg::Cancel);
+                    self.rebuild_rows();
+                    self.mark_session_dirty(now);
+                }
+                // The draft is pinned to another commit: keep the composer
+                // text and say so — submit or discard the pinned draft first
+                // (spec §7.2).
+                Err(PendingError::PinnedToOtherCommit { pinned }) => {
+                    self.composer.error = Some(format!(
+                        "the pending review is pinned to {pinned}; submit or discard it first"
+                    ));
+                }
+            }
             return Vec::new();
         }
 
@@ -611,7 +624,7 @@ impl PrSession {
 
     /// Drop a pending comment from the review.
     pub fn delete_pending(&mut self, local_id: u64, now: Instant) {
-        self.pending.retain(|p| p.local_id != local_id);
+        self.pending.delete(local_id);
         self.rebuild_rows();
         self.mark_session_dirty(now);
     }
@@ -1114,7 +1127,7 @@ mod tests {
         open_composer(&mut s, "for the review");
         let cmds = s.submit_comment(CommentMode::Pending, "me", Instant::now());
         assert!(cmds.is_empty(), "pending comments post nothing yet");
-        assert_eq!(s.pending.len(), 1);
+        assert_eq!(s.pending.comments.len(), 1);
         assert!(s.row_model.rows.contains(&RowRef::Pending { local_id: 1 }));
 
         s.delete_pending(1, Instant::now());

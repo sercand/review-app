@@ -487,7 +487,13 @@ fn render_row(
         RowRef::Pending { local_id } => {
             let id = *local_id;
             row.col(|ui| {
-                let Some(pending) = ctx.session.pending.iter().find(|p| p.local_id == id) else {
+                let Some(pending) = ctx
+                    .session
+                    .pending
+                    .comments
+                    .iter()
+                    .find(|p| p.local_id == id)
+                else {
                     return;
                 };
                 egui::Frame::new()
