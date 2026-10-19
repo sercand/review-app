@@ -102,3 +102,28 @@ pub fn loaded(path: &str, patch: &str) -> crate::github::files::LoadedFile {
 fn parse(patch: &str) -> Vec<crate::model::diff::Hunk> {
     crate::diff::parse::parse_patch(patch).expect("the test patch should parse")
 }
+
+/// A [`crate::github::metadata::PrMetadata`] authored by `"author"` with the
+/// given head SHA, in `o/r` as PR #7.
+pub fn meta(head_sha: &str) -> crate::github::metadata::PrMetadata {
+    crate::github::metadata::PrMetadata {
+        node_id: "node".to_owned(),
+        number: 7,
+        title: "a pull request".to_owned(),
+        body: String::new(),
+        author: "author".to_owned(),
+        state: "open".to_owned(),
+        draft: false,
+        base_ref: "main".to_owned(),
+        base_sha: "sha_base".to_owned(),
+        head_ref: "feature".to_owned(),
+        head_sha: head_sha.to_owned(),
+        additions: 1,
+        deletions: 1,
+        changed_files: 1,
+        requested_reviewers: Vec::new(),
+        labels: Vec::new(),
+        milestone: None,
+        html_url: "https://github.com/o/r/pull/7".to_owned(),
+    }
+}

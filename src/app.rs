@@ -17,11 +17,13 @@ use crate::auth::store::{KeyringStore, TokenStore};
 use crate::auth::DEFAULT_CLIENT_ID;
 use crate::github::client::{GithubClient, Me};
 use crate::github::error::GhError;
+use crate::model::RepoRef;
 use crate::persist::config_root;
 use crate::persist::settings::Settings;
 use crate::runtime::{
-    event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, Worker,
+    event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
 };
+use crate::state::pr_detail::PrSession;
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
@@ -86,6 +88,8 @@ pub struct ReviewApp {
     login_form: LoginForm,
     pr_list: PrListState,
     pr_list_form: PrListForm,
+    session: Option<PrSession>,
+    next_session: u64,
     toasts: Toasts,
     settings: Settings,
     config_dir: PathBuf,
@@ -142,6 +146,8 @@ impl ReviewApp {
             login_form: LoginForm::for_settings(&settings),
             pr_list,
             pr_list_form: PrListForm::default(),
+            session: None,
+            next_session: 1,
             toasts: Toasts::default(),
             settings,
             config_dir,
@@ -156,6 +162,7 @@ impl ReviewApp {
     fn handle_event(&mut self, event: Event, now: Instant) {
         let previous = self.screen;
         self.screen = route(self.screen, &event);
+        self.apply_session_event(&event);
 
         match event {
             Event::Pong(_) => {}
@@ -189,7 +196,7 @@ impl ReviewApp {
                     self.on_unauthorized(now);
                 }
             }
-            // The PR-detail screen folds these once it exists (Phase C).
+            // Folded into the open session by `apply_session_event` above.
             Event::PrFilesPage { .. } => {}
             Event::PrMetadataLoaded { .. } => {}
         }
@@ -198,6 +205,19 @@ impl ReviewApp {
         // first search.
         if self.screen == ScreenKind::PrList && previous != ScreenKind::PrList {
             self.apply_pr_list(PrListMsg::Refresh);
+        }
+    }
+
+    /// Fold a PR-scoped event into the open session and send its commands.
+    ///
+    /// The session drops events that are not its own, so a reply for a PR the
+    /// user has left never reaches the screen now showing.
+    fn apply_session_event(&mut self, event: &Event) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        for command in session.on_event(event) {
+            self.worker.send(command);
         }
     }
 
@@ -244,6 +264,7 @@ impl ReviewApp {
             tracing::warn!(%error, "could not clear the stored token");
         }
         self.exec.clear_client();
+        self.session = None;
         // `AuthFailure::Http` carries a user-facing message verbatim, which is
         // how the login screen shows the session-expiry notice (spec §6).
         self.auth_state = AuthState::Failed(AuthFailure::Http(
@@ -262,6 +283,7 @@ impl ReviewApp {
                 self.auth_state = AuthState::Idle;
                 self.screen = ScreenKind::Login;
                 self.reset_pr_list();
+                self.session = None;
                 self.toasts.push("signed out".to_owned(), now);
             }
             Err(error) => {
@@ -365,10 +387,23 @@ impl ReviewApp {
                         self.worker.send(command);
                     }
                 }
-                // Opening a PR is wired into the PR session in Task 22.
-                PrListAction::Open { .. } => {}
+                PrListAction::Open { repo, number } => self.open_pr(repo, number),
             }
         }
+    }
+
+    /// Open one PR: allocate a session id, start its load, and show the detail
+    /// screen.
+    fn open_pr(&mut self, repo: RepoRef, number: u64) {
+        let id = SessionId(self.next_session);
+        self.next_session += 1;
+
+        let (session, commands) = PrSession::open(id, self.settings.host.clone(), repo, number);
+        self.session = Some(session);
+        for command in commands {
+            self.worker.send(command);
+        }
+        self.screen = ScreenKind::PrDetail;
     }
 
     /// Draw the login screen and apply whatever the user asked for.
