@@ -140,8 +140,9 @@ fn discard_confirm_id() -> egui::Id {
 /// The summary and comment text edits bind straight into `pending` (like the
 /// composer binds into [`crate::state::composer::ComposerState`]); the
 /// matching `SetBody`/`EditComment` actions tell the app the draft changed so
-/// it can persist it. `Ctrl`/`⌘`+Enter submits when the view-model allows it,
-/// and Discard asks for confirmation before it reports anything.
+/// it can persist it. `Ctrl`/`⌘`+Enter submits when the view-model allows it
+/// and keyboard focus is on one of the panel's own text edits, and Discard
+/// asks for confirmation before it reports anything.
 pub fn render(
     ui: &mut egui::Ui,
     vm: &ReviewPanelVm,
@@ -158,11 +159,55 @@ pub fn render(
             }
             if let Some(reason) = vm.blocked_reason {
                 ui.colored_label(ui.visuals().warn_fg_color, reason);
+                // The REST list does not expose the verdict the reviewer
+                // picked in the web UI, so the banner asks for it explicitly
+                // (defaulting to Comment) instead of silently submitting one.
+                let mut choice = server_pending_choice(ui);
+                ui.horizontal(|ui| {
+                    ui.label("Submit as:");
+                    for (label, event, allowed, hover) in [
+                        ("Comment", ReviewEvent::Comment, true, ""),
+                        (
+                            "Approve",
+                            ReviewEvent::Approve,
+                            vm.can_approve,
+                            "you are the pull request's author",
+                        ),
+                        (
+                            "Request changes",
+                            ReviewEvent::RequestChanges,
+                            vm.can_request_changes,
+                            "you are the pull request's author",
+                        ),
+                    ] {
+                        let response = ui.add_enabled(
+                            allowed,
+                            egui::Button::selectable(choice.event == event, label),
+                        );
+                        if response.clicked() {
+                            choice.event = event;
+                            set_server_pending_choice(ui, choice.clone());
+                        }
+                        if !allowed {
+                            response.on_hover_text(hover);
+                        }
+                    }
+                });
+                let choice_body = ui.add(
+                    egui::TextEdit::multiline(&mut choice.body)
+                        .hint_text("Review summary (optional)")
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+                if choice_body.changed() {
+                    set_server_pending_choice(ui, choice.clone());
+                }
                 ui.horizontal(|ui| {
                     if ui.button("Submit pending review").clicked() {
-                        actions.push(ReviewAction::SubmitServerPending(
-                            ReviewEvent::Comment,
-                            String::new(),
+                        actions.push(server_pending_submit(
+                            choice.event,
+                            choice.body.clone(),
+                            !vm.can_approve,
                         ));
                     }
                     if ui.button("Discard pending review").clicked() {
@@ -212,6 +257,9 @@ pub fn render(
             if body_response.changed() {
                 actions.push(ReviewAction::SetBody(pending.body.clone()));
             }
+            // The widgets the submit shortcut may fire from: the panel's own
+            // text edits, so a field elsewhere can never trigger a submit.
+            let mut owned_ids = vec![body_response.id];
 
             for comment in &mut pending.comments {
                 ui.horizontal(|ui| {
@@ -226,6 +274,7 @@ pub fn render(
                         .desired_width(f32::INFINITY)
                         .font(egui::TextStyle::Monospace),
                 );
+                owned_ids.push(response.id);
                 if response.changed() {
                     actions.push(ReviewAction::EditComment(
                         comment.local_id,
@@ -262,8 +311,14 @@ pub fn render(
                     }
                 });
             }
-            let submit_shortcut =
-                ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+            // Scope the shortcut to the panel: it fires only while keyboard
+            // focus is on one of the panel's own text edits, so ⌘+Enter in
+            // the thread-reply composer (or any other field) can never
+            // submit the review by accident.
+            let focused = ui.ctx().memory(|m| m.focused());
+            let submit_shortcut = ui
+                .input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
+                && submit_shortcut_allowed(focused, &owned_ids);
             if submit_shortcut && vm.submit_enabled {
                 actions.push(ReviewAction::Submit);
             }
@@ -311,6 +366,53 @@ fn confirm_discard(ui: &egui::Ui) -> bool {
 fn set_confirm_discard(ui: &egui::Ui, on: bool) {
     let id = discard_confirm_id();
     ui.ctx().data_mut(|data| data.insert_temp(id, on));
+}
+
+/// The memory key holding the server-pending banner's verdict picker.
+fn server_pending_choice_id() -> egui::Id {
+    egui::Id::unique("review-panel-server-pending-choice")
+}
+
+/// The server-pending banner's picker state: the verdict and body its Submit
+/// button reports. The REST list does not expose the verdict the reviewer
+/// picked in the web UI, so the banner starts at `Comment` and lets the
+/// reviewer restate their choice explicitly.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ServerPendingChoice {
+    event: ReviewEvent,
+    body: String,
+}
+
+/// The picker state between frames.
+fn server_pending_choice(ui: &egui::Ui) -> ServerPendingChoice {
+    ui.ctx()
+        .data(|data| data.get_temp::<ServerPendingChoice>(server_pending_choice_id()))
+        .unwrap_or_default()
+}
+
+/// Store the picker state between frames.
+fn set_server_pending_choice(ui: &egui::Ui, choice: ServerPendingChoice) {
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(server_pending_choice_id(), choice));
+}
+
+/// The action the banner's Submit button reports for the chosen verdict and
+/// body. The PR author may not approve or request changes, so a stale pick
+/// (the state lives in memory across pull requests) falls back to `Comment`.
+fn server_pending_submit(event: ReviewEvent, body: String, viewer_is_author: bool) -> ReviewAction {
+    let event = match event {
+        ReviewEvent::Comment => ReviewEvent::Comment,
+        _ if viewer_is_author => ReviewEvent::Comment,
+        event => event,
+    };
+    ReviewAction::SubmitServerPending(event, body)
+}
+
+/// Whether the `Ctrl`/`⌘`+Enter submit shortcut may fire: only while keyboard
+/// focus is on a widget the panel owns (`focused` is one of `owned`), so no
+/// text field elsewhere on the screen can trigger an accidental submit.
+fn submit_shortcut_allowed(focused: Option<egui::Id>, owned: &[egui::Id]) -> bool {
+    focused.is_some_and(|id| owned.contains(&id))
 }
 
 #[cfg(test)]
@@ -426,5 +528,108 @@ mod tests {
             render(ui, &vm, &mut p, &past, &mut actions);
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
+    }
+
+    #[test]
+    fn server_pending_submit_carries_the_chosen_verdict() {
+        assert_eq!(
+            server_pending_submit(ReviewEvent::Comment, String::new(), false),
+            ReviewAction::SubmitServerPending(ReviewEvent::Comment, String::new())
+        );
+        assert_eq!(
+            server_pending_submit(ReviewEvent::Approve, "lgtm".into(), false),
+            ReviewAction::SubmitServerPending(ReviewEvent::Approve, "lgtm".into())
+        );
+        assert_eq!(
+            server_pending_submit(ReviewEvent::RequestChanges, "fix this".into(), false),
+            ReviewAction::SubmitServerPending(ReviewEvent::RequestChanges, "fix this".into())
+        );
+        assert_eq!(
+            ServerPendingChoice::default(),
+            ServerPendingChoice {
+                event: ReviewEvent::Comment,
+                body: String::new(),
+            },
+            "the picker defaults to Comment"
+        );
+    }
+
+    #[test]
+    fn server_pending_submit_falls_back_to_comment_for_the_author() {
+        // A stale Approve pick (kept in memory across pull requests) must
+        // never submit on a PR the viewer authored.
+        assert_eq!(
+            server_pending_submit(ReviewEvent::Approve, String::new(), true),
+            ReviewAction::SubmitServerPending(ReviewEvent::Comment, String::new())
+        );
+        assert_eq!(
+            server_pending_submit(ReviewEvent::RequestChanges, "x".into(), true),
+            ReviewAction::SubmitServerPending(ReviewEvent::Comment, "x".into())
+        );
+    }
+
+    #[test]
+    fn submit_shortcut_needs_focus_on_a_panel_owned_widget() {
+        let summary = egui::Id::unique("summary");
+        let comment = egui::Id::unique("comment");
+        let owned = [summary, comment];
+        assert!(submit_shortcut_allowed(Some(summary), &owned));
+        assert!(submit_shortcut_allowed(Some(comment), &owned));
+        assert!(
+            !submit_shortcut_allowed(Some(egui::Id::unique("thread-reply")), &owned),
+            "a foreign text field must never trigger a submit"
+        );
+        assert!(
+            !submit_shortcut_allowed(None, &owned),
+            "no focus, no submit"
+        );
+    }
+
+    /// The regression the focus gating exists for: ⌘+Enter while a text
+    /// field outside the panel (here, the thread-reply composer) has focus
+    /// must not submit the draft review.
+    #[test]
+    fn cmd_enter_does_not_submit_while_a_foreign_field_has_focus() {
+        let mut p = PendingReview::default();
+        p.add(line_anchor("a.rs", 1), "x".into(), "sha1").unwrap();
+        let vm = review_panel_vm(&inputs(&p));
+        assert!(vm.submit_enabled, "the draft is submittable");
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let foreign = egui::Id::unique("thread-reply");
+        let mut actions = Vec::new();
+        // Frame 1: paint once and move focus to a widget the panel does not
+        // own; `request_focus` takes effect at the start of the next frame.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().memory_mut(|m| m.request_focus(foreign));
+            render(ui, &vm, &mut p, &[], &mut actions);
+        })
+        .drop_without_applying_deltas();
+        // Frame 2: press Cmd/Ctrl+Enter with that focus still in place.
+        let mut input = egui::RawInput::default();
+        input
+            .events
+            .push(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        ctx.run_ui(input, |ui| {
+            assert_eq!(
+                ui.ctx().memory(|m| m.focused()),
+                Some(foreign),
+                "the foreign field still holds focus"
+            );
+            render(ui, &vm, &mut p, &[], &mut actions);
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            !actions.contains(&ReviewAction::Submit),
+            "⌘+Enter in a field outside the panel must not submit the review"
+        );
     }
 }
