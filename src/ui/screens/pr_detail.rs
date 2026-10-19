@@ -10,8 +10,15 @@ use eframe::egui;
 
 use crate::diff::highlight::HighlightCache;
 use crate::diff::row_model::{display_text, RowRef, ROW_H};
+use crate::github::files::PrFile;
+use crate::model::tree::build_tree;
+use crate::state::filters::{available_extensions, matches, without_hide_viewed, FilterState};
+use crate::state::folder_viewed::toggle_folder_viewed;
 use crate::state::pr_detail::PrSession;
+use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
+use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
+use crate::ui::widgets::filter_bar;
 
 /// The width the left pane starts at.
 const LEFT_W: f32 = 240.0;
@@ -52,6 +59,12 @@ pub fn render(
     diff_actions: &mut Vec<DiffAction>,
 ) -> Vec<PrDetailAction> {
     let mut actions = Vec::new();
+    let mut tree_actions = Vec::new();
+
+    // The file tree and the summary work from `PrFile`s; the session keeps the
+    // loaded files. Built once per frame and shared by the tree build, the row
+    // flatten, and the action handling below.
+    let pr_files: Vec<PrFile> = session.files.iter().map(|l| l.file.clone()).collect();
 
     egui::Panel::top("pr-detail-top").show(ui, |ui| {
         render_top_bar(ui, session, state, &mut actions);
@@ -61,9 +74,14 @@ pub fn render(
         .resizable(true)
         .default_size(LEFT_W)
         .show(ui, |ui| {
-            ui.heading("Files");
-            ui.label("the file tree lands with the file list (Phase D)");
+            render_files_pane(ui, session, &pr_files, &mut tree_actions);
         });
+
+    // Fold the tree's actions in before the diff draws, so selecting a file
+    // scrolls it into view on this very frame.
+    for action in tree_actions {
+        apply_tree_action(session, &pr_files, state, action);
+    }
 
     egui::Panel::right("pr-detail-right")
         .resizable(true)
@@ -79,6 +97,123 @@ pub fn render(
     });
 
     actions
+}
+
+/// Draw the filter bar, the invalidated-viewed hint, and the file tree.
+fn render_files_pane(
+    ui: &mut egui::Ui,
+    session: &mut PrSession,
+    pr_files: &[PrFile],
+    tree_actions: &mut Vec<TreeAction>,
+) {
+    filter_bar::render(ui, &mut session.filters, &available_extensions(pr_files));
+
+    // The tree covers exactly the files the filters keep, but its rows are
+    // resolved against the full list so a row's `file_index` stays valid.
+    let include = |f: &PrFile| matches(f, &session.filters, &session.viewed);
+    let tree = build_tree(pr_files, &include);
+    let rows = flatten_visible(
+        &tree,
+        &session.collapsed_dirs,
+        pr_files,
+        &session.filters,
+        &session.viewed,
+        session.last_opened_file.as_deref(),
+    );
+
+    let (viewed_filtered, total_filtered, additions, deletions) =
+        filtered_progress(pr_files, &session.filters, &session.viewed);
+    render_file_summary(ui, pr_files.len(), total_filtered, additions, deletions);
+    render_invalidated_hint(ui, session.viewed.invalidated_count(pr_files));
+
+    let progress = (
+        viewed_filtered,
+        total_filtered,
+        session.viewed.viewed_count(pr_files),
+        pr_files.len(),
+    );
+    file_tree::render(ui, &rows, &mut session.filters, progress, tree_actions);
+}
+
+/// The `N files, +X −Y` summary for the filtered set (spec §9.1).
+fn render_file_summary(
+    ui: &mut egui::Ui,
+    total: usize,
+    filtered: usize,
+    additions: u32,
+    deletions: u32,
+) {
+    let suffix = if filtered == total {
+        String::new()
+    } else {
+        format!(" ({filtered} shown)")
+    };
+    ui.weak(format!("{total} files, +{additions} −{deletions}{suffix}"));
+}
+
+/// The "N files you had viewed changed since" hint, when any mark was
+/// invalidated by a push (spec §10.3).
+fn render_invalidated_hint(ui: &mut egui::Ui, invalidated: usize) {
+    if invalidated == 0 {
+        return;
+    }
+    let color = ui.visuals().warn_fg_color;
+    ui.colored_label(
+        color,
+        format!("{invalidated} files you had viewed changed since"),
+    );
+}
+
+/// `(viewed, total, additions, deletions)` over the files the filters keep,
+/// hide-viewed ignored.
+fn filtered_progress(
+    files: &[PrFile],
+    filters: &FilterState,
+    viewed: &ViewedSet,
+) -> (usize, usize, u32, u32) {
+    let relaxed = without_hide_viewed(filters);
+    let kept: Vec<&PrFile> = files
+        .iter()
+        .filter(|f| matches(f, &relaxed, viewed))
+        .collect();
+    let viewed_count = kept.iter().filter(|f| viewed.is_viewed(f)).count();
+    let additions = kept.iter().map(|f| f.additions).sum();
+    let deletions = kept.iter().map(|f| f.deletions).sum();
+    (viewed_count, kept.len(), additions, deletions)
+}
+
+/// Fold one file-tree action into the session (and the diff's scroll target).
+fn apply_tree_action(
+    session: &mut PrSession,
+    pr_files: &[PrFile],
+    state: &mut PrDetailState,
+    action: TreeAction,
+) {
+    match action {
+        TreeAction::ToggleCollapsed(path) => {
+            if !session.collapsed_dirs.remove(&path) {
+                session.collapsed_dirs.insert(path);
+            }
+        }
+        TreeAction::ToggleViewed(path) => {
+            if let Some(file) = pr_files.iter().find(|f| f.path == path) {
+                let viewed = session.viewed.is_viewed(file);
+                session.viewed.set(file, !viewed);
+            }
+        }
+        TreeAction::ToggleFolderViewed(folder) => {
+            toggle_folder_viewed(&folder, pr_files, &session.filters, &mut session.viewed);
+        }
+        TreeAction::MarkAllViewed => {
+            toggle_folder_viewed("", pr_files, &session.filters, &mut session.viewed);
+        }
+        TreeAction::SelectFile(path) => {
+            if let Some(index) = pr_files.iter().position(|f| f.path == path) {
+                state.diff.scroll_to = Some(index as u32);
+                session.last_opened_file = Some(path);
+            }
+        }
+    }
 }
 
 /// The top bar: back, `repo#number`, title, refresh, and the right-pane toggle.

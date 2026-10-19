@@ -7,6 +7,8 @@
 //! so a reply for a PR the user has left is dropped rather than folded into the
 //! session now on screen (the stale-event rule).
 
+use std::collections::BTreeSet;
+
 use crate::diff::row_model::{build, RowModel};
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
@@ -60,6 +62,10 @@ pub struct PrSession {
     pub viewed: ViewedSet,
     /// What the file tree is filtering the file list by.
     pub filters: FilterState,
+    /// The file-tree directories the reviewer has collapsed, by path.
+    pub collapsed_dirs: BTreeSet<String>,
+    /// The last file selected in the tree, restored from the session file.
+    pub last_opened_file: Option<String>,
 }
 
 impl PrSession {
@@ -88,6 +94,8 @@ impl PrSession {
             head_moved: false,
             viewed: ViewedSet::default(),
             filters: FilterState::default(),
+            collapsed_dirs: BTreeSet::new(),
+            last_opened_file: None,
         };
 
         let commands = vec![Command::LoadPrMetadata {

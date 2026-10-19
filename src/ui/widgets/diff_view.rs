@@ -45,6 +45,11 @@ pub struct DiffViewState {
     pub mode: DiffMode,
     /// Whether long lines wrap instead of running off the pane.
     pub wrap: bool,
+    /// A file whose header the diff should scroll to on the next frame.
+    ///
+    /// The file tree sets this when a file is selected; [`render`] consumes it
+    /// (takes it) so the surface scrolls once and then leaves the user alone.
+    pub scroll_to: Option<u32>,
 }
 
 impl Default for DiffViewState {
@@ -52,6 +57,7 @@ impl Default for DiffViewState {
         DiffViewState {
             mode: DiffMode::Unified,
             wrap: false,
+            scroll_to: None,
         }
     }
 }
@@ -277,6 +283,14 @@ pub fn render(
     let mut table = TableBuilder::new(ui)
         .id_salt("diff-view")
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+
+    // A file picked in the tree: jump to its header this frame. `offset_of`
+    // gives the pixel offset of the file's first row (spec §9.2).
+    if let Some(file) = state.scroll_to.take() {
+        if let Some(range) = session.row_model.file_ranges.get(file as usize) {
+            table = table.vertical_scroll_offset(session.row_model.offset_of(range.start));
+        }
+    }
 
     // The gutters must not clip: a file header is drawn in the first one and
     // spans the row visually, the way a header does in GitHub's diff.
@@ -795,7 +809,11 @@ mod tests {
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new()));
         for mode in [DiffMode::Unified, DiffMode::Split] {
             for wrap in [false, true] {
-                let mut state = DiffViewState { mode, wrap };
+                let mut state = DiffViewState {
+                    mode,
+                    wrap,
+                    scroll_to: None,
+                };
                 let mut actions = Vec::new();
                 egui::__run_test_ui(|ui| {
                     render(ui, &session, &mut state, &mut cache, &mut actions);
