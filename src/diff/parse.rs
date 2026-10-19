@@ -151,7 +151,7 @@ fn parse_hunk_start(range: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::diff::Side;
+    use crate::model::diff::{LineKind, Side};
 
     #[test]
     fn numbers_rows_like_github() {
@@ -174,5 +174,39 @@ mod tests {
         let hunks = parse_patch("@@ -1 +1 @@\n-a\n+b\n@@ -10,2 +10,2 @@\n x\n-y\n+z\n").unwrap();
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[1].rows[2].new_no, Some(11));
+    }
+
+    #[test]
+    fn handles_edge_cases_without_shifting_numbers() {
+        // the no-newline marker flags the previous row and consumes no number
+        let r = &parse_patch("@@ -1,1 +1,1 @@\n-old\n+new\n\\ No newline at end of file\n")
+            .unwrap()[0]
+            .rows;
+        assert_eq!(r.len(), 2);
+        assert!(r[1].no_newline_at_eof && r[1].new_no == Some(1));
+
+        // abbreviated header with omitted counts
+        assert_eq!(
+            parse_patch("@@ -5 +5,2 @@\n ctx\n+added\n").unwrap()[0].rows[1].new_no,
+            Some(6)
+        );
+
+        // non-ASCII / emoji content keeps anchors
+        assert_eq!(
+            parse_patch("@@ -1,1 +1,2 @@\n old\n+répertoire 🎉\n").unwrap()[0].rows[1].new_no,
+            Some(2)
+        );
+
+        // CRLF input: header and rows both parse, one trailing \r stripped
+        let r = &parse_patch("@@ -1,1 +1,1 @@\r\n-a\r\n+b\r\n").unwrap()[0].rows;
+        assert_eq!((r[1].text.as_str(), r[1].new_no), ("b", Some(1)));
+
+        // a fully empty line inside a hunk is an empty context line
+        let r = &parse_patch("@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n").unwrap()[0].rows;
+        assert_eq!(
+            (r[1].kind.clone(), r[1].old_no, r[1].new_no),
+            (LineKind::Context, Some(2), Some(2))
+        );
+        assert_eq!(r[3].new_no, Some(3));
     }
 }
