@@ -1,0 +1,18 @@
+[
+  {
+    "id": 101,
+    "node_id": "IC_1",
+    "user": { "login": "alice", "id": 11 },
+    "created_at": "2026-10-01T09:00:00Z",
+    "updated_at": "2026-10-01T09:00:00Z",
+    "body": "First impression: the shape is right, but see #12 before merging."
+  },
+  {
+    "id": 102,
+    "node_id": "IC_2",
+    "user": { "login": "bob", "id": 12 },
+    "created_at": "2026-10-03T09:00:00Z",
+    "updated_at": "2026-10-03T09:00:00Z",
+    "body": "Agreed — merging once `acme/api#34` lands."
+  }
+]

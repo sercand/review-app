@@ -3,6 +3,7 @@ pub mod checks;
 pub mod client;
 pub mod comments;
 pub mod commits;
+pub mod conversation;
 pub mod error;
 pub mod files;
 pub mod graphql;

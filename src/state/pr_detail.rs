@@ -20,6 +20,7 @@ use crate::diff::suggestion::suggestion_block;
 use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::comments::NewComment;
 use crate::github::commits::Commit;
+use crate::github::conversation::ConversationComment;
 use crate::github::error::GhError;
 use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
@@ -138,6 +139,9 @@ pub struct PrSession {
     pub check_runs: Vec<CheckRun>,
     /// The head commit's legacy combined status, once loaded (Task 50).
     pub combined_status: Option<CombinedStatus>,
+    /// The PR's conversation (issue) comments, once loaded, oldest first
+    /// (Task 51).
+    pub conversation: Vec<ConversationComment>,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
     /// The live pending-review draft (Phase F submits it), pinned to one
@@ -299,6 +303,7 @@ impl PrSession {
             commits: Vec::new(),
             check_runs: Vec::new(),
             combined_status: None,
+            conversation: Vec::new(),
             composer: ComposerState::default(),
             pending,
             fallback: None,
@@ -364,6 +369,13 @@ impl PrSession {
             // And the commits: the right-pane list does not wait on the head
             // SHA the way the checks do (Task 50).
             Command::LoadCommits {
+                session: id,
+                repo: repo.clone(),
+                number,
+            },
+            // And the conversation: the timeline merges it with the reviews
+            // the command above brings back (Task 51).
+            Command::LoadConversation {
                 session: id,
                 repo,
                 number,
@@ -543,6 +555,10 @@ impl PrSession {
                 self.combined_status = Some(combined.clone());
                 Vec::new()
             }
+            Event::ConversationLoaded { session, comments } if *session == self.id => {
+                self.conversation = comments.clone();
+                Vec::new()
+            }
             Event::ServerPendingResolved { session } if *session == self.id => {
                 // The submit or discard changed GitHub's state; reload the
                 // reviews so the panel and the banner show the result.
@@ -676,6 +692,8 @@ impl PrSession {
         self.commits.clear();
         self.check_runs.clear();
         self.combined_status = None;
+        // The conversation is part of the timeline the reload rebuilds (Task 51).
+        self.conversation.clear();
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -696,6 +714,11 @@ impl PrSession {
                 number: self.number,
             },
             Command::LoadCommits {
+                session: self.id,
+                repo: self.repo.clone(),
+                number: self.number,
+            },
+            Command::LoadConversation {
                 session: self.id,
                 repo: self.repo.clone(),
                 number: self.number,
@@ -1588,7 +1611,8 @@ mod tests {
                 Command::LoadPrMetadata { .. },
                 Command::LoadThreads { .. },
                 Command::LoadReviews { .. },
-                Command::LoadCommits { .. }
+                Command::LoadCommits { .. },
+                Command::LoadConversation { .. }
             ]
         ));
         let cmds = s.on_event(&Event::PrMetadataLoaded {
@@ -1692,6 +1716,45 @@ mod tests {
                 .any(|c| matches!(c, Command::LoadCommits { .. })),
             "a refresh re-requests the commits; the checks ride back in on \
              the metadata reply that names the new head"
+        );
+    }
+
+    #[test]
+    fn the_conversation_loads_with_the_session_and_folds_in() {
+        use crate::github::conversation::ConversationComment;
+
+        let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadConversation { .. })),
+            "open asks for the conversation"
+        );
+
+        let comment = ConversationComment {
+            author: "alice".into(),
+            body: "looks good".into(),
+            created_at: "2026-10-01T00:00:00Z".into(),
+        };
+        s.on_event(&Event::ConversationLoaded {
+            session: SessionId(2),
+            comments: vec![comment.clone()],
+        });
+        assert!(
+            s.conversation.is_empty(),
+            "another session's reply is dropped"
+        );
+        s.on_event(&Event::ConversationLoaded {
+            session: SessionId(1),
+            comments: vec![comment.clone()],
+        });
+        assert_eq!(s.conversation, vec![comment]);
+
+        let cmds = s.refresh();
+        assert!(s.conversation.is_empty(), "a refresh drops it");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadConversation { .. })),
+            "and asks again"
         );
     }
 

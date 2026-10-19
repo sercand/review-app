@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use crate::diff::highlight::HighlightCache;
 use crate::diff::row_model::{display_text, RowRef, ROW_H};
+use crate::github::client::endpoints_for;
 use crate::github::files::PrFile;
 use crate::model::tree::build_tree;
 use crate::state::filters::{available_extensions, matches, without_hide_viewed, FilterState};
@@ -21,6 +22,7 @@ use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
 use crate::ui::widgets::filter_bar;
+use crate::ui::widgets::metadata_panel;
 use crate::ui::widgets::review_panel::{self, ReviewAction};
 use crate::ui::widgets::thread_view::CommentDrafts;
 
@@ -105,8 +107,23 @@ pub fn render(
         .resizable(true)
         .default_size(RIGHT_W)
         .show_collapsible(ui, &mut state.right_open, |ui| {
-            ui.heading("Conversation");
-            ui.label("the description and timeline land in Phase D");
+            // The whole right pane is the metadata panel: description,
+            // chips, referenced issues, commits, checks, and the read-only
+            // timeline (Tasks 50 and 51).
+            let web = endpoints_for(&session.host).web;
+            metadata_panel::render(
+                ui,
+                metadata_panel::PanelInputs {
+                    metadata: session.metadata.as_ref(),
+                    commits: &session.commits,
+                    check_runs: &session.check_runs,
+                    combined: session.combined_status.as_ref(),
+                    reviews: &session.reviews,
+                    conversation: &session.conversation,
+                    web: &web,
+                    repo: &session.repo,
+                },
+            );
         });
 
     // The review panel sits under the diff, always visible: it is where the
@@ -392,7 +409,12 @@ mod tests {
             done: true,
         });
 
-        let mut state = PrDetailState::default();
+        // Open the right pane so the metadata panel (Tasks 50 and 51) is
+        // painted by this smoke test too.
+        let mut state = PrDetailState {
+            right_open: true,
+            ..PrDetailState::default()
+        };
         let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new()));
         let mut diff_actions = Vec::new();
         let mut actions = Vec::new();

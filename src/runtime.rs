@@ -22,6 +22,7 @@ use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::comments::NewComment;
 use crate::github::commits::Commit;
+use crate::github::conversation::ConversationComment;
 use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
@@ -165,6 +166,15 @@ pub enum Command {
         repo: RepoRef,
         /// The commit SHA to check.
         sha: String,
+    },
+    /// Load a PR's conversation (issue) comments for the timeline (Task 51).
+    LoadConversation {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
     },
     /// Submit a server-side pending review with the given verdict (spec §7.2).
     SubmitServerPending {
@@ -413,6 +423,13 @@ pub enum Event {
         runs: Vec<CheckRun>,
         /// The legacy combined status beside them.
         combined: CombinedStatus,
+    },
+    /// A PR's conversation comments arrived (Task 51).
+    ConversationLoaded {
+        /// The session that asked for the conversation.
+        session: SessionId,
+        /// The comments, oldest first.
+        comments: Vec<ConversationComment>,
     },
     /// A review was submitted; the session clears its draft and reloads the
     /// threads and reviews so the new comments are anchored (spec §7.2).
@@ -981,6 +998,27 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 runs,
                 combined,
             });
+        }
+        Command::LoadConversation {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.list_issue_comments(&repo, number).await {
+                Ok(comments) => events.send(Event::ConversationLoaded { session, comments }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
         }
         Command::SubmitServerPending {
             session,
