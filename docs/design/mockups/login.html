@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — gh-review-desktop</title>
+<script>try{document.documentElement.dataset.theme=JSON.parse(localStorage.getItem("ghr.theme"))||"dark"}catch{document.documentElement.dataset.theme="dark"}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<style>
+  .stage { flex: 1; display: grid; place-items: center; overflow: auto; padding: 24px 16px; }
+  .card { width: min(420px, 100%); }
+  .mark {
+    width: 44px; height: 44px; border-radius: 12px; margin-bottom: 18px;
+    display: grid; place-items: center;
+    background: var(--accent); color: var(--accent-ink);
+  }
+  .mark svg.lucide { width: 24px; height: 24px; stroke-width: 2; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  .lede { color: var(--muted); margin: 0 0 22px; max-width: 46ch; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 18px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .label { font-size: 12px; color: var(--muted); margin-bottom: 6px; display: block; }
+  .tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin: -4px 0 16px; }
+  .tabs button { border: 0; background: none; padding: 8px 0; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  .code {
+    display: flex; gap: 6px; justify-content: center; margin: 4px 0 14px;
+    font: 600 26px/1 var(--font-code); letter-spacing: 0.04em;
+  }
+  .code span { width: 36px; height: 46px; display: grid; place-items: center; background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-md); }
+  .code i { width: 10px; display: grid; place-items: center; color: var(--faint); font-style: normal; }
+  .waiting { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12.5px; justify-content: center; margin-top: 14px; }
+  .spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .note { display: flex; gap: 8px; padding: 10px; border-radius: var(--r-md); background: var(--pending-soft); color: var(--pending); font-size: 12.5px; margin-top: 12px; }
+  .foot { display: flex; justify-content: space-between; margin-top: 14px; font-size: 12px; color: var(--faint); }
+  .step { display: none; }
+  .step.on { display: block; }
+  .w-full { width: 100%; justify-content: center; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="titlebar"><div class="lights"><span></span><span></span><span></span></div><span class="spacer"></span>
+    <button class="icon-btn" data-theme-icon onclick="toggleTheme()" data-tip="Toggle theme" data-tip-pos="left"></button>
+  </div>
+
+  <div class="stage">
+    <div class="card">
+      <div class="mark"><i data-lucide="git-pull-request"></i></div>
+      <h1>Sign in to review pull requests</h1>
+      <p class="lede">Your token stays in the system keychain. Drafts and viewed files are kept on this machine, even after you sign out.</p>
+
+      <div class="panel">
+        <span class="label">Host</span>
+        <div class="seg" style="margin-bottom:14px">
+          <button class="on" onclick="host(false, this)"><i data-lucide="github"></i>github.com</button>
+          <button onclick="host(true, this)"><i data-lucide="building-2"></i>Enterprise Server</button>
+        </div>
+        <div id="ent" style="display:none;margin-bottom:14px">
+          <div class="row" style="gap:10px">
+            <div style="flex:1"><span class="label">Host name</span><label class="field"><i data-lucide="globe"></i><input placeholder="github.acme.corp"></label></div>
+            <div style="flex:1"><span class="label">OAuth client ID</span><label class="field"><i data-lucide="key-round"></i><input placeholder="Iv1.…"></label></div>
+          </div>
+          <div class="note"><i data-lucide="info"></i>The built-in client ID only works on github.com. Use your own OAuth app, or a personal access token.</div>
+        </div>
+
+        <div class="tabs">
+          <button class="on" onclick="tab('device', this)">Browser sign-in</button>
+          <button onclick="tab('pat', this)">Access token</button>
+        </div>
+
+        <div class="step on" id="device-start">
+          <button class="btn primary lg w-full" onclick="show('device-code')"><i data-lucide="log-in"></i>Sign in with GitHub</button>
+          <p class="faint" style="font-size:12px;margin:10px 0 0;text-align:center">We'll show a one-time code to enter on github.com.</p>
+        </div>
+
+        <div class="step" id="device-code">
+          <span class="label" style="text-align:center">Enter this code at github.com/login/device</span>
+          <div class="code"><span>8</span><span>F</span><span>3</span><span>A</span><i>–</i><span>2</span><span>1</span><span>K</span><span>D</span></div>
+          <div class="row">
+            <button class="btn" style="flex:1;justify-content:center" onclick="toast('Code copied')"><i data-lucide="copy"></i>Copy code</button>
+            <button class="btn primary" style="flex:1;justify-content:center" onclick="location.href='prs.html'"><i data-lucide="external-link"></i>Open GitHub</button>
+          </div>
+          <div class="waiting"><span class="spin"></span>Waiting for you to approve. Code expires in 14:32.</div>
+          <div style="text-align:center;margin-top:8px"><button class="btn ghost" onclick="show('device-start')"><i data-lucide="rotate-ccw"></i>Start over</button></div>
+        </div>
+
+        <div class="step" id="pat">
+          <span class="label">Personal access token</span>
+          <label class="field" style="margin-bottom:10px"><i data-lucide="key-round"></i><input type="password" placeholder="ghp_… or github_pat_…"></label>
+          <button class="btn primary lg w-full" onclick="location.href='prs.html'"><i data-lucide="check"></i>Use this token</button>
+          <p class="faint" style="font-size:12px;margin:10px 0 0">Needs the <code>repo</code> scope to read private repositories and post comments.</p>
+        </div>
+      </div>
+
+      <div class="foot"><span>Requests scopes repo and read:org</span><a href="#" onclick="openModal('settings');return false">Settings</a></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+<script src="shared.js"></script>
+<script>
+  function show(id) { document.querySelectorAll(".step").forEach(s => s.classList.toggle("on", s.id === id)); }
+  function tab(which, btn) { markSeg(btn); show(which === "pat" ? "pat" : "device-start"); }
+  function host(ent, btn) { markSeg(btn); document.getElementById("ent").style.display = ent ? "block" : "none"; }
+  document.addEventListener("DOMContentLoaded", () => { injectGlobalModals([]); mockNav("login.html"); icons(); });
+</script>
+</body>
+</html>

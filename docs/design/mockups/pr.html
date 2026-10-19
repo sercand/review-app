@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>otsimo/journey#19 — gh-review-desktop</title>
+<script>try{document.documentElement.dataset.theme=JSON.parse(localStorage.getItem("ghr.theme"))||"dark"}catch{document.documentElement.dataset.theme="dark"}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<style>
+  /* ---------- top bar ---------- */
+  .crumb { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .crumb .repo { color: var(--muted); white-space: nowrap; }
+  .crumb .ttl { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .review-btn .count { background: var(--pending); color: #1d1503; border-radius: 9px; padding: 0 6px; font-size: 11px; font-weight: 700; line-height: 16px; }
+
+  /* ---------- layout ---------- */
+  .body { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--left, 300px) 1px 1fr auto; }
+  .resizer { background: var(--line); cursor: col-resize; position: relative; }
+  .resizer::after { content: ""; position: absolute; inset: 0 -3px; }
+  .resizer:hover, .resizer.drag { background: var(--accent); }
+
+  /* ---------- left: files ---------- */
+  .side { display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
+  .side-top { padding: 10px 10px 8px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--line); }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; height: 22px; padding: 0 4px 0 7px; border-radius: 11px; background: var(--accent-soft); color: var(--accent); font-size: 11.5px; border: 0; cursor: pointer; }
+  .chip svg.lucide { width: 12px; height: 12px; }
+  .chip .ficon { width: 13px; height: 13px; }
+  .progress { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .progress .track { flex: 1; height: 4px; border-radius: 2px; background: var(--raised); overflow: hidden; }
+  .progress .track b { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .tools { display: flex; align-items: center; gap: 2px; }
+  .tools .sum { font-size: 12px; color: var(--faint); margin-right: auto; font-family: var(--font-code); }
+
+  .tree { flex: 1; overflow: auto; padding: 4px 0 12px; }
+  .node {
+    display: flex; align-items: center; gap: 6px;
+    height: 26px; padding-right: 8px; cursor: pointer; white-space: nowrap;
+    padding-left: calc(8px + var(--d) * 14px);
+  }
+  .node:hover { background: var(--hover); }
+  .node.sel { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+  .node .chev { width: 14px; color: var(--faint); display: grid; place-items: center; flex: none; }
+  .node .chev svg.lucide { width: 14px; height: 14px; }
+  .node .nm { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .node.dir .nm { color: var(--muted); }
+  .node.viewed .nm { color: var(--faint); }
+  .node .end { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: none; }
+  .node .stat { font: 11px var(--font-code); color: var(--faint); }
+  .node .st { width: 14px; text-align: center; font: 700 10.5px var(--font-code); }
+  .st-A { color: var(--ok); } .st-M { color: var(--warn); } .st-D { color: var(--bad); } .st-R { color: var(--info); }
+  .node .cmt { display: inline-flex; align-items: center; gap: 2px; font-size: 11px; color: var(--muted); }
+  .node .cmt svg.lucide { width: 12px; height: 12px; }
+  .node .cmt.pend { color: var(--pending); }
+  .node .check { opacity: 0; }
+  .node:hover .check, .node .check.on, .node .check.some { opacity: 1; }
+
+  /* filter popover */
+  #filter-pop { width: 280px; }
+  .opt { display: flex; align-items: center; gap: 8px; width: 100%; height: 28px; padding: 0 8px; border: 0; border-radius: var(--r-sm); background: transparent; cursor: pointer; text-align: left; }
+  .opt:hover { background: var(--hover); }
+  .opt .n { margin-left: auto; color: var(--faint); font-size: 12px; }
+  .opt .box { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid var(--faint); display: grid; place-items: center; flex: none; }
+  .opt.on .box { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .opt .box svg.lucide { width: 11px; height: 11px; stroke-width: 3; }
+  .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }
+
+  /* ---------- center: diff ---------- */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+  .fhead {
+    display: flex; align-items: center; gap: 8px; flex: none;
+    height: 44px; padding: 0 10px 0 14px; border-bottom: 1px solid var(--line); background: var(--bg);
+  }
+  .fpath { display: flex; align-items: center; gap: 6px; min-width: 0; font-family: var(--font-code); font-size: 12.5px; }
+  .fpath .dir { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fpath .base { font-weight: 700; white-space: nowrap; }
+  .viewed-btn.on { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+
+  .banner { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: var(--pending-soft); color: var(--pending); border-bottom: 1px solid var(--line); font-size: 12.5px; flex: none; }
+  .banner .btn { height: 24px; }
+  .banner.hide { display: none; }
+
+  .diffwrap { flex: 1; overflow: auto; background: var(--bg); }
+  .diff { font: 12.5px/20px var(--font-code); min-width: 100%; padding-bottom: 40px; }
+  .r { display: grid; }
+  .r.u { grid-template-columns: 52px 52px 1fr; }
+  .r.s { grid-template-columns: 52px 1fr 52px 1fr; }
+  .ln { padding: 0 10px; text-align: right; color: var(--faint); user-select: none; position: relative; cursor: pointer; }
+  .ln:hover { color: var(--text); }
+  .code { padding: 0 12px 0 20px; white-space: pre; position: relative; min-width: 0; }
+  .wrap .code { white-space: pre-wrap; word-break: break-word; }
+  .nowrap .r.s .code { overflow: hidden; }
+  .diff.nowrap.unified { width: max-content; }
+  .code .sign { position: absolute; left: 6px; color: var(--faint); user-select: none; }
+  .add-row, .code.add { background: var(--add-bg); }
+  .ln.add, .add-row .ln { background: var(--add-gutter); color: var(--text); }
+  .del-row, .code.del { background: var(--del-bg); }
+  .ln.del, .del-row .ln { background: var(--del-gutter); color: var(--text); }
+  .add-row .sign, .code.add .sign { color: var(--ok); }
+  .del-row .sign, .code.del .sign { color: var(--bad); }
+  .code.empty, .ln.empty { background: var(--filler); }
+  .r.s .code + .ln { border-left: 1px solid var(--line); }
+  .wd-add { background: var(--add-word); border-radius: 2px; }
+  .wd-del { background: var(--del-word); border-radius: 2px; }
+  .r.sel-row .code, .r.sel-row .ln { box-shadow: inset 0 0 0 9999px rgba(122, 162, 247, 0.12); }
+
+  .plus {
+    position: absolute; left: 2px; top: 1px; z-index: 1;
+    width: 18px; height: 18px; border-radius: 4px; border: 0; padding: 0;
+    background: var(--accent); color: var(--accent-ink); display: none; place-items: center; cursor: pointer;
+  }
+  .plus svg.lucide { width: 12px; height: 12px; stroke-width: 2.5; }
+  .code:hover > .plus { display: grid; }
+
+  .hunk { display: flex; align-items: center; gap: 4px; height: 28px; background: var(--hunk-bg); color: var(--muted); font-size: 12px; padding-left: 4px; border-block: 1px solid var(--line-soft); }
+  .hunk .exp { height: 22px; padding: 0 6px; border: 0; border-radius: 4px; background: transparent; color: var(--accent); cursor: pointer; display: inline-flex; align-items: center; gap: 4px; font: 500 11.5px var(--font-ui); }
+  .hunk .exp:hover { background: var(--accent-soft); }
+  .hunk .hdr { margin-left: 8px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* threads + composer — egui: Frame inside a variable-height row */
+  .note-row { display: grid; border-block: 1px solid var(--line-soft); background: var(--surface); }
+  .note-row.u { grid-template-columns: 1fr; }
+  .note-row.s { grid-template-columns: 1fr 1fr; }
+  .note-row.s > .slot.empty { background: var(--filler); }
+  .thread { margin: 10px 14px 10px 64px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--bg); font: 13px/1.5 var(--font-ui); overflow: hidden; }
+  .note-row.s .thread { margin-left: 14px; }
+  .thread.pending { border-color: var(--pending); }
+  .thread.resolved { opacity: .75; }
+  .thread-bar { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); background: var(--surface); font-size: 12px; color: var(--muted); }
+  .cmt-item { display: grid; grid-template-columns: 28px 1fr; gap: 10px; padding: 10px 12px; }
+  .cmt-item + .cmt-item { border-top: 1px solid var(--line-soft); }
+  .cmt-meta { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+  .cmt-meta b { font-weight: 600; }
+  .cmt-body p { margin: 4px 0 0; }
+  .cmt-body code { background: var(--raised); padding: 1px 4px; border-radius: 3px; }
+  .suggest { margin-top: 8px; border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; font: 12px/18px var(--font-code); }
+  .suggest-head { display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; background: var(--surface); color: var(--muted); font: 12px var(--font-ui); border-bottom: 1px solid var(--line); }
+  .suggest .del-row, .suggest .add-row { padding: 0 10px; white-space: pre; }
+  .reply { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-top: 1px solid var(--line); }
+  .reply .field { flex: 1; }
+
+  .composer { margin: 10px 14px 10px 64px; border: 1px solid var(--accent); border-radius: var(--r-lg); background: var(--bg); font: 13px/1.5 var(--font-ui); }
+  .note-row.s .composer { margin-left: 14px; }
+  .composer-top { display: flex; align-items: center; gap: 2px; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  .composer-top .seg { margin-right: 8px; }
+  .composer textarea { border: 0; border-radius: 0; background: transparent; min-height: 90px; }
+  .composer-foot { display: flex; align-items: center; gap: 8px; padding: 8px; border-top: 1px solid var(--line); }
+  .composer-foot .hint { font-size: 12px; color: var(--faint); margin-right: auto; display: flex; gap: 6px; align-items: center; }
+
+  .placeholder { margin: 40px auto; max-width: 420px; text-align: center; color: var(--muted); font-family: var(--font-ui); }
+  .placeholder .big { width: 44px; height: 44px; margin: 0 auto 12px; border-radius: 12px; display: grid; place-items: center; background: var(--raised); color: var(--muted); }
+  .placeholder .big svg.lucide { width: 22px; height: 22px; }
+  .placeholder h3 { color: var(--text); font-size: 15px; margin: 0 0 6px; }
+
+  /* image diff */
+  .img-stage { padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 16px; font-family: var(--font-ui); }
+  .checker { background: repeating-conic-gradient(var(--raised) 0 25%, var(--surface) 0 50%) 0 0 / 16px 16px; border: 1px solid var(--line); border-radius: var(--r-md); position: relative; overflow: hidden; }
+  .twoup { display: flex; gap: 32px; flex-wrap: wrap; justify-content: center; }
+  .twoup figure { margin: 0; text-align: center; }
+  .twoup figure .checker { padding: 16px; border-width: 2px; }
+  .twoup figure.b .checker { border-color: var(--bad); }
+  .twoup figure.h .checker { border-color: var(--ok); }
+  .twoup figcaption { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .swipe { width: 320px; height: 320px; }
+  .swipe img { position: absolute; inset: 32px; width: 256px; height: 256px; }
+  .swipe .divider { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+  .img-stage input[type=range] { width: 320px; accent-color: var(--accent); }
+
+  .ffoot { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 10px; border-top: 1px solid var(--line); background: var(--surface); flex: none; font-size: 12.5px; }
+  .ffoot .btn { max-width: 40%; }
+  .ffoot .btn span.n { overflow: hidden; text-overflow: ellipsis; }
+
+  .find { position: absolute; top: 52px; right: 16px; z-index: 5; display: none; align-items: center; gap: 4px; padding: 4px; border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-pop); }
+  .find.open { display: flex; }
+  .find .field { width: 200px; }
+
+  /* ---------- right: details ---------- */
+  .details { width: 340px; border-left: 1px solid var(--line); background: var(--surface); display: flex; flex-direction: column; min-height: 0; }
+  .details.closed { display: none; }
+  .dtabs { display: flex; gap: 2px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  .dtabs button { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 28px; border: 0; border-radius: var(--r-md); background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; }
+  .dtabs button.on { background: var(--raised); color: var(--text); }
+  .dtabs .n { font-size: 11px; color: var(--faint); }
+  .dbody { flex: 1; overflow: auto; padding: 14px; }
+  .dbody h2 { font-size: 15px; line-height: 1.35; margin: 0 0 8px; }
+  .kv { display: grid; grid-template-columns: 84px 1fr; gap: 8px; font-size: 12.5px; margin: 14px 0; }
+  .kv dt { color: var(--faint); }
+  .kv dd { margin: 0; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .branch { font: 11.5px var(--font-code); background: var(--raised); padding: 1px 6px; border-radius: 4px; }
+  .md { font-size: 13px; color: var(--text); }
+  .md h4 { margin: 14px 0 4px; font-size: 13px; }
+  .md p, .md ul { margin: 0 0 8px; }
+  .md ul { padding-left: 18px; }
+  .md code { font-size: 11.5px; background: var(--raised); padding: 1px 4px; border-radius: 3px; }
+  .sect { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .sect-h { font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 8px; }
+  .person { display: flex; align-items: center; gap: 8px; height: 28px; font-size: 12.5px; }
+  .person .state { margin-left: auto; }
+  .tl { position: relative; padding-left: 26px; margin-bottom: 14px; font-size: 12.5px; }
+  .tl::before { content: ""; position: absolute; left: 9px; top: 22px; bottom: -14px; width: 1px; background: var(--line); }
+  .tl:last-child::before { display: none; }
+  .tl .avatar { position: absolute; left: 0; top: 0; }
+  .tl .bubble { margin-top: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+  .commit { display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; }
+  .commit .sha { font: 11px var(--font-code); color: var(--accent); }
+  .check-row { display: flex; align-items: center; gap: 8px; height: 30px; font-size: 12.5px; border-bottom: 1px solid var(--line-soft); }
+  .check-row .dur { margin-left: auto; color: var(--faint); font-size: 11.5px; }
+
+  /* review popover */
+  #review-pop { width: 380px; padding: 0; }
+  .rv-head { padding: 12px 14px 0; font-weight: 600; }
+  .rv-body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .verdict { display: grid; grid-template-columns: 20px 1fr; gap: 2px 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); cursor: pointer; }
+  .verdict.on { border-color: var(--accent); background: var(--accent-soft); }
+  .verdict.off { opacity: .5; cursor: not-allowed; }
+  .verdict small { grid-column: 2; color: var(--muted); }
+  .verdicts { display: flex; flex-direction: column; gap: 6px; }
+  .pend-item { display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 6px; border-radius: var(--r-sm); cursor: pointer; font-size: 12.5px; }
+  .pend-item:hover { background: var(--hover); }
+  .pend-item .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .rv-foot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+
+  /* syntax: highlight.js class names → tokens */
+  .hljs-keyword, .hljs-built_in, .hljs-literal { color: var(--syn-kw); }
+  .hljs-string, .hljs-template-string, .hljs-regexp { color: var(--syn-str); }
+  .hljs-title, .hljs-title.function_ { color: var(--syn-fn); }
+  .hljs-type, .hljs-title.class_ { color: var(--syn-type); }
+  .hljs-number { color: var(--syn-num); }
+  .hljs-comment, .hljs-doctag { color: var(--syn-com); font-style: italic; }
+  .hljs-attr, .hljs-property, .hljs-params { color: var(--syn-attr); }
+  .hljs-subst { color: var(--text); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="titlebar">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <a class="icon-btn" href="prs.html" data-tip="Back to list  Esc" data-tip-pos="right"><i data-lucide="arrow-left"></i></a>
+    <div class="crumb">
+      <span class="pill ok"><i data-lucide="git-pull-request"></i>Open</span>
+      <span class="repo">otsimo/journey <span class="faint">#19</span></span>
+      <span class="ttl">Default a push's deep links to the app's bare schemes</span>
+      <button class="icon-btn" data-pop="checks-pop" style="color:var(--ok)" data-tip="Checks passed"><i data-lucide="circle-check"></i></button>
+    </div>
+    <span class="spacer"></span>
+    <button class="icon-btn" onclick="openModal('palette')" data-tip="Commands  ⌘K"><i data-lucide="command"></i></button>
+    <button class="icon-btn" onclick="toast('Up to date', 'refresh-cw')" data-tip="Refresh"><i data-lucide="refresh-cw"></i></button>
+    <button class="icon-btn" data-theme-icon onclick="toggleTheme()" data-tip="Toggle theme"></button>
+    <button class="icon-btn" onclick="openModal('settings')" data-tip="Settings"><i data-lucide="settings"></i></button>
+    <button class="icon-btn" id="details-toggle" onclick="toggleDetails()" data-tip="Details  O" data-tip-pos="left"><i data-lucide="panel-right"></i></button>
+    <span class="vsep"></span>
+    <button class="btn primary review-btn" data-pop="review-pop" data-pop-align="right"><i data-lucide="send"></i>Review<span class="count" id="pend-count">2</span></button>
+  </div>
+
+  <div class="body" id="body">
+    <aside class="side">
+      <div class="side-top">
+        <div style="display:flex;gap:6px">
+          <label class="field" style="flex:1"><i data-lucide="search"></i><input id="pathq" placeholder="Filter paths, * matches any" oninput="state.path=this.value;renderTree()"></label>
+          <button class="icon-btn" data-pop="filter-pop" id="filter-btn" data-tip="Filter by type and status" data-tip-pos="left"><i data-lucide="list-filter"></i></button>
+        </div>
+        <div class="chips" id="chips"></div>
+        <div class="progress"><span id="prog-txt"></span><span class="track"><b id="prog-bar"></b></span></div>
+        <div class="tools">
+          <span class="sum" id="sum"></span>
+          <button class="icon-btn" id="hide-viewed" onclick="state.hideViewed=!state.hideViewed;store.set('hideViewed',state.hideViewed);renderTree()" data-tip="Hide viewed files"><i data-lucide="eye-off"></i></button>
+          <button class="icon-btn" id="sort-size" onclick="state.bySize=!state.bySize;renderTree()" data-tip="Largest change first"><i data-lucide="arrow-down-wide-narrow"></i></button>
+          <button class="icon-btn" onclick="collapseAll()" data-tip="Collapse folders"><i data-lucide="chevrons-down-up"></i></button>
+          <button class="icon-btn" onclick="markAll()" data-tip="Mark all viewed" data-tip-pos="left"><i data-lucide="check-check"></i></button>
+        </div>
+      </div>
+      <div class="tree" id="tree"></div>
+    </aside>
+
+    <div class="resizer" id="resizer"></div>
+
+    <main class="main">
+      <div class="fhead" id="fhead"></div>
+      <div class="banner hide" id="banner-server">
+        <i data-lucide="cloud"></i><span>You started a review on github.com with 2 comments. It has to be submitted or discarded before this draft can be sent.</span>
+        <span class="spacer"></span><button class="btn">Discard it</button><button class="btn primary">Submit it</button>
+        <button class="icon-btn" onclick="this.parentElement.classList.add('hide')"><i data-lucide="x"></i></button>
+      </div>
+      <div class="banner hide" id="banner-moved">
+        <i data-lucide="git-commit-horizontal"></i><span>New commits were pushed. Your draft was written against <code>a41c9e2</code>; 3 files you had viewed changed.</span>
+        <span class="spacer"></span><button class="icon-btn" onclick="this.parentElement.classList.add('hide')"><i data-lucide="x"></i></button>
+      </div>
+      <div class="find" id="find">
+        <label class="field"><i data-lucide="search"></i><input placeholder="Find in file"></label>
+        <span class="faint" style="font-size:12px;padding:0 4px">2 of 7</span>
+        <button class="icon-btn"><i data-lucide="chevron-up"></i></button>
+        <button class="icon-btn"><i data-lucide="chevron-down"></i></button>
+        <button class="icon-btn" onclick="toggleFind(false)"><i data-lucide="x"></i></button>
+      </div>
+      <div class="diffwrap" id="diffwrap"><div class="diff" id="diff"></div></div>
+      <div class="ffoot" id="ffoot"></div>
+    </main>
+
+    <aside class="details" id="details">
+      <div class="dtabs" id="dtabs"></div>
+      <div class="dbody" id="dbody"></div>
+    </aside>
+  </div>
+</div>
+
+<!-- popovers -->
+<div class="pop" id="filter-pop">
+  <label class="field" style="margin:2px 2px 4px"><i data-lucide="search"></i><input placeholder="File type" oninput="renderFilterPop(this.value)"></label>
+  <div class="pop-head">File types</div>
+  <div id="ext-opts"></div>
+  <div class="menu-sep"></div>
+  <div class="pop-head">Status</div>
+  <div class="status-grid" id="status-opts"></div>
+  <div class="menu-sep"></div>
+  <button class="menu-item" onclick="clearFilters()"><i data-lucide="x"></i>Clear filters</button>
+</div>
+
+<div class="pop" id="checks-pop" style="width:300px">
+  <div class="pop-head">Checks on 7f3e0b1</div>
+  <div style="padding:0 8px" id="checks-mini"></div>
+</div>
+
+<div class="pop" id="review-pop">
+  <div class="rv-head">Finish your review</div>
+  <div class="rv-body">
+    <textarea class="area" placeholder="Leave a summary (optional for Approve)"></textarea>
+    <div class="verdicts" id="verdicts"></div>
+    <div>
+      <div class="sect-h" style="display:flex;align-items:center;gap:6px"><i data-lucide="message-square-dashed" style="color:var(--pending)"></i>2 pending comments</div>
+      <div class="pend-item" onclick="closePops();openFile('src/lib/data-tools/push.ts')"><img class="ficon" src="https://cdn.jsdelivr.net/npm/material-icon-theme@5.11.1/icons/typescript.svg"><b style="font-weight:500">push.ts</b><span class="faint">R99</span><span class="txt">Should the warning include the template id?</span></div>
+      <div class="pend-item" onclick="closePops();openFile('src/lib/notifications/default-links.ts')"><img class="ficon" src="https://cdn.jsdelivr.net/npm/material-icon-theme@5.11.1/icons/typescript.svg"><b style="font-weight:500">default-links.ts</b><span class="faint">R4</span><span class="txt">nit: export the scheme regex</span></div>
+    </div>
+  </div>
+  <div class="rv-foot">
+    <button class="btn ghost danger" onclick="closePops();toast('Draft discarded','trash-2')"><i data-lucide="trash-2"></i>Discard</button>
+    <span class="spacer"></span>
+    <button class="btn primary" onclick="closePops();toast('Review submitted','send')">Submit review <kbd style="background:transparent;color:inherit;border-color:currentColor;opacity:.7">⌘↵</kbd></button>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/typescript.min.js"></script>
+<script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+<script src="shared.js"></script>
+<script src="pr.js"></script>
+</body>
+</html>
