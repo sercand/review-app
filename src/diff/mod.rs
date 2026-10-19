@@ -2,6 +2,7 @@
 //! (in later tasks) context expansion and local diffs.
 
 pub mod anchor;
+pub mod annotate;
 pub mod highlight;
 pub mod parse;
 pub mod row_model;

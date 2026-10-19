@@ -24,12 +24,14 @@ use crate::persist::settings::Settings;
 use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
 };
+use crate::state::composer::{self, ComposerAction};
 use crate::state::pr_detail::PrSession;
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
 use crate::ui::widgets::diff_view::DiffAction;
+use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::toast::Toasts;
 
 /// The three screens. Settings is a modal window, not a fourth screen.
@@ -203,14 +205,18 @@ impl ReviewApp {
                     self.on_unauthorized(now);
                 }
             }
-            // Folded into the open session by `apply_session_event` above.
+            // Folded into the open session by `apply_session_event` above:
+            // it replaces the optimistic bubble with the real comment,
+            // appends replies, and confirms resolved states there.
             Event::PrFilesPage { .. } => {}
             Event::PrMetadataLoaded { .. } => {}
             Event::ThreadsLoaded { .. } => {}
             Event::CommentPosted { .. } => {}
-            Event::CommentFailed { .. } => {}
             Event::ReplyPosted { .. } => {}
             Event::ThreadResolved { .. } => {}
+            // The session also rolls a failed post back into the composer;
+            // the toast covers the reply case, which has no other surface.
+            Event::CommentFailed { error, .. } => self.toasts.push(error.to_string(), now),
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
@@ -420,6 +426,9 @@ impl ReviewApp {
 
         let (session, commands) = PrSession::open(id, self.settings.host.clone(), repo, number);
         self.session = Some(session);
+        // The detail screen's per-PR state — the diff layout, reply drafts,
+        // and expanded threads — belongs to the PR being left, not this one.
+        self.pr_detail = PrDetailState::default();
         for command in commands {
             self.worker.send(command);
         }
@@ -460,7 +469,7 @@ impl ReviewApp {
             &mut diff_actions,
         );
 
-        self.apply_diff_actions(diff_actions);
+        self.apply_diff_actions(diff_actions, ui.ctx(), now);
 
         for action in actions {
             match action {
@@ -478,17 +487,101 @@ impl ReviewApp {
 
     /// Fold the diff surface's actions in.
     ///
-    /// Each of these changes state a later phase owns (viewed toggles, comment
-    /// composers, the file tree, large diffs, and context expansion); they are
-    /// recorded here rather than dropped so the wiring has one obvious home.
-    fn apply_diff_actions(&mut self, actions: Vec<DiffAction>) {
+    /// Comment and thread actions land on the open session (which owns the
+    /// composer, the pending list, and the optimistic bookkeeping) or become
+    /// commands; the rest are state a later phase owns and are recorded here
+    /// rather than dropped so the wiring has one obvious home.
+    fn apply_diff_actions(&mut self, actions: Vec<DiffAction>, ctx: &egui::Context, now: Instant) {
+        let login = self.login();
         for action in actions {
             match action {
                 DiffAction::ToggleViewed(_) => {}  // Phase D
-                DiffAction::StartComment(_) => {}  // Task 37
                 DiffAction::ScrollToFile(_) => {}  // Phase D (file tree)
                 DiffAction::LoadLargeDiff(_) => {} // Phase G
                 DiffAction::ExpandGap { .. } => {} // Task 45
+                DiffAction::StartComment(target) => {
+                    if let Some(session) = &mut self.session {
+                        session.open_comment(target);
+                    }
+                }
+                DiffAction::DeletePending { local_id } => {
+                    if let Some(session) = &mut self.session {
+                        session.delete_pending(local_id, now);
+                    }
+                }
+                DiffAction::Composer(action) => {
+                    let commands = self.apply_composer_action(action, &login, now);
+                    for command in commands {
+                        self.worker.send(command);
+                    }
+                }
+                DiffAction::Thread(action) => {
+                    let Some(session) = &mut self.session else {
+                        continue;
+                    };
+                    let command = match action {
+                        ThreadAction::Reply {
+                            thread_id,
+                            root_comment_id,
+                            body,
+                        } => Some(Command::ReplyToThread {
+                            session: session.id,
+                            repo: session.repo.clone(),
+                            number: session.number,
+                            thread_id,
+                            root_comment_id,
+                            body,
+                        }),
+                        ThreadAction::ToggleResolved {
+                            thread_id,
+                            resolved,
+                        } => Some(Command::SetThreadResolved {
+                            session: session.id,
+                            thread_id,
+                            resolved,
+                        }),
+                        ThreadAction::CopySuggestion(text) => {
+                            ctx.copy_text(text);
+                            None
+                        }
+                    };
+                    if let Some(command) = command {
+                        self.worker.send(command);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fold one composer control in and return the commands it produced.
+    fn apply_composer_action(
+        &mut self,
+        action: ComposerAction,
+        login: &str,
+        now: Instant,
+    ) -> Vec<Command> {
+        let Some(session) = &mut self.session else {
+            return Vec::new();
+        };
+        match action {
+            ComposerAction::Submit(mode) => session.submit_comment(mode, login, now),
+            ComposerAction::Cancel => {
+                composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
+                session.rebuild_rows();
+                Vec::new()
+            }
+            // The composer row stays put for these, so no re-annotation.
+            ComposerAction::SetSide(side) => {
+                composer::reduce(&mut session.composer, composer::ComposerMsg::SetSide(side));
+                Vec::new()
+            }
+            ComposerAction::TogglePreview => {
+                composer::reduce(&mut session.composer, composer::ComposerMsg::TogglePreview);
+                Vec::new()
+            }
+            ComposerAction::InsertSuggestion => {
+                session.insert_suggestion();
+                Vec::new()
             }
         }
     }

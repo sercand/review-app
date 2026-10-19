@@ -23,8 +23,12 @@ use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
-use crate::model::diff::{DiffRow, LineKind};
+use crate::model::diff::{DiffRow, LineKind, Side};
+use crate::state::composer::ComposerAction;
 use crate::state::pr_detail::{LoadPhase, PrSession};
+use crate::ui::widgets::comment_composer;
+use crate::ui::widgets::markdown;
+use crate::ui::widgets::thread_view::{self, CommentDrafts, ThreadAction};
 
 /// The width of one line-number gutter.
 pub const GUTTER_W: f32 = 48.0;
@@ -79,6 +83,15 @@ pub enum DiffAction {
         file: u32,
         /// The hunk the gap precedes.
         before_hunk: u32,
+    },
+    /// A composer control was used (Task 37).
+    Composer(ComposerAction),
+    /// A thread control was used (Task 37).
+    Thread(ThreadAction),
+    /// Remove a locally pending comment (Task 37).
+    DeletePending {
+        /// The pending comment's local id.
+        local_id: u64,
     },
 }
 
@@ -226,7 +239,18 @@ pub fn sticky_file(session: &PrSession, scroll_y: f32) -> Option<u32> {
     // Only the start of the visible range is needed, and that depends only on
     // `scroll_y`; the viewport height does not change which row is on top.
     let start = session.row_model.visible_range(scroll_y, 0.0).start;
-    session.row_model.rows.get(start).and_then(file_of)
+    let reference = session.row_model.rows.get(start)?;
+    if let Some(file) = file_of(reference) {
+        return Some(file);
+    }
+    // Thread, pending, and composer rows live inside their file's range, so
+    // the header that stays pinned over them is that file's.
+    session
+        .row_model
+        .file_ranges
+        .iter()
+        .position(|range| range.contains(&start))
+        .map(|file| file as u32)
 }
 
 /// The file a row belongs to, when it belongs to one.
@@ -246,9 +270,10 @@ fn file_of(reference: &RowRef) -> Option<u32> {
 /// 50 000-line PR costs the same per frame as a small one.
 pub fn render(
     ui: &mut egui::Ui,
-    session: &PrSession,
+    session: &mut PrSession,
     state: &mut DiffViewState,
     cache: &mut HighlightCache,
+    drafts: &mut CommentDrafts,
     actions: &mut Vec<DiffAction>,
 ) {
     let style = RowStyle {
@@ -279,6 +304,9 @@ pub fn render(
             HEADER_H,
         ),
     );
+    // The width a full-row widget (composer, thread) lays out at: the table
+    // itself, since those rows overflow their gutter column unclipped.
+    let full_width = band.width();
 
     let mut table = TableBuilder::new(ui)
         .id_salt("diff-view")
@@ -306,22 +334,25 @@ pub fn render(
             .column(Column::remainder().at_least(100.0)),
     };
 
-    let ctx = RowCtx {
+    let mut ctx = RowCtx {
         session,
         mode,
         wrap,
         content,
+        full_width,
         style: &style,
     };
+    // The heights are taken out first: the row closure reaches back into the
+    // session mutably to draw composer and thread rows.
+    let heights: Vec<f32> = ctx.session.row_model.heights().to_vec();
     let scroll_area = table.body(|body| {
-        let model = &session.row_model;
-        body.heterogeneous_rows(model.heights().iter().copied(), |mut row| {
+        body.heterogeneous_rows(heights.into_iter(), |mut row| {
             let index = row.index();
-            let Some(reference) = model.rows.get(index) else {
+            let Some(reference) = ctx.session.row_model.rows.get(index).cloned() else {
                 return;
             };
 
-            render_row(&mut row, reference, &ctx, cache, actions);
+            render_row(&mut row, &reference, &mut ctx, cache, drafts, actions);
         });
     });
 
@@ -330,12 +361,12 @@ pub fn render(
     // after the table draws it over the top row, exactly the way CSS
     // `position: sticky` overlaps the content behind it.
     let scroll_y = scroll_area.state.clamped_offset().y;
-    if let Some(file) = sticky_file(session, scroll_y) {
-        if let Some(loaded) = session.files.get(file as usize) {
+    if let Some(file) = sticky_file(ctx.session, scroll_y) {
+        if let Some(loaded) = ctx.session.files.get(file as usize) {
             ui.painter()
                 .rect_filled(band, 0.0, ui.visuals().faint_bg_color);
             ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| {
-                render_file_header(ui, file, loaded, session, &style, actions);
+                render_file_header(ui, file, loaded, ctx.session, &style, actions);
             });
         }
     }
@@ -354,11 +385,13 @@ struct RowStyle {
 /// Bundled so [`render_row`] stays within clippy's argument budget and every
 /// row is resolved against exactly the same session and layout.
 struct RowCtx<'a> {
-    session: &'a PrSession,
+    session: &'a mut PrSession,
     mode: DiffMode,
     wrap: bool,
     /// The width line text wraps at, from [`content_width`].
     content: f32,
+    /// The table's full width, for rows that span every column.
+    full_width: f32,
     style: &'a RowStyle,
 }
 
@@ -374,19 +407,18 @@ fn column_count(mode: DiffMode) -> usize {
 fn render_row(
     row: &mut egui_extras::TableRow<'_, '_>,
     reference: &RowRef,
-    ctx: &RowCtx<'_>,
+    ctx: &mut RowCtx<'_>,
     cache: &mut HighlightCache,
+    drafts: &mut CommentDrafts,
     actions: &mut Vec<DiffAction>,
 ) {
-    let session = ctx.session;
     let mode = ctx.mode;
-    let style = ctx.style;
     match reference {
         RowRef::FileHeader { file } => {
             let index = *file;
             row.col(|ui| {
-                if let Some(loaded) = session.files.get(index as usize) {
-                    render_file_header(ui, index, loaded, session, style, actions);
+                if let Some(loaded) = ctx.session.files.get(index as usize) {
+                    render_file_header(ui, index, loaded, ctx.session, ctx.style, actions);
                 }
             });
             blank_rest(row, mode);
@@ -394,7 +426,7 @@ fn render_row(
         RowRef::Placeholder { file } => {
             let index = *file;
             row.col(|ui| {
-                if let Some(loaded) = session.files.get(index as usize) {
+                if let Some(loaded) = ctx.session.files.get(index as usize) {
                     render_placeholder(ui, index, loaded, actions);
                 }
             });
@@ -418,13 +450,14 @@ fn render_row(
             hunk,
             row: row_index,
         } => {
-            let Some(diff_row) = line_at(session, *file, *hunk, *row_index) else {
+            let Some(diff_row) = line_at(ctx.session, *file, *hunk, *row_index) else {
                 blank_all(row, mode);
                 return;
             };
 
             let text = display_text(&diff_row.text);
-            let path = session
+            let path = ctx
+                .session
                 .files
                 .get(*file as usize)
                 .map(|loaded| loaded.file.path.as_str())
@@ -434,11 +467,92 @@ fn render_row(
 
             render_line_cells(row, diff_row, &text, spans, ctx);
         }
-        // Thread, pending, and composer rows are inserted from Task 37 on.
-        RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer => {
-            blank_all(row, mode);
+        RowRef::Thread { thread } => {
+            let index = *thread;
+            row.col(|ui| {
+                let Some(thread) = ctx.session.threads.get(index as usize) else {
+                    return;
+                };
+                let vm = thread_view::thread_vm(thread);
+                // Outdated and resolved threads arrive collapsed (spec §7.4);
+                // the reviewer expands them from the summary line.
+                let collapsed = (thread.is_outdated || thread.is_resolved)
+                    && !drafts.expanded.contains(&thread.id);
+                let mut thread_actions = Vec::new();
+                thread_view::render_thread(ui, thread, &vm, collapsed, drafts, &mut thread_actions);
+                actions.extend(thread_actions.into_iter().map(DiffAction::Thread));
+            });
+            blank_rest(row, mode);
+        }
+        RowRef::Pending { local_id } => {
+            let id = *local_id;
+            row.col(|ui| {
+                let Some(pending) = ctx.session.pending.iter().find(|p| p.local_id == id) else {
+                    return;
+                };
+                egui::Frame::new()
+                    .inner_margin(8.0)
+                    .corner_radius(6.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Pending comment").small().weak());
+                            if ui.button("Remove").clicked() {
+                                actions.push(DiffAction::DeletePending { local_id: id });
+                            }
+                        });
+                        markdown::render(ui, &markdown::to_doc(&pending.body));
+                    });
+            });
+            blank_rest(row, mode);
+        }
+        RowRef::Composer => {
+            let has_open_review = !ctx.session.pending.is_empty();
+            let show_side = anchor_is_context(ctx.session, ctx.session.composer.target.as_ref());
+            let width = ctx.full_width;
+            row.col(|ui| {
+                let mut composer_actions = Vec::new();
+                comment_composer::render_composer(
+                    ui,
+                    &mut ctx.session.composer,
+                    has_open_review,
+                    show_side,
+                    width,
+                    &mut composer_actions,
+                );
+                actions.extend(composer_actions.into_iter().map(DiffAction::Composer));
+            });
+            blank_rest(row, mode);
         }
     }
+}
+
+/// Whether the composer's anchor sits on a context row, where the side
+/// toggle is meaningful (spec §7.3): the row exists on both sides, and the
+/// anchor is a single line.
+pub fn anchor_is_context(session: &PrSession, target: Option<&CommentTarget>) -> bool {
+    let Some(CommentTarget::Line(anchor)) = target else {
+        return false;
+    };
+    if anchor.start_line.is_some() {
+        return false;
+    }
+    let Some(loaded) = session.files.iter().find(|l| l.file.path == anchor.path) else {
+        return false;
+    };
+    let Some(diff) = &loaded.diff else {
+        return false;
+    };
+    diff.hunks
+        .iter()
+        .flat_map(|hunk| hunk.rows.iter())
+        .any(|row| {
+            let on_side = match anchor.side {
+                Side::Right => row.new_no,
+                Side::Left => row.old_no,
+            } == Some(anchor.line);
+            on_side && row.old_no.is_some() && row.new_no.is_some()
+        })
 }
 
 /// Draw one line row, placing it in the columns `mode` expects.
@@ -717,7 +831,7 @@ fn blank_all(row: &mut egui_extras::TableRow<'_, '_>, mode: DiffMode) {
 mod tests {
     use super::*;
     use crate::github::files::{PatchState, PrFile};
-    use crate::test_support::{file, rows_from};
+    use crate::test_support::{file, line_anchor, rows_from};
 
     #[test]
     fn split_pairs_align_changed_runs() {
@@ -799,13 +913,57 @@ mod tests {
     /// and must actually resolve its rows, not draw an empty frame.
     ///
     /// A lay-out smoke test standing in for the phase's manual QA: a gap, a
-    /// line run, both placeholder kinds, and a second file are drawn in both
-    /// modes, wrapped and unwrapped.
+    /// line run, both placeholder kinds, a second file, an anchored thread,
+    /// a pending comment, and the open composer are drawn in both modes,
+    /// wrapped and unwrapped.
     #[test]
     fn the_surface_paints_every_mode_without_panicking() {
         use crate::diff::highlight::SyntectHighlighter;
+        use crate::model::diff::Side;
+        use crate::model::thread::{ReviewThread, SubjectType};
+        use crate::state::composer::CommentMode;
+        use std::time::Instant;
 
-        let session = surface_session();
+        let mut session = surface_session();
+        session.threads.push(ReviewThread {
+            id: "PRRT_1".into(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "src/a.rs".into(),
+            line: Some(4),
+            start_line: None,
+            side: Some(Side::Right),
+            subject_type: SubjectType::Line,
+            comments: vec![crate::model::thread::ThreadComment {
+                database_id: 1,
+                author: "octocat".into(),
+                avatar_url: None,
+                body: "why here?".into(),
+                created_at: "2026-10-01T00:00:00Z".into(),
+            }],
+        });
+        session.rebuild_rows();
+        session.open_comment(CommentTarget::Line(line_anchor("src/b.rs", 1)));
+        crate::state::composer::reduce(
+            &mut session.composer,
+            crate::state::composer::ComposerMsg::SetBody("hold for the review".into()),
+        );
+        session.submit_comment(CommentMode::Pending, "me", Instant::now());
+        // And leave a file-level composer open, on a placeholder file.
+        session.open_comment(CommentTarget::File {
+            path: "assets/logo.png".into(),
+        });
+        assert!(session
+            .row_model
+            .rows
+            .contains(&RowRef::Thread { thread: 0 }));
+        assert!(session
+            .row_model
+            .rows
+            .iter()
+            .any(|r| matches!(r, RowRef::Pending { .. })));
+        assert!(session.row_model.rows.contains(&RowRef::Composer));
+
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new()));
         for mode in [DiffMode::Unified, DiffMode::Split] {
             for wrap in [false, true] {
@@ -814,10 +972,22 @@ mod tests {
                     wrap,
                     scroll_to: None,
                 };
+                let mut drafts = CommentDrafts::default();
                 let mut actions = Vec::new();
                 egui::__run_test_ui(|ui| {
-                    render(ui, &session, &mut state, &mut cache, &mut actions);
+                    render(
+                        ui,
+                        &mut session,
+                        &mut state,
+                        &mut cache,
+                        &mut drafts,
+                        &mut actions,
+                    );
                 });
+                assert!(
+                    actions.is_empty(),
+                    "painting without input emits no actions"
+                );
             }
         }
 
@@ -826,6 +996,40 @@ mod tests {
         assert!(
             cache.misses() > 0,
             "the surface must resolve and highlight the rows it draws"
+        );
+    }
+
+    #[test]
+    fn the_side_toggle_shows_only_on_context_rows() {
+        let session = surface_session();
+        // "src/a.rs" is "@@ -4,2 +4,2 @@\n-a\n+b\n c\n": "-a" is old 4,
+        // "+b" is new 4, " c" is old 5 / new 5.
+        assert!(
+            !anchor_is_context(
+                &session,
+                Some(&CommentTarget::Line(line_anchor("src/a.rs", 4)))
+            ),
+            "an added row has no left side to toggle to"
+        );
+        assert!(
+            anchor_is_context(
+                &session,
+                Some(&CommentTarget::Line(line_anchor("src/a.rs", 5)))
+            ),
+            "a context row exists on both sides"
+        );
+        assert!(
+            !anchor_is_context(&session, None),
+            "a closed composer has no side"
+        );
+        assert!(
+            !anchor_is_context(
+                &session,
+                Some(&CommentTarget::File {
+                    path: "src/a.rs".into()
+                })
+            ),
+            "a file target has no side"
         );
     }
 

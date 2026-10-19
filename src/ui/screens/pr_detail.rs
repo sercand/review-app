@@ -21,6 +21,7 @@ use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
 use crate::ui::widgets::filter_bar;
+use crate::ui::widgets::thread_view::CommentDrafts;
 
 /// The width the left pane starts at.
 const LEFT_W: f32 = 240.0;
@@ -47,6 +48,8 @@ pub struct PrDetailState {
     /// The `(wrap, content width)` the line heights were measured for, so a
     /// width change only re-measures when it actually matters (spec §8.4).
     pub last_layout: Option<(bool, f32)>,
+    /// Reply texts and manually expanded threads, by thread node id.
+    pub drafts: CommentDrafts,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -95,7 +98,14 @@ pub fn render(
 
     egui::CentralPanel::default().show(ui, |ui| {
         recompute_line_heights(ui, session, state);
-        diff_view::render(ui, session, &mut state.diff, cache, diff_actions);
+        diff_view::render(
+            ui,
+            session,
+            &mut state.diff,
+            cache,
+            &mut state.drafts,
+            diff_actions,
+        );
     });
 
     actions

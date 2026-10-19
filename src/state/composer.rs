@@ -57,6 +57,24 @@ pub enum ComposerMsg {
     Submitted,
 }
 
+/// A control the composer widget reported for the app to fold in.
+///
+/// The mode buttons double as submit buttons, exactly as GitHub's do, so
+/// `Submit` carries the mode the clicked button stands for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ComposerAction {
+    /// Post (or add to the review) in the clicked button's mode.
+    Submit(CommentMode),
+    /// Dismiss the composer.
+    Cancel,
+    /// Move a single-line anchor to the other side.
+    SetSide(Side),
+    /// Swap the text edit for the markdown preview.
+    TogglePreview,
+    /// Append a suggestion block for the anchored rows.
+    InsertSuggestion,
+}
+
 /// The mode GitHub defaults to when the composer opens.
 pub fn default_mode(has_open_review: bool) -> CommentMode {
     if has_open_review {

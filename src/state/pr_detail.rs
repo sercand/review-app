@@ -11,14 +11,19 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::diff::row_model::{build, RowModel};
+use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
+use crate::diff::row_model::{build, RowModel, RowRef};
+use crate::diff::suggestion::suggestion_block;
+use crate::github::comments::NewComment;
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
-use crate::model::thread::ReviewThread;
+use crate::model::comment::CommentTarget;
+use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
 use crate::persist::session::{self, DebouncedWriter, SessionFile};
-use crate::runtime::{Command, Event, SessionId};
+use crate::runtime::{Command, Event, SessionId, NO_OPTIMISTIC_BUBBLE};
+use crate::state::composer::{self, can_submit, CommentMode, ComposerMsg, ComposerState};
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
 
@@ -33,6 +38,32 @@ pub enum LoadPhase {
     Ready,
     /// Loading stopped on an error.
     Failed,
+}
+
+/// A comment held for the pending review (Phase F submits it): local only,
+/// anchored where it was written, rendered as a `Pending` row (spec §7.2).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingComment {
+    /// The session-allocated id, echoed by the row and never 0.
+    pub local_id: u64,
+    /// What the comment is attached to.
+    pub target: CommentTarget,
+    /// The comment body.
+    pub body: String,
+}
+
+/// An immediate comment in flight: what it takes to replace it on success
+/// or roll it back on failure.
+#[derive(Clone, Debug)]
+struct OptimisticPost {
+    /// The id echoed by the result events.
+    optimistic_id: u64,
+    /// Where the placeholder thread was pushed in `threads`.
+    thread_index: usize,
+    /// The body, restored to the composer if the post fails.
+    body: String,
+    /// The anchor, restored to the composer if the post fails.
+    target: CommentTarget,
 }
 
 /// One open PR, its loaded data, and its loading progress.
@@ -68,6 +99,15 @@ pub struct PrSession {
     pub filters: FilterState,
     /// The PR's review threads, once loaded (spec §7.4).
     pub threads: Vec<ReviewThread>,
+    /// The inline comment composer's state machine (spec §7.1).
+    pub composer: ComposerState,
+    /// Comments held for the pending review, in the order they were added.
+    pub pending: Vec<PendingComment>,
+    /// The next locally allocated comment id; starts at 1 because 0 is the
+    /// reserved "no optimistic bubble" sentinel.
+    next_optimistic_id: u64,
+    /// The immediate comment currently in flight, if any.
+    optimistic: Option<OptimisticPost>,
     /// The file-tree directories the reviewer has collapsed, by path.
     pub collapsed_dirs: BTreeSet<String>,
     /// The last file selected in the tree, restored from the session file.
@@ -141,6 +181,10 @@ impl PrSession {
             viewed,
             filters: FilterState::default(),
             threads: Vec::new(),
+            composer: ComposerState::default(),
+            pending: Vec::new(),
+            next_optimistic_id: 1,
+            optimistic: None,
             collapsed_dirs,
             last_opened_file,
             draft,
@@ -195,7 +239,7 @@ impl PrSession {
                 done,
             } if *session == self.id => {
                 self.files.extend(files.iter().cloned());
-                self.row_model = build(&self.files);
+                self.rebuild_rows();
 
                 if *done {
                     // The diff on screen now corresponds to the head we loaded
@@ -214,6 +258,80 @@ impl PrSession {
             }
             Event::ThreadsLoaded { session, threads } if *session == self.id => {
                 self.threads = threads.clone();
+                // A full thread list replaces everything it should contain,
+                // including any optimistic placeholder an in-flight post
+                // pushed; that post's result event then finds nothing to
+                // touch and is ignored.
+                self.optimistic = None;
+                self.rebuild_rows();
+                Vec::new()
+            }
+            Event::CommentPosted {
+                session,
+                optimistic_id,
+                comment,
+            } if *session == self.id => {
+                if let Some(post) = self.optimistic.take() {
+                    if post.optimistic_id == *optimistic_id {
+                        // Replace the placeholder's body with what GitHub
+                        // created; the anchor and slot stay put.
+                        if let Some(thread) = self.threads.get_mut(post.thread_index) {
+                            thread.comments = vec![comment.clone()];
+                        }
+                    } else {
+                        self.optimistic = Some(post);
+                    }
+                }
+                self.rebuild_rows();
+                Vec::new()
+            }
+            Event::CommentFailed {
+                session,
+                optimistic_id,
+                error,
+            } if *session == self.id => {
+                // A reply failure (the reserved id) has no bubble to roll
+                // back; its composer reports the failure itself.
+                if *optimistic_id != NO_OPTIMISTIC_BUBBLE {
+                    if let Some(post) = self.optimistic.take() {
+                        if post.optimistic_id == *optimistic_id {
+                            if post.thread_index < self.threads.len() {
+                                self.threads.remove(post.thread_index);
+                            }
+                            // The reviewer's text comes back so a retry
+                            // starts from what they wrote (spec §7.1).
+                            self.composer.target = Some(post.target.clone());
+                            self.composer.body = post.body.clone();
+                            self.composer.mode = CommentMode::Immediate;
+                            self.composer.error = Some(error.to_string());
+                        } else {
+                            self.optimistic = Some(post);
+                        }
+                    }
+                    self.rebuild_rows();
+                }
+                Vec::new()
+            }
+            Event::ReplyPosted {
+                session,
+                thread_id,
+                comment,
+            } if *session == self.id => {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == *thread_id) {
+                    thread.comments.push(comment.clone());
+                }
+                self.rebuild_rows();
+                Vec::new()
+            }
+            Event::ThreadResolved {
+                session,
+                thread_id,
+                resolved,
+            } if *session == self.id => {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == *thread_id) {
+                    thread.is_resolved = *resolved;
+                }
+                self.rebuild_rows();
                 Vec::new()
             }
             Event::Failed {
@@ -232,23 +350,224 @@ impl PrSession {
     ///
     /// The previous diff is dropped immediately so stale rows are never shown
     /// against a new head; `diff_head_sha` is kept so the metadata reply can
-    /// detect that the head moved.
+    /// detect that the head moved. Threads are dropped and re-requested for
+    /// the same reason: a rendered thread must never stay anchored to the old
+    /// head. The composer keeps its text — a post in flight or being retried
+    /// is the reviewer's, not the cache's.
     pub fn refresh(&mut self) -> Vec<Command> {
         self.head_moved = false;
         self.files.clear();
         self.row_model = build(&[]);
+        self.threads.clear();
+        self.optimistic = None;
         self.phase = LoadPhase::Header;
         self.error = None;
 
-        vec![Command::LoadPrMetadata {
+        vec![
+            Command::LoadPrMetadata {
+                session: self.id,
+                repo: self.repo.clone(),
+                number: self.number,
+            },
+            Command::LoadThreads {
+                session: self.id,
+                repo: self.repo.clone(),
+                number: self.number,
+            },
+        ]
+    }
+
+    /// Re-derive the row model from the files plus the current threads,
+    /// pending comments, and composer (spec §8.4).
+    ///
+    /// Called wherever those change. The patch rows are rebuilt, but their
+    /// measured heights are carried over in order — the line rows come out
+    /// of `build` in exactly the order they went in — so a comment event
+    /// never collapses wrapped lines back to [`ROW_H`](crate::diff::row_model::ROW_H).
+    pub fn rebuild_rows(&mut self) {
+        let items = self.inline_items();
+        let measured: Vec<f32> = self
+            .row_model
+            .rows
+            .iter()
+            .zip(self.row_model.heights())
+            .filter(|(row, _)| matches!(row, RowRef::Line { .. }))
+            .map(|(_, height)| *height)
+            .collect();
+
+        let mut model = annotate(&build(&self.files), &self.files, &items);
+        let mut heights = measured.into_iter();
+        for index in 0..model.rows.len() {
+            if matches!(model.rows[index], RowRef::Line { .. }) {
+                if let Some(height) = heights.next() {
+                    model.set_height(index, height);
+                }
+            }
+        }
+        self.row_model = model;
+    }
+
+    /// The rows to splice in: every thread that has a file, every pending
+    /// comment, and the composer while it is open — in that order, so
+    /// [`annotate`] can keep threads ahead of pending ahead of the composer
+    /// at any one point.
+    fn inline_items(&self) -> Vec<InlineItem> {
+        let mut items = Vec::new();
+        for (index, thread) in self.threads.iter().enumerate() {
+            if let Some(item) = place_thread(thread, index as u32, &self.files) {
+                items.push(item);
+            }
+        }
+        for pending in &self.pending {
+            if let Some(file) = self.file_of(&pending.target) {
+                items.push(InlineItem {
+                    file,
+                    placement: target_placement(&pending.target),
+                    row: RowRef::Pending {
+                        local_id: pending.local_id,
+                    },
+                });
+            }
+        }
+        if let Some(target) = &self.composer.target {
+            if let Some(file) = self.file_of(target) {
+                items.push(InlineItem {
+                    file,
+                    placement: target_placement(target),
+                    row: RowRef::Composer,
+                });
+            }
+        }
+        items
+    }
+
+    /// The index of the file a target is anchored to.
+    fn file_of(&self, target: &CommentTarget) -> Option<u32> {
+        let path = match target {
+            CommentTarget::Line(anchor) => anchor.path.as_str(),
+            CommentTarget::File { path } => path,
+        };
+        self.files
+            .iter()
+            .position(|l| l.file.path == path)
+            .map(|index| index as u32)
+    }
+
+    /// Open the composer for `target`, picking the mode GitHub would.
+    pub fn open_comment(&mut self, target: CommentTarget) {
+        composer::reduce(
+            &mut self.composer,
+            ComposerMsg::OpenFor {
+                target,
+                has_open_review: !self.pending.is_empty(),
+            },
+        );
+        self.rebuild_rows();
+    }
+
+    /// Post the composer in `mode`: immediately as a single comment, or as
+    /// a pending comment for the review (Phase F submits that).
+    ///
+    /// An immediate post inserts an optimistic single-comment thread right
+    /// away and sends the mutation exactly once; the result events replace
+    /// or roll it back (spec §7.1).
+    pub fn submit_comment(
+        &mut self,
+        mode: CommentMode,
+        author: &str,
+        now: Instant,
+    ) -> Vec<Command> {
+        if !can_submit(&self.composer) {
+            return Vec::new();
+        }
+        let Some(target) = self.composer.target.clone() else {
+            return Vec::new();
+        };
+        // A file-level comment is never pending, whatever button was hit.
+        let mode = match target {
+            CommentTarget::File { .. } => CommentMode::Immediate,
+            CommentTarget::Line(_) => mode,
+        };
+        let body = self.composer.body.clone();
+
+        if mode == CommentMode::Pending {
+            let local_id = self.allocate_id();
+            self.pending.push(PendingComment {
+                local_id,
+                target,
+                body,
+            });
+            composer::reduce(&mut self.composer, ComposerMsg::Cancel);
+            self.rebuild_rows();
+            self.mark_session_dirty(now);
+            return Vec::new();
+        }
+
+        let Some(commit_id) = self.diff_head_sha.clone() else {
+            self.composer.error = Some("the diff is still loading".to_owned());
+            return Vec::new();
+        };
+
+        let optimistic_id = self.allocate_id();
+        let thread_index = self.threads.len();
+        self.threads.push(optimistic_thread(
+            &target,
+            optimistic_id,
+            &body,
+            if author.is_empty() { "me" } else { author },
+        ));
+        self.optimistic = Some(OptimisticPost {
+            optimistic_id,
+            thread_index,
+            body: body.clone(),
+            target: target.clone(),
+        });
+        composer::reduce(&mut self.composer, ComposerMsg::Submitted);
+        self.rebuild_rows();
+
+        vec![Command::PostComment {
             session: self.id,
             repo: self.repo.clone(),
             number: self.number,
+            comment: NewComment {
+                commit_id,
+                body,
+                target,
+            },
+            optimistic_id,
         }]
     }
 
-    /// Note that the session file needs writing; the next [`PrSession::tick`]
-    /// past the debounce window writes it.
+    /// Append a suggestion block for the composer's anchored rows (spec §7.4).
+    pub fn insert_suggestion(&mut self) {
+        let Some(CommentTarget::Line(anchor)) = self.composer.target.clone() else {
+            return;
+        };
+        let Some(block) = suggestion_block(&rows_for_anchor(&self.files, &anchor)) else {
+            return;
+        };
+        if !self.composer.body.ends_with('\n') {
+            self.composer.body.push('\n');
+        }
+        self.composer.body.push_str(&block);
+        self.composer.body.push('\n');
+    }
+
+    /// Drop a pending comment from the review.
+    pub fn delete_pending(&mut self, local_id: u64, now: Instant) {
+        self.pending.retain(|p| p.local_id != local_id);
+        self.rebuild_rows();
+        self.mark_session_dirty(now);
+    }
+
+    /// Take the next local comment id. Never 0: that id is the reserved
+    /// "no optimistic bubble" sentinel.
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_optimistic_id;
+        self.next_optimistic_id += 1;
+        id
+    }
+
     pub fn mark_session_dirty(&mut self, now: Instant) {
         self.writer.mark_dirty(now);
     }
@@ -295,12 +614,56 @@ impl PrSession {
     }
 }
 
+/// The placement a comment target implies, mirroring how
+/// [`place_thread`](crate::diff::annotate::place_thread) reads a thread.
+fn target_placement(target: &CommentTarget) -> Placement {
+    match target {
+        CommentTarget::File { .. } => Placement::AfterHeader,
+        CommentTarget::Line(anchor) => Placement::AfterLine {
+            side: anchor.side,
+            line: anchor.line,
+        },
+    }
+}
+
+/// The placeholder thread an optimistic immediate comment shows as: one
+/// comment, anchored exactly where the real one will be, with a local id
+/// the result events can find it by.
+fn optimistic_thread(target: &CommentTarget, id: u64, body: &str, author: &str) -> ReviewThread {
+    let (path, line, side, subject_type) = match target {
+        CommentTarget::File { path } => (path.clone(), None, None, SubjectType::File),
+        CommentTarget::Line(anchor) => (
+            anchor.path.clone(),
+            Some(anchor.line),
+            Some(anchor.side),
+            SubjectType::Line,
+        ),
+    };
+    ReviewThread {
+        id: format!("optimistic-{id}"),
+        is_resolved: false,
+        is_outdated: false,
+        path,
+        line,
+        start_line: None,
+        side,
+        subject_type,
+        comments: vec![ThreadComment {
+            database_id: id,
+            author: author.to_owned(),
+            avatar_url: None,
+            body: body.to_owned(),
+            created_at: String::new(),
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github::error::GhError;
     use crate::runtime::{Command, Event, SessionId};
-    use crate::test_support::{loaded, meta, repo};
+    use crate::test_support::{line_anchor, loaded, meta, repo};
 
     #[test]
     fn metadata_then_files_then_ready() {
@@ -505,5 +868,166 @@ mod tests {
             Some(&composer_draft),
             "a viewed write must not clobber the saved composer draft"
         );
+    }
+
+    /// A session with one loaded file and a known head SHA.
+    fn loaded_session() -> PrSession {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("a.rs", "@@ -1,2 +1,2 @@\n-x\n+y\n z\n")],
+            done: true,
+        });
+        s
+    }
+
+    fn comment(database_id: u64, body: &str) -> ThreadComment {
+        ThreadComment {
+            database_id,
+            author: "me".into(),
+            avatar_url: None,
+            body: body.into(),
+            created_at: "2026-10-01T00:00:00Z".into(),
+        }
+    }
+
+    fn anchored_thread(id: &str) -> ReviewThread {
+        ReviewThread {
+            id: id.into(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "a.rs".into(),
+            line: Some(1),
+            start_line: None,
+            side: Some(crate::model::diff::Side::Right),
+            subject_type: SubjectType::Line,
+            comments: vec![comment(5, "root")],
+        }
+    }
+
+    fn open_composer(s: &mut PrSession, body: &str) {
+        s.open_comment(CommentTarget::Line(line_anchor("a.rs", 1)));
+        composer::reduce(&mut s.composer, ComposerMsg::SetBody(body.into()));
+    }
+
+    #[test]
+    fn refresh_clears_threads_and_asks_for_them_again() {
+        let mut s = loaded_session();
+        s.on_event(&Event::ThreadsLoaded {
+            session: SessionId(1),
+            threads: vec![anchored_thread("PRRT_1")],
+        });
+        assert_eq!(s.threads.len(), 1);
+
+        let cmds = s.refresh();
+        assert!(
+            s.threads.is_empty(),
+            "threads anchored to the old head must not survive a refresh"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. })),
+            "a refresh re-requests the threads"
+        );
+    }
+
+    #[test]
+    fn an_immediate_comment_shows_optimistically_then_confirms() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "hi");
+        let cmds = s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+        assert!(
+            matches!(
+                &cmds[..],
+                [Command::PostComment {
+                    optimistic_id: 1,
+                    ..
+                }]
+            ),
+            "the first optimistic id is 1, never 0"
+        );
+        assert_eq!(s.threads.len(), 1, "the bubble shows before the reply");
+        assert_eq!(s.threads[0].comments[0].body, "hi");
+        assert!(s.row_model.rows.contains(&RowRef::Thread { thread: 0 }));
+        assert!(s.composer.target.is_none(), "the composer closes");
+
+        s.on_event(&Event::CommentPosted {
+            session: SessionId(1),
+            optimistic_id: 1,
+            comment: comment(99, "hi"),
+        });
+        assert_eq!(s.threads[0].comments[0].database_id, 99);
+        assert_eq!(s.threads[0].comments[0].created_at, "2026-10-01T00:00:00Z");
+    }
+
+    #[test]
+    fn a_failed_comment_rolls_back_and_restores_the_text() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "my lost words");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+        assert_eq!(s.threads.len(), 1);
+
+        s.on_event(&Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Server(500),
+        });
+        assert!(s.threads.is_empty(), "the optimistic bubble is removed");
+        assert_eq!(s.composer.body, "my lost words", "the text comes back");
+        assert_eq!(
+            s.composer.target,
+            Some(CommentTarget::Line(line_anchor("a.rs", 1)))
+        );
+        assert!(s.composer.error.is_some(), "the failure is shown");
+    }
+
+    #[test]
+    fn a_pending_comment_gets_a_row_and_can_be_removed() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "for the review");
+        let cmds = s.submit_comment(CommentMode::Pending, "me", Instant::now());
+        assert!(cmds.is_empty(), "pending comments post nothing yet");
+        assert_eq!(s.pending.len(), 1);
+        assert!(s.row_model.rows.contains(&RowRef::Pending { local_id: 1 }));
+
+        s.delete_pending(1, Instant::now());
+        assert!(s.pending.is_empty());
+        assert!(!s.row_model.rows.contains(&RowRef::Pending { local_id: 1 }));
+    }
+
+    #[test]
+    fn reply_and_resolve_events_fold_into_their_threads() {
+        let mut s = loaded_session();
+        s.on_event(&Event::ThreadsLoaded {
+            session: SessionId(1),
+            threads: vec![anchored_thread("PRRT_1")],
+        });
+        assert!(s.row_model.rows.contains(&RowRef::Thread { thread: 0 }));
+
+        s.on_event(&Event::ReplyPosted {
+            session: SessionId(1),
+            thread_id: "PRRT_1".into(),
+            comment: comment(6, "reply"),
+        });
+        assert_eq!(s.threads[0].comments.len(), 2);
+
+        s.on_event(&Event::ThreadResolved {
+            session: SessionId(1),
+            thread_id: "PRRT_1".into(),
+            resolved: true,
+        });
+        assert!(s.threads[0].is_resolved);
+
+        // Another session's events change nothing.
+        s.on_event(&Event::ThreadResolved {
+            session: SessionId(2),
+            thread_id: "PRRT_1".into(),
+            resolved: false,
+        });
+        assert!(s.threads[0].is_resolved);
     }
 }

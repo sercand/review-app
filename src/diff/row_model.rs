@@ -83,6 +83,16 @@ pub struct RowModel {
 }
 
 impl RowModel {
+    /// An empty model: no rows, no ranges, the one prefix sum.
+    pub(crate) fn empty() -> RowModel {
+        RowModel {
+            rows: Vec::new(),
+            file_ranges: Vec::new(),
+            heights: Vec::new(),
+            prefix: vec![0.0],
+        }
+    }
+
     /// The per-row heights, parallel to [`RowModel::rows`].
     pub fn heights(&self) -> &[f32] {
         &self.heights
@@ -130,7 +140,7 @@ impl RowModel {
     }
 
     /// Append one row with its default height, extending the prefix sums.
-    fn push(&mut self, row: RowRef, height: f32) {
+    pub(crate) fn push(&mut self, row: RowRef, height: f32) {
         self.rows.push(row);
         self.heights.push(height);
         let total = self.prefix.last().copied().unwrap_or(0.0) + height;

@@ -641,7 +641,7 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
 
 /// The [`Event::CommentFailed`] id for a failure that has no pending bubble
 /// to roll back — a thread reply, whose composer reports the failure itself.
-const NO_OPTIMISTIC_BUBBLE: u64 = 0;
+pub(crate) const NO_OPTIMISTIC_BUBBLE: u64 = 0;
 
 /// Prove a fresh credential with `GET /user`, then install it and announce it.
 ///
