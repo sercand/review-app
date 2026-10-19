@@ -18,7 +18,9 @@ use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::error::GhError;
+use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
+use crate::model::RepoRef;
 
 /// Identifies one open PR's session.
 ///
@@ -57,6 +59,15 @@ pub enum Command {
         query: String,
         /// The `endCursor` to fetch the page after, when paging.
         after: Option<String>,
+    },
+    /// Load a PR's changed files, one page at a time.
+    LoadPrFiles {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
     },
 }
 
@@ -104,6 +115,15 @@ pub enum Event {
         request: u64,
         /// The classified failure.
         error: GhError,
+    },
+    /// One page of a PR's changed files arrived.
+    PrFilesPage {
+        /// The session that asked for the files.
+        session: SessionId,
+        /// The files on this page, with their patches parsed.
+        files: Vec<LoadedFile>,
+        /// Whether this was the last page.
+        done: bool,
     },
 }
 
@@ -327,6 +347,47 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                     page,
                 }),
                 Err(error) => events.send(Event::PrSearchFailed { request, error }),
+            }
+        }
+        Command::LoadPrFiles {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // One request per page, following `Link: rel="next"`; each page is
+            // parsed and sent as it arrives, so the UI can render while the
+            // remaining pages are still loading.
+            let mut next = Some(format!(
+                "/repos/{}/{}/pulls/{number}/files?per_page=100",
+                repo.owner, repo.name
+            ));
+            while let Some(path) = next {
+                match client.get_json::<Vec<PrFile>>(&path).await {
+                    Ok((page, link)) => {
+                        let files = page.into_iter().map(LoadedFile::parse).collect();
+                        events.send(Event::PrFilesPage {
+                            session,
+                            files,
+                            done: link.is_none(),
+                        });
+                        next = link;
+                    }
+                    Err(error) => {
+                        events.send(Event::Failed {
+                            session: Some(session),
+                            error,
+                        });
+                        return;
+                    }
+                }
             }
         }
     }

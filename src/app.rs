@@ -189,6 +189,8 @@ impl ReviewApp {
                     self.on_unauthorized(now);
                 }
             }
+            // The PR-detail screen folds these once it exists (Phase C).
+            Event::PrFilesPage { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
