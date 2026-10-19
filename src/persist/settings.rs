@@ -34,7 +34,11 @@ pub struct Settings {
     /// The cached account, or `None` when signed out.
     pub account: Option<Account>,
     /// The scopes the PR list starts with.
-    #[serde(default)]
+    ///
+    /// A file written by an older version has no key here; the container's
+    /// `#[serde(default)]` then supplies [`Settings::default`]'s three scopes.
+    /// (A field-level `#[serde(default)]` would override that with `Vec::new()`
+    /// and leave the list showing nothing.)
     pub default_scopes: Vec<Scope>,
 }
 
@@ -117,5 +121,27 @@ mod tests {
 
         std::fs::write(dir.path().join("settings.toml"), "not = [valid").unwrap();
         assert_eq!(Settings::load_or_default(dir.path()).host, "github.com");
+    }
+
+    #[test]
+    fn default_scopes_are_the_three_queries_and_survive_a_file_without_them() {
+        let three = vec![Scope::ReviewRequested, Scope::Assigned, Scope::Authored];
+        assert_eq!(Settings::default().default_scopes, three);
+
+        // A file written before `default_scopes` existed keeps the defaults.
+        let dir = tempdir();
+        std::fs::write(dir.path().join("settings.toml"), "host = \"github.com\"\n").unwrap();
+        assert_eq!(Settings::load_or_default(dir.path()).default_scopes, three);
+
+        // An explicit selection round-trips.
+        let explicit = Settings {
+            default_scopes: vec![Scope::Assigned],
+            ..Default::default()
+        };
+        explicit.save(dir.path()).unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).default_scopes,
+            vec![Scope::Assigned]
+        );
     }
 }
