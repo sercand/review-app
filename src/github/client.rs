@@ -145,7 +145,6 @@ impl GithubClient {
     ///
     /// A 2xx response is returned untouched so the caller can read its body; any
     /// other status is classified into a [`GhError`].
-    #[allow(dead_code)] // first used by later tasks' write paths
     pub(crate) async fn send_mutation(&self, request: RequestBuilder) -> Result<Response, GhError> {
         let response = request.send().await.map_err(network)?;
         let status = response.status().as_u16();

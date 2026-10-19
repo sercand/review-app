@@ -94,6 +94,34 @@ pub fn route(current: ScreenKind, event: &Event) -> ScreenKind {
     }
 }
 
+/// Whether the global key path may dispatch `action` while a text edit has
+/// keyboard focus.
+///
+/// `submit_review` is the gated one. `resolve_key` deliberately resolves
+/// `Cmd+Enter` even with text focus — the review panel's own scoped handler
+/// (gated on focus in one of its text edits) depends on that — so without
+/// this gate the global path fires alongside the panel's handler and posts
+/// the review twice in one frame, and `Cmd+Enter` while typing a thread
+/// reply or a composer body submits the draft review by accident. Every
+/// other action either needs no focus (`palette`, `close`) or is already
+/// suppressed by `resolve_key` under text focus.
+fn global_key_allowed(action: &str, text_focused: bool) -> bool {
+    action != "submit_review" || !text_focused
+}
+
+/// Whether `action` may run while `screen` is showing.
+///
+/// The palette, help, close, and settings actions are global. Everything
+/// else in the registry acts on the open PR — and after Back the session
+/// stays loaded for a fast return, so running a detail action from the list
+/// would edit (and persist marks for) a PR the reviewer cannot see.
+fn action_allowed(action: &str, screen: ScreenKind) -> bool {
+    match action {
+        "palette" | "settings" | "help" | "close" => true,
+        _ => screen == ScreenKind::PrDetail,
+    }
+}
+
 /// The login of the cached account, or the empty string when signed out.
 fn account_login(settings: &Settings) -> String {
     settings
@@ -332,6 +360,22 @@ impl ReviewApp {
         self.pr_list_form = PrListForm::default();
     }
 
+    /// Write any debounced session change before the session is dropped or
+    /// replaced (spec §11): a viewed mark, collapse, or composer draft made
+    /// inside the debounce window must not die with the session.
+    fn flush_session(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.flush_session();
+        }
+    }
+
+    /// Leave the detail screen for the list, flushing the session first:
+    /// it stays loaded for a fast return, but its owed writes do not wait.
+    fn close_detail(&mut self) {
+        self.flush_session();
+        self.screen = ScreenKind::PrList;
+    }
+
     /// Store the token and cache the account for the next launch.
     fn finish_login(&mut self, me: &Me, token: &str, now: Instant) {
         match complete_login(self.store.as_ref(), &mut self.settings, me, token) {
@@ -355,6 +399,7 @@ impl ReviewApp {
             tracing::warn!(%error, "could not clear the stored token");
         }
         self.exec.clear_client();
+        self.flush_session();
         self.session = None;
         // `AuthFailure::Http` carries a user-facing message verbatim, which is
         // how the login screen shows the session-expiry notice (spec §6).
@@ -376,6 +421,7 @@ impl ReviewApp {
                 self.auth_state = AuthState::Idle;
                 self.screen = ScreenKind::Login;
                 self.reset_pr_list();
+                self.flush_session();
                 self.session = None;
                 self.toasts.push("signed out".to_owned(), now);
             }
@@ -412,6 +458,7 @@ impl ReviewApp {
                     self.save_settings(now);
                     if host_changed {
                         self.exec.clear_client();
+                        self.flush_session();
                         self.session = None;
                         self.screen = ScreenKind::Login;
                         self.reset_pr_list();
@@ -567,6 +614,9 @@ impl ReviewApp {
     /// Open one PR: allocate a session id, start its load, and show the detail
     /// screen.
     fn open_pr(&mut self, repo: RepoRef, number: u64) {
+        // The session being replaced may still owe a debounced write
+        // (spec §11); it does not survive the new PR.
+        self.flush_session();
         let id = SessionId(self.next_session);
         self.next_session += 1;
 
@@ -641,7 +691,7 @@ impl ReviewApp {
 
         for action in actions {
             match action {
-                PrDetailAction::Back => self.screen = ScreenKind::PrList,
+                PrDetailAction::Back => self.close_detail(),
                 PrDetailAction::Refresh => {
                     if let Some(session) = &mut self.session {
                         for command in session.refresh() {
@@ -939,13 +989,22 @@ impl ReviewApp {
         });
         for press in &presses {
             if let Some(action) = command::resolve_key(press, text_focused) {
-                self.dispatch(action, now);
+                if global_key_allowed(action, text_focused) {
+                    self.dispatch(action, now);
+                }
             }
         }
     }
 
     /// Run one registry action against the current app state.
+    ///
+    /// Detail-only actions are gated on the screen here, so both the key
+    /// path and the palette respect it and a hidden session is never
+    /// touched.
     fn dispatch(&mut self, action: &'static str, now: Instant) {
+        if !action_allowed(action, self.screen) {
+            return;
+        }
         match action {
             "palette" => {
                 self.palette.open_now();
@@ -969,7 +1028,10 @@ impl ReviewApp {
             "split" => self.pr_detail.diff.mode = DiffMode::Split,
             "unified" => self.pr_detail.diff.mode = DiffMode::Unified,
             // The same path the review panel's Submit button takes, author
-            // rule and all (Task 44).
+            // rule and all (Task 44). Reached from the palette, or from the
+            // global key path only while no text edit is focused (see
+            // `global_key_allowed`); inside the panel the panel's own
+            // scoped ⌘Enter handler owns the shortcut.
             "submit_review" => {
                 let login = self.login();
                 for command in self.apply_review_action(ReviewAction::Submit, &login, now) {
@@ -981,6 +1043,11 @@ impl ReviewApp {
     }
 
     /// `Esc`: dismiss the topmost surface, then back out of the detail screen.
+    ///
+    /// The composer cancel belongs to the detail screen: on the list the
+    /// hidden session's open composer must not swallow the `Esc` that was
+    /// meant for the visible screen. Leaving for the list flushes the
+    /// session's debounced writes (spec §11).
     fn dispatch_close(&mut self) {
         if self.palette.open {
             self.palette.close();
@@ -994,6 +1061,9 @@ impl ReviewApp {
             self.settings_window.close();
             return;
         }
+        if self.screen != ScreenKind::PrDetail {
+            return;
+        }
         if let Some(session) = &mut self.session {
             if session.composer.target.is_some() {
                 composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
@@ -1001,9 +1071,7 @@ impl ReviewApp {
                 return;
             }
         }
-        if self.screen == ScreenKind::PrDetail {
-            self.screen = ScreenKind::PrList;
-        }
+        self.close_detail();
     }
 
     /// `j`/`k`: move the current file to the next/previous one the filters
@@ -1350,5 +1418,67 @@ mod tests {
             route(ScreenKind::PrList, &Event::Toast("hi".into())),
             ScreenKind::PrList
         ));
+    }
+
+    #[test]
+    fn detail_actions_only_run_on_the_detail_screen() {
+        // Every action that reaches for the session or the detail screen's
+        // own state must not run while the session is merely hidden: after
+        // Back it stays loaded, and mutating it from the list edits (and
+        // persists marks for) a PR the reviewer cannot see.
+        for action in [
+            "next_file",
+            "prev_file",
+            "next_hunk",
+            "prev_hunk",
+            "toggle_viewed",
+            "mark_viewed_and_next",
+            "comment",
+            "reply",
+            "toggle_side_pane",
+            "split",
+            "unified",
+            "submit_review",
+        ] {
+            assert!(
+                action_allowed(action, ScreenKind::PrDetail),
+                "{action} runs on the detail screen"
+            );
+            assert!(
+                !action_allowed(action, ScreenKind::PrList),
+                "{action} must not touch the hidden session"
+            );
+            assert!(
+                !action_allowed(action, ScreenKind::Login),
+                "{action} must not run from the login screen"
+            );
+        }
+    }
+
+    #[test]
+    fn palette_help_close_and_settings_stay_global() {
+        for action in ["palette", "settings", "help", "close"] {
+            for screen in [ScreenKind::Login, ScreenKind::PrList, ScreenKind::PrDetail] {
+                assert!(
+                    action_allowed(action, screen),
+                    "{action} is global, even on {screen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_global_submit_shortcut_yields_to_text_focus() {
+        // With focus on a review-panel text edit the panel's own scoped
+        // ⌘Enter handler submits; firing the global path in the same frame
+        // would post twice. With focus on any other field — a thread reply,
+        // the composer — the global path would submit the review by
+        // accident. Either way, text focus means the global path stays out.
+        assert!(!global_key_allowed("submit_review", true));
+        // With no text focused ⌘Enter is the documented global shortcut.
+        assert!(global_key_allowed("submit_review", false));
+        // The other always-resolving keys must survive text focus.
+        assert!(global_key_allowed("palette", true));
+        assert!(global_key_allowed("close", true));
     }
 }
