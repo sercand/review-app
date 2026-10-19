@@ -124,6 +124,18 @@ fn parse(patch: &str) -> Vec<crate::model::diff::Hunk> {
     crate::diff::parse::parse_patch(patch).expect("the test patch should parse")
 }
 
+/// A single-line [`crate::model::comment::Anchor`] on the RIGHT side of `path`
+/// at `line`, with no range.
+pub fn line_anchor(path: &str, line: u32) -> crate::model::comment::Anchor {
+    crate::model::comment::Anchor {
+        path: path.to_owned(),
+        side: crate::model::diff::Side::Right,
+        line,
+        start_line: None,
+        start_side: None,
+    }
+}
+
 /// A [`crate::github::metadata::PrMetadata`] authored by `"author"` with the
 /// given head SHA, in `o/r` as PR #7.
 pub fn meta(head_sha: &str) -> crate::github::metadata::PrMetadata {

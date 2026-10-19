@@ -1,3 +1,4 @@
+pub mod composer;
 pub mod filters;
 pub mod folder_viewed;
 pub mod pr_detail;
