@@ -13,6 +13,7 @@ use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
 use crate::model::RepoRef;
 use crate::runtime::{Command, Event, SessionId};
+use crate::state::viewed::ViewedSet;
 
 /// How far a session has got through loading its PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +55,8 @@ pub struct PrSession {
     pub error: Option<GhError>,
     /// Whether the head moved since the diff on screen was loaded.
     pub head_moved: bool,
+    /// Which files the reviewer has marked viewed, keyed by blob SHA.
+    pub viewed: ViewedSet,
 }
 
 impl PrSession {
@@ -80,6 +83,7 @@ impl PrSession {
             phase: LoadPhase::Header,
             error: None,
             head_moved: false,
+            viewed: ViewedSet::default(),
         };
 
         let commands = vec![Command::LoadPrMetadata {
