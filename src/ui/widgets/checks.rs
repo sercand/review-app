@@ -1,33 +1,60 @@
-//! The right-pane CI checks list (Task 50).
-//!
-//! The rollup line comes from [`ci_state`], which weighs the check runs
-//! against the legacy combined status; each run then gets its own row, and
-//! a row with a URL opens that run in the browser.
+//! The CI checks list (Task 50, restyled by redesign Task 13): the rollup
+//! line, then one row per run — state icon, name, and detail in `faint`.
+//! A row with a URL opens that run in the browser.
 
-use eframe::egui;
+use eframe::egui::{self, RichText};
 
 use crate::github::checks::{ci_state, CheckRun, CombinedStatus};
 use crate::model::pr::CiState;
+use crate::ui::{icons, theme};
 
 /// Draw the CI rollup and one row per check run.
 ///
 /// `combined` is `None` while the status is still loading; the rollup then
 /// reads it as "no signal" rather than guessing.
 pub fn render(ui: &mut egui::Ui, runs: &[CheckRun], combined: Option<&CombinedStatus>) {
+    let p = theme::palette_of(ui);
     let empty = CombinedStatus {
         state: String::new(),
         total_count: 0,
     };
     match ci_state(runs, combined.unwrap_or(&empty)) {
-        Some(CiState::Success) => ui.label("✓ Checks passing"),
-        Some(CiState::Failure) => ui.colored_label(ui.visuals().warn_fg_color, "✗ Checks failing"),
-        Some(CiState::Pending) => ui.weak("… Checks running"),
-        None => ui.weak("No checks"),
-    };
+        Some(CiState::Success) => {
+            ui.label(
+                RichText::new(icons::icon_text(icons::CIRCLE_CHECK, "Checks passing")).color(p.ok),
+            );
+        }
+        Some(CiState::Failure) => {
+            ui.label(
+                RichText::new(icons::icon_text(icons::CIRCLE_X, "Checks failing")).color(p.bad),
+            );
+        }
+        Some(CiState::Pending) => {
+            ui.label(
+                RichText::new(icons::icon_text(icons::CIRCLE_DOT_DASHED, "Checks running"))
+                    .color(p.warn),
+            );
+        }
+        None => {
+            ui.weak("No checks");
+        }
+    }
 
     for run in runs {
         ui.horizontal(|ui| {
-            ui.label(glyph(run));
+            let (glyph, color) = if run.status != "completed" {
+                (icons::CIRCLE_DOT_DASHED, p.warn)
+            } else {
+                match run.conclusion.as_deref() {
+                    Some("success") => (icons::CIRCLE_CHECK, p.ok),
+                    Some("failure")
+                    | Some("timed_out")
+                    | Some("cancelled")
+                    | Some("action_required") => (icons::CIRCLE_X, p.bad),
+                    _ => (icons::CIRCLE, p.faint),
+                }
+            };
+            ui.label(RichText::new(glyph).color(color));
             match &run.html_url {
                 Some(url) => {
                     if ui.link(&run.name).clicked() {
@@ -44,21 +71,9 @@ pub fn render(ui: &mut egui::Ui, runs: &[CheckRun], combined: Option<&CombinedSt
                 run.conclusion.as_deref().unwrap_or_default()
             };
             if !detail.is_empty() {
-                ui.weak(detail);
+                ui.colored_label(p.faint, detail);
             }
         });
-    }
-}
-
-/// The row's state mark: running, passed, failed, or neither.
-fn glyph(run: &CheckRun) -> &'static str {
-    if run.status != "completed" {
-        return "…";
-    }
-    match run.conclusion.as_deref() {
-        Some("success") => "✓",
-        Some("failure") | Some("timed_out") | Some("cancelled") | Some("action_required") => "✗",
-        _ => "–",
     }
 }
 

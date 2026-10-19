@@ -37,6 +37,8 @@ pub struct Layout {
     pub right_pane: f32,
     /// Whether the metadata pane is open.
     pub right_open: bool,
+    /// Which details tab the pane last showed (redesign Task 13).
+    pub details_tab: crate::ui::widgets::metadata_panel::DetailsTab,
 }
 
 /// User settings, persisted as `settings.toml` in the config directory.
@@ -97,9 +99,10 @@ impl Default for Settings {
             // The detail screen's starting pane sizes; the user's own sizes
             // overwrite these as soon as they drag a divider.
             layout: Layout {
-                left_pane: 240.0,
-                right_pane: 320.0,
+                left_pane: 300.0,
+                right_pane: 340.0,
                 right_open: false,
+                details_tab: crate::ui::widgets::metadata_panel::DetailsTab::default(),
             },
             diff: DiffPrefs::default(),
         }
@@ -150,6 +153,18 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::test_support::tempdir;
+
+    #[test]
+    fn details_tab_round_trips() {
+        let dir = tempdir();
+        let mut s = Settings::default();
+        s.layout.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Checks;
+        s.save(dir.path()).unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.details_tab,
+            crate::ui::widgets::metadata_panel::DetailsTab::Checks
+        );
+    }
 
     #[test]
     fn diff_prefs_default_to_split_and_round_trip() {

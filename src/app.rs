@@ -630,6 +630,10 @@ impl ReviewApp {
                 self.settings.layout.right_open = self.pr_detail.right_open;
                 dirty = true;
             }
+            if self.pr_detail.details_tab != self.settings.layout.details_tab {
+                self.settings.layout.details_tab = self.pr_detail.details_tab;
+                dirty = true;
+            }
             if dirty {
                 self.settings_writer.mark_dirty(now);
             }
@@ -761,6 +765,7 @@ impl ReviewApp {
             left_pane: self.settings.layout.left_pane,
             right_pane: self.settings.layout.right_pane,
             right_open: self.settings.layout.right_open,
+            details_tab: self.settings.layout.details_tab,
             ..PrDetailState::default()
         };
         for command in commands {

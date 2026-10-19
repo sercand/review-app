@@ -31,8 +31,8 @@ use crate::ui::widgets::top_bar;
 /// The width the left pane starts at (mockup 02).
 const LEFT_W: f32 = 300.0;
 
-/// The width the right pane starts at, when open.
-const RIGHT_W: f32 = 320.0;
+/// The width the right pane starts at (mockup 02), when open.
+const RIGHT_W: f32 = 340.0;
 
 /// What the user asked of the detail screen beyond the diff.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +89,8 @@ pub struct PrDetailState {
     pub filter_bar: filter_bar::FilterBarState,
     /// Whether the top bar's review popover is open (Task 12).
     pub review_open: bool,
+    /// Which details tab the right pane shows (Task 13).
+    pub details_tab: metadata_panel::DetailsTab,
 }
 
 impl Default for PrDetailState {
@@ -104,6 +106,7 @@ impl Default for PrDetailState {
             find_open: false,
             filter_bar: filter_bar::FilterBarState::default(),
             review_open: false,
+            details_tab: metadata_panel::DetailsTab::default(),
         }
     }
 }
@@ -205,12 +208,17 @@ pub fn render(
 
     let right = egui::Panel::right("pr-detail-right")
         .resizable(true)
+        .frame(
+            egui::Frame::new()
+                .fill(crate::ui::theme::palette_of(ui).surface)
+                .inner_margin(egui::Margin::symmetric(12, 8)),
+        )
         .default_size(state.right_pane)
         .show_collapsible(ui, &mut state.right_open, |ui| {
-            // The whole right pane is the metadata panel: description,
-            // chips, referenced issues, commits, checks, and the read-only
-            // timeline (Tasks 50 and 51).
+            // The whole right pane is the tabbed details panel: Overview,
+            // Conversation, Commits, and Checks (Tasks 50, 51, and 13).
             let web = endpoints_for(&session.host).web;
+            let counts = metadata_panel::tab_counts(session);
             metadata_panel::render(
                 ui,
                 metadata_panel::PanelInputs {
@@ -223,6 +231,8 @@ pub fn render(
                     web: &web,
                     repo: &session.repo,
                 },
+                &mut state.details_tab,
+                counts,
             );
         });
     // Only capture while open: the close animation slides the panel through

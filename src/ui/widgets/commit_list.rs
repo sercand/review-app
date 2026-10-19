@@ -1,13 +1,13 @@
-//! The right-pane commits list (Task 50).
-//!
-//! One row per commit — short SHA, subject, author — and each row's SHA is
-//! a link that opens the commit in the browser. The commits endpoint is
-//! read through the session; this widget only draws what arrived.
+//! The details pane's commits tab (Task 50, restyled by redesign Task 13):
+//! message first, the short SHA in accent mono linking to the commit, and a
+//! relative time.
 
-use eframe::egui;
+use eframe::egui::{self, RichText};
 
 use crate::github::commits::Commit;
 use crate::ui::widgets::review_panel::sha7;
+use crate::ui::widgets::thread_view::relative_time;
+use crate::ui::{fonts, theme};
 
 /// Draw `commits`.
 ///
@@ -15,6 +15,7 @@ use crate::ui::widgets::review_panel::sha7;
 /// the commit URL is built from it because the list is what the session
 /// caches, and it carries no URLs of its own.
 pub fn render(ui: &mut egui::Ui, commits: &[Commit], repo_web: &str) {
+    let p = theme::palette_of(ui);
     if commits.is_empty() {
         ui.weak("No commits.");
         return;
@@ -22,17 +23,24 @@ pub fn render(ui: &mut egui::Ui, commits: &[Commit], repo_web: &str) {
     for commit in commits {
         let subject = commit.message.lines().next().unwrap_or_default();
         ui.horizontal(|ui| {
-            if ui.link(sha7(&commit.sha)).clicked() {
-                let url = format!("{repo_web}/commit/{}", commit.sha);
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-            }
-            ui.label(subject);
-        });
-        ui.horizontal(|ui| {
-            ui.weak(format!("by {}", commit.author));
-            if !commit.committed_at.is_empty() {
-                ui.weak(&commit.committed_at);
-            }
+            ui.label(RichText::new(subject).color(p.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !commit.committed_at.is_empty() {
+                    ui.colored_label(p.faint, relative_time(&commit.committed_at));
+                }
+                let sha = ui.add(
+                    egui::Label::new(
+                        RichText::new(sha7(&commit.sha))
+                            .color(p.accent)
+                            .font(fonts::mono_bold(11.0)),
+                    )
+                    .selectable(false),
+                );
+                if sha.on_hover_text("Open in browser").clicked() {
+                    let url = format!("{repo_web}/commit/{}", commit.sha);
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            });
         });
     }
 }
