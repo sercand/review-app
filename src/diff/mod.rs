@@ -5,6 +5,7 @@ pub mod anchor;
 pub mod annotate;
 pub mod expand;
 pub mod highlight;
+pub mod image;
 pub mod local;
 pub mod options;
 pub mod parse;

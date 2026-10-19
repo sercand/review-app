@@ -88,6 +88,79 @@ impl GithubClient {
         Err(classify(&meta, &body, SystemTime::now()))
     }
 
+    /// `GET /repos/{o}/{r}/contents/{encode_path(path)}?ref={sha}` as raw
+    /// bytes, capped at `max` (Task 49).
+    ///
+    /// `Ok(None)` means the blob is over the cap: `Content-Length` is checked
+    /// before any buffering, and the streamed body is abandoned the moment it
+    /// exceeds `max`, so an over-large blob is never held in memory. A read:
+    /// retried under the same policy as [`Self::file_content`].
+    pub async fn file_bytes(
+        &self,
+        repo: &RepoRef,
+        path: &str,
+        sha: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>, GhError> {
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}?ref={}",
+            self.endpoints().rest,
+            repo.owner,
+            repo.name,
+            encode_path(path),
+            sha
+        );
+
+        let mut attempt = 0;
+        loop {
+            match self.get_bytes_once(&url, max).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) if error.is_retryable_read() && attempt < READ_BACKOFF.len() => {
+                    tokio::time::sleep(READ_BACKOFF[attempt]).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One raw byte `GET` with the cap applied, classified like
+    /// [`GithubClient`] classifies its JSON reads.
+    async fn get_bytes_once(&self, url: &str, max: u64) -> Result<Option<Vec<u8>>, GhError> {
+        let response = self
+            .http()
+            .get(url)
+            .header(ACCEPT, HeaderValue::from_static(RAW_ACCEPT))
+            .send()
+            .await
+            .map_err(network)?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+
+        if !(200..300).contains(&status) {
+            let body = response.text().await.map_err(network)?;
+            let meta = ResponseMeta::from_headers(status, &headers);
+            return Err(classify(&meta, &body, SystemTime::now()));
+        }
+
+        // The advertised size settles it without reading a byte of an
+        // over-cap body.
+        if response.content_length().is_some_and(|len| len > max) {
+            return Ok(None);
+        }
+        // Chunked bodies advertise nothing, so read in chunks and bail as
+        // soon as the accumulated size passes the cap.
+        let mut body: Vec<u8> = Vec::new();
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(network)? {
+            if body.len() as u64 + chunk.len() as u64 > max {
+                return Ok(None);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(body))
+    }
+
     /// `GET /repos/{o}/{r}/compare/{base}...{head}` → `merge_base_commit.sha`.
     ///
     /// The merge base is where a locally computed diff reads the base blob:

@@ -16,6 +16,7 @@ use crate::auth::device_flow::{AuthFailure, DeviceCode};
 use crate::auth::device_http::{run_device_flow, HttpDeviceFlow};
 use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
+use crate::diff::image::{ImageBlob, MAX_IMAGE_BYTES};
 use crate::diff::local::local_diff;
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::comments::NewComment;
@@ -209,6 +210,31 @@ pub enum Command {
         /// The path to read the head blob at, if this file has a head side.
         head_path: Option<String>,
     },
+    /// Fetch both sides of an image file's diff (Task 49).
+    ///
+    /// Like [`Command::LoadLargeDiff`], the command carries everything the
+    /// stateless executor needs: the base blob is read at the merge base
+    /// (fetched when the session has not cached one), the head blob at
+    /// `head_sha`, each capped at [`crate::diff::image::MAX_IMAGE_BYTES`].
+    /// A side is `None` when the file has no blob on it.
+    LoadImages {
+        /// The session that asked for the images.
+        session: SessionId,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The repository the file lives in.
+        repo: RepoRef,
+        /// The PR's base SHA, one end of the compare request.
+        base_sha: String,
+        /// The head SHA the diff on screen belongs to.
+        head_sha: String,
+        /// The session's cached merge base, when it has one.
+        merge_base: Option<String>,
+        /// The path to read the base blob at, if this file has a base side.
+        base_path: Option<String>,
+        /// The path to read the head blob at, if this file has a head side.
+        head_path: Option<String>,
+    },
     /// Submit a review built by [`crate::github::reviews::review_payload`]
     /// (spec §7.2).
     SubmitReview {
@@ -386,6 +412,20 @@ pub enum Event {
         diff: FileDiff,
         /// The merge base the base blob was read at.
         merge_base: String,
+    },
+    /// Both sides of an image file's diff arrived (Task 49). A side is
+    /// `Absent` when the file has no blob there or its fetch failed (the
+    /// failure rode along as its own [`Event::Toast`], so one bad blob
+    /// never fails the session), and `TooLarge` when it is over the cap.
+    ImagesLoaded {
+        /// The session that asked for the images.
+        session: SessionId,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The base side, read at the merge base.
+        base: ImageBlob,
+        /// The head side, read at the diff's head SHA.
+        head: ImageBlob,
     },
 }
 
@@ -1018,12 +1058,85 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 merge_base,
             });
         }
+        Command::LoadImages {
+            session,
+            file,
+            repo,
+            base_sha,
+            head_sha,
+            merge_base,
+            base_path,
+            head_path,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // Reads only, so the shared read-retry applies. A side that
+            // cannot be fetched must not fail the session the way a files
+            // page would: the file falls back to its placeholder and the
+            // reviewer sees a toast instead (Task 49).
+            let merge_base = match merge_base {
+                Some(sha) => Some(sha),
+                None => match client.merge_base(&repo, &base_sha, &head_sha).await {
+                    Ok(sha) => Some(sha),
+                    Err(error) => {
+                        events.send(Event::Toast(format!(
+                            "could not find the merge base for the image diff: {error}"
+                        )));
+                        None
+                    }
+                },
+            };
+            let base = match (&base_path, &merge_base) {
+                (Some(path), Some(sha)) => {
+                    fetch_image_side(&client, &repo, path, sha, &events).await
+                }
+                _ => ImageBlob::Absent,
+            };
+            let head = match &head_path {
+                Some(path) => fetch_image_side(&client, &repo, path, &head_sha, &events).await,
+                None => ImageBlob::Absent,
+            };
+            events.send(Event::ImagesLoaded {
+                session,
+                file,
+                base,
+                head,
+            });
+        }
     }
 }
 
 /// Unchanged lines kept around each change in a locally computed diff —
 /// GitHub's own context width for the patches it sends.
 const LOCAL_DIFF_CONTEXT: usize = 3;
+
+/// Fetch one side of an image diff, capped at [`MAX_IMAGE_BYTES`].
+///
+/// Over the cap the blob was never buffered and becomes `TooLarge`; a
+/// failed fetch becomes `Absent` with a toast, so one bad side still leaves
+/// the other side (and the session) intact (Task 49).
+async fn fetch_image_side(
+    client: &GithubClient,
+    repo: &RepoRef,
+    path: &str,
+    sha: &str,
+    events: &EventSender,
+) -> ImageBlob {
+    match client.file_bytes(repo, path, sha, MAX_IMAGE_BYTES).await {
+        Ok(Some(bytes)) => ImageBlob::Bytes(bytes.into()),
+        Ok(None) => ImageBlob::TooLarge,
+        Err(error) => {
+            events.send(Event::Toast(format!("could not load {path}: {error}")));
+            ImageBlob::Absent
+        }
+    }
+}
 
 /// The [`Event::CommentFailed`] id for a failure that has no pending bubble
 /// to roll back — a thread reply, whose composer reports the failure itself.

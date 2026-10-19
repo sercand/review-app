@@ -13,12 +13,13 @@ use std::time::Instant;
 
 use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
 use crate::diff::expand::{expand, gaps, Expand};
+use crate::diff::image::{image_kind, image_sources, image_uri, ImageBlob, ImageKind};
 use crate::diff::options::hide_whitespace_only;
 use crate::diff::row_model::{build, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::comments::NewComment;
 use crate::github::error::GhError;
-use crate::github::files::{FileStatus, LoadedFile};
+use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{review_payload, Review, ServerPendingComment};
 use crate::model::comment::{Anchor, CommentTarget};
@@ -57,6 +58,21 @@ pub struct FallbackPrompt {
     pub message: String,
     /// The comment as it would post if the reviewer accepts.
     pub comment: NewComment,
+}
+
+/// The most all of one session's image blobs may hold at once; the oldest
+/// loaded file is evicted past it (Task 49).
+const MAX_IMAGE_CACHE_BYTES: u64 = 200 * 1024 * 1024;
+
+/// One file's loaded image sides and the bytes they cost the cache.
+#[derive(Debug)]
+pub struct ImageEntry {
+    /// The base side, read at the merge base.
+    pub base: ImageBlob,
+    /// The head side, read at the diff's head SHA.
+    pub head: ImageBlob,
+    /// The bytes both sides buffer.
+    bytes: u64,
 }
 
 /// An immediate comment in flight: what it takes to replace it on success
@@ -143,6 +159,26 @@ pub struct PrSession {
     /// Files already run through [`hide_whitespace_only`] since the option
     /// last changed, so a rebuild never re-filters (or re-stashes) them.
     filtered_files: std::collections::HashSet<u32>,
+    /// Loaded image diffs by file index, evicted oldest-first once the
+    /// total exceeds [`MAX_IMAGE_CACHE_BYTES`] (Task 49).
+    images: HashMap<u32, ImageEntry>,
+    /// File indices in `images`, oldest first: the eviction order.
+    image_lru: std::collections::VecDeque<u32>,
+    /// The bytes `images` currently holds.
+    image_bytes: u64,
+    /// Texture URIs whose blobs were evicted (or dropped with a refresh).
+    /// The session must not know about egui, so the app drains this each
+    /// frame and calls `ctx.forget_image` on every entry.
+    pub evicted_images: Vec<String>,
+    /// Files whose image blobs are in flight or loaded: the lazy trigger
+    /// fires once per file (until eviction allows a re-request).
+    images_requested: std::collections::HashSet<u32>,
+    /// SVG files shown rendered instead of as a text diff (Task 49).
+    pub rendered_svg: std::collections::HashSet<u32>,
+    /// The text diffs stashed while an SVG shows rendered, by file index:
+    /// the row model resolves a file's rows from its diff, so "no diff" is
+    /// what puts the viewer where the lines were.
+    svg_diffs: HashMap<u32, FileDiff>,
     /// The next locally allocated comment id; starts at 1 because 0 is the
     /// reserved "no optimistic bubble" sentinel.
     next_optimistic_id: u64,
@@ -261,6 +297,13 @@ impl PrSession {
             hide_whitespace: false,
             original_diffs: HashMap::new(),
             filtered_files: std::collections::HashSet::new(),
+            images: HashMap::new(),
+            image_lru: std::collections::VecDeque::new(),
+            image_bytes: 0,
+            evicted_images: Vec::new(),
+            images_requested: std::collections::HashSet::new(),
+            rendered_svg: std::collections::HashSet::new(),
+            svg_diffs: HashMap::new(),
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
@@ -513,6 +556,18 @@ impl PrSession {
                 self.rebuild_rows();
                 Vec::new()
             }
+            Event::ImagesLoaded {
+                session,
+                file,
+                base,
+                head,
+            } if *session == self.id => {
+                // The placeholder row already exists, so only the cache
+                // changes; the row's height follows once the viewer lays
+                // out (Task 49).
+                self.put_images(*file, base.clone(), head.clone());
+                Vec::new()
+            }
             Event::Failed {
                 session: Some(session),
                 error,
@@ -537,6 +592,25 @@ impl PrSession {
     /// not the cache's (spec §7.1).
     pub fn refresh(&mut self) -> Vec<Command> {
         self.head_moved = false;
+        // Image blobs belong to the diff being dropped: forget them and
+        // queue their textures for the app to release (Task 49). The paths
+        // are still loaded here, so the URIs are exact.
+        for file in 0..self.files.len() {
+            let file = file as u32;
+            if self.images.contains_key(&file) {
+                let path = self.files[file as usize].file.path.as_str();
+                self.evicted_images
+                    .push(image_uri(self.id.0, file, "base", path));
+                self.evicted_images
+                    .push(image_uri(self.id.0, file, "head", path));
+            }
+        }
+        self.images.clear();
+        self.image_lru.clear();
+        self.image_bytes = 0;
+        self.images_requested.clear();
+        self.rendered_svg.clear();
+        self.svg_diffs.clear();
         self.files.clear();
         self.row_model = build(&[]);
         self.threads.clear();
@@ -797,6 +871,118 @@ impl PrSession {
                 self.original_diffs.entry(file).or_insert(diff);
                 self.files[index].diff = Some(filtered);
             }
+        }
+    }
+
+    /// Whether `file` is an image whose viewer is on screen and whose blobs
+    /// have not been asked for yet (Task 49): a binary raster at its
+    /// placeholder, or an SVG the reviewer switched to rendered.
+    pub fn wants_images(&self, file: u32) -> bool {
+        if self.images_requested.contains(&file) {
+            return false;
+        }
+        let Some(loaded) = self.files.get(file as usize) else {
+            return false;
+        };
+        match image_kind(&loaded.file.path) {
+            Some(ImageKind::Raster) => loaded.file.patch_state == PatchState::Binary,
+            Some(ImageKind::Svg) => self.rendered_svg.contains(&file),
+            None => false,
+        }
+    }
+
+    /// Ask for both sides of an image file's diff (Task 49), once per file.
+    ///
+    /// The command carries everything the stateless executor needs: the
+    /// base blob is read at the merge base — the session's cached one when
+    /// it has one — and the head blob at the diff's head SHA.
+    pub fn load_images(&mut self, file: u32) -> Vec<Command> {
+        if !self.wants_images(file) {
+            return Vec::new();
+        }
+        let Some(loaded) = self.files.get(file as usize) else {
+            return Vec::new();
+        };
+        let Some(metadata) = self.metadata.as_ref() else {
+            return Vec::new();
+        };
+        self.images_requested.insert(file);
+        let (base_path, head_path) = image_sources(&loaded.file);
+        vec![Command::LoadImages {
+            session: self.id,
+            file,
+            repo: self.repo.clone(),
+            base_sha: metadata.base_sha.clone(),
+            head_sha: self
+                .diff_head_sha
+                .clone()
+                .unwrap_or_else(|| metadata.head_sha.clone()),
+            merge_base: self.merge_base.clone(),
+            base_path,
+            head_path,
+        }]
+    }
+
+    /// The loaded image sides of one file, when the cache holds them.
+    pub fn image_for(&self, file: u32) -> Option<&ImageEntry> {
+        self.images.get(&file)
+    }
+
+    /// Show an SVG file rendered instead of as a text diff, or back again
+    /// (Task 49). The text diff is stashed while rendered so un-rendering
+    /// restores exactly what was there.
+    pub fn toggle_rendered_svg(&mut self, file: u32) {
+        if self.rendered_svg.remove(&file) {
+            if let Some(diff) = self.svg_diffs.remove(&file) {
+                if let Some(loaded) = self.files.get_mut(file as usize) {
+                    loaded.diff = Some(diff);
+                }
+                // The restored diff has never seen the whitespace filter.
+                self.filtered_files.remove(&file);
+            }
+        } else {
+            if let Some(loaded) = self.files.get_mut(file as usize) {
+                if let Some(diff) = loaded.diff.take() {
+                    self.svg_diffs.insert(file, diff);
+                }
+            }
+            self.rendered_svg.insert(file);
+        }
+        self.rebuild_rows();
+    }
+
+    /// Store one file's image sides, evicting the oldest-loaded files until
+    /// the cache is back under [`MAX_IMAGE_CACHE_BYTES`]. An evicted file's
+    /// egui texture URIs are recorded in [`Self::evicted_images`] for the
+    /// app to forget, and it may be requested again if it comes back on
+    /// screen (Task 49).
+    fn put_images(&mut self, file: u32, base: ImageBlob, head: ImageBlob) {
+        let bytes = base.size().unwrap_or(0) + head.size().unwrap_or(0);
+        if let Some(old) = self.images.remove(&file) {
+            self.image_bytes -= old.bytes;
+            self.image_lru.retain(|f| *f != file);
+        }
+        self.image_bytes += bytes;
+        self.images.insert(file, ImageEntry { base, head, bytes });
+        self.image_lru.push_back(file);
+        while self.image_bytes > MAX_IMAGE_CACHE_BYTES {
+            let Some(oldest) = self.image_lru.pop_front() else {
+                break;
+            };
+            let Some(entry) = self.images.remove(&oldest) else {
+                continue;
+            };
+            self.image_bytes -= entry.bytes;
+            self.images_requested.remove(&oldest);
+            let path = self
+                .files
+                .get(oldest as usize)
+                .map(|loaded| loaded.file.path.as_str())
+                .unwrap_or_default();
+            self.evicted_images
+                .push(image_uri(self.id.0, oldest, "base", path));
+            self.evicted_images
+                .push(image_uri(self.id.0, oldest, "head", path));
         }
     }
 
@@ -2257,5 +2443,116 @@ mod tests {
         assert_eq!(s.files[0].diff.as_ref().unwrap().hunks.len(), 1);
         assert_eq!(s.files[2].diff.as_ref().unwrap().hunks.len(), 1);
         assert_eq!(s.row_model.rows.len(), before + 4);
+    }
+
+    /// A binary raster file, as the files API describes a PNG.
+    fn png(path: &str) -> crate::github::files::LoadedFile {
+        let mut f = loaded(path, "@@ -1 +1 @@\n-a\n+b\n");
+        f.file.patch = None;
+        f.file.patch_state = crate::github::files::PatchState::Binary;
+        f.diff = None;
+        f
+    }
+
+    #[test]
+    fn images_load_once_and_evict_oldest_past_the_cap() {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        let pngs: Vec<_> = (0..201u32).map(|i| png(&format!("img{i}.png"))).collect();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: pngs,
+            done: true,
+        });
+
+        let cmds = s.load_images(0);
+        assert!(
+            matches!(&cmds[..], [Command::LoadImages { merge_base: None, head_sha, .. }]
+                if head_sha == "sha1"),
+            "the command carries the session's (missing) merge base and head"
+        );
+        assert!(s.load_images(0).is_empty(), "one request per file");
+        assert!(s.wants_images(1));
+        assert!(!s.wants_images(999));
+
+        let blob = || ImageBlob::Bytes(vec![7u8; 1024 * 1024].into());
+        s.on_event(&Event::ImagesLoaded {
+            session: SessionId(2),
+            file: 0,
+            base: ImageBlob::Absent,
+            head: blob(),
+        });
+        assert!(
+            s.image_for(0).is_none(),
+            "an event for another session is dropped"
+        );
+        s.on_event(&Event::ImagesLoaded {
+            session: SessionId(1),
+            file: 0,
+            base: ImageBlob::Absent,
+            head: blob(),
+        });
+        assert!(s.image_for(0).is_some());
+
+        // 201 MB of head blobs over the 200 MB cap: the oldest files are
+        // gone, their textures are queued for the app to forget, and they
+        // may be requested again if they come back on screen.
+        for file in 1..201u32 {
+            s.on_event(&Event::ImagesLoaded {
+                session: SessionId(1),
+                file,
+                base: ImageBlob::Absent,
+                head: blob(),
+            });
+        }
+        assert!(s.image_for(0).is_none());
+        assert!(s.image_for(200).is_some());
+        assert!(s
+            .evicted_images
+            .iter()
+            .any(|uri| uri.ends_with("/0/head.png")));
+        assert!(
+            !s.load_images(0).is_empty(),
+            "an evicted file can be requested again"
+        );
+    }
+
+    #[test]
+    fn rendered_svg_swaps_the_text_diff_for_the_viewer() {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("x.svg", "@@ -1 +1 @@\n-a\n+b\n")],
+            done: true,
+        });
+        assert!(!s.wants_images(0), "an SVG in text mode asks for nothing");
+
+        s.toggle_rendered_svg(0);
+        assert!(s.files[0].diff.is_none(), "the text diff is stashed");
+        assert!(s.row_model.rows.contains(&RowRef::Placeholder { file: 0 }));
+        assert!(s.wants_images(0));
+        assert!(matches!(
+            &s.load_images(0)[..],
+            [Command::LoadImages { .. }]
+        ));
+
+        s.toggle_rendered_svg(0);
+        assert!(
+            s.files[0].diff.is_some(),
+            "the stashed text diff comes back"
+        );
+        assert!(!s.wants_images(0));
+        assert!(s
+            .row_model
+            .rows
+            .iter()
+            .any(|r| matches!(r, RowRef::Line { .. })));
     }
 }

@@ -119,6 +119,10 @@ pub struct ReviewApp {
 impl ReviewApp {
     /// Build the app: load settings, restore any token, and start the worker.
     pub fn new(cc: &eframe::CreationContext<'_>) -> ReviewApp {
+        // The image diff viewer draws through `egui::Image` (Task 49); the
+        // supported formats are the ones enabled on the `image` dependency.
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let config_dir = config_root();
         let settings = Settings::load_or_default(&config_dir);
         let store: Arc<dyn TokenStore> = Arc::new(KeyringStore);
@@ -246,6 +250,10 @@ impl ReviewApp {
             // The session installs the local diff and caches the merge base
             // through `apply_session_event` above.
             Event::LocalDiffReady { .. } => {}
+            // The session stores both sides in its image LRU through
+            // `apply_session_event` above; evictions are drained after the
+            // detail screen paints (Task 49).
+            Event::ImagesLoaded { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -516,6 +524,15 @@ impl ReviewApp {
 
         self.apply_diff_actions(diff_actions, ui.ctx(), now);
 
+        // Blobs the session's image LRU dropped (or a refresh discarded)
+        // must have their egui textures released too (Task 49).
+        if let Some(session) = &mut self.session {
+            let ctx = ui.ctx().clone();
+            for uri in session.evicted_images.drain(..) {
+                ctx.forget_image(&uri);
+            }
+        }
+
         for action in actions {
             match action {
                 PrDetailAction::Back => self.screen = ScreenKind::PrList,
@@ -653,6 +670,18 @@ impl ReviewApp {
                     // Row indices changed, so any find match now points at a
                     // different row (Task 48).
                     self.pr_detail.diff.clear_find();
+                }
+                DiffAction::LoadImages(file) => {
+                    if let Some(session) = &mut self.session {
+                        for command in session.load_images(file) {
+                            self.worker.send(command);
+                        }
+                    }
+                }
+                DiffAction::ToggleRendered(file) => {
+                    if let Some(session) = &mut self.session {
+                        session.toggle_rendered_svg(file);
+                    }
                 }
                 DiffAction::ExpandGap {
                     file,

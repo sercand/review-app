@@ -22,6 +22,7 @@ use egui_extras::{Column, TableBuilder};
 use crate::diff::annotate::rows_for_anchor;
 use crate::diff::expand::Expand;
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
+use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
 use crate::diff::options::{find_matches, next_match, prev_match};
 use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
@@ -30,6 +31,7 @@ use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
 use crate::state::pr_detail::{LoadPhase, PrSession};
 use crate::ui::widgets::comment_composer;
+use crate::ui::widgets::image_diff;
 use crate::ui::widgets::markdown;
 use crate::ui::widgets::thread_view::{self, CommentDrafts, ThreadAction};
 
@@ -69,6 +71,12 @@ pub struct DiffViewState {
     /// A row the surface should scroll to on the next frame — the selected
     /// find match, consumed by [`render`] like [`Self::scroll_to`].
     pub scroll_to_row: Option<usize>,
+    /// How image diffs are drawn (Task 49).
+    pub image_mode: ImageMode,
+    /// The swipe divider position, normalized 0..=1.
+    pub image_swipe: f32,
+    /// The onion skin's head opacity, 0..=1.
+    pub image_opacity: f32,
 }
 
 impl Default for DiffViewState {
@@ -82,6 +90,9 @@ impl Default for DiffViewState {
             find_matches: Vec::new(),
             find_current: None,
             scroll_to_row: None,
+            image_mode: ImageMode::default(),
+            image_swipe: 0.5,
+            image_opacity: 0.5,
         }
     }
 }
@@ -111,6 +122,12 @@ pub enum DiffAction {
     LoadLargeDiff(u32),
     /// Flip the hide-whitespace-only-hunks option (Task 48).
     ToggleHideWhitespace,
+    /// A raster image's (or rendered SVG's) placeholder row became visible
+    /// and its blobs have not been asked for yet (Task 49).
+    LoadImages(u32),
+    /// Switch an SVG file between its text diff and the rendered viewer
+    /// (Task 49).
+    ToggleRendered(u32),
     /// Expand the omitted context before one hunk (Task 45).
     ExpandGap {
         /// The index of the file.
@@ -381,6 +398,7 @@ pub fn render(
         wrap,
         content,
         full_width,
+        state,
         style: &style,
     };
     // The heights are taken out first: the row closure reaches back into the
@@ -433,6 +451,8 @@ struct RowCtx<'a> {
     content: f32,
     /// The table's full width, for rows that span every column.
     full_width: f32,
+    /// The surface's own state, which the image viewer drives (Task 49).
+    state: &'a mut DiffViewState,
     style: &'a RowStyle,
 }
 
@@ -466,12 +486,76 @@ fn render_row(
         }
         RowRef::Placeholder { file } => {
             let index = *file;
-            row.col(|ui| {
-                if let Some(loaded) = ctx.session.files.get(index as usize) {
-                    render_placeholder(ui, index, loaded, actions);
+            let row_index = row.index();
+            match image_slot(ctx.session, index) {
+                ImageSlot::Plain => {
+                    row.col(|ui| {
+                        if let Some(loaded) = ctx.session.files.get(index as usize) {
+                            render_placeholder(ui, index, loaded, actions);
+                        }
+                    });
+                    blank_rest(row, mode);
                 }
-            });
-            blank_rest(row, mode);
+                ImageSlot::Request => {
+                    // The row is on screen for the first time: ask once
+                    // (Task 49's lazy loading).
+                    actions.push(DiffAction::LoadImages(index));
+                    row.col(|ui| {
+                        if let Some(loaded) = ctx.session.files.get(index as usize) {
+                            render_placeholder(ui, index, loaded, actions);
+                        }
+                        ui.spinner();
+                    });
+                    blank_rest(row, mode);
+                }
+                ImageSlot::Loading => {
+                    row.col(|ui| {
+                        ui.spinner();
+                        ui.label("loading image…");
+                    });
+                    blank_rest(row, mode);
+                }
+                ImageSlot::Ready(base, head) => {
+                    // Resolve everything the viewer needs up front so the
+                    // session is free for the height update afterwards.
+                    let Some(loaded) = ctx.session.files.get(index as usize) else {
+                        blank_rest(row, mode);
+                        return;
+                    };
+                    let pr_file = loaded.file.clone();
+                    let session_id = ctx.session.id.0;
+                    let browser_url = ctx
+                        .session
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| format!("{}/files", metadata.html_url));
+                    let full_width = ctx.full_width;
+                    let state = &mut *ctx.state;
+                    let mut height = 0.0;
+                    row.col(|ui| {
+                        height = image_diff::render(
+                            ui,
+                            session_id,
+                            index,
+                            &pr_file,
+                            &base,
+                            &head,
+                            &mut state.image_mode,
+                            &mut state.image_swipe,
+                            &mut state.image_opacity,
+                            browser_url.as_deref(),
+                            full_width,
+                        );
+                    });
+                    // The row grows to the laid-out images; the table
+                    // picks the new height up next frame (Task 49).
+                    let current = ctx.session.row_model.heights()[row_index];
+                    if (current - height).abs() > 1.0 {
+                        ctx.session.row_model.set_height(row_index, height);
+                    }
+                    blank_rest(row, mode);
+                }
+            }
         }
         RowRef::Gap { file, before_hunk } => {
             let (file, before_hunk) = (*file, *before_hunk);
@@ -818,7 +902,59 @@ fn render_file_header(
                 }
             }
         }
+
+        // An SVG has a text patch, so the reviewer picks what the body
+        // shows: the diff lines or the rendered viewer (Task 49).
+        if image_kind(&loaded.file.path) == Some(ImageKind::Svg) {
+            let rendered = session.rendered_svg.contains(&file);
+            if ui.selectable_label(!rendered, "Text").clicked() && rendered {
+                actions.push(DiffAction::ToggleRendered(file));
+            }
+            if ui.selectable_label(rendered, "Rendered").clicked() && !rendered {
+                actions.push(DiffAction::ToggleRendered(file));
+            }
+        }
     });
+}
+
+/// What a placeholder row should draw for an image file (Task 49).
+enum ImageSlot {
+    /// Not an image viewer: the plain placeholder.
+    Plain,
+    /// The viewer belongs here and the blobs have not been asked for yet.
+    Request,
+    /// The blobs are in flight.
+    Loading,
+    /// The blobs are cached: draw the viewer.
+    Ready(ImageBlob, ImageBlob),
+}
+
+/// Decide what this file's placeholder row shows, from the session's image
+/// state (Task 49).
+fn image_slot(session: &PrSession, file: u32) -> ImageSlot {
+    if let Some(entry) = session.image_for(file) {
+        return ImageSlot::Ready(entry.base.clone(), entry.head.clone());
+    }
+    if session.wants_images(file) {
+        ImageSlot::Request
+    } else if is_image_view(session, file) {
+        ImageSlot::Loading
+    } else {
+        ImageSlot::Plain
+    }
+}
+
+/// Whether this file's placeholder row is an image viewer rather than the
+/// plain placeholder text: a binary raster, or an SVG switched to rendered.
+fn is_image_view(session: &PrSession, file: u32) -> bool {
+    let Some(loaded) = session.files.get(file as usize) else {
+        return false;
+    };
+    match image_kind(&loaded.file.path) {
+        Some(ImageKind::Raster) => loaded.file.patch_state == PatchState::Binary,
+        Some(ImageKind::Svg) => session.rendered_svg.contains(&file),
+        None => false,
+    }
 }
 
 /// The placeholder that stands in for a file with no textual diff.
@@ -1137,8 +1273,10 @@ mod tests {
                     );
                 });
                 assert!(
-                    actions.is_empty(),
-                    "painting without input emits no actions"
+                    actions
+                        .iter()
+                        .all(|action| matches!(action, DiffAction::LoadImages(_))),
+                    "painting without input emits nothing but lazy image loads"
                 );
             }
         }

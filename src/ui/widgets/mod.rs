@@ -4,6 +4,7 @@ pub mod comment_composer;
 pub mod diff_view;
 pub mod file_tree;
 pub mod filter_bar;
+pub mod image_diff;
 pub mod markdown;
 pub mod pr_row;
 pub mod review_panel;
