@@ -22,6 +22,8 @@ use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
 use crate::github::metadata::PrMetadata;
+use crate::github::reviews::{viewer_pending_review, Review, ServerPendingComment};
+use crate::model::review::ReviewEvent;
 use crate::model::thread::{ReviewThread, ThreadComment};
 use crate::model::RepoRef;
 
@@ -127,6 +129,42 @@ pub enum Command {
         thread_id: String,
         /// The state to move the thread to.
         resolved: bool,
+    },
+    /// Load a PR's reviews, including the viewer's server-side pending
+    /// review (spec §7.2).
+    LoadReviews {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+    },
+    /// Submit a server-side pending review with the given verdict (spec §7.2).
+    SubmitServerPending {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The pending review's REST id.
+        review_id: u64,
+        /// The verdict to submit it with.
+        event: ReviewEvent,
+        /// The review body.
+        body: String,
+    },
+    /// Discard a server-side pending review, deleting it and its comments.
+    DeleteServerPending {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The pending review's REST id.
+        review_id: u64,
     },
 }
 
@@ -238,6 +276,22 @@ pub enum Event {
         thread_id: String,
         /// The state the thread is now in.
         resolved: bool,
+    },
+    /// A PR's reviews arrived, with the viewer's server-side pending review
+    /// and its comments split out when they have one (spec §7.2).
+    ReviewsLoaded {
+        /// The session that asked for the reviews.
+        session: SessionId,
+        /// The reviews, in API order.
+        reviews: Vec<Review>,
+        /// The viewer's pending review and its comments, when they have one.
+        server_pending: Option<(Review, Vec<ServerPendingComment>)>,
+    },
+    /// A server-side pending review was submitted or discarded; the session
+    /// asks for the reviews again to see the result.
+    ServerPendingResolved {
+        /// The session that asked for the change.
+        session: SessionId,
     },
 }
 
@@ -630,6 +684,118 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                     thread_id,
                     resolved: is_resolved,
                 }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::LoadReviews {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // The viewer's login is what names their own pending review, so
+            // the list is not usable without it; `me()` is a cheap read.
+            let me = match client.me().await {
+                Ok(me) => me,
+                Err(error) => {
+                    events.send(Event::Failed {
+                        session: Some(session),
+                        error,
+                    });
+                    return;
+                }
+            };
+            let reviews = match client.list_reviews(&repo, number).await {
+                Ok(reviews) => reviews,
+                Err(error) => {
+                    events.send(Event::Failed {
+                        session: Some(session),
+                        error,
+                    });
+                    return;
+                }
+            };
+            // A pending review is useless without its comments, so a failure
+            // to fetch them fails the load like any other part of it.
+            let server_pending = match viewer_pending_review(&reviews, &me.user.login) {
+                Some(pending) => {
+                    match client
+                        .pending_review_comments(&repo, number, pending.id)
+                        .await
+                    {
+                        Ok(comments) => Some((pending.clone(), comments)),
+                        Err(error) => {
+                            events.send(Event::Failed {
+                                session: Some(session),
+                                error,
+                            });
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
+            events.send(Event::ReviewsLoaded {
+                session,
+                reviews,
+                server_pending,
+            });
+        }
+        Command::SubmitServerPending {
+            session,
+            repo,
+            number,
+            review_id,
+            event,
+            body,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A mutation: sent once, never retried.
+            match client
+                .submit_server_pending(&repo, number, review_id, event, &body)
+                .await
+            {
+                Ok(_) => events.send(Event::ServerPendingResolved { session }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::DeleteServerPending {
+            session,
+            repo,
+            number,
+            review_id,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A mutation: sent once, never retried.
+            match client.delete_server_pending(&repo, number, review_id).await {
+                Ok(()) => events.send(Event::ServerPendingResolved { session }),
                 Err(error) => events.send(Event::Failed {
                     session: Some(session),
                     error,

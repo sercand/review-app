@@ -1,0 +1,22 @@
+[
+  {
+    "id": 1,
+    "user": { "login": "alice" },
+    "state": "APPROVED",
+    "body": "lgtm",
+    "submitted_at": "2026-10-18T10:00:00Z"
+  },
+  {
+    "id": 2,
+    "user": { "login": "bob" },
+    "state": "CHANGES_REQUESTED",
+    "body": "please fix the tests",
+    "submitted_at": "2026-10-18T11:30:00Z"
+  },
+  {
+    "id": 77,
+    "user": { "login": "me" },
+    "state": "PENDING",
+    "body": "working through this"
+  }
+]

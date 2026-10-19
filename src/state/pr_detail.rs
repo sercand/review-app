@@ -18,6 +18,7 @@ use crate::github::comments::NewComment;
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
+use crate::github::reviews::{Review, ServerPendingComment};
 use crate::model::comment::CommentTarget;
 use crate::model::review::{PendingError, PendingReview};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
@@ -104,6 +105,11 @@ pub struct PrSession {
     pub filters: FilterState,
     /// The PR's review threads, once loaded (spec §7.4).
     pub threads: Vec<ReviewThread>,
+    /// The PR's reviews, once loaded, in API order (spec §7.2).
+    pub reviews: Vec<Review>,
+    /// The viewer's server-side pending review and its comments, when they
+    /// have one; it blocks a local submit (Phase F).
+    pub server_pending: Option<(Review, Vec<ServerPendingComment>)>,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
     /// The live pending-review draft (Phase F submits it), pinned to one
@@ -221,6 +227,8 @@ impl PrSession {
             viewed,
             filters: FilterState::default(),
             threads: Vec::new(),
+            reviews: Vec::new(),
+            server_pending: None,
             composer: ComposerState::default(),
             pending,
             fallback: None,
@@ -244,6 +252,13 @@ impl PrSession {
             // Threads are independent of the head SHA, so they load alongside
             // the metadata rather than waiting for the files.
             Command::LoadThreads {
+                session: id,
+                repo: repo.clone(),
+                number,
+            },
+            // Reviews too: the review panel and the server-pending banner
+            // should be there as soon as the PR opens (spec §7.2).
+            Command::LoadReviews {
                 session: id,
                 repo,
                 number,
@@ -391,6 +406,24 @@ impl PrSession {
                 self.rebuild_rows();
                 Vec::new()
             }
+            Event::ReviewsLoaded {
+                session,
+                reviews,
+                server_pending,
+            } if *session == self.id => {
+                self.reviews = reviews.clone();
+                self.server_pending = server_pending.clone();
+                Vec::new()
+            }
+            Event::ServerPendingResolved { session } if *session == self.id => {
+                // The submit or discard changed GitHub's state; reload the
+                // reviews so the panel and the banner show the result.
+                vec![Command::LoadReviews {
+                    session: self.id,
+                    repo: self.repo.clone(),
+                    number: self.number,
+                }]
+            }
             Event::Failed {
                 session: Some(session),
                 error,
@@ -430,6 +463,11 @@ impl PrSession {
                 number: self.number,
             },
             Command::LoadThreads {
+                session: self.id,
+                repo: self.repo.clone(),
+                number: self.number,
+            },
+            Command::LoadReviews {
                 session: self.id,
                 repo: self.repo.clone(),
                 number: self.number,
@@ -839,7 +877,11 @@ mod tests {
         let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
         assert!(matches!(
             &cmds[..],
-            [Command::LoadPrMetadata { .. }, Command::LoadThreads { .. }]
+            [
+                Command::LoadPrMetadata { .. },
+                Command::LoadThreads { .. },
+                Command::LoadReviews { .. }
+            ]
         ));
         let cmds = s.on_event(&Event::PrMetadataLoaded {
             session: SessionId(1),

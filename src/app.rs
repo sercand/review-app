@@ -215,6 +215,8 @@ impl ReviewApp {
             Event::PrFilesPage { .. } => {}
             Event::PrMetadataLoaded { .. } => {}
             Event::ThreadsLoaded { .. } => {}
+            Event::ReviewsLoaded { .. } => {}
+            Event::ServerPendingResolved { .. } => {}
             Event::CommentPosted { .. } => {}
             Event::ReplyPosted { .. } => {}
             Event::ThreadResolved { .. } => {}
