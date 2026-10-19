@@ -36,6 +36,11 @@ pub enum PrDetailAction {
     Back,
     /// Re-fetch the PR from scratch.
     Refresh,
+    /// Answer the 422 file-level fallback dialog (Task 38).
+    FileFallback {
+        /// Post the file-level comment, or keep editing the line one.
+        accept: bool,
+    },
 }
 
 /// The screen's own layout state, owned across frames by the app.
@@ -107,6 +112,26 @@ pub fn render(
             diff_actions,
         );
     });
+
+    // A line comment GitHub rejected with a 422: offer the same text as a
+    // file-level comment, with GitHub's message as the reason (Task 38).
+    if let Some(prompt) = &session.fallback {
+        egui::Window::new("Could not post the line comment").show(ui, |ui| {
+            ui.label(&prompt.message);
+            ui.label(
+                "The line may have moved out of the diff. You can post the \
+                 same comment on the file instead.",
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Add as a file-level comment").clicked() {
+                    actions.push(PrDetailAction::FileFallback { accept: true });
+                }
+                if ui.button("Keep editing").clicked() {
+                    actions.push(PrDetailAction::FileFallback { accept: false });
+                }
+            });
+        });
+    }
 
     actions
 }
@@ -350,5 +375,48 @@ mod tests {
         assert!(actions.is_empty());
         assert!(diff_actions.is_empty());
         assert!(state.last_layout.is_some());
+    }
+
+    /// The 422 fallback dialog must paint over a loaded session without
+    /// panicking, and emit nothing until the reviewer answers it.
+    #[test]
+    fn the_fallback_dialog_paints_without_answering_itself() {
+        use crate::github::comments::NewComment;
+        use crate::model::comment::CommentTarget;
+        use crate::state::pr_detail::FallbackPrompt;
+
+        let (mut session, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        session.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        session.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("src/a.rs", "@@ -1 +1 @@\n-a\n+b\n")],
+            done: true,
+        });
+        session.fallback = Some(FallbackPrompt {
+            message: "Validation Failed: line must be part of the diff".into(),
+            comment: NewComment {
+                commit_id: "sha1".into(),
+                body: "keep me".into(),
+                target: CommentTarget::File {
+                    path: "src/a.rs".into(),
+                },
+            },
+        });
+
+        let mut state = PrDetailState::default();
+        let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new()));
+        let mut diff_actions = Vec::new();
+        let mut actions = Vec::new();
+        egui::__run_test_ui(|ui| {
+            actions = render(ui, &mut session, &mut state, &mut cache, &mut diff_actions);
+        });
+        assert!(
+            actions.is_empty(),
+            "an unanswered dialog emits no actions, and the text is kept"
+        );
+        assert!(session.fallback.is_some());
     }
 }

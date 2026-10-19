@@ -6,6 +6,8 @@
 //! changed for a single-line comment — a range already pins both ends
 //! (spec §7.3).
 
+use crate::github::comments::NewComment;
+use crate::github::error::GhError;
 use crate::model::comment::CommentTarget;
 use crate::model::diff::Side;
 
@@ -73,6 +75,51 @@ pub enum ComposerAction {
     TogglePreview,
     /// Append a suggestion block for the anchored rows.
     InsertSuggestion,
+}
+
+/// Whether the composer stays open after a failed post, and what it offers.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PostOutcome {
+    /// A server or network failure: the text is kept and only a manual
+    /// retry button is offered — mutations are never retried automatically.
+    Retryable(GhError),
+    /// A 422 on a line anchor: GitHub rejected the coordinate, so posting
+    /// the same text as a file-level comment can still succeed. Carries
+    /// GitHub's message for the dialog.
+    NeedsFileLevelFallback(String),
+    /// Anything else: show the error and let the reviewer edit or cancel.
+    Fatal(GhError),
+}
+
+/// Decide what a failed post means for the composer (spec §7.1).
+///
+/// A `Validation` (422) on a **line** target is the "line must be part of
+/// the diff" case that a file-level comment survives; a 422 on a file
+/// target has nowhere further to fall back to.
+pub fn interpret_post_error(target: &CommentTarget, error: GhError) -> PostOutcome {
+    match error {
+        GhError::Validation(message) => match target {
+            CommentTarget::Line(_) => PostOutcome::NeedsFileLevelFallback(message),
+            CommentTarget::File { .. } => PostOutcome::Fatal(GhError::Validation(message)),
+        },
+        error @ (GhError::Server(_) | GhError::Network(_)) => PostOutcome::Retryable(error),
+        error => PostOutcome::Fatal(error),
+    }
+}
+
+/// The same comment re-anchored to the file: body and commit kept, only
+/// the target gives up its coordinates (spec §7.3).
+pub fn fallback_comment(c: &NewComment) -> NewComment {
+    NewComment {
+        commit_id: c.commit_id.clone(),
+        body: c.body.clone(),
+        target: CommentTarget::File {
+            path: match &c.target {
+                CommentTarget::Line(anchor) => anchor.path.clone(),
+                CommentTarget::File { path } => path.clone(),
+            },
+        },
+    }
 }
 
 /// The mode GitHub defaults to when the composer opens.
@@ -267,5 +314,42 @@ mod tests {
         assert!(!can_submit(&s));
         reduce(&mut s, ComposerMsg::SetBody("comment".into()));
         assert!(can_submit(&s));
+    }
+
+    #[test]
+    fn validation_on_a_line_offers_file_level_fallback() {
+        let line = CommentTarget::Line(line_anchor("src/a.rs", 3));
+        assert!(matches!(
+            interpret_post_error(
+                &line,
+                GhError::Validation("line must be part of the diff".into())
+            ),
+            PostOutcome::NeedsFileLevelFallback(m) if m.contains("part of the diff")
+        ));
+        assert!(matches!(
+            interpret_post_error(&line, GhError::Network("x".into())),
+            PostOutcome::Retryable(_)
+        ));
+        let file = CommentTarget::File {
+            path: "src/a.rs".into(),
+        };
+        assert!(matches!(
+            interpret_post_error(&file, GhError::Validation("x".into())),
+            PostOutcome::Fatal(_)
+        ));
+
+        let fb = fallback_comment(&NewComment {
+            commit_id: "s".into(),
+            body: "b".into(),
+            target: line,
+        });
+        assert_eq!(
+            fb.target,
+            CommentTarget::File {
+                path: "src/a.rs".into()
+            }
+        );
+        assert_eq!(fb.commit_id, "s");
+        assert_eq!(fb.body, "b");
     }
 }

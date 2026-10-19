@@ -23,7 +23,10 @@ use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
 use crate::persist::session::{self, DebouncedWriter, SessionFile};
 use crate::runtime::{Command, Event, SessionId, NO_OPTIMISTIC_BUBBLE};
-use crate::state::composer::{self, can_submit, CommentMode, ComposerMsg, ComposerState};
+use crate::state::composer::{
+    self, can_submit, fallback_comment, interpret_post_error, CommentMode, ComposerMsg,
+    ComposerState, PostOutcome,
+};
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
 
@@ -52,6 +55,16 @@ pub struct PendingComment {
     pub body: String,
 }
 
+/// A 422 on a line anchor: GitHub's message and the same comment re-anchored
+/// to the file, offered to the reviewer as a dialog (Task 38, spec §7.1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FallbackPrompt {
+    /// GitHub's validation message, shown verbatim.
+    pub message: String,
+    /// The comment as it would post if the reviewer accepts.
+    pub comment: NewComment,
+}
+
 /// An immediate comment in flight: what it takes to replace it on success
 /// or roll it back on failure.
 #[derive(Clone, Debug)]
@@ -60,6 +73,9 @@ struct OptimisticPost {
     optimistic_id: u64,
     /// Where the placeholder thread was pushed in `threads`.
     thread_index: usize,
+    /// The commit the post was anchored to, so a fallback re-posts against
+    /// the same commit the reviewer saw.
+    commit_id: String,
     /// The body, restored to the composer if the post fails.
     body: String,
     /// The anchor, restored to the composer if the post fails.
@@ -103,6 +119,9 @@ pub struct PrSession {
     pub composer: ComposerState,
     /// Comments held for the pending review, in the order they were added.
     pub pending: Vec<PendingComment>,
+    /// A line post rejected with a 422, awaiting the reviewer's decision
+    /// on the file-level fallback.
+    pub fallback: Option<FallbackPrompt>,
     /// The next locally allocated comment id; starts at 1 because 0 is the
     /// reserved "no optimistic bubble" sentinel.
     next_optimistic_id: u64,
@@ -183,6 +202,7 @@ impl PrSession {
             threads: Vec::new(),
             composer: ComposerState::default(),
             pending: Vec::new(),
+            fallback: None,
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
@@ -304,6 +324,20 @@ impl PrSession {
                             self.composer.body = post.body.clone();
                             self.composer.mode = CommentMode::Immediate;
                             self.composer.error = Some(error.to_string());
+                            // A 422 on a line anchor offers the file-level
+                            // fallback; everything else just shows the error.
+                            if let PostOutcome::NeedsFileLevelFallback(message) =
+                                interpret_post_error(&post.target, error.clone())
+                            {
+                                self.fallback = Some(FallbackPrompt {
+                                    message,
+                                    comment: fallback_comment(&NewComment {
+                                        commit_id: post.commit_id.clone(),
+                                        body: post.body.clone(),
+                                        target: post.target.clone(),
+                                    }),
+                                });
+                            }
                         } else {
                             self.optimistic = Some(post);
                         }
@@ -360,6 +394,7 @@ impl PrSession {
         self.row_model = build(&[]);
         self.threads.clear();
         self.optimistic = None;
+        self.fallback = None;
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -519,6 +554,7 @@ impl PrSession {
         self.optimistic = Some(OptimisticPost {
             optimistic_id,
             thread_index,
+            commit_id: commit_id.clone(),
             body: body.clone(),
             target: target.clone(),
         });
@@ -558,6 +594,25 @@ impl PrSession {
         self.pending.retain(|p| p.local_id != local_id);
         self.rebuild_rows();
         self.mark_session_dirty(now);
+    }
+
+    /// Post the 422 fallback: the same text as a file-level comment, as a
+    /// fresh optimistic immediate post. The composer text stays until this
+    /// one succeeds.
+    pub fn post_fallback(&mut self, author: &str, now: Instant) -> Vec<Command> {
+        let Some(prompt) = self.fallback.take() else {
+            return Vec::new();
+        };
+        self.composer.target = Some(prompt.comment.target.clone());
+        self.composer.body = prompt.comment.body.clone();
+        self.composer.mode = CommentMode::Immediate;
+        self.composer.error = None;
+        self.submit_comment(CommentMode::Immediate, author, now)
+    }
+
+    /// Close the fallback dialog; the composer keeps its text for editing.
+    pub fn dismiss_fallback(&mut self) {
+        self.fallback = None;
     }
 
     /// Take the next local comment id. Never 0: that id is the reserved
@@ -997,6 +1052,93 @@ mod tests {
         s.delete_pending(1, Instant::now());
         assert!(s.pending.is_empty());
         assert!(!s.row_model.rows.contains(&RowRef::Pending { local_id: 1 }));
+    }
+
+    #[test]
+    fn a_422_on_a_line_offers_the_file_level_fallback() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "this line moved");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+
+        s.on_event(&Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Validation("Validation Failed: line must be part of the diff".into()),
+        });
+        let prompt = s.fallback.as_ref().expect("a line 422 offers the fallback");
+        assert!(prompt.message.contains("part of the diff"));
+        assert_eq!(
+            prompt.comment.target,
+            CommentTarget::File {
+                path: "a.rs".into()
+            },
+            "the fallback keeps the body and commit and drops the coordinates"
+        );
+        assert_eq!(prompt.comment.commit_id, "sha1");
+        assert_eq!(prompt.comment.body, "this line moved");
+        assert_eq!(
+            s.composer.body, "this line moved",
+            "the composer text is kept until a post succeeds"
+        );
+
+        // Accepting posts the file-level comment as a new optimistic post.
+        let cmds = s.post_fallback("me", Instant::now());
+        assert!(
+            matches!(
+                &cmds[..],
+                [Command::PostComment {
+                    optimistic_id: 2,
+                    ..
+                }]
+            ),
+            "the fallback reuses the immediate-post path with a fresh id"
+        );
+        assert!(s.fallback.is_none());
+        assert_eq!(s.threads.len(), 1);
+        assert_eq!(
+            s.threads[0].subject_type,
+            SubjectType::File,
+            "the placeholder is a file-level thread"
+        );
+
+        // A success clears the composer and leaves no prompt behind.
+        s.on_event(&Event::CommentPosted {
+            session: SessionId(1),
+            optimistic_id: 2,
+            comment: comment(77, "this line moved"),
+        });
+        assert!(s.fallback.is_none());
+        assert!(s.composer.target.is_none());
+    }
+
+    #[test]
+    fn a_server_error_keeps_the_text_but_offers_no_fallback() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "transient");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+        s.on_event(&Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Server(502),
+        });
+        assert!(s.fallback.is_none(), "5xx is retryable, not a fallback");
+        assert_eq!(s.composer.body, "transient");
+    }
+
+    #[test]
+    fn dismissing_the_fallback_keeps_the_composer_text() {
+        let mut s = loaded_session();
+        open_composer(&mut s, "keep me");
+        s.submit_comment(CommentMode::Immediate, "me", Instant::now());
+        s.on_event(&Event::CommentFailed {
+            session: SessionId(1),
+            optimistic_id: 1,
+            error: GhError::Validation("nope".into()),
+        });
+        assert!(s.fallback.is_some());
+        s.dismiss_fallback();
+        assert!(s.fallback.is_none());
+        assert_eq!(s.composer.body, "keep me");
     }
 
     #[test]

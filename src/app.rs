@@ -471,6 +471,7 @@ impl ReviewApp {
 
         self.apply_diff_actions(diff_actions, ui.ctx(), now);
 
+        let login = self.login();
         for action in actions {
             match action {
                 PrDetailAction::Back => self.screen = ScreenKind::PrList,
@@ -478,6 +479,17 @@ impl ReviewApp {
                     if let Some(session) = &mut self.session {
                         for command in session.refresh() {
                             self.worker.send(command);
+                        }
+                    }
+                }
+                PrDetailAction::FileFallback { accept } => {
+                    if let Some(session) = &mut self.session {
+                        if accept {
+                            for command in session.post_fallback(&login, now) {
+                                self.worker.send(command);
+                            }
+                        } else {
+                            session.dismiss_fallback();
                         }
                     }
                 }
