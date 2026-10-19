@@ -4,3 +4,4 @@
 pub mod anchor;
 pub mod highlight;
 pub mod parse;
+pub mod row_model;

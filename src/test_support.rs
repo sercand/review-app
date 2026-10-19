@@ -75,3 +75,30 @@ pub fn pr_summary(number: u64, title: &str, comments: u32) -> crate::model::pr::
         url: format!("https://github.com/o/r/pull/{number}"),
     }
 }
+
+/// Every row of `patch`, flattened across its hunks.
+pub fn rows_from(patch: &str) -> Vec<crate::model::diff::DiffRow> {
+    parse(patch)
+        .into_iter()
+        .flat_map(|hunk| hunk.rows)
+        .collect()
+}
+
+/// A [`crate::github::files::LoadedFile`] at `path` carrying `patch`, with the
+/// patch already parsed into its diff.
+pub fn loaded(path: &str, patch: &str) -> crate::github::files::LoadedFile {
+    crate::github::files::LoadedFile {
+        file: crate::github::files::PrFile {
+            patch: Some(patch.to_owned()),
+            ..file(path)
+        },
+        diff: Some(crate::model::diff::FileDiff {
+            hunks: parse(patch),
+        }),
+    }
+}
+
+/// Parse a test patch, panicking on a malformed one.
+fn parse(patch: &str) -> Vec<crate::model::diff::Hunk> {
+    crate::diff::parse::parse_patch(patch).expect("the test patch should parse")
+}
