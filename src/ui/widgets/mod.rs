@@ -12,5 +12,6 @@ pub mod markdown;
 pub mod metadata_panel;
 pub mod pr_row;
 pub mod review_panel;
+pub mod settings_window;
 pub mod thread_view;
 pub mod toast;

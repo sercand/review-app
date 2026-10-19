@@ -23,6 +23,7 @@ use crate::model::comment::CommentTarget;
 use crate::model::review::ReviewEvent;
 use crate::model::RepoRef;
 use crate::persist::config_root;
+use crate::persist::session::DebouncedWriter;
 use crate::persist::settings::Settings;
 use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
@@ -38,6 +39,7 @@ use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
 use crate::ui::widgets::command_palette::{self, PaletteState};
 use crate::ui::widgets::diff_view::{DiffAction, DiffMode};
 use crate::ui::widgets::review_panel::ReviewAction;
+use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::toast::Toasts;
 
@@ -115,6 +117,9 @@ pub struct ReviewApp {
     toasts: Toasts,
     palette: PaletteState,
     help_open: bool,
+    settings_window: SettingsWindowState,
+    settings_writer: DebouncedWriter,
+    applied_theme: Option<egui::Theme>,
     settings: Settings,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
@@ -181,6 +186,9 @@ impl ReviewApp {
             toasts: Toasts::default(),
             palette: PaletteState::default(),
             help_open: false,
+            settings_window: SettingsWindowState::default(),
+            settings_writer: DebouncedWriter::default(),
+            applied_theme: None,
             settings,
             config_dir,
             store,
@@ -317,9 +325,7 @@ impl ReviewApp {
 
     /// Drop the loaded rows, so one account's PRs never show under another's.
     ///
-    /// Only sign-out calls this today; the settings window (Task 53) is the
-    /// next caller, so it is kept rather than inlined.
-    #[allow(dead_code)]
+    /// Sign-out and a settings host change call this.
     fn reset_pr_list(&mut self) {
         self.pr_list = PrListState::default();
         self.pr_list.scopes = self.settings.default_scopes.clone();
@@ -361,9 +367,7 @@ impl ReviewApp {
 
     /// Sign out: clear the keychain entry and the cached account.
     ///
-    /// Reached from the settings window in Task 53; the temporary placeholder
-    /// button it used to back is gone now that the detail screen is real.
-    #[allow(dead_code)]
+    /// Reached from the settings window's Sign out button (Task 53).
     fn perform_sign_out(&mut self, now: Instant) {
         match sign_out(self.store.as_ref(), &mut self.settings) {
             Ok(()) => {
@@ -389,6 +393,84 @@ impl ReviewApp {
             tracing::warn!(%error, "could not save settings");
             self.toasts
                 .push(format!("could not save settings: {error}"), now);
+        }
+    }
+
+    /// Open the settings window on a fresh copy of the current settings.
+    fn open_settings(&mut self) {
+        self.settings_window.open_with(&self.settings);
+    }
+
+    /// Fold the settings window's actions in: Save persists (and a host
+    /// change ends the session, since the stored token belongs to the old
+    /// host), and Sign out rides the existing sign-out flow (RULING R10).
+    fn apply_settings_actions(&mut self, actions: Vec<SettingsAction>, now: Instant) {
+        for action in actions {
+            match action {
+                SettingsAction::Apply(vm) => {
+                    let host_changed = vm.apply(&mut self.settings);
+                    self.save_settings(now);
+                    if host_changed {
+                        self.exec.clear_client();
+                        self.session = None;
+                        self.screen = ScreenKind::Login;
+                        self.reset_pr_list();
+                        // The login screen's fields must show the host the
+                        // user just chose, not the one from startup.
+                        self.login_form.host_input = self.settings.host.clone();
+                        self.login_form.client_id_input =
+                            self.settings.client_id.clone().unwrap_or_default();
+                        self.toasts
+                            .push("host changed, please sign in again".to_owned(), now);
+                    }
+                }
+                SettingsAction::SignOut => self.perform_sign_out(now),
+            }
+        }
+    }
+
+    /// Apply the theme preference against the OS's current light/dark flag.
+    ///
+    /// `ctx.system_theme()` keeps reporting the OS value after an override,
+    /// so `System` follows a mid-session OS switch; the other preferences
+    /// ignore it.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let system_dark = ctx.system_theme() == Some(egui::Theme::Dark);
+        let desired = self.settings.theme.resolve(system_dark);
+        if self.applied_theme != Some(desired) {
+            ctx.set_theme(desired);
+            self.applied_theme = Some(desired);
+        }
+    }
+
+    /// Feed the detail screen's pane geometry back into the settings and
+    /// persist it through the debounce (Task 53).
+    fn sync_layout(&mut self, now: Instant) {
+        if self.screen == ScreenKind::PrDetail {
+            let mut dirty = false;
+            let left = self.pr_detail.left_pane;
+            if (left - self.settings.layout.left_pane).abs() > 0.5 {
+                self.settings.layout.left_pane = left;
+                dirty = true;
+            }
+            if self.pr_detail.right_open {
+                let right = self.pr_detail.right_pane;
+                if (right - self.settings.layout.right_pane).abs() > 0.5 {
+                    self.settings.layout.right_pane = right;
+                    dirty = true;
+                }
+            }
+            if self.pr_detail.right_open != self.settings.layout.right_open {
+                self.settings.layout.right_open = self.pr_detail.right_open;
+                dirty = true;
+            }
+            if dirty {
+                self.settings_writer.mark_dirty(now);
+            }
+        }
+        if self.settings_writer.should_flush(now) {
+            self.settings_writer.flushed();
+            self.save_settings(now);
         }
     }
 
@@ -477,6 +559,7 @@ impl ReviewApp {
                     }
                 }
                 PrListAction::Open { repo, number } => self.open_pr(repo, number),
+                PrListAction::Settings => self.open_settings(),
             }
         }
     }
@@ -491,7 +574,14 @@ impl ReviewApp {
         self.session = Some(session);
         // The detail screen's per-PR state — the diff layout, reply drafts,
         // and expanded threads — belongs to the PR being left, not this one.
-        self.pr_detail = PrDetailState::default();
+        // The pane geometry is the user's global layout, restored from
+        // settings (Task 53).
+        self.pr_detail = PrDetailState {
+            left_pane: self.settings.layout.left_pane,
+            right_pane: self.settings.layout.right_pane,
+            right_open: self.settings.layout.right_open,
+            ..PrDetailState::default()
+        };
         for command in commands {
             self.worker.send(command);
         }
@@ -575,6 +665,7 @@ impl ReviewApp {
                         self.worker.send(command);
                     }
                 }
+                PrDetailAction::OpenSettings => self.open_settings(),
             }
         }
     }
@@ -860,6 +951,7 @@ impl ReviewApp {
                 self.palette.open_now();
                 self.help_open = false;
             }
+            "settings" => self.open_settings(),
             "help" => self.help_open = !self.help_open,
             "close" => self.dispatch_close(),
             "next_file" => self.step_file(true, now),
@@ -896,6 +988,10 @@ impl ReviewApp {
         }
         if self.help_open {
             self.help_open = false;
+            return;
+        }
+        if self.settings_window.open {
+            self.settings_window.close();
             return;
         }
         if let Some(session) = &mut self.session {
@@ -1086,20 +1182,33 @@ impl eframe::App for ReviewApp {
             self.handle_event(event, now);
         }
 
+        let ctx = ui.ctx().clone();
+        self.apply_theme(&ctx);
+
         // Global shortcuts run before the screens draw, so a `scroll_to` set
         // by `j`/`k` is consumed by the diff on this very frame.
-        let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx, now);
         self.render_screen(ui, now);
+        self.sync_layout(now);
 
-        // The palette and the help overlay float above every screen. The
-        // palette runs its selection through the same dispatch as a keybinding.
+        // The palette, the settings window, and the help overlay float above
+        // every screen. The palette runs its selection through the same
+        // dispatch as a keybinding.
         let entries = command::registry();
         let mut palette_actions: Vec<&'static str> = Vec::new();
         command_palette::render(&ctx, &mut self.palette, &entries, &mut palette_actions);
         for action in palette_actions {
             self.dispatch(action, now);
         }
+        let mut settings_actions = Vec::new();
+        let signed_in = self.settings.account.is_some();
+        settings_window::render(
+            &ctx,
+            &mut self.settings_window,
+            signed_in,
+            &mut settings_actions,
+        );
+        self.apply_settings_actions(settings_actions, now);
         command_palette::render_help(&ctx, &mut self.help_open, &entries);
 
         self.toasts.render(ui, now);
@@ -1110,6 +1219,11 @@ impl eframe::App for ReviewApp {
     fn on_exit(&mut self) {
         if let Some(session) = &mut self.session {
             session.flush_session();
+        }
+        // A pane drag still inside its debounce window must not be lost (Task 53).
+        if self.settings_writer.is_dirty() {
+            self.settings_writer.flushed();
+            self.save_settings(Instant::now());
         }
     }
 }

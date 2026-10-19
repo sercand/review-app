@@ -47,6 +47,8 @@ pub enum PrListAction {
         /// The PR number.
         number: u64,
     },
+    /// Open the settings window (Task 53).
+    Settings,
 }
 
 /// The chip label for a scope.
@@ -123,6 +125,11 @@ pub fn render(
         if state.loading {
             ui.spinner();
         }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Settings").clicked() {
+                actions.push(PrListAction::Settings);
+            }
+        });
     });
     if let Some(error) = &state.error {
         let color = ui.visuals().error_fg_color;

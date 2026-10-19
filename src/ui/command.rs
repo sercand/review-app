@@ -27,6 +27,11 @@ pub fn registry() -> Vec<ActionEntry> {
             keybinding: Some("Cmd+K"),
         },
         ActionEntry {
+            id: "settings",
+            label: "Open settings",
+            keybinding: None,
+        },
+        ActionEntry {
             id: "help",
             label: "Show keyboard shortcuts",
             keybinding: Some("?"),

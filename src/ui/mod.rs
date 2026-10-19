@@ -5,4 +5,5 @@
 
 pub mod command;
 pub mod screens;
+pub mod theme;
 pub mod widgets;

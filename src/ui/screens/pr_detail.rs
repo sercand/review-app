@@ -49,10 +49,12 @@ pub enum PrDetailAction {
     },
     /// A control the review panel reported (Task 44).
     Review(ReviewAction),
+    /// Open the settings window (Task 53).
+    OpenSettings,
 }
 
 /// The screen's own layout state, owned across frames by the app.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PrDetailState {
     /// The diff surface's mode and wrap.
     pub diff: DiffViewState,
@@ -61,11 +63,32 @@ pub struct PrDetailState {
     /// The row of the hunk `n`/`p` last moved to, so the pair walks the
     /// current file's hunks instead of jumping to one each time (Task 52).
     pub hunk_row: Option<usize>,
+    /// The left pane's current outer width: seeded from the saved layout on
+    /// open, fed back from the panel every frame (Task 53).
+    pub left_pane: f32,
+    /// The right pane's current outer width, same round trip; only captured
+    /// while the pane is open, so the close animation never saves a shrunk
+    /// width.
+    pub right_pane: f32,
     /// The `(wrap, content width)` the line heights were measured for, so a
     /// width change only re-measures when it actually matters (spec §8.4).
     pub last_layout: Option<(bool, f32)>,
     /// Reply texts and manually expanded threads, by thread node id.
     pub drafts: CommentDrafts,
+}
+
+impl Default for PrDetailState {
+    fn default() -> Self {
+        PrDetailState {
+            diff: DiffViewState::default(),
+            right_open: false,
+            hunk_row: None,
+            left_pane: LEFT_W,
+            right_pane: RIGHT_W,
+            last_layout: None,
+            drafts: CommentDrafts::default(),
+        }
+    }
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -93,12 +116,15 @@ pub fn render(
         render_top_bar(ui, session, state, &mut actions);
     });
 
-    egui::Panel::left("pr-detail-left")
+    let left = egui::Panel::left("pr-detail-left")
         .resizable(true)
-        .default_size(LEFT_W)
+        .default_size(state.left_pane)
         .show(ui, |ui| {
             render_files_pane(ui, session, &pr_files, &mut tree_actions);
         });
+    // The panel's response carries its outer rect — the same measure
+    // `default_size` consumes — so the saved width restores exactly (Task 53).
+    state.left_pane = left.response.rect.width();
 
     // Fold the tree's actions in before the diff draws, so selecting a file
     // scrolls it into view on this very frame.
@@ -106,9 +132,9 @@ pub fn render(
         apply_tree_action(session, &pr_files, state, action, Instant::now());
     }
 
-    egui::Panel::right("pr-detail-right")
+    let right = egui::Panel::right("pr-detail-right")
         .resizable(true)
-        .default_size(RIGHT_W)
+        .default_size(state.right_pane)
         .show_collapsible(ui, &mut state.right_open, |ui| {
             // The whole right pane is the metadata panel: description,
             // chips, referenced issues, commits, checks, and the read-only
@@ -128,6 +154,14 @@ pub fn render(
                 },
             );
         });
+    // Only capture while open: the close animation slides the panel through
+    // every smaller width on its way out, and none of those are the size the
+    // user chose.
+    if state.right_open {
+        if let Some(right) = right {
+            state.right_pane = right.response.rect.width();
+        }
+    }
 
     // The review panel sits under the diff, always visible: it is where the
     // draft is edited and submitted (spec §7.2). Its actions ride out as
@@ -335,6 +369,9 @@ fn render_top_bar(
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Settings").clicked() {
+                actions.push(PrDetailAction::OpenSettings);
+            }
             let toggle = if state.right_open {
                 "Hide details"
             } else {

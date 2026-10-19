@@ -9,6 +9,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::github::search::Scope;
+use crate::ui::theme::Theme;
 
 /// The cached identity of the signed-in account.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -21,6 +22,20 @@ pub struct Account {
     pub avatar_url: Option<String>,
     /// The scopes GitHub granted, e.g. `["repo", "read:org"]`.
     pub scopes: Vec<String>,
+}
+
+/// The window layout the user left the app in (Task 53).
+///
+/// Tree collapse state is per PR and lives in the session file instead.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    /// The file-tree pane's width.
+    pub left_pane: f32,
+    /// The metadata pane's width.
+    pub right_pane: f32,
+    /// Whether the metadata pane is open.
+    pub right_open: bool,
 }
 
 /// User settings, persisted as `settings.toml` in the config directory.
@@ -40,6 +55,10 @@ pub struct Settings {
     /// (A field-level `#[serde(default)]` would override that with `Vec::new()`
     /// and leave the list showing nothing.)
     pub default_scopes: Vec<Scope>,
+    /// The theme preference, defaulted the same container-level way.
+    pub theme: Theme,
+    /// The pane sizes and open/closed state, defaulted the same way.
+    pub layout: Layout,
 }
 
 impl Default for Settings {
@@ -49,6 +68,14 @@ impl Default for Settings {
             client_id: None,
             account: None,
             default_scopes: vec![Scope::ReviewRequested, Scope::Assigned, Scope::Authored],
+            theme: Theme::default(),
+            // The detail screen's starting pane sizes; the user's own sizes
+            // overwrite these as soon as they drag a divider.
+            layout: Layout {
+                left_pane: 240.0,
+                right_pane: 320.0,
+                right_open: false,
+            },
         }
     }
 }
@@ -143,5 +170,17 @@ mod tests {
             Settings::load_or_default(dir.path()).default_scopes,
             vec![Scope::Assigned]
         );
+    }
+
+    #[test]
+    fn layout_survives_save_load() {
+        let dir = tempdir();
+        let mut s = Settings::load_or_default(dir.path());
+        s.layout.left_pane = 321.0;
+        s.layout.right_open = false;
+        s.save(dir.path()).unwrap();
+        let r = Settings::load_or_default(dir.path());
+        assert_eq!(r.layout.left_pane, 321.0);
+        assert!(!r.layout.right_open);
     }
 }
