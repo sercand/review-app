@@ -8,6 +8,8 @@
 
 use eframe::egui;
 
+use std::time::Instant;
+
 use crate::diff::highlight::HighlightCache;
 use crate::diff::row_model::{display_text, RowRef, ROW_H};
 use crate::github::files::PrFile;
@@ -80,7 +82,7 @@ pub fn render(
     // Fold the tree's actions in before the diff draws, so selecting a file
     // scrolls it into view on this very frame.
     for action in tree_actions {
-        apply_tree_action(session, &pr_files, state, action);
+        apply_tree_action(session, &pr_files, state, action, Instant::now());
     }
 
     egui::Panel::right("pr-detail-right")
@@ -183,11 +185,15 @@ fn filtered_progress(
 }
 
 /// Fold one file-tree action into the session (and the diff's scroll target).
+///
+/// Every action changes state the session file persists, so it marks the
+/// session dirty and the debounced writer picks the change up next frame.
 fn apply_tree_action(
     session: &mut PrSession,
     pr_files: &[PrFile],
     state: &mut PrDetailState,
     action: TreeAction,
+    now: Instant,
 ) {
     match action {
         TreeAction::ToggleCollapsed(path) => {
@@ -214,6 +220,7 @@ fn apply_tree_action(
             }
         }
     }
+    session.mark_session_dirty(now);
 }
 
 /// The top bar: back, `repo#number`, title, refresh, and the right-pane toggle.

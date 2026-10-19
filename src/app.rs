@@ -374,7 +374,7 @@ impl ReviewApp {
         match self.screen {
             ScreenKind::Login => self.render_login(ui, now),
             ScreenKind::PrList => self.render_pr_list(ui),
-            ScreenKind::PrDetail => self.render_pr_detail(ui),
+            ScreenKind::PrDetail => self.render_pr_detail(ui, now),
         }
     }
 
@@ -437,11 +437,14 @@ impl ReviewApp {
     ///
     /// Without an open session there is nothing to draw — a 401 clears it — so
     /// the screen falls back to the list.
-    fn render_pr_detail(&mut self, ui: &mut egui::Ui) {
+    fn render_pr_detail(&mut self, ui: &mut egui::Ui, now: Instant) {
         let Some(session) = &mut self.session else {
             self.screen = ScreenKind::PrList;
             return;
         };
+
+        // Flush any debounced session change whose window has elapsed.
+        session.tick(now);
 
         let mut diff_actions = Vec::new();
         let actions = pr_detail::render(
@@ -494,6 +497,14 @@ impl eframe::App for ReviewApp {
         }
         self.render_screen(ui, now);
         self.toasts.render(ui, now);
+    }
+
+    /// Flush the open PR's session file before the app exits, regardless of the
+    /// debounce (spec §11).
+    fn on_exit(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.flush_session();
+        }
     }
 }
 

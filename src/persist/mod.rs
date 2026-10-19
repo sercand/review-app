@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+pub mod session;
 pub mod settings;
 
 /// The application's config directory

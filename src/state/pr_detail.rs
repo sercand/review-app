@@ -8,12 +8,15 @@
 //! session now on screen (the stale-event rule).
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::diff::row_model::{build, RowModel};
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
 use crate::model::RepoRef;
+use crate::persist::session::{self, DebouncedWriter, SessionFile};
 use crate::runtime::{Command, Event, SessionId};
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
@@ -66,6 +69,10 @@ pub struct PrSession {
     pub collapsed_dirs: BTreeSet<String>,
     /// The last file selected in the tree, restored from the session file.
     pub last_opened_file: Option<String>,
+    /// The config root the session file lives under.
+    root: PathBuf,
+    /// Coalesces viewed/collapse changes into debounced writes.
+    writer: DebouncedWriter,
 }
 
 impl PrSession {
@@ -80,6 +87,17 @@ impl PrSession {
         repo: RepoRef,
         number: u64,
     ) -> (PrSession, Vec<Command>) {
+        let root = crate::persist::config_root();
+        let (viewed, collapsed_dirs, last_opened_file) =
+            match session::load(&root, &host, &repo, number) {
+                Ok(Some(file)) => (file.viewed, file.collapsed_dirs, file.last_opened_file),
+                Ok(None) => (ViewedSet::default(), BTreeSet::new(), None),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the PR session file");
+                    (ViewedSet::default(), BTreeSet::new(), None)
+                }
+            };
+
         let session = PrSession {
             id,
             host,
@@ -92,10 +110,12 @@ impl PrSession {
             phase: LoadPhase::Header,
             error: None,
             head_moved: false,
-            viewed: ViewedSet::default(),
+            viewed,
             filters: FilterState::default(),
-            collapsed_dirs: BTreeSet::new(),
-            last_opened_file: None,
+            collapsed_dirs,
+            last_opened_file,
+            root,
+            writer: DebouncedWriter::default(),
         };
 
         let commands = vec![Command::LoadPrMetadata {
@@ -181,6 +201,51 @@ impl PrSession {
             repo: self.repo.clone(),
             number: self.number,
         }]
+    }
+
+    /// Note that the session file needs writing; the next [`PrSession::tick`]
+    /// past the debounce window writes it.
+    pub fn mark_session_dirty(&mut self, now: Instant) {
+        self.writer.mark_dirty(now);
+    }
+
+    /// Write the session file once the debounce window has elapsed.
+    ///
+    /// Called once per frame; the writer coalesces a burst of toggles into one
+    /// write 250 ms after the last change.
+    pub fn tick(&mut self, now: Instant) {
+        if self.writer.should_flush(now) {
+            self.write_session();
+        }
+    }
+
+    /// Write any pending change now — used on exit, regardless of the debounce.
+    pub fn flush_session(&mut self) {
+        if self.writer.is_dirty() {
+            self.write_session();
+        }
+    }
+
+    /// The [`SessionFile`] this session would persist.
+    fn session_file(&self) -> SessionFile {
+        SessionFile {
+            head_sha: self.diff_head_sha.clone(),
+            viewed: self.viewed.clone(),
+            // Filled by Task 40; a write here must not clobber a saved draft.
+            draft: None,
+            composer_draft: None,
+            last_opened_file: self.last_opened_file.clone(),
+            collapsed_dirs: self.collapsed_dirs.clone(),
+        }
+    }
+
+    /// Write the session file atomically, reporting but not retrying a failure.
+    fn write_session(&mut self) {
+        let file = self.session_file();
+        if let Err(error) = session::save(&self.root, &self.host, &self.repo, self.number, &file) {
+            tracing::warn!(%error, "could not save the PR session");
+        }
+        self.writer.flushed();
     }
 }
 
@@ -273,5 +338,38 @@ mod tests {
 
         s.refresh();
         assert!(!s.head_moved);
+    }
+
+    #[test]
+    fn viewed_and_collapsed_changes_are_debounced_then_persisted() {
+        use crate::test_support::{file, tempdir};
+        use std::time::Duration;
+
+        let dir = tempdir();
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        // Point the session at a temp config root so the test never touches the
+        // real one (the field is private, but this module owns it).
+        s.root = dir.path().to_path_buf();
+
+        let a = file("src/a.rs");
+        s.viewed.set(&a, true);
+        s.collapsed_dirs.insert("src".into());
+
+        let t0 = Instant::now();
+        s.mark_session_dirty(t0);
+        s.tick(t0);
+        assert!(
+            crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+                .unwrap()
+                .is_none(),
+            "nothing is written before the debounce elapses"
+        );
+
+        s.tick(t0 + Duration::from_millis(300));
+        let saved = crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .unwrap();
+        assert!(saved.viewed.is_viewed(&a));
+        assert!(saved.collapsed_dirs.contains("src"));
     }
 }
