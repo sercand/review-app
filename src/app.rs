@@ -209,6 +209,7 @@ impl ReviewApp {
             Event::ThreadsLoaded { .. } => {}
             Event::CommentPosted { .. } => {}
             Event::CommentFailed { .. } => {}
+            Event::ReplyPosted { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its

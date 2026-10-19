@@ -104,6 +104,21 @@ pub enum Command {
         /// events so the pending bubble can be replaced or rolled back.
         optimistic_id: u64,
     },
+    /// Reply to a review thread's root comment (spec §7.4).
+    ReplyToThread {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The thread's GraphQL node id, for the result event.
+        thread_id: String,
+        /// The thread's root comment, the reply endpoint's anchor.
+        root_comment_id: u64,
+        /// The reply body.
+        body: String,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -196,6 +211,15 @@ pub enum Event {
         optimistic_id: u64,
         /// The classified failure.
         error: GhError,
+    },
+    /// A thread reply arrived; it belongs to the thread named by `thread_id`.
+    ReplyPosted {
+        /// The session that sent the reply.
+        session: SessionId,
+        /// The thread the reply was posted to.
+        thread_id: String,
+        /// The reply as GitHub created it.
+        comment: ThreadComment,
     },
 }
 
@@ -536,8 +560,45 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 }),
             }
         }
+        Command::ReplyToThread {
+            session,
+            repo,
+            number,
+            thread_id,
+            root_comment_id,
+            body,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id: NO_OPTIMISTIC_BUBBLE,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client
+                .reply_to_comment(&repo, number, root_comment_id, &body)
+                .await
+            {
+                Ok(comment) => events.send(Event::ReplyPosted {
+                    session,
+                    thread_id,
+                    comment,
+                }),
+                Err(error) => events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id: NO_OPTIMISTIC_BUBBLE,
+                    error,
+                }),
+            }
+        }
     }
 }
+
+/// The [`Event::CommentFailed`] id for a failure that has no pending bubble
+/// to roll back — a thread reply, whose composer reports the failure itself.
+const NO_OPTIMISTIC_BUBBLE: u64 = 0;
 
 /// Prove a fresh credential with `GET /user`, then install it and announce it.
 ///

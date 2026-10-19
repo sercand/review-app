@@ -106,6 +106,31 @@ impl GithubClient {
         let body = response.json::<Value>().await.map_err(decode)?;
         comment_from_rest(&body)
     }
+
+    /// Reply to a review thread's root comment, returning the reply as
+    /// GitHub created it.
+    ///
+    /// A reply inherits its anchor from the thread, so the body is the only
+    /// thing sent. A mutation: sent once, never retried.
+    pub async fn reply_to_comment(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        root_comment_id: u64,
+        body: &str,
+    ) -> Result<ThreadComment, GhError> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{number}/comments/{root_comment_id}/replies",
+            self.endpoints().rest,
+            repo.owner,
+            repo.name
+        );
+        let response = self
+            .send_mutation(self.http().post(&url).json(&json!({ "body": body })))
+            .await?;
+        let body = response.json::<Value>().await.map_err(decode)?;
+        comment_from_rest(&body)
+    }
 }
 
 /// Map a body-read failure to [`GhError::Decode`].
