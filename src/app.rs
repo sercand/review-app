@@ -185,6 +185,9 @@ fn account_login(settings: &Settings) -> String {
 pub struct ReviewApp {
     screen: ScreenKind,
     auth_state: AuthState,
+    /// When the current device-flow code was shown, for the expiry countdown
+    /// (redesign Task 16).
+    login_started: Option<std::time::Instant>,
     login_form: LoginForm,
     pr_list: PrListState,
     pr_list_form: PrListForm,
@@ -279,6 +282,7 @@ impl ReviewApp {
         ReviewApp {
             screen: initial_screen(restored.is_some()),
             auth_state: AuthState::Idle,
+            login_started: None,
             login_form: LoginForm::for_settings(&settings),
             pr_list,
             pr_list_form: PrListForm::default(),
@@ -321,8 +325,14 @@ impl ReviewApp {
                 tracing::error!(%message, "worker task panicked");
                 self.toasts.push(format!("internal error: {message}"), now);
             }
-            Event::DeviceCode(code) => self.auth_state = device_flow::start(code),
-            Event::AuthFailed(failure) => self.auth_state = AuthState::Failed(failure),
+            Event::DeviceCode(code) => {
+                self.auth_state = device_flow::start(code);
+                self.login_started = Some(now);
+            }
+            Event::AuthFailed(failure) => {
+                self.auth_state = AuthState::Failed(failure);
+                self.login_started = None;
+            }
             Event::LoggedIn { me, token } => self.finish_login(&me, &token, now),
             Event::Failed {
                 error: GhError::Unauthorized,
@@ -507,6 +517,7 @@ impl ReviewApp {
 
     /// Store the token and cache the account for the next launch.
     fn finish_login(&mut self, me: &Me, token: &str, now: Instant) {
+        self.login_started = None;
         match complete_login(self.store.as_ref(), &mut self.settings, me, token) {
             Ok(()) => {
                 self.save_settings(now);
@@ -530,6 +541,7 @@ impl ReviewApp {
         self.exec.clear_client();
         self.flush_session();
         self.session = None;
+        self.login_started = None;
         // `AuthFailure::Http` carries a user-facing message verbatim, which is
         // how the login screen shows the session-expiry notice (spec §6).
         self.auth_state = AuthState::Failed(AuthFailure::Http(
@@ -733,6 +745,7 @@ impl ReviewApp {
                         ctx.open_url(egui::OpenUrl::new_tab(code.verification_uri.clone()));
                     }
                 }
+                LoginAction::OpenSettings => self.open_settings(),
             }
         }
     }
@@ -821,9 +834,15 @@ impl ReviewApp {
     /// Draw the login screen and apply whatever the user asked for.
     fn render_login(&mut self, ui: &mut egui::Ui, now: Instant) {
         let mut actions = Vec::new();
+        let remaining = match (&self.auth_state, self.login_started) {
+            (AuthState::Polling { code, .. }, Some(started)) => {
+                Some(code.expires_in.saturating_sub(now.duration_since(started)))
+            }
+            _ => None,
+        };
         egui::CentralPanel::default().show(ui, |ui| {
             let vm = login::login_vm(&self.auth_state, &self.settings);
-            login::render(ui, &vm, &mut self.login_form, &mut actions);
+            login::render(ui, &vm, &mut self.login_form, &mut actions, remaining);
         });
 
         let ctx = ui.ctx().clone();

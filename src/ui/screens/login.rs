@@ -1,13 +1,22 @@
-//! The login screen: device-flow panel with a PAT fallback.
+//! The login screen: a centred 420 pt column with the device flow and a PAT
+//! fallback (redesign Task 16).
 //!
-//! All widget logic lives in the pure [`login_vm`] so it can be unit-tested;
-//! [`render`] only paints that view-model and records what the user asked for in
-//! a list of [`LoginAction`]s, which the app shell turns into commands.
+//! All widget logic lives in the pure [`login_vm`] and the small helpers here
+//! so it can be unit-tested; [`render`] only paints that view-model and
+//! records what the user asked for in a list of [`LoginAction`]s, which the
+//! app shell turns into commands.
+
+use std::time::Duration;
 
 use eframe::egui;
+use egui::{Align, Align2, Layout, Pos2, Rect, RichText, Stroke, UiBuilder, Vec2};
 
 use crate::auth::device_flow::{AuthFailure, AuthState};
 use crate::persist::settings::Settings;
+use crate::ui::{icons, theme};
+
+/// The width of the centred login column (Task 16).
+const COLUMN_W: f32 = 420.0;
 
 /// Everything the login screen needs to draw, derived from auth state.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +36,7 @@ pub struct LoginVm {
 /// What the user asked the login screen to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LoginAction {
-    /// Start the OAuth device flow.
+    /// Start (or restart) the OAuth device flow.
     StartDeviceFlow,
     /// Validate and store this personal access token (trimmed).
     SubmitPat(String),
@@ -39,10 +48,22 @@ pub enum LoginAction {
     CopyCode,
     /// Open the verification URI in the browser.
     OpenBrowser,
+    /// Open the settings window.
+    OpenSettings,
+}
+
+/// Which of the two underline tabs is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoginTab {
+    /// The OAuth device flow.
+    #[default]
+    Browser,
+    /// The personal-access-token fallback.
+    Pat,
 }
 
 /// The login screen's editable fields, owned across frames by the app.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LoginForm {
     /// The host text field.
     pub host_input: String,
@@ -50,6 +71,22 @@ pub struct LoginForm {
     pub client_id_input: String,
     /// The personal access token text field.
     pub pat_input: String,
+    /// Whether the Enterprise Server segment of the host picker is active.
+    pub enterprise: bool,
+    /// The open underline tab.
+    pub tab: LoginTab,
+}
+
+impl Default for LoginForm {
+    fn default() -> LoginForm {
+        LoginForm {
+            host_input: Settings::default().host,
+            client_id_input: String::new(),
+            pat_input: String::new(),
+            enterprise: false,
+            tab: LoginTab::default(),
+        }
+    }
 }
 
 impl LoginForm {
@@ -59,6 +96,8 @@ impl LoginForm {
             host_input: settings.host.clone(),
             client_id_input: settings.client_id.clone().unwrap_or_default(),
             pat_input: String::new(),
+            enterprise: settings.host != "github.com",
+            tab: LoginTab::default(),
         }
     }
 }
@@ -109,101 +148,421 @@ fn failure_message(failure: &AuthFailure) -> String {
     }
 }
 
+/// Split a device code on `-` into its character groups (Task 16):
+/// `"8F3A-21KD"` → `[[8,F,3,A],[2,1,K,D]]`; a dashless code is one group.
+pub fn code_groups(user_code: &str) -> Vec<Vec<char>> {
+    user_code
+        .split('-')
+        .map(|group| group.chars().collect())
+        .collect()
+}
+
+/// The countdown line under the shown code; fixed copy at zero.
+pub fn expiry_label(remaining: Duration) -> String {
+    if remaining.is_zero() {
+        return "The code expired. Start over to get a new one.".to_owned();
+    }
+    let secs = remaining.as_secs();
+    format!(
+        "Waiting for you to approve. Code expires in {}:{:02}.",
+        secs / 60,
+        secs % 60
+    )
+}
+
 /// Paint the login screen, appending whatever the user asked for to `actions`.
+/// `remaining` is the device code's countdown while one is showing.
 pub fn render(
     ui: &mut egui::Ui,
     vm: &LoginVm,
     form: &mut LoginForm,
     actions: &mut Vec<LoginAction>,
+    remaining: Option<Duration>,
 ) {
-    ui.heading("Sign in to GitHub");
-    ui.add_space(4.0);
+    let pal = theme::palette_of(ui);
+    let area = ui.available_rect_before_wrap();
+    let x = (area.center().x - COLUMN_W / 2.0).max(area.min.x + 12.0);
+    let column = Rect::from_min_max(
+        Pos2::new(x, area.min.y + 36.0),
+        Pos2::new(x + COLUMN_W, area.max.y),
+    );
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(column)
+            .layout(Layout::top_down(Align::Min)),
+        |ui| {
+            ui.set_width(COLUMN_W);
 
-    ui.horizontal(|ui| {
-        ui.label("GitHub host:");
-        ui.add(egui::TextEdit::singleline(&mut form.host_input).desired_width(200.0));
-        if ui.button("Use this host").clicked() {
+            // The 44 pt accent mark.
+            let (logo, _) = ui.allocate_exact_size(Vec2::new(44.0, 44.0), egui::Sense::hover());
+            ui.painter().rect_filled(logo, 10.0, pal.accent);
+            ui.painter().text(
+                logo.center(),
+                Align2::CENTER_CENTER,
+                icons::GIT_PULL_REQUEST,
+                egui::FontId::proportional(24.0),
+                pal.accent_ink,
+            );
+
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new("Sign in to review pull requests")
+                    .size(22.0)
+                    .strong()
+                    .color(pal.text),
+            );
+            ui.label(
+                RichText::new(
+                    "Your token stays in the system keychain. Drafts and viewed files are \
+                     kept on this machine, even after you sign out.",
+                )
+                .size(12.0)
+                .color(pal.muted),
+            );
+
+            ui.add_space(14.0);
+            egui::Frame::new()
+                .fill(pal.surface)
+                .stroke(Stroke::new(1.0, pal.line))
+                .corner_radius(10.0)
+                .inner_margin(18.0)
+                .show(ui, |ui| {
+                    ui.set_width(COLUMN_W - 36.0);
+                    host_section(ui, form, actions);
+                    ui.add_space(10.0);
+                    tabs(ui, form);
+                    ui.add_space(10.0);
+                    match form.tab {
+                        LoginTab::Browser => browser_tab(ui, vm, actions, remaining),
+                        LoginTab::Pat => pat_tab(ui, vm, form, actions),
+                    }
+                    if let Some(error) = &vm.error {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(error).size(12.0).color(pal.bad));
+                    }
+                });
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Requests scopes repo and read:org")
+                        .size(11.0)
+                        .color(pal.faint),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Settings").size(11.5).color(pal.accent),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        actions.push(LoginAction::OpenSettings);
+                    }
+                });
+            });
+        },
+    );
+}
+
+/// The host segment: "github.com" versus "Enterprise Server", with the
+/// enterprise fields underneath while the latter is active.
+fn host_section(ui: &mut egui::Ui, form: &mut LoginForm, actions: &mut Vec<LoginAction>) {
+    let pal = theme::palette_of(ui);
+    ui.label(RichText::new("Host").size(11.0).color(pal.faint));
+    let seg_w = (ui.available_width() - 4.0) / 2.0;
+    let github = segment(
+        ui,
+        seg_w,
+        icons::GITHUB,
+        "github.com",
+        !form.enterprise,
+        pal,
+    );
+    ui.add_space(0.0);
+    let enterprise = segment(
+        ui,
+        seg_w,
+        icons::BUILDING_2,
+        "Enterprise Server",
+        form.enterprise,
+        pal,
+    );
+    if github.clicked() && form.enterprise {
+        form.enterprise = false;
+        form.host_input = "github.com".to_owned();
+        actions.push(LoginAction::SetHost("github.com".to_owned()));
+    }
+    if enterprise.clicked() && !form.enterprise {
+        form.enterprise = true;
+    }
+
+    if form.enterprise {
+        ui.add_space(8.0);
+        field_label(ui, "Host name");
+        let host = ui.add(
+            egui::TextEdit::singleline(&mut form.host_input)
+                .hint_text("ghe.acme.io")
+                .desired_width(ui.available_width()),
+        );
+        let entered = host.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (host.lost_focus() || entered) && !form.host_input.trim().is_empty() {
             let host = form.host_input.trim().to_owned();
-            if !host.is_empty() {
+            if host != crate::persist::settings::Settings::default().host {
                 actions.push(LoginAction::SetHost(host));
             }
         }
-    });
-
-    if vm.needs_client_id {
-        let warn = ui.visuals().warn_fg_color;
-        ui.colored_label(
-            warn,
-            "This host needs its own OAuth App client ID — a github.com client ID does not work \
-             here. Register one with Device Flow enabled, or use a personal access token below.",
+        field_label(ui, "OAuth client ID");
+        let client = ui.add(
+            egui::TextEdit::singleline(&mut form.client_id_input)
+                .hint_text("Iv1.xxxxxxxxxxxxxxxx")
+                .desired_width(ui.available_width()),
         );
-        ui.horizontal(|ui| {
-            ui.label("OAuth App client ID:");
-            ui.add(egui::TextEdit::singleline(&mut form.client_id_input).desired_width(260.0));
-            if ui.button("Use this client ID").clicked() {
-                let client_id = form.client_id_input.trim().to_owned();
-                if !client_id.is_empty() {
-                    actions.push(LoginAction::SetClientId(client_id));
-                }
-            }
-        });
+        if client.lost_focus() && !form.client_id_input.trim().is_empty() {
+            actions.push(LoginAction::SetClientId(
+                form.client_id_input.trim().to_owned(),
+            ));
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "The built-in client ID only works on github.com. Use your own OAuth app, \
+                 or a personal access token.",
+            )
+            .size(11.0)
+            .color(pal.pending),
+        );
     }
+}
 
-    ui.separator();
+/// One half of the host segment control.
+fn segment(
+    ui: &mut egui::Ui,
+    width: f32,
+    icon: char,
+    label: &str,
+    on: bool,
+    pal: &'static theme::Palette,
+) -> egui::Response {
+    ui.add_sized(
+        [width, 28.0],
+        egui::Button::new(
+            RichText::new(format!("{icon} {label}"))
+                .size(12.0)
+                .color(if on { pal.accent } else { pal.muted }),
+        )
+        .fill(if on { pal.accent_soft } else { pal.raised })
+        .stroke(Stroke::new(1.0, if on { pal.accent } else { pal.line }))
+        .corner_radius(6.0),
+    )
+}
 
+/// The two underline tabs.
+fn tabs(ui: &mut egui::Ui, form: &mut LoginForm) {
+    let pal = theme::palette_of(ui);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        for (tab, label) in [
+            (LoginTab::Browser, "Browser sign-in"),
+            (LoginTab::Pat, "Access token"),
+        ] {
+            let on = form.tab == tab;
+            let response = ui.add(
+                egui::Button::new(RichText::new(label).size(13.0).color(if on {
+                    pal.text
+                } else {
+                    pal.muted
+                }))
+                .frame(false),
+            );
+            if on {
+                let rect = response.rect;
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.max.y + 2.0,
+                    Stroke::new(2.0, pal.accent),
+                );
+            }
+            if response.clicked() {
+                form.tab = tab;
+            }
+        }
+    });
+}
+
+/// The device-flow tab: the primary button, or the code once it is shown.
+fn browser_tab(
+    ui: &mut egui::Ui,
+    vm: &LoginVm,
+    actions: &mut Vec<LoginAction>,
+    remaining: Option<Duration>,
+) {
+    let pal = theme::palette_of(ui);
     match (&vm.user_code, &vm.verification_uri) {
         (Some(user_code), Some(verification_uri)) => {
-            ui.label("Enter this code on GitHub:");
-            ui.monospace(user_code);
+            ui.label(
+                RichText::new(format!(
+                    "Enter this code at {}",
+                    verification_uri
+                        .trim_start_matches("https://")
+                        .trim_end_matches('/')
+                ))
+                .size(12.5)
+                .color(pal.text),
+            );
+            ui.add_space(8.0);
+            code_boxes(ui, user_code);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Copy code").clicked() {
+                if icons::icon_button(ui, icons::COPY, "Copy the code")
+                    .on_hover_text("Copy code")
+                    .clicked()
+                {
                     actions.push(LoginAction::CopyCode);
                 }
-                if ui.button("Open in browser").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 30.0],
+                        primary(pal, icons::EXTERNAL_LINK, "Open GitHub"),
+                    )
+                    .clicked()
+                {
                     actions.push(LoginAction::OpenBrowser);
                 }
             });
-            ui.label(verification_uri);
-            if vm.spinner {
-                ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if vm.spinner {
                     ui.spinner();
-                    ui.label("waiting for authorization…");
-                });
+                }
+                let text = remaining
+                    .map(expiry_label)
+                    .unwrap_or_else(|| "Waiting for you to approve.".to_owned());
+                ui.label(RichText::new(text).size(11.5).color(pal.muted));
+            });
+            ui.add_space(4.0);
+            if ui
+                .add(ghost(pal, icons::ROTATE_CCW, "Start over"))
+                .clicked()
+            {
+                actions.push(LoginAction::StartDeviceFlow);
             }
         }
         _ => {
+            let sized = ui.available_width();
             let button = ui.add_enabled(
                 !vm.needs_client_id,
-                egui::Button::new("Sign in with GitHub"),
+                primary(pal, icons::LOG_IN, "Sign in with GitHub").min_size(Vec2::new(sized, 32.0)),
             );
             if button.clicked() {
                 actions.push(LoginAction::StartDeviceFlow);
             }
+            ui.label(
+                RichText::new("We'll show a one-time code to enter on github.com.")
+                    .size(11.0)
+                    .color(pal.faint),
+            );
             if vm.spinner {
                 ui.spinner();
             }
         }
     }
+}
 
-    ui.separator();
-
-    ui.label("Or paste a personal access token:");
+/// The device code as 36×46 mono boxes, an en dash between groups.
+fn code_boxes(ui: &mut egui::Ui, user_code: &str) {
+    let pal = theme::palette_of(ui);
     ui.horizontal(|ui| {
-        ui.add(
-            egui::TextEdit::singleline(&mut form.pat_input)
-                .password(true)
-                .hint_text("ghp_…")
-                .desired_width(280.0),
-        );
-        if ui.button("Use token").clicked() {
-            actions.push(LoginAction::SubmitPat(form.pat_input.trim().to_owned()));
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for (i, group) in code_groups(user_code).iter().enumerate() {
+            if i > 0 {
+                ui.label(RichText::new("\u{2013}").size(20.0).color(pal.faint));
+            }
+            for ch in group {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 46.0), egui::Sense::hover());
+                ui.painter().rect_stroke(
+                    rect,
+                    8.0,
+                    Stroke::new(1.0, pal.line),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().rect_filled(rect.shrink(1.0), 8.0, pal.raised);
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    *ch,
+                    egui::FontId::monospace(20.0),
+                    pal.text,
+                );
+            }
         }
     });
+}
 
-    if let Some(error) = &vm.error {
-        let error_color = ui.visuals().error_fg_color;
-        ui.colored_label(error_color, error);
+/// The personal-access-token tab.
+fn pat_tab(ui: &mut egui::Ui, vm: &LoginVm, form: &mut LoginForm, actions: &mut Vec<LoginAction>) {
+    let pal = theme::palette_of(ui);
+    let field = ui.add_sized(
+        [ui.available_width(), 28.0],
+        egui::TextEdit::singleline(&mut form.pat_input)
+            .password(true)
+            .hint_text("ghp_… or github_pat_…"),
+    );
+    let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if entered && !form.pat_input.trim().is_empty() {
+        actions.push(LoginAction::SubmitPat(form.pat_input.trim().to_owned()));
     }
+    ui.add_space(8.0);
+    if ui
+        .add_sized(
+            [ui.available_width(), 32.0],
+            primary(pal, icons::KEY_ROUND, "Use this token"),
+        )
+        .clicked()
+        && !form.pat_input.trim().is_empty()
+    {
+        actions.push(LoginAction::SubmitPat(form.pat_input.trim().to_owned()));
+    }
+    ui.label(
+        RichText::new("Needs the repo scope to read private repositories and post comments.")
+            .size(11.0)
+            .color(pal.faint),
+    );
+    if vm.spinner {
+        ui.spinner();
+    }
+}
+
+/// A small muted field caption.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    let pal = theme::palette_of(ui);
+    ui.add_space(6.0);
+    ui.label(RichText::new(text).size(11.0).color(pal.faint));
+}
+
+/// The accent-filled primary button label style.
+fn primary(pal: &'static theme::Palette, icon: char, label: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(format!("{icon}  {label}"))
+            .size(13.0)
+            .color(pal.accent_ink),
+    )
+    .fill(pal.accent)
+    .corner_radius(6.0)
+}
+
+/// A transparent, outlined ghost button.
+fn ghost(pal: &'static theme::Palette, icon: char, label: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(format!("{icon} {label}"))
+            .size(12.0)
+            .color(pal.muted),
+    )
+    .fill(egui::Color32::TRANSPARENT)
+    .stroke(Stroke::new(1.0, pal.line))
+    .corner_radius(6.0)
 }
 
 #[cfg(test)]
@@ -265,5 +624,59 @@ mod tests {
         assert_eq!(form.host_input, "ghe.acme.io");
         assert_eq!(form.client_id_input, "Iv1.abc");
         assert!(form.pat_input.is_empty());
+        assert!(form.enterprise);
+    }
+
+    #[test]
+    fn device_code_groups_and_expiry_copy() {
+        assert_eq!(
+            code_groups("8F3A-21KD"),
+            vec![vec!['8', 'F', '3', 'A'], vec!['2', '1', 'K', 'D']]
+        );
+        assert_eq!(code_groups("ABCD"), vec![vec!['A', 'B', 'C', 'D']]);
+        assert_eq!(
+            expiry_label(Duration::from_secs(14 * 60 + 32)),
+            "Waiting for you to approve. Code expires in 14:32."
+        );
+        assert_eq!(
+            expiry_label(Duration::from_secs(5)),
+            "Waiting for you to approve. Code expires in 0:05."
+        );
+        assert_eq!(
+            expiry_label(Duration::ZERO),
+            "The code expired. Start over to get a new one."
+        );
+    }
+
+    #[test]
+    fn the_screen_paints_every_state_without_asking_for_anything() {
+        for state in [
+            AuthState::Idle,
+            AuthState::Polling {
+                code: DeviceCode {
+                    device_code: "dc".into(),
+                    user_code: "ABCD-1234".into(),
+                    verification_uri: "https://github.com/login/device".into(),
+                    interval: Duration::from_secs(5),
+                    expires_in: Duration::from_secs(900),
+                },
+                interval: Duration::from_secs(5),
+            },
+            AuthState::Failed(AuthFailure::Expired),
+        ] {
+            let vm = login_vm(&state, &Settings::default());
+            let mut form = LoginForm::default();
+            let mut actions = Vec::new();
+            egui::__run_test_ui(|ui| {
+                render(
+                    ui,
+                    &vm,
+                    &mut form,
+                    &mut actions,
+                    Some(Duration::from_secs(600)),
+                );
+            });
+            assert!(actions.is_empty());
+        }
     }
 }
