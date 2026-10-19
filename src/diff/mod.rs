@@ -2,4 +2,5 @@
 //! (in later tasks) context expansion and local diffs.
 
 pub mod anchor;
+pub mod highlight;
 pub mod parse;
