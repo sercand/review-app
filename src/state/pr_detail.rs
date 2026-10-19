@@ -154,6 +154,7 @@ impl PrSession {
     /// against a new head; `diff_head_sha` is kept so the metadata reply can
     /// detect that the head moved.
     pub fn refresh(&mut self) -> Vec<Command> {
+        self.head_moved = false;
         self.files.clear();
         self.row_model = build(&[]);
         self.phase = LoadPhase::Header;
@@ -234,5 +235,27 @@ mod tests {
             meta: meta("sha2"),
         });
         assert!(s.head_moved);
+    }
+
+    #[test]
+    fn refresh_clears_a_moved_head() {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![],
+            done: true,
+        });
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha2"),
+        });
+        assert!(s.head_moved);
+
+        s.refresh();
+        assert!(!s.head_moved);
     }
 }

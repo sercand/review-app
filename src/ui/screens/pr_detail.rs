@@ -133,7 +133,7 @@ fn render_top_bar(
 /// keep whatever height their own renderer measured (spec §8.4).
 fn recompute_line_heights(ui: &egui::Ui, session: &mut PrSession, state: &mut PrDetailState) {
     let wrap = state.diff.wrap;
-    let width = diff_view::content_width(ui.available_width(), state.diff.mode);
+    let width = diff_view::content_width(ui, state.diff.mode);
     if state.last_layout == Some((wrap, width)) {
         return;
     }

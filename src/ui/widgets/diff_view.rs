@@ -7,15 +7,20 @@
 //! exactly those rows, through the bounded cache of
 //! [`crate::diff::highlight`].
 //!
+//! The file whose rows are at the top of the viewport has its header pinned over
+//! the table ([`sticky_file`]), so a long file's header stays on screen while its
+//! lines scroll under it.
+//!
 //! Everything the widget decides is a pure function ([`row_height`],
-//! [`split_pairs`], [`placeholder_text`], [`header_buttons`]) so it can be
-//! tested without a window; [`render`] only turns those decisions into widgets.
+//! [`split_pairs`], [`placeholder_text`], [`header_buttons`], [`sticky_file`]) so
+//! it can be tested without a window; [`render`] only turns those decisions into
+//! widgets.
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
-use crate::diff::row_model::{display_text, RowRef, ROW_H};
+use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
 use crate::model::diff::{DiffRow, LineKind};
@@ -23,9 +28,6 @@ use crate::state::pr_detail::{LoadPhase, PrSession};
 
 /// The width of one line-number gutter.
 pub const GUTTER_W: f32 = 48.0;
-
-/// Space the table leaves between columns, subtracted from the content width.
-const CELL_SPACING: f32 = 16.0;
 
 /// How the diff is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,16 +98,21 @@ pub fn char_width(ui: &egui::Ui) -> f32 {
     ui.fonts_mut(|fonts| fonts.glyph_width(&font_id, ' '))
 }
 
-/// The width available to line text in `mode`, given the pane width.
+/// The width available to line text in `mode`, from the diff pane's [`egui::Ui`].
 ///
-/// Split mode halves it, because two lines share the pane.
-pub fn content_width(pane_width: f32, mode: DiffMode) -> f32 {
-    let content = pane_width - 2.0 * GUTTER_W - CELL_SPACING;
-    let content = match mode {
-        DiffMode::Unified => content,
-        DiffMode::Split => content / 2.0,
-    };
-    content.max(1.0)
+/// Mirrors the width `egui_extras` gives the text column: the pane minus the
+/// vertical scroll bar, the fixed gutters, and the space between columns. Split
+/// mode halves what is left, because two text columns share the pane.
+///
+/// [`add_line`] wraps each line at this width and the screen measures the wrapped
+/// height at the same one, so a wrapped row is never a line short.
+pub fn content_width(ui: &egui::Ui, mode: DiffMode) -> f32 {
+    let table = ui.available_width() - ui.spacing().scroll.allocated_width();
+    let spacing = ui.spacing().item_spacing.x;
+    match mode {
+        DiffMode::Unified => (table - 2.0 * GUTTER_W - 2.0 * spacing).max(1.0),
+        DiffMode::Split => ((table - 2.0 * GUTTER_W - 3.0 * spacing) / 2.0).max(1.0),
+    }
 }
 
 /// Pair each run of removed lines with the run of added lines that follows it.
@@ -204,6 +211,29 @@ pub fn line_at(session: &PrSession, file: u32, hunk: u32, row: u32) -> Option<&D
         .get(row as usize)
 }
 
+/// The file whose header is pinned to the top of the viewport.
+///
+/// The file that owns the row at `scroll_y`, so [`render`] can keep its header
+/// on screen while the file's lines scroll under it (the brief's sticky file
+/// headers). `None` only when there is no row to own it.
+pub fn sticky_file(session: &PrSession, scroll_y: f32) -> Option<u32> {
+    // Only the start of the visible range is needed, and that depends only on
+    // `scroll_y`; the viewport height does not change which row is on top.
+    let start = session.row_model.visible_range(scroll_y, 0.0).start;
+    session.row_model.rows.get(start).and_then(file_of)
+}
+
+/// The file a row belongs to, when it belongs to one.
+fn file_of(reference: &RowRef) -> Option<u32> {
+    match reference {
+        RowRef::FileHeader { file }
+        | RowRef::Placeholder { file }
+        | RowRef::Line { file, .. }
+        | RowRef::Gap { file, .. } => Some(*file),
+        RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer => None,
+    }
+}
+
 /// Draw the whole diff surface.
 ///
 /// Only the rows the table actually paints are resolved and highlighted, so a
@@ -231,6 +261,19 @@ pub fn render(
 
     let mode = state.mode;
     let wrap = state.wrap;
+    let content = content_width(ui, mode);
+
+    // Where a sticky header is pinned: the top of the table, as wide as its text
+    // area (the scroll bar keeps its own column).
+    let band_area = ui.available_rect_before_wrap();
+    let band = egui::Rect::from_min_size(
+        band_area.min,
+        egui::vec2(
+            band_area.width() - ui.spacing().scroll.allocated_width(),
+            HEADER_H,
+        ),
+    );
+
     let mut table = TableBuilder::new(ui)
         .id_salt("diff-view")
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
@@ -249,14 +292,15 @@ pub fn render(
             .column(Column::remainder().at_least(100.0)),
     };
 
-    table.body(|body| {
+    let ctx = RowCtx {
+        session,
+        mode,
+        wrap,
+        content,
+        style: &style,
+    };
+    let scroll_area = table.body(|body| {
         let model = &session.row_model;
-        let ctx = RowCtx {
-            session,
-            mode,
-            wrap,
-            style: &style,
-        };
         body.heterogeneous_rows(model.heights().iter().copied(), |mut row| {
             let index = row.index();
             let Some(reference) = model.rows.get(index) else {
@@ -266,6 +310,21 @@ pub fn render(
             render_row(&mut row, reference, &ctx, cache, actions);
         });
     });
+
+    // Pin the header of the file whose rows are at the top of the viewport, so a
+    // long file's header stays on screen as its lines scroll under it. Painting
+    // after the table draws it over the top row, exactly the way CSS
+    // `position: sticky` overlaps the content behind it.
+    let scroll_y = scroll_area.state.clamped_offset().y;
+    if let Some(file) = sticky_file(session, scroll_y) {
+        if let Some(loaded) = session.files.get(file as usize) {
+            ui.painter()
+                .rect_filled(band, 0.0, ui.visuals().faint_bg_color);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| {
+                render_file_header(ui, file, loaded, session, &style, actions);
+            });
+        }
+    }
 }
 
 /// The theme- and font-derived values every row needs.
@@ -284,6 +343,8 @@ struct RowCtx<'a> {
     session: &'a PrSession,
     mode: DiffMode,
     wrap: bool,
+    /// The width line text wraps at, from [`content_width`].
+    content: f32,
     style: &'a RowStyle,
 }
 
@@ -305,7 +366,6 @@ fn render_row(
 ) {
     let session = ctx.session;
     let mode = ctx.mode;
-    let wrap = ctx.wrap;
     let style = ctx.style;
     match reference {
         RowRef::FileHeader { file } => {
@@ -358,7 +418,7 @@ fn render_row(
             let syntax = syntax_for_path(path);
             let spans = cache.spans(&syntax, &text);
 
-            render_line_cells(row, diff_row, &text, spans, mode, wrap, style);
+            render_line_cells(row, diff_row, &text, spans, ctx);
         }
         // Thread, pending, and composer rows are inserted from Task 37 on.
         RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer => {
@@ -373,15 +433,15 @@ fn render_line_cells(
     diff_row: &DiffRow,
     text: &str,
     spans: &[HighlightSpan],
-    mode: DiffMode,
-    wrap: bool,
-    style: &RowStyle,
+    ctx: &RowCtx<'_>,
 ) {
+    let mode = ctx.mode;
+    let style = ctx.style;
     match mode {
         DiffMode::Unified => {
             row.col(|ui| render_number(ui, diff_row.old_no, style));
             row.col(|ui| render_number(ui, diff_row.new_no, style));
-            row.col(|ui| add_line(ui, text, spans, style, wrap));
+            row.col(|ui| add_line(ui, text, spans, ctx));
         }
         DiffMode::Split => {
             // Removed lines belong to the left (old) side, added lines to the
@@ -396,7 +456,7 @@ fn render_line_cells(
             });
             row.col(|ui| {
                 if on_left {
-                    add_line(ui, text, spans, style, wrap);
+                    add_line(ui, text, spans, ctx);
                 }
             });
             row.col(|ui| {
@@ -406,7 +466,7 @@ fn render_line_cells(
             });
             row.col(|ui| {
                 if on_right {
-                    add_line(ui, text, spans, style, wrap);
+                    add_line(ui, text, spans, ctx);
                 }
             });
         }
@@ -424,10 +484,13 @@ fn render_number(ui: &mut egui::Ui, number: Option<u32>, style: &RowStyle) {
 }
 
 /// Add one line of highlighted text to a cell.
-fn add_line(ui: &mut egui::Ui, text: &str, spans: &[HighlightSpan], style: &RowStyle, wrap: bool) {
-    let mut job = layout_job(text, spans, style);
-    if wrap {
-        job.wrap.max_width = ui.available_width().max(1.0);
+///
+/// The line wraps at [`RowCtx::content`] — the same width the row's height was
+/// measured at — so a wrapped line is never drawn taller than the row holding it.
+fn add_line(ui: &mut egui::Ui, text: &str, spans: &[HighlightSpan], ctx: &RowCtx<'_>) {
+    let mut job = layout_job(text, spans, ctx.style);
+    if ctx.wrap {
+        job.wrap.max_width = ctx.content;
         job.wrap.break_anywhere = true;
     }
 
@@ -683,14 +746,8 @@ mod tests {
         assert!(header_buttons(&text).contains(&HeaderButton::CommentOnFile));
     }
 
-    /// The widget must paint a real session in every layout without panicking.
-    ///
-    /// A lay-out smoke test standing in for the phase's manual QA: a gap, a
-    /// line run, a binary placeholder, and a too-large placeholder are all
-    /// drawn in both modes, wrapped and unwrapped.
-    #[test]
-    fn the_surface_paints_every_mode_without_panicking() {
-        use crate::diff::highlight::SyntectHighlighter;
+    /// A loaded session with two text files and both placeholder kinds.
+    fn surface_session() -> PrSession {
         use crate::runtime::{Event, SessionId};
         use crate::test_support::{loaded, meta, repo};
 
@@ -715,12 +772,26 @@ mod tests {
             files: vec![
                 // `old_start != 1` inserts a gap row before the hunk.
                 loaded("src/a.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n"),
+                loaded("src/b.rs", "@@ -1,2 +1,2 @@\n-c\n+d\n"),
                 binary,
                 huge,
             ],
             done: true,
         });
+        session
+    }
 
+    /// The widget must paint a real session in every layout without panicking —
+    /// and must actually resolve its rows, not draw an empty frame.
+    ///
+    /// A lay-out smoke test standing in for the phase's manual QA: a gap, a
+    /// line run, both placeholder kinds, and a second file are drawn in both
+    /// modes, wrapped and unwrapped.
+    #[test]
+    fn the_surface_paints_every_mode_without_panicking() {
+        use crate::diff::highlight::SyntectHighlighter;
+
+        let session = surface_session();
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new()));
         for mode in [DiffMode::Unified, DiffMode::Split] {
             for wrap in [false, true] {
@@ -731,5 +802,42 @@ mod tests {
                 });
             }
         }
+
+        // Rows were drawn and highlighted: an empty frame would leave the cache
+        // untouched.
+        assert!(
+            cache.misses() > 0,
+            "the surface must resolve and highlight the rows it draws"
+        );
+    }
+
+    #[test]
+    fn sticky_file_follows_the_top_row() {
+        use crate::runtime::{Event, SessionId};
+        use crate::test_support::{loaded, meta, repo};
+
+        let (mut session, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        session.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        session.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![
+                loaded("src/a.rs", "@@ -1,2 +1,2 @@\n-a\n+b\n"),
+                loaded("src/b.rs", "@@ -1,2 +1,2 @@\n-c\n+d\n"),
+            ],
+            done: true,
+        });
+
+        // The first row is the first file's header, so that file is pinned.
+        assert_eq!(sticky_file(&session, 0.0), Some(0));
+        // Scrolling past the header pins the file whose lines are now on top.
+        assert_eq!(sticky_file(&session, HEADER_H + 1.0), Some(0));
+
+        // At the second file's header offset, the second file is pinned.
+        let second = session.row_model.file_ranges[1].start;
+        let second_y = session.row_model.offset_of(second);
+        assert_eq!(sticky_file(&session, second_y), Some(1));
     }
 }
