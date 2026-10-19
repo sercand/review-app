@@ -9,9 +9,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
+use eframe::egui;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Theme, ThemeSet};
+use syntect::highlighting::ScopeSelectors;
+use syntect::highlighting::{Color, FontStyle, StyleModifier, Theme, ThemeItem};
 use syntect::parsing::SyntaxSet;
+
+use crate::ui::theme::{palette, Palette};
 
 /// One run of identically styled text inside a line.
 ///
@@ -74,6 +78,9 @@ pub const MAX_HIGHLIGHT_CHARS: usize = 2_000;
 pub struct HighlightCache {
     capacity: usize,
     highlighter: Box<dyn Highlighter>,
+    /// The dark-mode flag the current highlighter was built for; drives
+    /// [`Self::set_theme`].
+    dark: bool,
     spans: HashMap<HighlightKey, Vec<HighlightSpan>>,
     /// Least recently used first; every key appears at most once.
     order: VecDeque<HighlightKey>,
@@ -90,6 +97,7 @@ impl HighlightCache {
         HighlightCache {
             capacity,
             highlighter: h,
+            dark: true,
             spans: HashMap::new(),
             order: VecDeque::new(),
             hits: 0,
@@ -141,6 +149,17 @@ impl HighlightCache {
         self.misses
     }
 
+    /// Rebuild the highlighter for the given theme and drop every cached
+    /// span, so a mid-session theme switch cannot keep old colours.
+    pub fn set_theme(&mut self, dark: bool) {
+        if self.dark != dark {
+            self.dark = dark;
+            self.highlighter = Box::new(SyntectHighlighter::new(dark));
+            self.spans.clear();
+            self.order.clear();
+        }
+    }
+
     /// Move `key` to the most-recently-used end of the queue.
     fn touch(&mut self, key: &HighlightKey) {
         if let Some(position) = self.order.iter().position(|entry| entry == key) {
@@ -173,45 +192,121 @@ fn hash_text(text: &str) -> u64 {
 
 /// The syntax name to highlight `path` with.
 ///
-/// Extension-based, lowercased, with `"txt"` as the fallback; the same string
-/// is handed to the [`Highlighter`], so the cache key and the grammar agree.
+/// The lowercased extension, or the lowercased file name when there is none
+/// (`"Dockerfile"` → `"dockerfile"`); the same string is handed to the
+/// [`Highlighter`], so the cache key and the grammar agree.
 pub fn syntax_for_path(path: &str) -> String {
-    std::path::Path::new(path)
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    match std::path::Path::new(path)
         .extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .unwrap_or_else(|| "txt".to_owned())
+    {
+        Some(extension) => extension.to_ascii_lowercase(),
+        None => name.to_ascii_lowercase(),
+    }
 }
 
-/// The real highlighter: `syntect`'s default syntaxes and a bundled theme.
+/// Build the syntect theme from a design [`Palette`]: the foreground is
+/// `p.text`, the background `p.bg`, and the scope rules carry the `syn_*`
+/// tokens.
+pub fn review_theme(p: &Palette) -> Theme {
+    fn rgb(c: egui::Color32) -> Color {
+        Color {
+            r: c.r(),
+            g: c.g(),
+            b: c.b(),
+            a: 255,
+        }
+    }
+    fn rule(scopes: &str, color: egui::Color32, font: FontStyle) -> ThemeItem {
+        use std::str::FromStr;
+        ThemeItem {
+            scope: ScopeSelectors::from_str(scopes).expect("static scope selector"),
+            style: StyleModifier {
+                foreground: Some(rgb(color)),
+                background: None,
+                font_style: (font != FontStyle::empty()).then_some(font),
+            },
+        }
+    }
+    let mut theme = Theme {
+        name: Some("gh-review".into()),
+        ..Theme::default()
+    };
+    theme.settings.foreground = Some(rgb(p.text));
+    theme.settings.background = Some(rgb(p.bg));
+    theme.scopes = vec![
+        rule("comment", p.syn_com, FontStyle::ITALIC),
+        rule(
+            "string, constant.character, string.regexp",
+            p.syn_str,
+            FontStyle::empty(),
+        ),
+        rule(
+            "keyword, storage, storage.type, storage.modifier, constant.language, variable.language",
+            p.syn_kw,
+            FontStyle::empty(),
+        ),
+        rule(
+            "entity.name.function, support.function, meta.function-call variable.function",
+            p.syn_fn,
+            FontStyle::empty(),
+        ),
+        rule(
+            "entity.name.type, entity.name.class, support.type, support.class, entity.other.inherited-class",
+            p.syn_type,
+            FontStyle::empty(),
+        ),
+        rule("constant.numeric", p.syn_num, FontStyle::empty()),
+        rule(
+            "entity.other.attribute-name, variable.other.property, meta.object-literal.key, support.type.property-name",
+            p.syn_attr,
+            FontStyle::empty(),
+        ),
+    ];
+    theme
+}
+
+/// The real highlighter: bat's extended syntax set (via `two-face`, which
+/// covers TypeScript, TSX, Kotlin, Swift, TOML, Dockerfile and the rest)
+/// and a theme built from the design palette.
 ///
 /// Both are loaded once, in [`SyntectHighlighter::new`], because building a
-/// `SyntaxSet` from the dumped defaults is far too slow for a per-line call.
+/// `SyntaxSet` is far too slow for a per-line call.
 pub struct SyntectHighlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
 }
 
 impl SyntectHighlighter {
-    /// Load the default syntaxes and the `base16-ocean.dark` theme.
-    pub fn new() -> SyntectHighlighter {
-        let themes = ThemeSet::load_defaults();
-        let theme = themes
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .unwrap_or_default();
-
+    /// Load the extended syntaxes and the palette theme for `dark`.
+    pub fn new(dark: bool) -> SyntectHighlighter {
         SyntectHighlighter {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
-            theme,
+            syntaxes: two_face::syntax::extra_newlines(),
+            theme: review_theme(palette(dark)),
         }
+    }
+}
+
+impl SyntectHighlighter {
+    /// Whether `syntax` (a [`syntax_for_path`] name) resolves to a real
+    /// grammar rather than plain text.
+    pub fn has_syntax(&self, syntax: &str) -> bool {
+        self.syntaxes
+            .find_syntax_by_extension(syntax)
+            .or_else(|| self.syntaxes.find_syntax_by_token(syntax))
+            .is_some_and(|definition| {
+                !std::ptr::eq(definition, self.syntaxes.find_syntax_plain_text())
+            })
     }
 }
 
 impl Default for SyntectHighlighter {
     fn default() -> Self {
-        Self::new()
+        Self::new(true)
     }
 }
 
@@ -220,6 +315,7 @@ impl Highlighter for SyntectHighlighter {
         let definition = self
             .syntaxes
             .find_syntax_by_extension(syntax)
+            .or_else(|| self.syntaxes.find_syntax_by_token(syntax))
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
 
         let mut lines = HighlightLines::new(definition, &self.theme);
@@ -280,7 +376,7 @@ mod tests {
 
     #[test]
     fn real_highlighter_marks_rust_and_falls_back_to_plain_text() {
-        let highlighter = SyntectHighlighter::new();
+        let highlighter = SyntectHighlighter::new(true);
         let spans = highlighter.highlight("rs", "let x = 1;\n");
         assert!(!spans.is_empty());
         assert_eq!(spans[0].range.start, 0);
@@ -292,7 +388,63 @@ mod tests {
         assert_eq!(spans[0].range, 0.."not code".len());
 
         assert_eq!(syntax_for_path("src/lib.rs"), "rs");
-        assert_eq!(syntax_for_path("README"), "txt");
+        assert_eq!(syntax_for_path("README"), "readme");
         assert_eq!(syntax_for_path("dist/bundle.min.JS"), "js");
+    }
+
+    #[test]
+    fn common_languages_resolve_to_a_real_syntax() {
+        let h = SyntectHighlighter::new(true);
+        // `jsx` is not in two-face 0.5's extended set (bat ships no JSX
+        // grammar), so it is not listed; it falls back to plain text.
+        for path in [
+            "a.ts",
+            "a.tsx",
+            "a.js",
+            "a.rs",
+            "a.go",
+            "a.py",
+            "a.java",
+            "a.kt",
+            "a.swift",
+            "a.cs",
+            "a.cpp",
+            "a.json",
+            "a.yaml",
+            "a.toml",
+            "a.md",
+            "a.sh",
+            "a.sql",
+            "a.css",
+            "a.html",
+            "a.vue",
+            "a.svelte",
+            "Dockerfile",
+        ] {
+            assert!(
+                h.has_syntax(&syntax_for_path(path)),
+                "{path} resolves to plain text"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_keywords_use_the_palette() {
+        let h = SyntectHighlighter::new(true);
+        let spans = h.highlight("ts", "const prefilled = await withCreateDefaults(ctx);");
+        let kw = crate::ui::theme::DARK.syn_kw;
+        assert_eq!(spans[0].color, [kw.r(), kw.g(), kw.b()]); // `const`
+    }
+
+    #[test]
+    fn switching_theme_clears_cached_colours() {
+        let mut cache = HighlightCache::new(64, Box::new(SyntectHighlighter::new(true)));
+        let dark = cache.spans("ts", "const a = 1;")[0].color;
+        cache.set_theme(false);
+        assert!(cache.is_empty());
+        let light = cache.spans("ts", "const a = 1;")[0].color;
+        assert_ne!(dark, light);
+        cache.set_theme(false); // no change → keeps entries
+        assert_eq!(cache.len(), 1);
     }
 }

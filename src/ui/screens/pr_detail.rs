@@ -460,7 +460,7 @@ mod tests {
             right_open: true,
             ..PrDetailState::default()
         };
-        let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new()));
+        let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new(true)));
         let mut diff_actions = Vec::new();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
@@ -510,7 +510,7 @@ mod tests {
         });
 
         let mut state = PrDetailState::default();
-        let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new()));
+        let mut cache = HighlightCache::new(8, Box::new(SyntectHighlighter::new(true)));
         let mut diff_actions = Vec::new();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {

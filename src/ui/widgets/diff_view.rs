@@ -1274,7 +1274,7 @@ mod tests {
             .any(|r| matches!(r, RowRef::Pending { .. })));
         assert!(session.row_model.rows.contains(&RowRef::Composer));
 
-        let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new()));
+        let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new(true)));
         for mode in [DiffMode::Unified, DiffMode::Split] {
             for wrap in [false, true] {
                 let mut state = DiffViewState {

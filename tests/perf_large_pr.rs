@@ -15,7 +15,7 @@ fn visible_slice_work_stays_within_frame_budget() {
     let model = build(&files);
     assert!(model.rows.len() >= 50_000);
 
-    let mut cache = HighlightCache::new(4_096, Box::new(SyntectHighlighter::new()));
+    let mut cache = HighlightCache::new(4_096, Box::new(SyntectHighlighter::new(true)));
     cache.spans("rs", "fn warm_up() {}"); // syntax set loads outside the timed loop
 
     let viewport = 40.0 * ROW_H;

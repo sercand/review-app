@@ -275,7 +275,7 @@ impl ReviewApp {
             pr_list,
             pr_list_form: PrListForm::default(),
             pr_detail: PrDetailState::default(),
-            highlight_cache: HighlightCache::new(2048, Box::new(SyntectHighlighter::new())),
+            highlight_cache: HighlightCache::new(2048, Box::new(SyntectHighlighter::new(true))),
             session: None,
             next_session: 1,
             toasts: Toasts::default(),
@@ -588,6 +588,7 @@ impl ReviewApp {
         let desired = self.settings.theme.resolve(system_dark);
         if self.applied_theme != Some(desired) {
             ctx.set_theme(desired);
+            self.highlight_cache.set_theme(desired == egui::Theme::Dark);
             self.applied_theme = Some(desired);
         }
     }
