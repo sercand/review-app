@@ -240,6 +240,9 @@ impl ReviewApp {
             Event::CommentPosted { .. } => {}
             Event::ReplyPosted { .. } => {}
             Event::ThreadResolved { .. } => {}
+            // The session caches the blob and applies the waiting expansion
+            // through `apply_session_event` above; nothing else to do here.
+            Event::HeadBlobLoaded { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -634,7 +637,17 @@ impl ReviewApp {
                 DiffAction::ToggleViewed(_) => {}  // Phase D
                 DiffAction::ScrollToFile(_) => {}  // Phase D (file tree)
                 DiffAction::LoadLargeDiff(_) => {} // Phase G
-                DiffAction::ExpandGap { .. } => {} // Task 45
+                DiffAction::ExpandGap {
+                    file,
+                    before_hunk,
+                    how,
+                } => {
+                    if let Some(session) = &mut self.session {
+                        for command in session.expand_gap(file, before_hunk, how) {
+                            self.worker.send(command);
+                        }
+                    }
+                }
                 DiffAction::StartComment(target) => {
                     if let Some(session) = &mut self.session {
                         session.open_comment(target);

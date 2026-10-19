@@ -7,11 +7,12 @@
 //! so a reply for a PR the user has left is dropped rather than folded into the
 //! session now on screen (the stale-event rule).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
+use crate::diff::expand::{expand, gaps, Expand};
 use crate::diff::row_model::{build, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::comments::NewComment;
@@ -121,6 +122,12 @@ pub struct PrSession {
     /// A line post rejected with a 422, awaiting the reviewer's decision
     /// on the file-level fallback.
     pub fallback: Option<FallbackPrompt>,
+    /// Head-blob text by file index, cached for context expansion (Task 45);
+    /// the expansion itself runs on the UI thread, so the cache lives here.
+    pub head_blobs: HashMap<u32, String>,
+    /// Expansion requests waiting on their file's head blob, as
+    /// `(file, before_hunk, how)`.
+    pending_expands: Vec<(u32, u32, Expand)>,
     /// The next locally allocated comment id; starts at 1 because 0 is the
     /// reserved "no optimistic bubble" sentinel.
     next_optimistic_id: u64,
@@ -233,6 +240,8 @@ impl PrSession {
             composer: ComposerState::default(),
             pending,
             fallback: None,
+            head_blobs: HashMap::new(),
+            pending_expands: Vec::new(),
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
@@ -447,6 +456,29 @@ impl PrSession {
                 on_submit_error(self, error.clone());
                 Vec::new()
             }
+            Event::HeadBlobLoaded {
+                session,
+                file,
+                text,
+            } if *session == self.id => {
+                self.head_blobs.insert(*file, text.clone());
+                // Apply every expansion this blob unblocks, in click order;
+                // each recomputes its gap, so repeated clicks reveal the
+                // next chunk rather than re-inserting the same rows.
+                let mut applied = false;
+                for (pending_file, before_hunk, how) in std::mem::take(&mut self.pending_expands) {
+                    if pending_file == *file {
+                        self.apply_expand(pending_file, before_hunk, how);
+                        applied = true;
+                    } else {
+                        self.pending_expands.push((pending_file, before_hunk, how));
+                    }
+                }
+                if applied {
+                    self.rebuild_rows();
+                }
+                Vec::new()
+            }
             Event::Failed {
                 session: Some(session),
                 error,
@@ -476,6 +508,9 @@ impl PrSession {
         self.threads.clear();
         self.restore_optimistic_to_composer();
         self.fallback = None;
+        // Blob caches are keyed by file index, which the reload invalidates.
+        self.head_blobs.clear();
+        self.pending_expands.clear();
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -597,6 +632,73 @@ impl PrSession {
             .iter()
             .position(|l| l.file.path == path)
             .map(|index| index as u32)
+    }
+
+    /// Reveal omitted context in one gap (Task 45, Review Focus #4).
+    ///
+    /// With the file's head blob already cached the expansion applies right
+    /// away; otherwise the request is queued and the blob fetched. A repeat
+    /// click on the same gap while its blob is in flight asks once.
+    pub fn expand_gap(&mut self, file: u32, before_hunk: u32, how: Expand) -> Vec<Command> {
+        if !self
+            .files
+            .get(file as usize)
+            .is_some_and(|loaded| loaded.diff.is_some())
+        {
+            return Vec::new();
+        }
+        if self.head_blobs.contains_key(&file) {
+            self.apply_expand(file, before_hunk, how);
+            self.rebuild_rows();
+            return Vec::new();
+        }
+        if self
+            .pending_expands
+            .iter()
+            .any(|(f, b, _)| *f == file && *b == before_hunk)
+        {
+            return Vec::new();
+        }
+        self.pending_expands.push((file, before_hunk, how));
+        vec![Command::ExpandContext {
+            session: self.id,
+            repo: self.repo.clone(),
+            file,
+            path: self.files[file as usize].file.path.clone(),
+            sha: self.diff_head_sha.clone().unwrap_or_default(),
+        }]
+    }
+
+    /// Insert the chosen part of the gap before `before_hunk` from the
+    /// cached head blob.
+    ///
+    /// The gap is recomputed from the diff as it stands, so successive
+    /// expansions of one gap each reveal the next chunk, and a gap already
+    /// fully revealed expands to nothing.
+    fn apply_expand(&mut self, file: u32, before_hunk: u32, how: Expand) {
+        let Some(blob) = self.head_blobs.get(&file).cloned() else {
+            return;
+        };
+        let Some(diff) = self
+            .files
+            .get(file as usize)
+            .and_then(|loaded| loaded.diff.clone())
+        else {
+            return;
+        };
+        // The blob bounds the gap; a caller without a line count yet leaves
+        // the tail open-ended and `expand` clamps it to the blob.
+        let Some(gap) = gaps(&diff, u32::MAX)
+            .into_iter()
+            .find(|gap| gap.before_hunk == before_hunk)
+        else {
+            return;
+        };
+        let lines: Vec<&str> = blob.lines().collect();
+        let expanded = expand(&diff, &lines, gap, how);
+        if let Some(loaded) = self.files.get_mut(file as usize) {
+            loaded.diff = Some(expanded);
+        }
     }
 
     /// Open the composer for `target`, picking the mode GitHub would.
@@ -1771,5 +1873,72 @@ mod tests {
             saved.composer_draft.is_none(),
             "an empty composer stores None"
         );
+    }
+
+    #[test]
+    fn expanding_a_gap_waits_for_the_head_blob_then_inserts_rows() {
+        use crate::diff::expand::Expand;
+        use crate::model::diff::RowOrigin;
+
+        let (mut s, _dir) = loaded_session();
+        // `loaded_session`'s file is "@@ -1,2 +1,2 @@\n-x\n+y\n z\n", which
+        // starts at line 1 and has no gap; replace it with one that does.
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("b.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n")],
+            done: true,
+        });
+        assert!(s.row_model.rows.contains(&RowRef::Gap {
+            file: 1,
+            before_hunk: 0
+        }));
+
+        let cmds = s.expand_gap(1, 0, Expand::All);
+        assert!(
+            matches!(&cmds[..], [Command::ExpandContext { file: 1, sha, .. }] if sha == "sha1"),
+            "the first click asks the worker for the head blob at the shown head"
+        );
+        assert!(
+            s.expand_gap(1, 0, Expand::All).is_empty(),
+            "a second click while the blob is in flight asks once"
+        );
+
+        s.on_event(&Event::HeadBlobLoaded {
+            session: SessionId(1),
+            file: 1,
+            text: "l1\nl2\nl3\nb\n c\n".into(),
+        });
+        let rows: Vec<_> = s.files[1]
+            .diff
+            .as_ref()
+            .expect("the file has a diff")
+            .hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .collect();
+        let expanded: Vec<_> = rows
+            .iter()
+            .filter(|r| r.origin == RowOrigin::Expanded)
+            .collect();
+        assert_eq!(expanded.len(), 3, "the whole gap became real rows");
+        assert_eq!(
+            (
+                expanded[0].old_no,
+                expanded[0].new_no,
+                expanded[0].text.as_str()
+            ),
+            (Some(1), Some(1), "l1"),
+            "expanded rows carry exact coordinates"
+        );
+        assert!(
+            !s.row_model.rows.contains(&RowRef::Gap {
+                file: 1,
+                before_hunk: 0
+            }),
+            "a fully expanded gap is gone"
+        );
+
+        // The blob is cached: a later expansion applies without a command.
+        assert!(s.expand_gap(1, 0, Expand::All).is_empty());
     }
 }

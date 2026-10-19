@@ -1,3 +1,4 @@
+pub mod blobs;
 pub mod client;
 pub mod comments;
 pub mod error;

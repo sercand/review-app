@@ -166,6 +166,21 @@ pub enum Command {
         /// The pending review's REST id.
         review_id: u64,
     },
+    /// Fetch a file's head-blob text so the UI can expand an omitted-context
+    /// gap from it (Task 45). The expansion itself runs on the UI thread from
+    /// the session's per-file blob cache.
+    ExpandContext {
+        /// The session that asked for the expansion.
+        session: SessionId,
+        /// The repository the file lives in.
+        repo: RepoRef,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The file's path, as the contents API needs it.
+        path: String,
+        /// The head SHA the diff on screen belongs to.
+        sha: String,
+    },
     /// Submit a review built by [`crate::github::reviews::review_payload`]
     /// (spec §7.2).
     SubmitReview {
@@ -320,6 +335,16 @@ pub enum Event {
         session: SessionId,
         /// The classified failure.
         error: GhError,
+    },
+    /// A file's head-blob text arrived; the session caches it per file and
+    /// applies any expansion that was waiting for it (Task 45).
+    HeadBlobLoaded {
+        /// The session that asked for the blob.
+        session: SessionId,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The blob's text.
+        text: String,
     },
 }
 
@@ -849,6 +874,35 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             match client.submit_review(&repo, number, &payload).await {
                 Ok(review) => events.send(Event::ReviewSubmitted { session, review }),
                 Err(error) => events.send(Event::ReviewSubmitFailed { session, error }),
+            }
+        }
+        Command::ExpandContext {
+            session,
+            repo,
+            file,
+            path,
+            sha,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A read of the head blob; the gap itself is expanded on the UI
+            // thread from the session's per-file cache (Task 45).
+            match client.file_content(&repo, &path, &sha).await {
+                Ok(text) => events.send(Event::HeadBlobLoaded {
+                    session,
+                    file,
+                    text,
+                }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
             }
         }
     }

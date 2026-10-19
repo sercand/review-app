@@ -19,6 +19,7 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::diff::expand::Expand;
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
@@ -83,6 +84,8 @@ pub enum DiffAction {
         file: u32,
         /// The hunk the gap precedes.
         before_hunk: u32,
+        /// How much of the gap to reveal.
+        how: Expand,
     },
     /// A composer control was used (Task 37).
     Composer(ComposerAction),
@@ -435,13 +438,25 @@ fn render_row(
         RowRef::Gap { file, before_hunk } => {
             let (file, before_hunk) = (*file, *before_hunk);
             row.col(|ui| {
-                if ui
-                    .button("Expand context")
-                    .on_hover_text("show the lines GitHub omitted here")
-                    .clicked()
-                {
-                    actions.push(DiffAction::ExpandGap { file, before_hunk });
-                }
+                ui.horizontal(|ui| {
+                    for (label, how) in [
+                        ("↑ 20", Expand::Up(20)),
+                        ("↓ 20", Expand::Down(20)),
+                        ("all", Expand::All),
+                    ] {
+                        if ui
+                            .button(label)
+                            .on_hover_text("show the lines GitHub omitted here")
+                            .clicked()
+                        {
+                            actions.push(DiffAction::ExpandGap {
+                                file,
+                                before_hunk,
+                                how,
+                            });
+                        }
+                    }
+                });
             });
             blank_rest(row, mode);
         }
