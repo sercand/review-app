@@ -13,6 +13,7 @@ use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
 use crate::model::RepoRef;
 use crate::runtime::{Command, Event, SessionId};
+use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
 
 /// How far a session has got through loading its PR.
@@ -57,6 +58,8 @@ pub struct PrSession {
     pub head_moved: bool,
     /// Which files the reviewer has marked viewed, keyed by blob SHA.
     pub viewed: ViewedSet,
+    /// What the file tree is filtering the file list by.
+    pub filters: FilterState,
 }
 
 impl PrSession {
@@ -84,6 +87,7 @@ impl PrSession {
             error: None,
             head_moved: false,
             viewed: ViewedSet::default(),
+            filters: FilterState::default(),
         };
 
         let commands = vec![Command::LoadPrMetadata {
