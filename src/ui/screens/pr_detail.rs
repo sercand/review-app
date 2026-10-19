@@ -130,9 +130,9 @@ pub fn render(
     state.left_pane = left.response.rect.width();
 
     // Fold the tree's actions in before the diff draws, so selecting a file
-    // scrolls it into view on this very frame.
+    // rebuilds the rows for this very frame.
     for action in tree_actions {
-        apply_tree_action(session, &pr_files, state, action, Instant::now());
+        apply_tree_action(session, &pr_files, action, Instant::now());
     }
 
     let right = egui::Panel::right("pr-detail-right")
@@ -313,7 +313,6 @@ fn filtered_progress(
 fn apply_tree_action(
     session: &mut PrSession,
     pr_files: &[PrFile],
-    state: &mut PrDetailState,
     action: TreeAction,
     now: Instant,
 ) {
@@ -337,8 +336,7 @@ fn apply_tree_action(
         }
         TreeAction::SelectFile(path) => {
             if let Some(index) = pr_files.iter().position(|f| f.path == path) {
-                state.diff.scroll_to = Some(index as u32);
-                session.last_opened_file = Some(path);
+                session.select_file(index);
             }
         }
     }

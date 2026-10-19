@@ -105,6 +105,11 @@ pub fn annotate(model: &RowModel, files: &[LoadedFile], items: &[InlineItem]) ->
             continue;
         }
         let range = spans[file].clone();
+        if range.is_empty() {
+            // The file is not in the model (one file at a time: the other
+            // files' threads wait until their file is selected).
+            continue;
+        }
         let at = match item.placement {
             Placement::AfterHeader => range.start + 1,
             Placement::AfterLine { side, line } => find_line(files, &base, &range, side, line)
@@ -196,20 +201,21 @@ fn file_spans<'a>(
     files: usize,
     total: usize,
 ) -> Vec<Range<usize>> {
-    let headers: Vec<usize> = rows
+    let headers: Vec<(usize, usize)> = rows
         .enumerate()
-        .filter(|(_, row)| matches!(row, RowRef::FileHeader { .. }))
-        .map(|(index, _)| index)
-        .collect();
-    (0..files)
-        .map(|file| match headers.get(file) {
-            Some(&start) => {
-                let end = headers.get(file + 1).copied().unwrap_or(total);
-                start..end
-            }
-            None => 0..0,
+        .filter_map(|(index, row)| match row {
+            RowRef::FileHeader { file } => Some((*file as usize, index)),
+            _ => None,
         })
-        .collect()
+        .collect();
+    let mut spans = vec![0..0; files];
+    for (position, (file, start)) in headers.iter().enumerate() {
+        if *file < files {
+            let end = headers.get(position + 1).map_or(total, |(_, next)| *next);
+            spans[*file] = *start..end;
+        }
+    }
+    spans
 }
 
 /// The index, within `range`, of the first row whose coordinate on `side`
@@ -250,9 +256,55 @@ fn row_coordinate(files: &[LoadedFile], row: &RowRef, side: Side) -> Option<u32>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::row_model::build;
+    use crate::diff::row_model::{build, build_one};
     use crate::model::thread::SubjectType;
     use crate::test_support::loaded;
+
+    #[test]
+    fn file_level_threads_lead_the_file() {
+        let files = vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
+        let m = build_one(&files, Some(0));
+        let out = annotate(
+            &m,
+            &files,
+            &[InlineItem {
+                file: 0,
+                placement: Placement::AfterHeader,
+                row: RowRef::Thread { thread: 0 },
+            }],
+        );
+        let thread = out
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowRef::Thread { .. }))
+            .unwrap();
+        let line = out
+            .rows
+            .iter()
+            .position(|r| matches!(r, RowRef::Line { .. }))
+            .unwrap();
+        assert!(thread < line);
+        assert!(out.file_ranges[0].contains(&thread));
+    }
+
+    #[test]
+    fn threads_on_files_that_are_not_shown_are_dropped() {
+        let files = vec![
+            loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n"),
+            loaded("b.rs", "@@ -1 +1 @@\n-a\n+b\n"),
+        ];
+        let m = build_one(&files, Some(0));
+        let out = annotate(
+            &m,
+            &files,
+            &[InlineItem {
+                file: 1,
+                placement: Placement::AfterHeader,
+                row: RowRef::Thread { thread: 0 },
+            }],
+        );
+        assert!(!out.rows.iter().any(|r| matches!(r, RowRef::Thread { .. })));
+    }
 
     fn thread(path: &str, line: Option<u32>, side: Side, subject: SubjectType) -> ReviewThread {
         ReviewThread {

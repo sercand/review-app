@@ -29,7 +29,6 @@ use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
 };
 use crate::state::composer::{self, ComposerAction};
-use crate::state::filters;
 use crate::state::pr_detail::{start_submit, viewer_is_author, PrSession};
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::command::{self, next_index, KeyPress};
@@ -931,7 +930,12 @@ impl ReviewApp {
         for action in actions {
             match action {
                 DiffAction::ToggleViewed(_) => {} // Phase D
-                DiffAction::ScrollToFile(_) => {} // Phase D (file tree)
+                DiffAction::SelectFile(index) => {
+                    if let Some(session) = &mut self.session {
+                        session.select_file(index as usize);
+                        session.mark_session_dirty(now);
+                    }
+                }
                 DiffAction::LoadLargeDiff(file) => {
                     if let Some(session) = &mut self.session {
                         for command in session.load_large_diff(file) {
@@ -1204,43 +1208,22 @@ impl ReviewApp {
         self.close_detail();
     }
 
-    /// `j`/`k`: move the current file to the next/previous one the filters
-    /// keep, scrolling it into view through the tree's existing `scroll_to`
-    /// path (spec §9.2).
+    /// `j`/`k`: move the diff to the next/previous visible file in display
+    /// order (spec §9.2).
     fn step_file(&mut self, forward: bool, now: Instant) {
         let next = {
             let Some(session) = &self.session else {
                 return;
             };
-            let order: Vec<usize> = session
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, loaded)| {
-                    filters::matches(&loaded.file, &session.filters, &session.viewed)
-                })
-                .map(|(index, _)| index)
-                .collect();
-            let current = session
-                .last_opened_file
-                .as_deref()
-                .and_then(|path| session.files.iter().position(|l| l.file.path == path));
+            let order = session.file_order();
+            let current = session.current_file().map(|(index, _)| index);
             next_index(&order, current, forward)
         };
         let Some(next) = next else { return };
-        let Some(path) = self
-            .session
-            .as_ref()
-            .and_then(|session| session.files.get(next))
-            .map(|loaded| loaded.file.path.clone())
-        else {
-            return;
-        };
-        self.pr_detail.diff.scroll_to = Some(next as u32);
         // The hunk cursor belongs to the file it was set in.
         self.pr_detail.hunk_row = None;
         if let Some(session) = &mut self.session {
-            session.last_opened_file = Some(path);
+            session.select_file(next);
             session.mark_session_dirty(now);
         }
     }
@@ -1296,20 +1279,9 @@ impl ReviewApp {
         self.pr_detail.hunk_row = Some(target);
     }
 
-    /// The file the diff is on: the last one opened, else the first file the
-    /// filters keep.
+    /// The file the diff is on (see [`PrSession::current_file`]).
     fn current_file(session: &PrSession) -> Option<usize> {
-        if let Some(path) = session.last_opened_file.as_deref() {
-            if let Some(index) = session.files.iter().position(|l| l.file.path == path) {
-                return Some(index);
-            }
-        }
-        session
-            .files
-            .iter()
-            .enumerate()
-            .find(|(_, loaded)| filters::matches(&loaded.file, &session.filters, &session.viewed))
-            .map(|(index, _)| index)
+        session.current_file().map(|(index, _)| index)
     }
 
     /// `v` / `Shift+V`: flip (or set) the current file's viewed mark.
@@ -1317,10 +1289,7 @@ impl ReviewApp {
         let Some(session) = &mut self.session else {
             return;
         };
-        let Some(path) = session.last_opened_file.clone() else {
-            return;
-        };
-        let Some(index) = session.files.iter().position(|l| l.file.path == path) else {
+        let Some(index) = session.current_file().map(|(index, _)| index) else {
             return;
         };
         let currently = session.viewed.is_viewed(&session.files[index].file);
@@ -1335,7 +1304,10 @@ impl ReviewApp {
         let Some(session) = &mut self.session else {
             return;
         };
-        let Some(path) = session.last_opened_file.clone() else {
+        let Some(path) = session
+            .current_file()
+            .map(|(_, loaded)| loaded.file.path.clone())
+        else {
             return;
         };
         session.open_comment(CommentTarget::File { path });
@@ -1349,7 +1321,9 @@ impl ReviewApp {
         let Some(session) = &self.session else {
             return;
         };
-        let path = session.last_opened_file.clone();
+        let path = session
+            .current_file()
+            .map(|(_, loaded)| loaded.file.path.clone());
         let thread = match session
             .threads
             .iter()
@@ -1390,8 +1364,8 @@ impl eframe::App for ReviewApp {
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
 
-        // Global shortcuts run before the screens draw, so a `scroll_to` set
-        // by `j`/`k` is consumed by the diff on this very frame.
+        // Global shortcuts run before the screens draw, so a file selected
+        // by `j`/`k` is rebuilt and drawn on this very frame.
         self.handle_shortcuts(&ctx, now);
         self.render_screen(ui, now, write_blocked.as_deref());
         self.sync_layout(now);

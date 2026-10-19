@@ -15,7 +15,7 @@ use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem,
 use crate::diff::expand::{expand, gaps, Expand};
 use crate::diff::image::{image_kind, image_sources, image_uri, ImageBlob, ImageKind};
 use crate::diff::options::hide_whitespace_only;
-use crate::diff::row_model::{build, RowModel, RowRef};
+use crate::diff::row_model::{build_one, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::comments::NewComment;
@@ -300,7 +300,7 @@ impl PrSession {
             metadata: None,
             diff_head_sha: None,
             files: Vec::new(),
-            row_model: build(&[]),
+            row_model: build_one(&[], None),
             phase: LoadPhase::Header,
             error: None,
             head_moved: false,
@@ -695,7 +695,7 @@ impl PrSession {
         // The truncation verdict belongs to the load being dropped; the
         // reload sets it again only if it hits the cap too (spec §7.5).
         self.files_truncated = false;
-        self.row_model = build(&[]);
+        self.row_model = build_one(&[], None);
         self.threads.clear();
         self.restore_optimistic_to_composer();
         self.fallback = None;
@@ -770,21 +770,76 @@ impl PrSession {
     /// measured heights are carried over in order — the line rows come out
     /// of `build` in exactly the order they went in — so a comment event
     /// never collapses wrapped lines back to [`ROW_H`](crate::diff::row_model::ROW_H).
+    /// The visible files' indices in display order (see
+    /// [`filters::file_order`](crate::state::filters::file_order)).
+    pub fn file_order(&self) -> Vec<usize> {
+        let prs: Vec<crate::github::files::PrFile> = self
+            .files
+            .iter()
+            .map(|loaded| loaded.file.clone())
+            .collect();
+        crate::state::filters::file_order(&prs, &self.filters, &self.viewed)
+    }
+
+    /// The file the diff shows: `last_opened_file` while it is visible,
+    /// else the first file in display order. `None` only when no file is
+    /// visible at all (empty PR, or the filters hide everything).
+    pub fn current_file(&self) -> Option<(usize, &LoadedFile)> {
+        let order = self.file_order();
+        let index = self
+            .last_opened_file
+            .as_deref()
+            .and_then(|path| {
+                order
+                    .iter()
+                    .copied()
+                    .find(|i| self.files[*i].file.path == path)
+            })
+            .or_else(|| order.first().copied())?;
+        Some((index, &self.files[index]))
+    }
+
+    /// Show file `index`: remember it as the last opened file and rebuild
+    /// the rows. The composer is left alone — a written comment is never
+    /// lost to a file switch (spec S4).
+    pub fn select_file(&mut self, index: usize) {
+        let Some(loaded) = self.files.get(index) else {
+            return;
+        };
+        self.last_opened_file = Some(loaded.file.path.clone());
+        self.rebuild_rows();
+    }
+
     pub fn rebuild_rows(&mut self) {
         if self.hide_whitespace {
             self.filter_whitespace();
         }
         let items = self.inline_items();
-        let measured: Vec<f32> = self
+        let selected = self.current_file().map(|(index, _)| index);
+        // Measured heights belong to the file they were measured on: carry
+        // them over only while the selection is unchanged, never across a
+        // file switch.
+        let same_file = self
             .row_model
             .rows
-            .iter()
-            .zip(self.row_model.heights())
-            .filter(|(row, _)| matches!(row, RowRef::Line { .. }))
-            .map(|(_, height)| *height)
-            .collect();
+            .first()
+            .map(|row| {
+                matches!(row, RowRef::FileHeader { file } if *file as usize == selected.unwrap_or(usize::MAX))
+            })
+            .unwrap_or(true);
+        let measured: Vec<f32> = if same_file {
+            self.row_model
+                .rows
+                .iter()
+                .zip(self.row_model.heights())
+                .filter(|(row, _)| matches!(row, RowRef::Line { .. }))
+                .map(|(_, height)| *height)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        let mut model = annotate(&build(&self.files), &self.files, &items);
+        let mut model = annotate(&build_one(&self.files, selected), &self.files, &items);
         let mut heights = measured.into_iter();
         for index in 0..model.rows.len() {
             if matches!(model.rows[index], RowRef::Line { .. }) {
@@ -1661,6 +1716,87 @@ mod tests {
         assert_eq!(s.diff_head_sha.as_deref(), Some("sha1"));
     }
 
+    /// A ready session over `(path, patch)` pairs, in the given order.
+    fn session_with(files: &[(&str, &str)]) -> PrSession {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        let loaded_files = files
+            .iter()
+            .map(|(path, patch)| loaded(path, patch))
+            .collect();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: loaded_files,
+            done: true,
+        });
+        s
+    }
+
+    const PATCH: &str = "@@ -1 +1 @@\n-a\n+b\n";
+
+    #[test]
+    fn initial_selection_is_the_first_file_in_display_order() {
+        let s = session_with(&[("src/b.rs", PATCH), ("src/a.rs", PATCH)]);
+        assert_eq!(s.current_file().map(|(i, _)| i), Some(1));
+    }
+
+    #[test]
+    fn selecting_a_file_rebuilds_rows_and_keeps_the_composer() {
+        let mut s = session_with(&[("a.rs", PATCH), ("b.rs", PATCH)]);
+        s.composer.body = "wip".into();
+        s.composer.target = Some(CommentTarget::File {
+            path: "a.rs".into(),
+        });
+        s.select_file(1);
+        assert_eq!(s.current_file().map(|(i, _)| i), Some(1));
+        assert_eq!(s.last_opened_file.as_deref(), Some("b.rs"));
+        assert_eq!(
+            s.row_model
+                .rows
+                .iter()
+                .filter(|r| matches!(r, RowRef::FileHeader { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            &s.row_model.rows[s.row_model.file_ranges[1].start],
+            RowRef::FileHeader { file: 1 }
+        ));
+        // The written comment survives the switch untouched (spec S4).
+        assert_eq!(s.composer.body, "wip");
+        assert!(matches!(
+            &s.composer.target,
+            Some(CommentTarget::File { path }) if path == "a.rs"
+        ));
+    }
+
+    #[test]
+    fn restores_the_last_opened_file_and_survives_empty_prs() {
+        let mut s = session_with(&[("a.rs", PATCH), ("b.rs", PATCH)]);
+        s.last_opened_file = Some("b.rs".into());
+        assert_eq!(s.current_file().map(|(i, _)| i), Some(1));
+        s.rebuild_rows();
+        assert!(matches!(
+            &s.row_model.rows[s.row_model.file_ranges[1].start],
+            RowRef::FileHeader { file: 1 }
+        ));
+
+        // A file hidden by the filters falls back to the first visible one.
+        s.filters.path_query = "a.rs".into();
+        s.rebuild_rows();
+        assert_eq!(s.current_file().map(|(i, _)| i), Some(0));
+
+        // An empty PR has no selection and no rows, and stays that way.
+        let mut empty = session_with(&[]);
+        assert!(empty.current_file().is_none());
+        assert!(empty.row_model.rows.is_empty());
+        empty.rebuild_rows();
+        assert!(empty.row_model.rows.is_empty());
+    }
+
     #[test]
     fn reaching_the_file_cap_flags_the_diff_as_truncated() {
         let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
@@ -2502,6 +2638,7 @@ mod tests {
             files: vec![loaded("b.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n")],
             done: true,
         });
+        s.select_file(1);
         assert!(s.row_model.rows.contains(&RowRef::Gap {
             file: 1,
             before_hunk: 0
@@ -2721,7 +2858,9 @@ mod tests {
         assert!(!s.hide_whitespace);
         assert_eq!(s.files[0].diff.as_ref().unwrap().hunks.len(), 1);
         assert_eq!(s.files[2].diff.as_ref().unwrap().hunks.len(), 1);
-        assert_eq!(s.row_model.rows.len(), before + 4);
+        // One file at a time: the rows cover the current file (`a.rs`) only,
+        // and it comes back exactly as it was.
+        assert_eq!(s.row_model.rows.len(), before);
     }
 
     /// A binary raster file, as the files API describes a PNG.

@@ -1,19 +1,15 @@
 //! The virtualized diff surface (spec §8.4).
 //!
-//! One `egui_extras::TableBuilder` renders the whole PR: a header row per file,
-//! that file's lines, placeholders for files GitHub sent no patch for, and the
-//! expandable gaps between hunks. Rows come from [`RowModel`], so the table only
-//! ever touches the rows it actually draws — and highlighting is computed for
-//! exactly those rows, through the bounded cache of
+//! One `egui_extras::TableBuilder` renders the **one selected file**: its
+//! header row, its lines, a placeholder when GitHub sent no patch, and the
+//! expandable gaps between hunks. Rows come from [`RowModel`], so the table
+//! only ever touches the rows it actually draws — and highlighting is
+//! computed for exactly those rows, through the bounded cache of
 //! [`crate::diff::highlight`].
 //!
-//! The file whose rows are at the top of the viewport has its header pinned over
-//! the table ([`sticky_file`]), so a long file's header stays on screen while its
-//! lines scroll under it.
-//!
 //! Everything the widget decides is a pure function ([`row_height`],
-//! [`split_pairs`], [`placeholder_text`], [`header_buttons`], [`sticky_file`]) so
-//! it can be tested without a window; [`render`] only turns those decisions into
+//! [`split_pairs`], [`placeholder_text`], [`header_buttons`]) so it can be
+//! tested without a window; [`render`] only turns those decisions into
 //! widgets.
 
 use eframe::egui;
@@ -54,11 +50,6 @@ pub struct DiffViewState {
     pub mode: DiffMode,
     /// Whether long lines wrap instead of running off the pane.
     pub wrap: bool,
-    /// A file whose header the diff should scroll to on the next frame.
-    ///
-    /// The file tree sets this when a file is selected; [`render`] consumes it
-    /// (takes it) so the surface scrolls once and then leaves the user alone.
-    pub scroll_to: Option<u32>,
     /// The find box's text (Task 48).
     pub find_query: String,
     /// The query [`Self::find_matches`] was computed for, so an edited query
@@ -69,7 +60,7 @@ pub struct DiffViewState {
     /// The match currently selected, as a row index.
     pub find_current: Option<usize>,
     /// A row the surface should scroll to on the next frame — the selected
-    /// find match, consumed by [`render`] like [`Self::scroll_to`].
+    /// find match, consumed by [`render`].
     pub scroll_to_row: Option<usize>,
     /// How image diffs are drawn (Task 49).
     pub image_mode: ImageMode,
@@ -84,7 +75,6 @@ impl Default for DiffViewState {
         DiffViewState {
             mode: DiffMode::Unified,
             wrap: false,
-            scroll_to: None,
             find_query: String::new(),
             find_applied: String::new(),
             find_matches: Vec::new(),
@@ -116,8 +106,9 @@ pub enum DiffAction {
     ToggleViewed(u32),
     /// Start a comment on a line or a file.
     StartComment(CommentTarget),
-    /// Scroll one file's header into view (wired by the file tree).
-    ScrollToFile(u32),
+    /// Show the file at this index in `PrSession::files` (one file at a
+    /// time: the header's prev/next controls report through this).
+    SelectFile(u32),
     /// Fetch and locally diff a too-large file (Phase G).
     LoadLargeDiff(u32),
     /// Flip the hide-whitespace-only-hunks option (Task 48).
@@ -283,40 +274,6 @@ pub fn line_at(session: &PrSession, file: u32, hunk: u32, row: u32) -> Option<&D
         .get(row as usize)
 }
 
-/// The file whose header is pinned to the top of the viewport.
-///
-/// The file that owns the row at `scroll_y`, so [`render`] can keep its header
-/// on screen while the file's lines scroll under it (the brief's sticky file
-/// headers). `None` only when there is no row to own it.
-pub fn sticky_file(session: &PrSession, scroll_y: f32) -> Option<u32> {
-    // Only the start of the visible range is needed, and that depends only on
-    // `scroll_y`; the viewport height does not change which row is on top.
-    let start = session.row_model.visible_range(scroll_y, 0.0).start;
-    let reference = session.row_model.rows.get(start)?;
-    if let Some(file) = file_of(reference) {
-        return Some(file);
-    }
-    // Thread, pending, and composer rows live inside their file's range, so
-    // the header that stays pinned over them is that file's.
-    session
-        .row_model
-        .file_ranges
-        .iter()
-        .position(|range| range.contains(&start))
-        .map(|file| file as u32)
-}
-
-/// The file a row belongs to, when it belongs to one.
-fn file_of(reference: &RowRef) -> Option<u32> {
-    match reference {
-        RowRef::FileHeader { file }
-        | RowRef::Placeholder { file }
-        | RowRef::Line { file, .. }
-        | RowRef::Gap { file, .. } => Some(*file),
-        RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer => None,
-    }
-}
-
 /// Draw the whole diff surface.
 ///
 /// Only the rows the table actually paints are resolved and highlighted, so a
@@ -380,13 +337,6 @@ pub fn render(
         .id_salt("diff-view")
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
 
-    // A file picked in the tree: jump to its header this frame. `offset_of`
-    // gives the pixel offset of the file's first row (spec §9.2).
-    if let Some(file) = state.scroll_to.take() {
-        if let Some(range) = session.row_model.file_ranges.get(file as usize) {
-            table = table.vertical_scroll_offset(session.row_model.offset_of(range.start));
-        }
-    }
     // A find match the toolbar just selected: jump to that exact row
     // (Task 48).
     if let Some(row) = state.scroll_to_row.take() {
@@ -420,7 +370,7 @@ pub fn render(
     // The heights are taken out first: the row closure reaches back into the
     // session mutably to draw composer and thread rows.
     let heights: Vec<f32> = ctx.session.row_model.heights().to_vec();
-    let scroll_area = table.body(|body| {
+    table.body(|body| {
         body.heterogeneous_rows(heights.into_iter(), |mut row| {
             let index = row.index();
             let Some(reference) = ctx.session.row_model.rows.get(index).cloned() else {
@@ -430,21 +380,6 @@ pub fn render(
             render_row(&mut row, &reference, &mut ctx, cache, drafts, actions);
         });
     });
-
-    // Pin the header of the file whose rows are at the top of the viewport, so a
-    // long file's header stays on screen as its lines scroll under it. Painting
-    // after the table draws it over the top row, exactly the way CSS
-    // `position: sticky` overlaps the content behind it.
-    let scroll_y = scroll_area.state.clamped_offset().y;
-    if let Some(file) = sticky_file(ctx.session, scroll_y) {
-        if let Some(loaded) = ctx.session.files.get(file as usize) {
-            ui.painter()
-                .rect_filled(band, 0.0, ui.visuals().faint_bg_color);
-            ui.scope_builder(egui::UiBuilder::new().max_rect(band), |ui| {
-                render_file_header(ui, file, loaded, ctx.session, &style, actions);
-            });
-        }
-    }
 }
 
 /// The theme- and font-derived values every row needs.
@@ -1117,6 +1052,17 @@ fn render_status(ui: &mut egui::Ui, session: &PrSession) {
         return;
     }
 
+    if session.phase == LoadPhase::Ready {
+        // One file at a time: with nothing selected there are no rows, and
+        // the reason belongs on screen.
+        if session.files.is_empty() {
+            ui.label("This pull request has no files.");
+        } else {
+            ui.label("No files match the current filters.");
+        }
+        return;
+    }
+
     ui.horizontal(|ui| {
         ui.spinner();
         ui.label("loading the diff…");
@@ -1252,16 +1198,18 @@ mod tests {
                 created_at: "2026-10-01T00:00:00Z".into(),
             }],
         });
-        session.rebuild_rows();
-        session.open_comment(CommentTarget::Line(line_anchor("src/b.rs", 1)));
+        // One file at a time: every row this test exercises lives on
+        // `src/a.rs`, which is the file the surface shows.
+        session.select_file(0);
+        session.open_comment(CommentTarget::Line(line_anchor("src/a.rs", 1)));
         crate::state::composer::reduce(
             &mut session.composer,
             crate::state::composer::ComposerMsg::SetBody("hold for the review".into()),
         );
         session.submit_comment(CommentMode::Pending, "me", Instant::now());
-        // And leave a file-level composer open, on a placeholder file.
+        // And leave a file-level composer open on the same file.
         session.open_comment(CommentTarget::File {
-            path: "assets/logo.png".into(),
+            path: "src/a.rs".into(),
         });
         assert!(session
             .row_model
@@ -1275,32 +1223,37 @@ mod tests {
         assert!(session.row_model.rows.contains(&RowRef::Composer));
 
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new(true)));
-        for mode in [DiffMode::Unified, DiffMode::Split] {
-            for wrap in [false, true] {
-                let mut state = DiffViewState {
-                    mode,
-                    wrap,
-                    ..Default::default()
-                };
-                let mut drafts = CommentDrafts::default();
-                let mut actions = Vec::new();
-                egui::__run_test_ui(|ui| {
-                    render(
-                        ui,
-                        &mut session,
-                        &mut state,
-                        &mut cache,
-                        &mut drafts,
-                        &mut actions,
-                        None,
+        // Every file in turn: one file at a time, so the loop is what puts
+        // the placeholders and the second file on screen.
+        for file in 0..session.files.len() {
+            session.select_file(file);
+            for mode in [DiffMode::Unified, DiffMode::Split] {
+                for wrap in [false, true] {
+                    let mut state = DiffViewState {
+                        mode,
+                        wrap,
+                        ..Default::default()
+                    };
+                    let mut drafts = CommentDrafts::default();
+                    let mut actions = Vec::new();
+                    egui::__run_test_ui(|ui| {
+                        render(
+                            ui,
+                            &mut session,
+                            &mut state,
+                            &mut cache,
+                            &mut drafts,
+                            &mut actions,
+                            None,
+                        );
+                    });
+                    assert!(
+                        actions
+                            .iter()
+                            .all(|action| matches!(action, DiffAction::LoadImages(_))),
+                        "painting without input emits nothing but lazy image loads"
                     );
-                });
-                assert!(
-                    actions
-                        .iter()
-                        .all(|action| matches!(action, DiffAction::LoadImages(_))),
-                    "painting without input emits nothing but lazy image loads"
-                );
+                }
             }
         }
 
@@ -1348,7 +1301,22 @@ mod tests {
 
     #[test]
     fn find_walks_the_line_rows_and_scrolls() {
-        let session = surface_session();
+        use crate::runtime::{Event, SessionId};
+        use crate::test_support::{loaded, meta, repo};
+
+        // One file, two matching lines: the find walks the rows of the file
+        // the surface shows.
+        let (mut session, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        session.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        session.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("src/a.rs", "@@ -1,3 +1,3 @@\n-a\n+c\n+c2\n")],
+            done: true,
+        });
+        let session = session;
         let mut state = DiffViewState {
             find_query: "c".into(),
             ..Default::default()
@@ -1372,35 +1340,5 @@ mod tests {
         search_diff(&session, &mut state, false);
         assert!(state.find_matches.is_empty());
         assert_eq!(state.find_current, None);
-    }
-
-    #[test]
-    fn sticky_file_follows_the_top_row() {
-        use crate::runtime::{Event, SessionId};
-        use crate::test_support::{loaded, meta, repo};
-
-        let (mut session, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
-        session.on_event(&Event::PrMetadataLoaded {
-            session: SessionId(1),
-            meta: meta("sha1"),
-        });
-        session.on_event(&Event::PrFilesPage {
-            session: SessionId(1),
-            files: vec![
-                loaded("src/a.rs", "@@ -1,2 +1,2 @@\n-a\n+b\n"),
-                loaded("src/b.rs", "@@ -1,2 +1,2 @@\n-c\n+d\n"),
-            ],
-            done: true,
-        });
-
-        // The first row is the first file's header, so that file is pinned.
-        assert_eq!(sticky_file(&session, 0.0), Some(0));
-        // Scrolling past the header pins the file whose lines are now on top.
-        assert_eq!(sticky_file(&session, HEADER_H + 1.0), Some(0));
-
-        // At the second file's header offset, the second file is pinned.
-        let second = session.row_model.file_ranges[1].start;
-        let second_y = session.row_model.offset_of(second);
-        assert_eq!(sticky_file(&session, second_y), Some(1));
     }
 }

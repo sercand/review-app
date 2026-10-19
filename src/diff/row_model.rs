@@ -162,42 +162,68 @@ pub fn build(files: &[LoadedFile]) -> RowModel {
     };
 
     for (file_idx, loaded) in files.iter().enumerate() {
-        let file = file_idx as u32;
         let start = model.rows.len();
-        model.push(RowRef::FileHeader { file }, HEADER_H);
-
-        match &loaded.diff {
-            None => model.push(RowRef::Placeholder { file }, ROW_H),
-            Some(diff) => {
-                for (hunk_idx, hunk) in diff.hunks.iter().enumerate() {
-                    let hunk_idx = hunk_idx as u32;
-                    if hunk.old_start != 1 {
-                        model.push(
-                            RowRef::Gap {
-                                file,
-                                before_hunk: hunk_idx,
-                            },
-                            ROW_H,
-                        );
-                    }
-                    for row_idx in 0..hunk.rows.len() {
-                        model.push(
-                            RowRef::Line {
-                                file,
-                                hunk: hunk_idx,
-                                row: row_idx as u32,
-                            },
-                            ROW_H,
-                        );
-                    }
-                }
-            }
-        }
-
+        push_file(&mut model, file_idx as u32, loaded);
         model.file_ranges.push(start..model.rows.len());
     }
 
     model
+}
+
+/// Build the row list for the **one** file the diff shows (redesign spec:
+/// one file at a time).
+///
+/// Rows are emitted only for `selected`; [`RowModel::file_ranges`] stays
+/// indexed by file — empty for every other file — so row references and
+/// per-file lookups keep working unchanged. `None`, or an index past the
+/// end of `files`, produces a model with no rows.
+pub fn build_one(files: &[LoadedFile], selected: Option<usize>) -> RowModel {
+    let mut model = RowModel {
+        rows: Vec::new(),
+        file_ranges: vec![0..0; files.len()],
+        heights: Vec::new(),
+        prefix: vec![0.0],
+    };
+
+    if let Some(file_idx) = selected.filter(|i| *i < files.len()) {
+        let start = model.rows.len();
+        push_file(&mut model, file_idx as u32, &files[file_idx]);
+        model.file_ranges[file_idx] = start..model.rows.len();
+    }
+
+    model
+}
+
+/// Append one file's rows: header, then placeholder or hunk lines.
+fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile) {
+    model.push(RowRef::FileHeader { file }, HEADER_H);
+    match &loaded.diff {
+        None => model.push(RowRef::Placeholder { file }, ROW_H),
+        Some(diff) => {
+            for (hunk_idx, hunk) in diff.hunks.iter().enumerate() {
+                let hunk_idx = hunk_idx as u32;
+                if hunk.old_start != 1 {
+                    model.push(
+                        RowRef::Gap {
+                            file,
+                            before_hunk: hunk_idx,
+                        },
+                        ROW_H,
+                    );
+                }
+                for row_idx in 0..hunk.rows.len() {
+                    model.push(
+                        RowRef::Line {
+                            file,
+                            hunk: hunk_idx,
+                            row: row_idx as u32,
+                        },
+                        ROW_H,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The text to draw for one line: `text`, truncated at
@@ -224,6 +250,37 @@ pub fn display_text(text: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
     use crate::test_support::loaded;
+
+    #[test]
+    fn build_one_holds_only_the_selected_file() {
+        let files = vec![
+            loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n"),
+            loaded("b.rs", "@@ -1 +1 @@\n-a\n+b\n"),
+        ];
+        let m = build_one(&files, Some(1));
+        assert_eq!(m.file_ranges.len(), 2);
+        assert!(m.file_ranges[0].is_empty());
+        assert_eq!(
+            m.rows
+                .iter()
+                .filter(|r| matches!(r, RowRef::FileHeader { .. }))
+                .count(),
+            1
+        );
+        assert!(m.rows[m.file_ranges[1].clone()].iter().all(|r| match r {
+            RowRef::FileHeader { file } | RowRef::Line { file, .. } => *file == 1,
+            RowRef::Gap { file, .. } => *file == 1,
+            other => panic!("unexpected row {other:?}"),
+        }));
+    }
+
+    #[test]
+    fn build_one_without_a_selection_is_empty() {
+        let files = vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
+        let m = build_one(&files, None);
+        assert!(m.rows.is_empty());
+        assert_eq!(m.file_ranges, vec![0..0]);
+    }
 
     #[test]
     fn builds_ranges_placeholders_and_gaps() {

@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use crate::github::files::{FileStatus, PrFile};
+use crate::model::tree::{build_tree, TreeNode};
 use crate::state::viewed::ViewedSet;
 
 /// What the left pane is filtering the file list by.
@@ -81,6 +82,26 @@ pub fn apply<'a>(
         .collect()
 }
 
+/// The indices of the visible files in **display order**: the same
+/// folders-first, alphabetical order the file tree shows, so `j`/`k`, the
+/// initial selection, and "next unviewed" all follow what the reviewer sees.
+pub fn file_order(files: &[PrFile], filters: &FilterState, viewed: &ViewedSet) -> Vec<usize> {
+    let root = build_tree(files, &|f| matches(f, filters, viewed));
+    let mut out = Vec::new();
+    collect_file_indices(&root, &mut out);
+    out
+}
+
+/// Depth-first collect of `node`'s file indices, in the tree's display order.
+fn collect_file_indices(node: &TreeNode, out: &mut Vec<usize>) {
+    for child in &node.children {
+        match child.file_index {
+            Some(index) => out.push(index),
+            None => collect_file_indices(child, out),
+        }
+    }
+}
+
 /// Every extension present in `files`, sorted and deduplicated.
 ///
 /// Includes `""` for files with no extension.
@@ -118,6 +139,22 @@ mod tests {
     use crate::github::files::FileStatus;
     use crate::state::viewed::ViewedSet;
     use crate::test_support::files_at;
+
+    #[test]
+    fn file_order_follows_the_tree_and_the_filters() {
+        let files = files_at(&["src/b.rs", "src/a.rs", "README.md"]);
+        let none = ViewedSet::default();
+        // Folders precede root files; inside `src`, `a.rs` precedes `b.rs`.
+        assert_eq!(
+            file_order(&files, &FilterState::default(), &none),
+            vec![1, 0, 2]
+        );
+        let f = FilterState {
+            path_query: "src".into(),
+            ..FilterState::default()
+        };
+        assert_eq!(file_order(&files, &f, &none), vec![1, 0]);
+    }
 
     #[test]
     fn filters_form_a_conjunction() {
