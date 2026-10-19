@@ -217,6 +217,11 @@ impl ReviewApp {
             Event::ThreadsLoaded { .. } => {}
             Event::ReviewsLoaded { .. } => {}
             Event::ServerPendingResolved { .. } => {}
+            // Task 44 folds these into the session (clearing the draft on
+            // success, keeping it on failure); the toast covers the failure
+            // surface meanwhile.
+            Event::ReviewSubmitted { .. } => {}
+            Event::ReviewSubmitFailed { error, .. } => self.toasts.push(error.to_string(), now),
             Event::CommentPosted { .. } => {}
             Event::ReplyPosted { .. } => {}
             Event::ThreadResolved { .. } => {}

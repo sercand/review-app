@@ -7,12 +7,12 @@
 //! and no `submitted_at`; its comments come from a separate endpoint.
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
 use crate::model::diff::Side;
-use crate::model::review::ReviewEvent;
+use crate::model::review::{PendingReview, ReviewEvent};
 use crate::model::RepoRef;
 
 /// The state a review is in, as GitHub reports it.
@@ -130,6 +130,44 @@ fn to_review(raw: RawReview) -> Option<Review> {
     })
 }
 
+/// The REST body for `POST .../pulls/{number}/reviews` (spec §7.2).
+///
+/// `commit_id` is the draft's pin when it has one — the comments were written
+/// against that commit — and `head_sha` only when the draft has no comments
+/// and so no pin. `comments` is omitted entirely when empty, and each comment
+/// carries no per-comment `commit_id`: the review's own `commit_id` covers
+/// them all.
+pub fn review_payload(p: &PendingReview, head_sha: &str) -> Value {
+    let mut payload = json!({
+        "commit_id": p.commit_id.clone().unwrap_or_else(|| head_sha.to_owned()),
+        "body": p.body,
+        "event": p.event.as_api_str(),
+    });
+    if !p.comments.is_empty() {
+        let comments: Vec<Value> = p
+            .comments
+            .iter()
+            .map(|c| {
+                let mut comment = json!({
+                    "path": c.anchor.path,
+                    "line": c.anchor.line,
+                    "side": c.anchor.side,
+                    "body": c.body,
+                });
+                if let Some(start_line) = c.anchor.start_line {
+                    comment["start_line"] = json!(start_line);
+                }
+                if let Some(start_side) = c.anchor.start_side {
+                    comment["start_side"] = json!(start_side);
+                }
+                comment
+            })
+            .collect();
+        payload["comments"] = Value::Array(comments);
+    }
+    payload
+}
+
 impl GithubClient {
     /// Every review of PR `number`, in API order, oldest first.
     ///
@@ -215,6 +253,29 @@ impl GithubClient {
         self.send_mutation(self.http().delete(&url)).await?;
         Ok(())
     }
+
+    /// Submit a review built by [`review_payload`].
+    ///
+    /// A mutation: sent once through the non-retrying path, returning the
+    /// review as GitHub created it.
+    pub async fn submit_review(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        payload: &Value,
+    ) -> Result<Review, GhError> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{number}/reviews",
+            self.endpoints().rest,
+            repo.owner,
+            repo.name
+        );
+        let response = self
+            .send_mutation(self.http().post(&url).json(payload))
+            .await?;
+        let raw: RawReview = response.json().await.map_err(decode)?;
+        to_review(raw).ok_or_else(|| GhError::Decode("review: unknown state".to_owned()))
+    }
 }
 
 /// Map a body-read failure to [`GhError::Decode`].
@@ -226,6 +287,8 @@ fn decode(error: reqwest::Error) -> GhError {
 mod tests {
     use super::*;
     use crate::fixture;
+    use crate::model::review::{PendingReview, ReviewEvent};
+    use crate::test_support::{line_anchor, range_anchor};
 
     #[test]
     fn finds_the_viewers_pending_review() {
@@ -235,5 +298,33 @@ mod tests {
         let p = viewer_pending_review(&rs, "me").unwrap();
         assert_eq!((p.id, p.state.clone()), (77, ReviewState::Pending));
         assert!(viewer_pending_review(&rs, "someone-else").is_none());
+    }
+
+    #[test]
+    fn payload_uses_the_pinned_commit_and_ranges() {
+        let mut p = PendingReview::default();
+        p.add(line_anchor("src/a.rs", 42), "b1".into(), "sha1")
+            .unwrap();
+        p.add(range_anchor("src/b.rs", 10, 14), "b2".into(), "sha1")
+            .unwrap();
+        p.set_body("overall".into());
+        p.set_event(ReviewEvent::RequestChanges);
+        let v = review_payload(&p, "sha2"); // head moved; the pin wins
+        assert_eq!(
+            v,
+            json!({
+            "commit_id": "sha1", "body": "overall", "event": "REQUEST_CHANGES",
+            "comments": [
+                {"path": "src/a.rs", "line": 42, "side": "RIGHT", "body": "b1"},
+                {"path": "src/b.rs", "start_line": 10, "start_side": "RIGHT", "line": 14, "side": "RIGHT", "body": "b2"}
+            ]})
+        );
+
+        let mut approve = PendingReview::default();
+        approve.set_event(ReviewEvent::Approve);
+        assert_eq!(
+            review_payload(&approve, "sha2"),
+            json!({"commit_id": "sha2", "body": "", "event": "APPROVE"})
+        );
     }
 }

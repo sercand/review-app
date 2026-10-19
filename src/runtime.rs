@@ -166,6 +166,19 @@ pub enum Command {
         /// The pending review's REST id.
         review_id: u64,
     },
+    /// Submit a review built by [`crate::github::reviews::review_payload`]
+    /// (spec §7.2).
+    SubmitReview {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The REST body, built once by the session so the contract is fixed
+        /// at click time.
+        payload: serde_json::Value,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -292,6 +305,21 @@ pub enum Event {
     ServerPendingResolved {
         /// The session that asked for the change.
         session: SessionId,
+    },
+    /// A review was submitted; the session clears its draft and reloads the
+    /// threads and reviews so the new comments are anchored (spec §7.2).
+    ReviewSubmitted {
+        /// The session that submitted the review.
+        session: SessionId,
+        /// The review as GitHub created it.
+        review: Review,
+    },
+    /// Submitting a review failed; the draft is kept intact (spec §11).
+    ReviewSubmitFailed {
+        /// The session that tried to submit.
+        session: SessionId,
+        /// The classified failure.
+        error: GhError,
     },
 }
 
@@ -800,6 +828,27 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                     session: Some(session),
                     error,
                 }),
+            }
+        }
+        Command::SubmitReview {
+            session,
+            repo,
+            number,
+            payload,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::ReviewSubmitFailed {
+                    session,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A mutation: sent once, never retried; the draft survives until
+            // GitHub confirms (spec §11).
+            match client.submit_review(&repo, number, &payload).await {
+                Ok(review) => events.send(Event::ReviewSubmitted { session, review }),
+                Err(error) => events.send(Event::ReviewSubmitFailed { session, error }),
             }
         }
     }

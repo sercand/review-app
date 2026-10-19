@@ -136,6 +136,18 @@ pub fn line_anchor(path: &str, line: u32) -> crate::model::comment::Anchor {
     }
 }
 
+/// A range [`crate::model::comment::Anchor`] on the RIGHT side of `path`,
+/// from `start` to `end`.
+pub fn range_anchor(path: &str, start: u32, end: u32) -> crate::model::comment::Anchor {
+    crate::model::comment::Anchor {
+        path: path.to_owned(),
+        side: crate::model::diff::Side::Right,
+        line: end,
+        start_line: Some(start),
+        start_side: Some(crate::model::diff::Side::Right),
+    }
+}
+
 /// A [`crate::github::metadata::PrMetadata`] authored by `"author"` with the
 /// given head SHA, in `o/r` as PR #7.
 pub fn meta(head_sha: &str) -> crate::github::metadata::PrMetadata {
