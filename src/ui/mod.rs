@@ -4,6 +4,7 @@
 //! drift.
 
 pub mod command;
+pub mod file_icons;
 pub mod fonts;
 pub mod icons;
 pub mod screens;
