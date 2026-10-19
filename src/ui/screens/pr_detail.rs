@@ -26,15 +26,13 @@ use crate::ui::widgets::filter_bar;
 use crate::ui::widgets::metadata_panel;
 use crate::ui::widgets::review_panel::{self, ReviewAction};
 use crate::ui::widgets::thread_view::CommentDrafts;
+use crate::ui::widgets::top_bar;
 
 /// The width the left pane starts at (mockup 02).
 const LEFT_W: f32 = 300.0;
 
 /// The width the right pane starts at, when open.
 const RIGHT_W: f32 = 320.0;
-
-/// The height the review panel starts at.
-const REVIEW_H: f32 = 220.0;
 
 /// What the user asked of the detail screen beyond the diff.
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +50,10 @@ pub enum PrDetailAction {
     Review(ReviewAction),
     /// Open the settings window (Task 53).
     OpenSettings,
+    /// Open the command palette from the top bar (Task 12).
+    Palette,
+    /// Cycle the theme from the top bar (Task 12).
+    ToggleTheme,
     /// A control in the file header bar (Task 7).
     FileHeader(FileHeaderAction),
     /// A control in the file footer bar (Task 7).
@@ -85,6 +87,8 @@ pub struct PrDetailState {
     pub find_open: bool,
     /// The filter combobox's popover and file-type search text (Task 10).
     pub filter_bar: filter_bar::FilterBarState,
+    /// Whether the top bar's review popover is open (Task 12).
+    pub review_open: bool,
 }
 
 impl Default for PrDetailState {
@@ -99,26 +103,38 @@ impl Default for PrDetailState {
             drafts: CommentDrafts::default(),
             find_open: false,
             filter_bar: filter_bar::FilterBarState::default(),
+            review_open: false,
         }
     }
+}
+
+/// Window-level chrome the screen draws but does not own (Task 12).
+pub struct ScreenInputs<'a> {
+    /// The signed-in user, so the review popover can apply the author rule.
+    pub login: &'a str,
+    /// The rate-limit tooltip (spec §13): `Some` while writes are disabled,
+    /// gating the review popover and composer Submit buttons.
+    pub write_blocked: Option<&'a str>,
+    /// The configured theme, for the bar's theme glyph.
+    pub theme: crate::ui::theme::Theme,
+    /// Whether the OS is dark right now, same reason.
+    pub system_dark: bool,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
 ///
 /// The diff's own actions are pushed onto `diff_actions` for the app to fold
-/// in; the screen's actions are returned. `login` is the signed-in user, so
-/// the review panel can apply the author rule. `write_blocked` is the
-/// rate-limit tooltip (spec §13): `Some` while writes are disabled, gating
-/// the review-panel and composer Submit buttons.
+/// in; the screen's actions are returned.
 pub fn render(
     ui: &mut egui::Ui,
     session: &mut PrSession,
     state: &mut PrDetailState,
     cache: &mut HighlightCache,
     diff_actions: &mut Vec<DiffAction>,
-    login: &str,
-    write_blocked: Option<&str>,
+    inputs: ScreenInputs<'_>,
 ) -> Vec<PrDetailAction> {
+    let login = inputs.login;
+    let write_blocked = inputs.write_blocked;
     let mut actions = Vec::new();
     let mut tree_actions = Vec::new();
 
@@ -127,9 +143,49 @@ pub fn render(
     // flatten, and the action handling below.
     let pr_files: Vec<PrFile> = session.files.iter().map(|l| l.file.clone()).collect();
 
+    // The review view-model is read by the top bar's popover and the banner
+    // strip; computed once per frame before either borrows the session.
+    let panel_inputs = review_panel::PanelInputs {
+        pending: &session.pending,
+        viewer_is_author: viewer_is_author(session, login),
+        server_pending: session.server_pending.is_some(),
+        head_moved_since_pin: head_moved_since_pin(session),
+        write_blocked: write_blocked.map(str::to_owned),
+    };
+    let review_vm = review_panel::review_panel_vm(&panel_inputs);
+
+    // The top bar: back, state pill, repo/title, CI, tools, and the Review
+    // button whose popover replaced the bottom review panel (Task 12).
+    let bar_vm = top_bar::top_bar_vm(session);
+    let mut bar_actions = Vec::new();
+    let mut review_actions = Vec::new();
     egui::Panel::top("pr-detail-top").show(ui, |ui| {
-        render_top_bar(ui, session, state, &mut actions);
+        top_bar::render(
+            ui,
+            &bar_vm,
+            &top_bar::TopBarSettings {
+                theme: inputs.theme,
+                system_dark: inputs.system_dark,
+                details_open: state.right_open,
+            },
+            &mut state.review_open,
+            &mut bar_actions,
+            |ui| {
+                review_panel::render(ui, &review_vm, &mut session.pending, &mut review_actions);
+            },
+        );
     });
+    for action in bar_actions {
+        match action {
+            top_bar::TopBarAction::Back => actions.push(PrDetailAction::Back),
+            top_bar::TopBarAction::Palette => actions.push(PrDetailAction::Palette),
+            top_bar::TopBarAction::Refresh => actions.push(PrDetailAction::Refresh),
+            top_bar::TopBarAction::ToggleTheme => actions.push(PrDetailAction::ToggleTheme),
+            top_bar::TopBarAction::Settings => actions.push(PrDetailAction::OpenSettings),
+            top_bar::TopBarAction::ToggleDetails => state.right_open = !state.right_open,
+        }
+    }
+    actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
 
     let left = egui::Panel::left("pr-detail-left")
         .resizable(true)
@@ -178,28 +234,36 @@ pub fn render(
         }
     }
 
-    // The review panel sits under the diff, always visible: it is where the
-    // draft is edited and submitted (spec §7.2). Its actions ride out as
-    // screen actions for the app, which owns the session mutations.
-    let mut review_actions = Vec::new();
-    egui::Panel::bottom("pr-detail-review")
-        .resizable(true)
-        .default_size(REVIEW_H)
-        .show(ui, |ui| {
-            let inputs = review_panel::PanelInputs {
-                pending: &session.pending,
-                viewer_is_author: viewer_is_author(session, login),
-                server_pending: session.server_pending.is_some(),
-                head_moved_since_pin: head_moved_since_pin(session),
-                write_blocked: write_blocked.map(str::to_owned),
-            };
-            let vm = review_panel::review_panel_vm(&inputs);
-            let past = review_panel::reviews_vm(&session.reviews);
-            review_panel::render(ui, &vm, &mut session.pending, &past, &mut review_actions);
-        });
-    actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
+    // The review draft is edited and submitted from the top bar's popover
+    // now (Task 12); the banners it used to carry moved to the strip above
+    // the diff.
 
     egui::CentralPanel::default().show(ui, |ui| {
+        // Banner strip (Task 12): pinned-commit, server-side pending, and
+        // the 3000-file cap, full width above the diff.
+        if let Some(banner) = &review_vm.banner {
+            review_panel::banner_frame(ui, |ui| {
+                let p = crate::ui::theme::palette_of(ui);
+                ui.colored_label(p.pending, banner.clone());
+            });
+        }
+        let mut banner_actions = Vec::new();
+        review_panel::render_server_pending_banner(ui, &review_vm, &mut banner_actions);
+        actions.extend(banner_actions.into_iter().map(PrDetailAction::Review));
+        if session.files_truncated {
+            review_panel::banner_frame(ui, |ui| {
+                let p = crate::ui::theme::palette_of(ui);
+                ui.colored_label(
+                    p.pending,
+                    format!(
+                        "GitHub only provides the diff for the first {} files — use \
+                         'Open in browser' to see the rest.",
+                        crate::state::pr_detail::GITHUB_FILE_CAP
+                    ),
+                );
+            });
+        }
+
         // The centre column: the file header bar on top, the diff between,
         // and the footer navigation under it (redesign mockup).
         let current = session.current_file().map(|(index, _)| index);
@@ -422,53 +486,6 @@ fn collect_dir_paths(node: &crate::model::tree::TreeNode, out: &mut Vec<String>)
     }
 }
 
-/// The top bar: back, `repo#number`, title, refresh, and the right-pane toggle.
-fn render_top_bar(
-    ui: &mut egui::Ui,
-    session: &PrSession,
-    state: &mut PrDetailState,
-    actions: &mut Vec<PrDetailAction>,
-) {
-    ui.horizontal(|ui| {
-        if ui.button("← Back").clicked() {
-            actions.push(PrDetailAction::Back);
-        }
-        ui.separator();
-
-        ui.strong(format!("{}#{}", session.repo, session.number));
-
-        match &session.metadata {
-            Some(metadata) => {
-                ui.label(&metadata.title);
-                if metadata.draft {
-                    ui.label("draft");
-                }
-            }
-            // Nothing to title the PR with yet.
-            None => {
-                ui.spinner();
-            }
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("Settings").clicked() {
-                actions.push(PrDetailAction::OpenSettings);
-            }
-            let toggle = if state.right_open {
-                "Hide details"
-            } else {
-                "Show details"
-            };
-            if ui.button(toggle).clicked() {
-                state.right_open = !state.right_open;
-            }
-            if ui.button("Refresh").clicked() {
-                actions.push(PrDetailAction::Refresh);
-            }
-        });
-    });
-}
-
 /// Recompute every line row's height when wrap or the content width changed.
 ///
 /// Unwrapped rows always measure [`ROW_H`], so this is a no-op unless wrap is
@@ -569,8 +586,12 @@ mod tests {
                 &mut state,
                 &mut cache,
                 &mut diff_actions,
-                "me",
-                None,
+                ScreenInputs {
+                    login: "me",
+                    write_blocked: None,
+                    theme: crate::ui::theme::Theme::default(),
+                    system_dark: false,
+                },
             );
         });
 
@@ -619,8 +640,12 @@ mod tests {
                 &mut state,
                 &mut cache,
                 &mut diff_actions,
-                "me",
-                None,
+                ScreenInputs {
+                    login: "me",
+                    write_blocked: None,
+                    theme: crate::ui::theme::Theme::default(),
+                    system_dark: false,
+                },
             );
         });
         assert!(

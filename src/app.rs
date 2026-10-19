@@ -800,14 +800,19 @@ impl ReviewApp {
         session.tick(now);
 
         let mut diff_actions = Vec::new();
+        let system_dark = ui.ctx().system_theme() == Some(egui::Theme::Dark);
         let actions = pr_detail::render(
             ui,
             session,
             &mut self.pr_detail,
             &mut self.highlight_cache,
             &mut diff_actions,
-            &login,
-            write_blocked,
+            pr_detail::ScreenInputs {
+                login: &login,
+                write_blocked,
+                theme: self.settings.theme,
+                system_dark,
+            },
         );
 
         self.apply_diff_actions(diff_actions, ui.ctx(), now);
@@ -848,6 +853,13 @@ impl ReviewApp {
                     }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),
+                PrDetailAction::Palette => self.palette.open_now(),
+                PrDetailAction::ToggleTheme => {
+                    let system_dark = ui.ctx().system_theme() == Some(egui::Theme::Dark);
+                    self.settings.theme =
+                        crate::ui::widgets::top_bar::next_theme(self.settings.theme, system_dark);
+                    self.save_settings(now);
+                }
                 PrDetailAction::FileHeader(action) => {
                     self.apply_file_header_action(action, ui.ctx(), now);
                 }
@@ -900,6 +912,32 @@ impl ReviewApp {
             }
             ReviewAction::DeleteComment(local_id) => {
                 session.delete_pending(local_id, now);
+                Vec::new()
+            }
+            ReviewAction::LocatePending(local_id) => {
+                // Task 12: jump the diff to the comment's anchor.
+                let anchor = session
+                    .pending
+                    .comments
+                    .iter()
+                    .find(|comment| comment.local_id == local_id)
+                    .map(|comment| comment.anchor.clone());
+                if let Some(anchor) = anchor {
+                    if let Some(index) = session
+                        .files
+                        .iter()
+                        .position(|l| l.file.path == anchor.path)
+                    {
+                        session.select_file(index);
+                        if let Some(row) =
+                            session
+                                .row_model
+                                .row_of_line(&session.files, anchor.side, anchor.line)
+                        {
+                            self.pr_detail.diff.scroll_to_row = Some(row);
+                        }
+                    }
+                }
                 Vec::new()
             }
             ReviewAction::Discard => {
@@ -1227,9 +1265,16 @@ impl ReviewApp {
             // `global_key_allowed`); inside the panel the panel's own
             // scoped ⌘Enter handler owns the shortcut.
             "submit_review" => {
-                let login = self.login();
-                for command in self.apply_review_action(ReviewAction::Submit, &login, now) {
-                    self.worker.send(command);
+                // Task 12: with the review popover closed the shortcut opens
+                // it; with it open the shortcut submits, subject to the same
+                // rule and all (Task 44).
+                if self.session.is_some() && !self.pr_detail.review_open {
+                    self.pr_detail.review_open = true;
+                } else {
+                    let login = self.login();
+                    for command in self.apply_review_action(ReviewAction::Submit, &login, now) {
+                        self.worker.send(command);
+                    }
                 }
             }
             _ => {}

@@ -26,7 +26,7 @@ use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
-use crate::state::pr_detail::{LoadPhase, PrSession, GITHUB_FILE_CAP};
+use crate::state::pr_detail::{LoadPhase, PrSession};
 use crate::ui::icons::{CHEVRONS_DOWN, CHEVRONS_UP, PLUS, UNFOLD_VERTICAL};
 use crate::ui::theme::palette_of;
 use crate::ui::widgets::comment_composer;
@@ -263,19 +263,8 @@ pub fn render(
         weak: ui.visuals().weak_text_color(),
     };
 
-    // Spec §7.5: GitHub's files API returns at most 3000 files per PR and
-    // says nothing when it truncates; the session flags the cap and this
-    // banner keeps the reason on screen while any of the diff shows.
-    if session.files_truncated {
-        ui.colored_label(
-            ui.visuals().warn_fg_color,
-            format!(
-                "GitHub only provides the diff for the first {} files — use \
-                 'Open in browser' to see the rest.",
-                GITHUB_FILE_CAP
-            ),
-        );
-    }
+    // Spec §7.5: the 3000-file banner now lives in the detail screen's
+    // banner strip above the diff (redesign Task 12).
 
     if session.row_model.rows.is_empty() {
         render_status(ui, session);

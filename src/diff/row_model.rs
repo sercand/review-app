@@ -117,6 +117,49 @@ impl RowModel {
         &self.heights
     }
 
+    /// The first surface row that shows `line` on `side` (Task 12: jumping to
+    /// a pending comment). `files` resolves the row references; a line no row
+    /// carries (collapsed away, or never in the diff) is `None`.
+    pub fn row_of_line(
+        &self,
+        files: &[LoadedFile],
+        side: crate::model::diff::Side,
+        line: u32,
+    ) -> Option<usize> {
+        let carries = |file: u32, hunk: u32, row: u32| -> bool {
+            files
+                .get(file as usize)
+                .and_then(|loaded| loaded.diff.as_ref())
+                .and_then(|diff| diff.hunks.get(hunk as usize))
+                .and_then(|hunk| hunk.rows.get(row as usize))
+                .and_then(|diff_row| match side {
+                    crate::model::diff::Side::Left => diff_row.old_no,
+                    crate::model::diff::Side::Right => diff_row.new_no,
+                })
+                == Some(line)
+        };
+        self.rows.iter().enumerate().find_map(|(index, row)| {
+            let holds = match row {
+                RowRef::Line { file, hunk, row } => carries(*file, *hunk, *row),
+                RowRef::Pair {
+                    file,
+                    hunk,
+                    left,
+                    right,
+                } => match side {
+                    crate::model::diff::Side::Left => {
+                        left.is_some_and(|row| carries(*file, *hunk, row))
+                    }
+                    crate::model::diff::Side::Right => {
+                        right.is_some_and(|row| carries(*file, *hunk, row))
+                    }
+                },
+                _ => false,
+            };
+            holds.then_some(index)
+        })
+    }
+
     /// Record a measured height for one row.
     ///
     /// Called when word wrap is on and the pane width changes; out-of-range
@@ -329,7 +372,22 @@ pub fn display_text(text: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::diff::Side;
     use crate::test_support::loaded;
+
+    #[test]
+    fn row_of_line_finds_pairs_and_lines() {
+        let files = vec![loaded("a.rs", "@@ -1,2 +1,2 @@\n-a\n+b\n c\n")];
+        // Rows: 0 FileHeader, 1 HunkHeader, 2 Pair(-a,+b), 3 Pair(c,c).
+        let split = build_one(&files, Some(0), DiffMode::Split);
+        assert_eq!(split.row_of_line(&files, Side::Right, 2), Some(3));
+        assert_eq!(split.row_of_line(&files, Side::Left, 1), Some(2));
+        assert_eq!(split.row_of_line(&files, Side::Right, 99), None);
+        // Unified: 2 is `-a`, 3 is `+b`, 4 is ` c`.
+        let unified = build_one(&files, Some(0), DiffMode::Unified);
+        assert_eq!(unified.row_of_line(&files, Side::Right, 2), Some(4));
+        assert_eq!(unified.row_of_line(&files, Side::Left, 1), Some(2));
+    }
 
     #[test]
     fn build_one_holds_only_the_selected_file() {

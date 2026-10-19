@@ -16,3 +16,4 @@ pub mod review_panel;
 pub mod settings_window;
 pub mod thread_view;
 pub mod toast;
+pub mod top_bar;

@@ -10,11 +10,12 @@
 //! Focus #7). [`render`] only draws the view-model and reports controls as
 //! [`ReviewAction`]s; the app folds them into the session.
 
-use eframe::egui;
+use eframe::egui::{self, RichText, Sense};
 
 use crate::github::reviews::{Review, ReviewState};
 use crate::model::review::{PendingReview, ReviewEvent};
 use crate::ui::widgets::markdown::{self, MarkdownDoc};
+use crate::ui::{file_icons, icons, theme};
 
 /// The blocked-reason shown while the viewer has a pending review on the
 /// server (Review Focus #6): it must be submitted or discarded there first.
@@ -131,10 +132,63 @@ pub enum ReviewAction {
     EditComment(u64, String),
     /// Drop one pending comment.
     DeleteComment(u64),
+    /// Jump the diff to one pending comment (Task 12).
+    LocatePending(u64),
     /// Submit the server-side pending review with this verdict and body.
     SubmitServerPending(ReviewEvent, String),
     /// Discard the server-side pending review.
     DiscardServerPending,
+}
+
+/// One pending comment as the popover lists it (Task 12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingItemVm {
+    /// The draft id the click reports back with.
+    pub local_id: u64,
+    /// The full path, for the file icon.
+    pub path: String,
+    /// The file's name only.
+    pub name: String,
+    /// The anchor label, `"R99"` or `"L12"`.
+    pub line: String,
+    /// The body's first line, cut to 60 characters with an ellipsis.
+    pub excerpt: String,
+}
+
+/// The popover's pending-comment list.
+pub fn pending_items(pending: &PendingReview) -> Vec<PendingItemVm> {
+    pending
+        .comments
+        .iter()
+        .map(|comment| {
+            let first = comment.body.lines().next().unwrap_or_default();
+            let excerpt = if first.chars().count() > 60 {
+                format!("{}…", first.chars().take(60).collect::<String>())
+            } else {
+                first.to_owned()
+            };
+            PendingItemVm {
+                local_id: comment.local_id,
+                path: comment.anchor.path.clone(),
+                name: comment
+                    .anchor
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                line: format!(
+                    "{}{}",
+                    match comment.anchor.side {
+                        crate::model::diff::Side::Right => "R",
+                        crate::model::diff::Side::Left => "L",
+                    },
+                    comment.anchor.line
+                ),
+                excerpt,
+            }
+        })
+        .collect()
 }
 
 /// The memory key holding the Discard confirmation's open state.
@@ -142,225 +196,262 @@ fn discard_confirm_id() -> egui::Id {
     egui::Id::unique("review-panel-discard-confirm")
 }
 
-/// Draw the review panel: banners, verdict, summary, pending list, and the
-/// submitted reviews.
+/// The server-side pending review banner (Task 12): the REST list does not
+/// expose the verdict the reviewer picked in the web UI, so the banner asks
+/// for it explicitly (defaulting to Comment) before Submit it or Discard it.
+pub fn render_server_pending_banner(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    actions: &mut Vec<ReviewAction>,
+) {
+    let Some(reason) = vm.blocked_reason else {
+        return;
+    };
+    let p = theme::palette_of(ui);
+    banner_frame(ui, |ui| {
+        ui.colored_label(p.pending, reason);
+        let mut choice = server_pending_choice(ui);
+        ui.horizontal(|ui| {
+            ui.label("Submit as:");
+            for (label, event, allowed, hover) in [
+                ("Comment", ReviewEvent::Comment, true, ""),
+                (
+                    "Approve",
+                    ReviewEvent::Approve,
+                    vm.can_approve,
+                    "you are the pull request's author",
+                ),
+                (
+                    "Request changes",
+                    ReviewEvent::RequestChanges,
+                    vm.can_request_changes,
+                    "you are the pull request's author",
+                ),
+            ] {
+                let response = ui.add_enabled(
+                    allowed,
+                    egui::Button::selectable(choice.event == event, label),
+                );
+                if response.clicked() {
+                    choice.event = event;
+                    set_server_pending_choice(ui, choice.clone());
+                }
+                if !allowed {
+                    response.on_hover_text(hover);
+                }
+            }
+        });
+        let choice_body = ui.add(
+            egui::TextEdit::multiline(&mut choice.body)
+                .hint_text("Review summary (optional)")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY),
+        );
+        if choice_body.changed() {
+            set_server_pending_choice(ui, choice.clone());
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Submit it").clicked() {
+                actions.push(server_pending_submit(
+                    choice.event,
+                    choice.body.clone(),
+                    !vm.can_approve,
+                ));
+            }
+            if ui.button("Discard it").clicked() {
+                actions.push(ReviewAction::DiscardServerPending);
+            }
+        });
+    });
+}
+
+/// The full-width banner strip style (redesign Task 12): `pending_soft`
+/// fill, `pending` text.
+pub fn banner_frame(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    let p = theme::palette_of(ui);
+    egui::Frame::new()
+        .fill(p.pending_soft)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.vertical(content);
+        });
+}
+
+/// Draw the review popover's content (Task 12): summary, verdict cards,
+/// the pending-comment list, and the Submit/Discard footer. The banners and
+/// the server-pending picker live in the banner strip above the diff.
 ///
-/// The summary and comment text edits bind straight into `pending` (like the
-/// composer binds into [`crate::state::composer::ComposerState`]); the
-/// matching `SetBody`/`EditComment` actions tell the app the draft changed so
-/// it can persist it. `Ctrl`/`⌘`+Enter submits when the view-model allows it
-/// and keyboard focus is on one of the panel's own text edits, and Discard
-/// asks for confirmation before it reports anything.
+/// The summary edit binds straight into `pending`; the matching `SetBody`
+/// action tells the app the draft changed so it can persist it. `Ctrl`/`⌘`
+/// +Enter submits when the view-model allows it and keyboard focus is on the
+/// popover's own summary field, and Discard asks for confirmation before it
+/// reports anything.
 pub fn render(
     ui: &mut egui::Ui,
     vm: &ReviewPanelVm,
     pending: &mut PendingReview,
-    past: &[ReviewVm],
     actions: &mut Vec<ReviewAction>,
 ) {
-    egui::ScrollArea::vertical()
-        .id_salt("review-panel")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            if let Some(banner) = &vm.banner {
-                ui.colored_label(ui.visuals().warn_fg_color, banner);
-            }
-            if let Some(reason) = vm.blocked_reason {
-                ui.colored_label(ui.visuals().warn_fg_color, reason);
-                // The REST list does not expose the verdict the reviewer
-                // picked in the web UI, so the banner asks for it explicitly
-                // (defaulting to Comment) instead of silently submitting one.
-                let mut choice = server_pending_choice(ui);
-                ui.horizontal(|ui| {
-                    ui.label("Submit as:");
-                    for (label, event, allowed, hover) in [
-                        ("Comment", ReviewEvent::Comment, true, ""),
-                        (
-                            "Approve",
-                            ReviewEvent::Approve,
-                            vm.can_approve,
-                            "you are the pull request's author",
-                        ),
-                        (
-                            "Request changes",
-                            ReviewEvent::RequestChanges,
-                            vm.can_request_changes,
-                            "you are the pull request's author",
-                        ),
-                    ] {
-                        let response = ui.add_enabled(
-                            allowed,
-                            egui::Button::selectable(choice.event == event, label),
-                        );
-                        if response.clicked() {
-                            choice.event = event;
-                            set_server_pending_choice(ui, choice.clone());
-                        }
-                        if !allowed {
-                            response.on_hover_text(hover);
-                        }
-                    }
-                });
-                let choice_body = ui.add(
-                    egui::TextEdit::multiline(&mut choice.body)
-                        .hint_text("Review summary (optional)")
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY),
-                );
-                if choice_body.changed() {
-                    set_server_pending_choice(ui, choice.clone());
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("Submit pending review").clicked() {
-                        actions.push(server_pending_submit(
-                            choice.event,
-                            choice.body.clone(),
-                            !vm.can_approve,
-                        ));
-                    }
-                    if ui.button("Discard pending review").clicked() {
-                        actions.push(ReviewAction::DiscardServerPending);
-                    }
-                });
-            }
+    let p = theme::palette_of(ui);
+    ui.set_width(380.0);
+    ui.strong("Finish your review");
 
-            ui.strong(format!("Pending review ({})", vm.pending_count));
+    let body_response = ui.add(
+        egui::TextEdit::multiline(&mut pending.body)
+            .hint_text("Leave a summary (optional for Approve)")
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    );
+    // The edit wrote straight into `pending.body`; report the change so the
+    // app persists the draft.
+    if body_response.changed() {
+        actions.push(ReviewAction::SetBody(pending.body.clone()));
+    }
+    // The widget the scoped submit shortcut may fire from.
+    let owned_ids = [body_response.id];
+
+    for (label, description, event, icon, allowed, reason) in [
+        (
+            "Comment",
+            "Feedback without approving",
+            ReviewEvent::Comment,
+            icons::MESSAGE_SQUARE,
+            true,
+            "",
+        ),
+        (
+            "Approve",
+            "Ready to merge",
+            ReviewEvent::Approve,
+            icons::CIRCLE_CHECK,
+            vm.can_approve,
+            "you are the pull request's author",
+        ),
+        (
+            "Request changes",
+            "Needs work before merging; needs a summary",
+            ReviewEvent::RequestChanges,
+            icons::CIRCLE_X,
+            vm.can_request_changes,
+            "you are the pull request's author",
+        ),
+    ] {
+        let selected = pending.event == event;
+        let frame = egui::Frame::new()
+            .fill(if !allowed {
+                p.surface
+            } else if selected {
+                p.accent_soft
+            } else {
+                p.raised
+            })
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(10, 6));
+        let card = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (label, event, allowed, reason) in [
-                    ("Comment", ReviewEvent::Comment, true, ""),
-                    (
-                        "Approve",
-                        ReviewEvent::Approve,
-                        vm.can_approve,
-                        "you are the pull request's author",
-                    ),
-                    (
-                        "Request changes",
-                        ReviewEvent::RequestChanges,
-                        vm.can_request_changes,
-                        "you are the pull request's author",
-                    ),
-                ] {
-                    let response = ui.add_enabled(
-                        allowed,
-                        egui::Button::selectable(pending.event == event, label),
-                    );
-                    if response.clicked() {
-                        actions.push(ReviewAction::SetEvent(event));
-                    }
-                    if !allowed {
-                        response.on_hover_text(reason);
-                    }
-                }
-            });
-
-            let body_response = ui.add(
-                egui::TextEdit::multiline(&mut pending.body)
-                    .hint_text("Leave a review summary")
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
-            // The edit wrote straight into `pending.body`; report the change
-            // so the app persists the draft.
-            if body_response.changed() {
-                actions.push(ReviewAction::SetBody(pending.body.clone()));
-            }
-            // The widgets the submit shortcut may fire from: the panel's own
-            // text edits, so a field elsewhere can never trigger a submit.
-            let mut owned_ids = vec![body_response.id];
-
-            for comment in &mut pending.comments {
-                ui.horizontal(|ui| {
-                    ui.weak(format!("{}:{}", comment.anchor.path, comment.anchor.line));
-                    if ui.button("Delete").clicked() {
-                        actions.push(ReviewAction::DeleteComment(comment.local_id));
-                    }
-                });
-                let response = ui.add(
-                    egui::TextEdit::multiline(&mut comment.body)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                owned_ids.push(response.id);
-                if response.changed() {
-                    actions.push(ReviewAction::EditComment(
-                        comment.local_id,
-                        comment.body.clone(),
-                    ));
-                }
-                ui.separator();
-            }
-
-            ui.horizontal(|ui| {
-                let submit = ui.add_enabled(
-                    vm.submit_enabled,
-                    egui::Button::new(egui::RichText::new("Submit review").strong()),
-                );
-                if submit.clicked() {
-                    actions.push(ReviewAction::Submit);
-                }
-                match &vm.write_blocked {
-                    Some(reason) => submit.on_disabled_hover_text(reason),
-                    None => submit.on_disabled_hover_text(
-                        "a comment needs a body or a comment, request changes needs a body",
-                    ),
+                let radio = if selected {
+                    icons::CIRCLE_DOT
+                } else {
+                    icons::CIRCLE
                 };
-                if ui.button("Discard").clicked() {
+                let tint = if allowed { p.text } else { p.faint };
+                ui.label(RichText::new(radio).color(if selected { p.accent } else { p.faint }));
+                ui.label(RichText::new(icon).color(tint));
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(label).color(tint).strong());
+                    ui.colored_label(p.muted, description);
+                });
+            });
+        });
+        let response = ui.interact(
+            card.response.rect,
+            ui.make_persistent_id(("verdict-card", label)),
+            Sense::click(),
+        );
+        if response.clicked() && allowed {
+            actions.push(ReviewAction::SetEvent(event));
+        }
+        if !allowed {
+            response.on_hover_text(reason);
+        }
+    }
+
+    if vm.pending_count > 0 {
+        ui.label(format!("{} pending comments", vm.pending_count));
+        for item in pending_items(pending) {
+            let frame = egui::Frame::new()
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(6, 2));
+            let row = frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    file_icons::file_icon(ui, &item.path);
+                    ui.label(item.name.clone());
+                    ui.colored_label(p.faint, item.line.clone());
+                    ui.colored_label(p.muted, item.excerpt.clone());
+                });
+            });
+            let response = ui.interact(
+                row.response.rect,
+                ui.make_persistent_id(("pending-item", item.local_id)),
+                Sense::click(),
+            );
+            if response.clicked() {
+                actions.push(ReviewAction::LocatePending(item.local_id));
+            }
+        }
+    }
+
+    ui.separator();
+    if confirm_discard(ui) {
+        ui.horizontal(|ui| {
+            ui.label("Discard the whole review?");
+            if ui.button("Yes, discard").clicked() {
+                actions.push(ReviewAction::Discard);
+                set_confirm_discard(ui, false);
+            }
+            if ui.button("Keep").clicked() {
+                set_confirm_discard(ui, false);
+            }
+        });
+    } else {
+        ui.horizontal(|ui| {
+            let submit = ui.add_enabled(
+                vm.submit_enabled,
+                egui::Button::new(
+                    RichText::new(icons::icon_text(icons::SEND, "Submit review"))
+                        .color(p.accent_ink),
+                )
+                .fill(p.accent),
+            );
+            if submit.clicked() {
+                actions.push(ReviewAction::Submit);
+            }
+            match &vm.write_blocked {
+                Some(reason) => submit.on_disabled_hover_text(reason),
+                None => submit.on_disabled_hover_text(
+                    "a comment needs a body or a comment, request changes needs a body",
+                ),
+            };
+            ui.label(RichText::new("⌘↵").color(p.faint));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let discard =
+                    ui.add(egui::Button::new(RichText::new("Discard").color(p.bad)).frame(false));
+                if discard.clicked() {
                     set_confirm_discard(ui, true);
                 }
             });
-            if confirm_discard(ui) {
-                ui.horizontal(|ui| {
-                    ui.label("Discard the whole review?");
-                    if ui.button("Yes, discard").clicked() {
-                        actions.push(ReviewAction::Discard);
-                        set_confirm_discard(ui, false);
-                    }
-                    if ui.button("Keep").clicked() {
-                        set_confirm_discard(ui, false);
-                    }
-                });
-            }
-            // Scope the shortcut to the panel: it fires only while keyboard
-            // focus is on one of the panel's own text edits, so ⌘+Enter in
-            // the thread-reply composer (or any other field) can never
-            // submit the review by accident.
-            let focused = ui.ctx().memory(|m| m.focused());
-            let submit_shortcut = ui
-                .input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
-                && submit_shortcut_allowed(focused, &owned_ids);
-            if submit_shortcut && vm.submit_enabled {
-                actions.push(ReviewAction::Submit);
-            }
-
-            ui.add_space(8.0);
-            ui.strong("Reviews");
-            for review in past {
-                ui.horizontal(|ui| {
-                    ui.strong(&review.author);
-                    ui.weak(state_label(&review.state));
-                    if !review.submitted_at.is_empty() {
-                        ui.weak(&review.submitted_at);
-                    }
-                });
-                markdown::render(ui, &review.body_doc);
-                ui.separator();
-            }
         });
-}
-
-/// The label for a review's state.
-fn state_label(state: &ReviewState) -> &'static str {
-    match state {
-        ReviewState::Approved => "approved",
-        ReviewState::ChangesRequested => "requested changes",
-        ReviewState::Commented => "commented",
-        ReviewState::Dismissed => "dismissed",
-        ReviewState::Pending => "pending",
+    }
+    // Scope the shortcut to the popover: it fires only while keyboard focus
+    // is on the summary field, so ⌘+Enter in the thread-reply composer (or
+    // any other field) can never submit the review by accident.
+    let focused = ui.ctx().memory(|m| m.focused());
+    let submit_shortcut = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
+        && submit_shortcut_allowed(focused, &owned_ids);
+    if submit_shortcut && vm.submit_enabled {
+        actions.push(ReviewAction::Submit);
     }
 }
-
 /// The short form of a SHA used in banners and error messages.
 pub fn sha7(sha: &str) -> String {
     sha.chars().take(7).collect()
@@ -537,21 +628,14 @@ mod tests {
         assert_eq!(vms[1].state, ReviewState::Commented);
     }
 
-    /// The panel must paint a draft, a server-pending banner, and past
-    /// reviews without panicking and without inventing actions.
+    /// The popover must paint a draft, and the banner a server-pending
+    /// review, without panicking and without inventing actions.
     #[test]
     fn render_paints_the_panel_without_actions() {
         let mut p = PendingReview::default();
         p.add(line_anchor("a.rs", 1), "needs work".into(), "sha1")
             .unwrap();
         p.set_event(ReviewEvent::RequestChanges);
-        let past = reviews_vm(&[Review {
-            id: 2,
-            author: "other".into(),
-            state: ReviewState::ChangesRequested,
-            body: "fix **this**".into(),
-            submitted_at: Some("2026-10-19T00:00:00Z".into()),
-        }]);
         let vm = review_panel_vm(&PanelInputs {
             server_pending: true,
             head_moved_since_pin: true,
@@ -559,9 +643,28 @@ mod tests {
         });
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            render(ui, &vm, &mut p, &past, &mut actions);
+            render_server_pending_banner(ui, &vm, &mut actions);
+            render(ui, &vm, &mut p, &mut actions);
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
+    }
+
+    #[test]
+    fn pending_items_label_lines_and_cut_excerpts() {
+        let pending = PendingReview {
+            comments: vec![crate::model::review::PendingComment {
+                local_id: 1,
+                anchor: line_anchor("src/lib/data-tools/push.ts", 99),
+                body: "Should the warning include the template id? It makes the toast actionable.\nsecond line"
+                    .into(),
+            }],
+            ..Default::default()
+        };
+        let items = pending_items(&pending);
+        assert_eq!(items[0].name, "push.ts");
+        assert_eq!(items[0].line, "R99");
+        assert_eq!(items[0].excerpt.chars().count(), 61);
+        assert!(items[0].excerpt.ends_with('…'));
     }
 
     #[test]
@@ -637,7 +740,7 @@ mod tests {
         // own; `request_focus` takes effect at the start of the next frame.
         ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.ctx().memory_mut(|m| m.request_focus(foreign));
-            render(ui, &vm, &mut p, &[], &mut actions);
+            render(ui, &vm, &mut p, &mut actions);
         })
         .drop_without_applying_deltas();
         // Frame 2: press Cmd/Ctrl+Enter with that focus still in place.
@@ -658,7 +761,7 @@ mod tests {
                 Some(foreign),
                 "the foreign field still holds focus"
             );
-            render(ui, &vm, &mut p, &[], &mut actions);
+            render(ui, &vm, &mut p, &mut actions);
         })
         .drop_without_applying_deltas();
         assert!(
