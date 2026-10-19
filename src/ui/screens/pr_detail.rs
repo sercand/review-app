@@ -398,7 +398,7 @@ fn render_top_bar(
 /// keep whatever height their own renderer measured (spec §8.4).
 fn recompute_line_heights(ui: &egui::Ui, session: &mut PrSession, state: &mut PrDetailState) {
     let wrap = state.diff.wrap;
-    let width = diff_view::content_width(ui, state.diff.mode);
+    let width = diff_view::content_width(ui, session.mode);
     if state.last_layout == Some((wrap, width)) {
         return;
     }
@@ -417,6 +417,28 @@ fn recompute_line_heights(ui: &egui::Ui, session: &mut PrSession, state: &mut Pr
                         ),
                         None => ROW_H,
                     }
+                }
+                RowRef::Pair {
+                    file,
+                    hunk,
+                    left,
+                    right,
+                } => {
+                    // A wrapped pair is as tall as its taller side.
+                    let side = |index: Option<u32>| {
+                        index
+                            .and_then(|index| diff_view::line_at(session, *file, *hunk, index))
+                            .map(|diff_row| {
+                                diff_view::row_height(
+                                    wrap,
+                                    &display_text(&diff_row.text),
+                                    char_width,
+                                    width,
+                                )
+                            })
+                            .unwrap_or(ROW_H)
+                    };
+                    side(*left).max(side(*right))
                 }
                 _ => continue,
             }

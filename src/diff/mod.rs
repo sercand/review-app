@@ -11,3 +11,4 @@ pub mod options;
 pub mod parse;
 pub mod row_model;
 pub mod suggestion;
+pub mod word;

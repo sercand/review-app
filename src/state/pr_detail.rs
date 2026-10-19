@@ -26,7 +26,7 @@ use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{review_payload, Review, ServerPendingComment};
 use crate::model::comment::{Anchor, CommentTarget};
-use crate::model::diff::FileDiff;
+use crate::model::diff::{DiffMode, FileDiff};
 use crate::model::review::{PendingError, PendingReview, ReviewEvent};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
@@ -174,6 +174,8 @@ pub struct PrSession {
     /// resolves line rows by hunk index, so hiding filters each file's diff
     /// in place rather than only the rows built from it.
     pub hide_whitespace: bool,
+    /// The layout the diff shows: unified rows or paired split rows.
+    pub mode: DiffMode,
     /// The unfiltered diffs stashed while whitespace is hidden, by file
     /// index, so turning the option off restores exactly what was on screen.
     original_diffs: HashMap<u32, FileDiff>,
@@ -300,7 +302,7 @@ impl PrSession {
             metadata: None,
             diff_head_sha: None,
             files: Vec::new(),
-            row_model: build_one(&[], None),
+            row_model: build_one(&[], None, DiffMode::Unified),
             phase: LoadPhase::Header,
             error: None,
             head_moved: false,
@@ -321,6 +323,7 @@ impl PrSession {
             pending_expands: Vec::new(),
             merge_base: None,
             hide_whitespace: false,
+            mode: DiffMode::Unified,
             original_diffs: HashMap::new(),
             filtered_files: std::collections::HashSet::new(),
             images: HashMap::new(),
@@ -695,7 +698,7 @@ impl PrSession {
         // The truncation verdict belongs to the load being dropped; the
         // reload sets it again only if it hits the cap too (spec §7.5).
         self.files_truncated = false;
-        self.row_model = build_one(&[], None);
+        self.row_model = build_one(&[], None, DiffMode::Unified);
         self.threads.clear();
         self.restore_optimistic_to_composer();
         self.fallback = None;
@@ -810,39 +813,58 @@ impl PrSession {
         self.rebuild_rows();
     }
 
+    /// Switch between the unified and split layouts and rebuild the rows;
+    /// measured heights belong to the old layout and are dropped with it.
+    pub fn set_mode(&mut self, mode: DiffMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.rebuild_rows();
+    }
+
     pub fn rebuild_rows(&mut self) {
         if self.hide_whitespace {
             self.filter_whitespace();
         }
         let items = self.inline_items();
         let selected = self.current_file().map(|(index, _)| index);
-        // Measured heights belong to the file they were measured on: carry
-        // them over only while the selection is unchanged, never across a
-        // file switch.
-        let same_file = self
+        // Measured heights belong to the file and layout they were measured
+        // on: carry them over only while neither changes.
+        let same_layout = self
             .row_model
             .rows
             .first()
             .map(|row| {
                 matches!(row, RowRef::FileHeader { file } if *file as usize == selected.unwrap_or(usize::MAX))
             })
-            .unwrap_or(true);
-        let measured: Vec<f32> = if same_file {
+            .unwrap_or(true)
+            && self
+                .row_model
+                .rows
+                .iter()
+                .any(|row| matches!(row, RowRef::Pair { .. }))
+                == (self.mode == DiffMode::Split);
+        let measured: Vec<f32> = if same_layout {
             self.row_model
                 .rows
                 .iter()
                 .zip(self.row_model.heights())
-                .filter(|(row, _)| matches!(row, RowRef::Line { .. }))
+                .filter(|(row, _)| matches!(row, RowRef::Line { .. } | RowRef::Pair { .. }))
                 .map(|(_, height)| *height)
                 .collect()
         } else {
             Vec::new()
         };
 
-        let mut model = annotate(&build_one(&self.files, selected), &self.files, &items);
+        let mut model = annotate(
+            &build_one(&self.files, selected, self.mode),
+            &self.files,
+            &items,
+        );
         let mut heights = measured.into_iter();
         for index in 0..model.rows.len() {
-            if matches!(model.rows[index], RowRef::Line { .. }) {
+            if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. }) {
                 if let Some(height) = heights.next() {
                     model.set_height(index, height);
                 }

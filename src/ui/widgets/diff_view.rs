@@ -20,12 +20,14 @@ use crate::diff::expand::Expand;
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
 use crate::diff::options::{find_matches, next_match, prev_match};
-use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
+use crate::diff::row_model::{display_text, pair_indices, RowRef, HEADER_H, ROW_H};
+use crate::diff::word::word_diff;
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
 use crate::model::diff::{DiffRow, LineKind, Side};
 use crate::state::composer::{anchor_warning, ComposerAction};
 use crate::state::pr_detail::{LoadPhase, PrSession, GITHUB_FILE_CAP};
+use crate::ui::theme::palette_of;
 use crate::ui::widgets::comment_composer;
 use crate::ui::widgets::image_diff;
 use crate::ui::widgets::markdown;
@@ -34,20 +36,14 @@ use crate::ui::widgets::thread_view::{self, CommentDrafts, ThreadAction};
 /// The width of one line-number gutter.
 pub const GUTTER_W: f32 = 48.0;
 
-/// How the diff is laid out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffMode {
-    /// One column of lines, with the old and new numbers in the gutters.
-    Unified,
-    /// Removed and added lines side by side.
-    Split,
-}
+/// The width of the sign column (`+`/`−`) in front of a line's text.
+pub const SIGN_W: f32 = 14.0;
+
+pub use crate::model::diff::DiffMode;
 
 /// The diff surface's own UI state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DiffViewState {
-    /// The layout to draw.
-    pub mode: DiffMode,
     /// Whether long lines wrap instead of running off the pane.
     pub wrap: bool,
     /// The find box's text (Task 48).
@@ -73,7 +69,6 @@ pub struct DiffViewState {
 impl Default for DiffViewState {
     fn default() -> Self {
         DiffViewState {
-            mode: DiffMode::Unified,
             wrap: false,
             find_query: String::new(),
             find_applied: String::new(),
@@ -109,6 +104,10 @@ pub enum DiffAction {
     /// Show the file at this index in `PrSession::files` (one file at a
     /// time: the header's prev/next controls report through this).
     SelectFile(u32),
+    /// Switch between the unified and split layouts (the toolbar reports
+    /// the click; the session owns the mode because switching rebuilds
+    /// the rows).
+    SetMode(DiffMode),
     /// Fetch and locally diff a too-large file (Phase G).
     LoadLargeDiff(u32),
     /// Flip the hide-whitespace-only-hunks option (Task 48).
@@ -184,41 +183,15 @@ pub fn content_width(ui: &egui::Ui, mode: DiffMode) -> f32 {
 /// them. Runs of unequal length leave the shorter side blank, which is how a
 /// deletion with no matching insertion (or vice versa) is rendered.
 pub fn split_pairs(rows: &[DiffRow]) -> Vec<(Option<&DiffRow>, Option<&DiffRow>)> {
-    let mut pairs = Vec::new();
-    let mut index = 0;
-
-    while index < rows.len() {
-        match rows[index].kind {
-            LineKind::Context => {
-                pairs.push((Some(&rows[index]), Some(&rows[index])));
-                index += 1;
-            }
-            LineKind::Removed => {
-                let removed_start = index;
-                while index < rows.len() && rows[index].kind == LineKind::Removed {
-                    index += 1;
-                }
-                let removed = &rows[removed_start..index];
-
-                let added_start = index;
-                while index < rows.len() && rows[index].kind == LineKind::Added {
-                    index += 1;
-                }
-                let added = &rows[added_start..index];
-
-                for offset in 0..removed.len().max(added.len()) {
-                    pairs.push((removed.get(offset), added.get(offset)));
-                }
-            }
-            LineKind::Added => {
-                // An insertion with no deletion to sit beside.
-                pairs.push((None, Some(&rows[index])));
-                index += 1;
-            }
-        }
-    }
-
-    pairs
+    pair_indices(rows)
+        .into_iter()
+        .map(|(left, right)| {
+            (
+                left.map(|index| &rows[index as usize]),
+                right.map(|index| &rows[index as usize]),
+            )
+        })
+        .collect()
 }
 
 /// The placeholder text shown in place of a file GitHub sent no patch for.
@@ -315,12 +288,12 @@ pub fn render(
         return;
     }
 
-    let mode = state.mode;
+    let mode = session.mode;
     let wrap = state.wrap;
     let content = content_width(ui, mode);
 
-    // Where a sticky header is pinned: the top of the table, as wide as its text
-    // area (the scroll bar keeps its own column).
+    // The table's own area: as wide as its text area (the scroll bar keeps
+    // its own column).
     let band_area = ui.available_rect_before_wrap();
     let band = egui::Rect::from_min_size(
         band_area.min,
@@ -383,7 +356,7 @@ pub fn render(
 }
 
 /// The theme- and font-derived values every row needs.
-struct RowStyle {
+pub(crate) struct RowStyle {
     font_id: egui::FontId,
     plain: egui::Color32,
     strong: egui::Color32,
@@ -556,7 +529,85 @@ fn render_row(
             let syntax = syntax_for_path(path);
             let spans = cache.spans(&syntax, &text);
 
-            render_line_cells(row, diff_row, &text, spans, ctx);
+            // Unified word marks: the row's partner in the removed/added run
+            // it belongs to, paired the same way split mode pairs them.
+            let mark = unified_word_mark(ctx.session, *file, *hunk, *row_index);
+            render_line_cells(row, diff_row, &text, spans, mark, ctx);
+        }
+        RowRef::Pair {
+            file,
+            hunk,
+            left,
+            right,
+        } => {
+            let left_row = left.and_then(|index| line_at(ctx.session, *file, *hunk, index));
+            let right_row = right.and_then(|index| line_at(ctx.session, *file, *hunk, index));
+            let left_text = left_row.map(|row| display_text(&row.text));
+            let right_text = right_row.map(|row| display_text(&row.text));
+
+            let path = ctx
+                .session
+                .files
+                .get(*file as usize)
+                .map(|loaded| loaded.file.path.as_str())
+                .unwrap_or_default();
+            let syntax = syntax_for_path(path);
+            // The cache hands out one borrow at a time, so the left spans
+            // are copied before the right side asks for its own.
+            let left_spans: Vec<HighlightSpan> = match &left_text {
+                Some(text) => cache.spans(&syntax, text).to_vec(),
+                None => Vec::new(),
+            };
+            let right_spans: Vec<HighlightSpan> = match &right_text {
+                Some(text) => cache.spans(&syntax, text).to_vec(),
+                None => Vec::new(),
+            };
+
+            // The changed bytes, bounded per visible pair by
+            // `MAX_DISPLAY_CHARS` inside `word_diff`'s inputs.
+            let marks = match (&left_text, &right_text) {
+                (Some(left), Some(right)) => word_diff(left, right),
+                _ => None,
+            };
+
+            row.col(|ui| {
+                number_cell(
+                    ui,
+                    left_row.and_then(|row| row.old_no),
+                    cell_kind(left_row),
+                    None,
+                    ctx,
+                )
+            });
+            row.col(|ui| {
+                code_cell(
+                    ui,
+                    left_text.as_deref(),
+                    &left_spans,
+                    marks.as_ref().map(|(left, _)| left.clone()),
+                    cell_kind(left_row),
+                    ctx,
+                )
+            });
+            row.col(|ui| {
+                number_cell(
+                    ui,
+                    right_row.and_then(|row| row.new_no),
+                    cell_kind(right_row),
+                    Some(true),
+                    ctx,
+                )
+            });
+            row.col(|ui| {
+                code_cell(
+                    ui,
+                    right_text.as_deref(),
+                    &right_spans,
+                    marks.as_ref().map(|(_, right)| right.clone()),
+                    cell_kind(right_row),
+                    ctx,
+                )
+            });
         }
         RowRef::Thread { thread } => {
             let index = *thread;
@@ -668,68 +719,220 @@ pub fn anchor_is_context(session: &PrSession, target: Option<&CommentTarget>) ->
         })
 }
 
+/// The colour role of one side of a pair, or one unified line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellKind {
+    /// Present on both sides: no background.
+    Context,
+    /// Old side only: red.
+    Removed,
+    /// New side only: green.
+    Added,
+    /// The blank half of an uneven run: the flat filler.
+    Missing,
+}
+
+/// The role a resolved side of a pair plays.
+fn cell_kind(row: Option<&DiffRow>) -> CellKind {
+    match row.map(|row| &row.kind) {
+        None => CellKind::Missing,
+        Some(LineKind::Context) => CellKind::Context,
+        Some(LineKind::Removed) => CellKind::Removed,
+        Some(LineKind::Added) => CellKind::Added,
+    }
+}
+
+/// The word-diff mark for one unified line, if it has a partner: unified
+/// pairs removed/added runs by index within the block, exactly the way
+/// [`pair_indices`] does, and the partner is what `word_diff` runs against.
+fn unified_word_mark(
+    session: &PrSession,
+    file: u32,
+    hunk: u32,
+    row_index: u32,
+) -> Option<std::ops::Range<usize>> {
+    let rows = session
+        .files
+        .get(file as usize)?
+        .diff
+        .as_ref()?
+        .hunks
+        .get(hunk as usize)?
+        .rows
+        .as_slice();
+    let me = usize::try_from(row_index).ok()?;
+    for (left, right) in pair_indices(rows) {
+        let (left, right) = (left? as usize, right? as usize);
+        if left == right || left == me || right == me {
+            continue;
+        }
+        let (other_index, mark_side) = if left == me {
+            (right, true)
+        } else {
+            (left, false)
+        };
+        let other = &rows[other_index];
+        let mine = &rows[me];
+        let mark = if mark_side {
+            word_diff(&mine.text, &other.text).map(|(mark, _)| mark)
+        } else {
+            word_diff(&other.text, &mine.text).map(|(_, mark)| mark)
+        }?;
+        return Some(mark);
+    }
+    None
+}
+
 /// Draw one line row, placing it in the columns `mode` expects.
 fn render_line_cells(
     row: &mut egui_extras::TableRow<'_, '_>,
     diff_row: &DiffRow,
     text: &str,
     spans: &[HighlightSpan],
+    mark: Option<std::ops::Range<usize>>,
     ctx: &RowCtx<'_>,
 ) {
     let mode = ctx.mode;
-    let style = ctx.style;
+    let kind = cell_kind(Some(diff_row));
     match mode {
         DiffMode::Unified => {
-            row.col(|ui| render_number(ui, diff_row.old_no, style));
-            row.col(|ui| render_number(ui, diff_row.new_no, style));
-            row.col(|ui| add_line(ui, text, spans, ctx));
+            row.col(|ui| number_cell(ui, diff_row.old_no, kind, None, ctx));
+            row.col(|ui| number_cell(ui, diff_row.new_no, kind, None, ctx));
+            row.col(|ui| code_cell(ui, Some(text), spans, mark, kind, ctx));
         }
         DiffMode::Split => {
-            // Removed lines belong to the left (old) side, added lines to the
-            // right (new) side, and context lines to both.
+            // Split rows are `RowRef::Pair`s; a `Line` row only reaches split
+            // when the model was built in the other mode, one frame late.
+            // Draw it on the side its kind belongs to.
             let on_left = diff_row.kind != LineKind::Added;
             let on_right = diff_row.kind != LineKind::Removed;
-
             row.col(|ui| {
                 if on_left {
-                    render_number(ui, diff_row.old_no, style);
+                    number_cell(ui, diff_row.old_no, kind, None, ctx);
                 }
             });
             row.col(|ui| {
                 if on_left {
-                    add_line(ui, text, spans, ctx);
+                    code_cell(ui, Some(text), spans, mark.clone(), kind, ctx);
                 }
             });
             row.col(|ui| {
                 if on_right {
-                    render_number(ui, diff_row.new_no, style);
+                    number_cell(ui, diff_row.new_no, kind, Some(true), ctx);
                 }
             });
             row.col(|ui| {
                 if on_right {
-                    add_line(ui, text, spans, ctx);
+                    code_cell(ui, Some(text), spans, mark.clone(), kind, ctx);
                 }
             });
         }
     }
 }
 
-/// A gutter line number, or nothing when the row has no number on that side.
-fn render_number(ui: &mut egui::Ui, number: Option<u32>, style: &RowStyle) {
+/// One gutter cell: the line number over the kind's background.
+fn number_cell(
+    ui: &mut egui::Ui,
+    number: Option<u32>,
+    kind: CellKind,
+    divider: Option<bool>,
+    ctx: &RowCtx<'_>,
+) {
+    let palette = palette_of(ui);
+    let bg = match kind {
+        CellKind::Context => None,
+        CellKind::Removed => Some(palette.del_gutter),
+        CellKind::Added => Some(palette.add_gutter),
+        CellKind::Missing => Some(palette.filler),
+    };
+    let rect = ui.max_rect();
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, 0.0, bg);
+    }
+    if divider == Some(true) {
+        ui.painter()
+            .line_segment([rect.left_top(), rect.left_bottom()], (1.0, palette.line));
+    }
     let text = number.map(|number| number.to_string()).unwrap_or_default();
+    let color = match kind {
+        CellKind::Missing => palette.faint,
+        _ => style_weak(ctx),
+    };
     ui.label(
         egui::RichText::new(text)
-            .font(style.font_id.clone())
-            .color(style.weak),
+            .font(ctx.style.font_id.clone())
+            .color(color),
     );
+}
+
+/// One code cell: background fill, sign glyph, and the highlighted text with
+/// its word-diff mark. A missing side is just the filler.
+fn code_cell(
+    ui: &mut egui::Ui,
+    text: Option<&str>,
+    spans: &[HighlightSpan],
+    mark: Option<std::ops::Range<usize>>,
+    kind: CellKind,
+    ctx: &RowCtx<'_>,
+) {
+    let palette = palette_of(ui);
+    let bg = match kind {
+        CellKind::Context => None,
+        CellKind::Removed => Some(palette.del_bg),
+        CellKind::Added => Some(palette.add_bg),
+        CellKind::Missing => Some(palette.filler),
+    };
+    let rect = ui.max_rect();
+    if let Some(bg) = bg {
+        ui.painter().rect_filled(rect, 0.0, bg);
+    }
+    let Some(text) = text else {
+        return;
+    };
+
+    let (sign, sign_color) = match kind {
+        CellKind::Removed => ("−", palette.bad),
+        CellKind::Added => ("+", palette.ok),
+        _ => (" ", style_weak(ctx)),
+    };
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_sized(
+            [SIGN_W, 0.0],
+            egui::Label::new(
+                egui::RichText::new(sign)
+                    .font(ctx.style.font_id.clone())
+                    .color(sign_color),
+            )
+            .selectable(false),
+        );
+        let mark_bg = match kind {
+            CellKind::Added => palette.add_word,
+            _ => palette.del_word,
+        };
+        add_line_marked(ui, text, spans, mark, mark_bg, ctx);
+    });
+}
+
+/// The weak text colour, for gutters and context signs.
+fn style_weak(ctx: &RowCtx<'_>) -> egui::Color32 {
+    ctx.style.weak
 }
 
 /// Add one line of highlighted text to a cell.
 ///
 /// The line wraps at [`RowCtx::content`] — the same width the row's height was
 /// measured at — so a wrapped line is never drawn taller than the row holding it.
-fn add_line(ui: &mut egui::Ui, text: &str, spans: &[HighlightSpan], ctx: &RowCtx<'_>) {
-    let mut job = layout_job(text, spans, ctx.style);
+fn add_line_marked(
+    ui: &mut egui::Ui,
+    text: &str,
+    spans: &[HighlightSpan],
+    mark: Option<std::ops::Range<usize>>,
+    mark_bg: egui::Color32,
+    ctx: &RowCtx<'_>,
+) {
+    let mut job = layout_job(text, spans, mark, mark_bg, ctx.style);
     if ctx.wrap {
         job.wrap.max_width = ctx.content;
         job.wrap.break_anywhere = true;
@@ -743,62 +946,71 @@ fn add_line(ui: &mut egui::Ui, text: &str, spans: &[HighlightSpan], ctx: &RowCtx
 }
 
 /// Build the [`egui::text::LayoutJob`] for one line: plain text split by the
-/// highlight spans' byte ranges.
-fn layout_job(text: &str, spans: &[HighlightSpan], style: &RowStyle) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    let mut cursor = 0;
-
-    for span in spans {
-        let start = span.range.start.min(text.len());
-        let end = span.range.end.min(text.len());
-
-        // `get` rather than indexing: a range that is not on a `char` boundary
-        // is skipped instead of panicking.
-        if start > cursor {
-            if let Some(plain) = text.get(cursor..start) {
-                push_section(&mut job, plain, style.plain, style, false, false);
-            }
-        }
-        if end > start {
-            if let Some(colored) = text.get(start..end) {
-                let color = egui::Color32::from_rgb(span.color[0], span.color[1], span.color[2]);
-                push_section(&mut job, colored, color, style, span.bold, span.italic);
-            }
-        }
-        cursor = end.max(cursor);
-    }
-
-    if let Some(rest) = text.get(cursor..) {
-        if !rest.is_empty() {
-            push_section(&mut job, rest, style.plain, style, false, false);
-        }
-    }
-
-    job
-}
-
-/// Append one styled section to a layout job.
+/// highlight spans' and the word-diff mark's byte ranges.
 ///
-/// egui has no bold font weight, so a bold span is drawn with the strong text
-/// colour — the same approximation `RichText::strong` makes.
-fn push_section(
-    job: &mut egui::text::LayoutJob,
+/// Sections are cut at every span and mark boundary, so exactly the bytes
+/// inside `mark` carry `mark_bg` as their background — the mockup's strong
+/// word highlight — while the rest keeps the syntax colours.
+pub(crate) fn layout_job(
     text: &str,
-    color: egui::Color32,
+    spans: &[HighlightSpan],
+    mark: Option<std::ops::Range<usize>>,
+    mark_bg: egui::Color32,
     style: &RowStyle,
-    bold: bool,
-    italic: bool,
-) {
-    job.append(
-        text,
-        0.0,
-        egui::TextFormat {
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+
+    // Every boundary that must start a new section, clamped and deduplicated.
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    for span in spans {
+        cuts.push(span.range.start.min(text.len()));
+        cuts.push(span.range.end.min(text.len()));
+    }
+    if let Some(mark) = &mark {
+        cuts.push(mark.start.min(text.len()));
+        cuts.push(mark.end.min(text.len()));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    for window in cuts.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        if start >= end {
+            continue;
+        }
+        // `get` rather than indexing: a range that is not on a `char`
+        // boundary is skipped instead of panicking.
+        let Some(piece) = text.get(start..end) else {
+            continue;
+        };
+        let color = spans
+            .iter()
+            .find(|span| span.range.start <= start && end <= span.range.end)
+            .map(|span| egui::Color32::from_rgb(span.color[0], span.color[1], span.color[2]))
+            .unwrap_or(style.plain);
+        let bold = spans
+            .iter()
+            .any(|span| span.bold && span.range.start <= start && end <= span.range.end);
+        let italic = spans
+            .iter()
+            .any(|span| span.italic && span.range.start <= start && end <= span.range.end);
+        let marked = mark
+            .as_ref()
+            .is_some_and(|mark| mark.start <= start && end <= mark.end);
+
+        let mut format = egui::TextFormat {
             font_id: style.font_id.clone(),
             color: if bold { style.strong } else { color },
             italics: italic,
             ..Default::default()
-        },
-    );
+        };
+        if marked {
+            format.background = mark_bg;
+        }
+        job.append(piece, 0.0, format);
+    }
+
+    job
 }
 
 /// The file header row: path, counts, and [`header_buttons`].
@@ -948,16 +1160,16 @@ fn render_toolbar(
 ) {
     ui.horizontal(|ui| {
         if ui
-            .selectable_label(state.mode == DiffMode::Unified, "Unified")
+            .selectable_label(session.mode == DiffMode::Unified, "Unified")
             .clicked()
         {
-            state.mode = DiffMode::Unified;
+            actions.push(DiffAction::SetMode(DiffMode::Unified));
         }
         if ui
-            .selectable_label(state.mode == DiffMode::Split, "Split")
+            .selectable_label(session.mode == DiffMode::Split, "Split")
             .clicked()
         {
-            state.mode = DiffMode::Split;
+            actions.push(DiffAction::SetMode(DiffMode::Split));
         }
         ui.checkbox(&mut state.wrap, "Wrap");
 
@@ -1088,6 +1300,40 @@ mod tests {
     use super::*;
     use crate::github::files::{PatchState, PrFile};
     use crate::test_support::{file, line_anchor, rows_from};
+
+    #[test]
+    fn layout_job_marks_exactly_the_changed_bytes() {
+        let style = test_row_style();
+        let job = layout_job(
+            "import { apps, content }",
+            &[],
+            Some(9..15),
+            crate::ui::theme::DARK.add_word,
+            &style,
+        );
+        let marked: String = job
+            .sections
+            .iter()
+            .filter(|s| s.format.background == crate::ui::theme::DARK.add_word)
+            .map(|s| {
+                let range = s.byte_range.start.0..s.byte_range.end.0;
+                &job.text[range]
+            })
+            .collect();
+        assert_eq!(marked, "apps, ");
+    }
+
+    /// A [`RowStyle`] built the way [`render`] builds one, from the default
+    /// style — enough for the pure layout functions to be tested.
+    fn test_row_style() -> RowStyle {
+        let style = egui::Style::default();
+        RowStyle {
+            font_id: egui::TextStyle::Monospace.resolve(&style),
+            plain: style.visuals.text_color(),
+            strong: style.visuals.strong_text_color(),
+            weak: style.visuals.weak_text_color(),
+        }
+    }
 
     #[test]
     fn split_pairs_align_changed_runs() {
@@ -1228,9 +1474,9 @@ mod tests {
         for file in 0..session.files.len() {
             session.select_file(file);
             for mode in [DiffMode::Unified, DiffMode::Split] {
+                session.set_mode(mode);
                 for wrap in [false, true] {
                     let mut state = DiffViewState {
-                        mode,
                         wrap,
                         ..Default::default()
                     };

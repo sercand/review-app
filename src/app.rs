@@ -936,6 +936,16 @@ impl ReviewApp {
                         session.mark_session_dirty(now);
                     }
                 }
+                DiffAction::SetMode(mode) => {
+                    if let Some(session) = &mut self.session {
+                        session.set_mode(mode);
+                    }
+                    // Row indices changed, so any find match now points at a
+                    // different row.
+                    self.pr_detail.diff.clear_find();
+                    // The two layouts measure heights at different widths.
+                    self.pr_detail.last_layout = None;
+                }
                 DiffAction::LoadLargeDiff(file) => {
                     if let Some(session) = &mut self.session {
                         for command in session.load_large_diff(file) {
@@ -1159,8 +1169,16 @@ impl ReviewApp {
             "comment" => self.open_comment_on_current(),
             "reply" => self.expand_first_thread_of_current(),
             "toggle_side_pane" => self.pr_detail.right_open = !self.pr_detail.right_open,
-            "split" => self.pr_detail.diff.mode = DiffMode::Split,
-            "unified" => self.pr_detail.diff.mode = DiffMode::Unified,
+            "split" => {
+                if let Some(session) = &mut self.session {
+                    session.set_mode(DiffMode::Split);
+                }
+            }
+            "unified" => {
+                if let Some(session) = &mut self.session {
+                    session.set_mode(DiffMode::Unified);
+                }
+            }
             // The same path the review panel's Submit button takes, author
             // rule and all (Task 44). Reached from the palette, or from the
             // global key path only while no text edit is focused (see

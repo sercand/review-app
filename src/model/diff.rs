@@ -17,6 +17,15 @@ pub enum Side {
     Right,
 }
 
+/// How the diff is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffMode {
+    /// One column of lines, with the old and new numbers in the gutters.
+    Unified,
+    /// Removed and added lines side by side.
+    Split,
+}
+
 /// What a row is, relative to the two sides.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LineKind {

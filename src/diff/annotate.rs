@@ -232,24 +232,35 @@ fn find_line(
         .position(|(row, _)| row_coordinate(files, row, side) == Some(line))
 }
 
-/// Resolve a [`RowRef::Line`] to its coordinate on `side`.
+/// Resolve a [`RowRef::Line`]'s (or a [`RowRef::Pair`]'s side) coordinate on
+/// `side`. A pair answers from the row its `side` points at: the left row
+/// for `Left`, the right row for `Right`.
 fn row_coordinate(files: &[LoadedFile], row: &RowRef, side: Side) -> Option<u32> {
-    let RowRef::Line {
-        file,
-        hunk,
-        row: index,
-    } = row
-    else {
-        return None;
+    let (file, hunk, index) = match row {
+        RowRef::Line { file, hunk, row } => (*file, *hunk, *row),
+        RowRef::Pair {
+            file,
+            hunk,
+            left,
+            right,
+        } => (
+            *file,
+            *hunk,
+            match side {
+                Side::Left => left.as_ref().copied()?,
+                Side::Right => right.as_ref().copied()?,
+            },
+        ),
+        _ => return None,
     };
     files
-        .get(*file as usize)?
+        .get(file as usize)?
         .diff
         .as_ref()?
         .hunks
-        .get(*hunk as usize)?
+        .get(hunk as usize)?
         .rows
-        .get(*index as usize)
+        .get(index as usize)
         .and_then(|diff_row| coordinate(diff_row, side))
 }
 
@@ -261,9 +272,29 @@ mod tests {
     use crate::test_support::loaded;
 
     #[test]
+    fn threads_land_after_the_pair_holding_their_line() {
+        use crate::model::diff::DiffMode;
+        let files = vec![loaded("a.rs", "@@ -1,2 +1,2 @@\n-a\n+b\n c\n")];
+        let base = build_one(&files, Some(0), DiffMode::Split);
+        let item = InlineItem {
+            file: 0,
+            placement: Placement::AfterLine {
+                side: Side::Right,
+                line: 1,
+            },
+            row: RowRef::Thread { thread: 0 },
+        };
+        let out = annotate(&base, &files, &[item]);
+        // Row 0 is the file header; the pair holding new line 1 leads the
+        // file, and the thread lands right after it.
+        assert!(matches!(out.rows[1], RowRef::Pair { right: Some(1), .. }));
+        assert_eq!(out.rows[2], RowRef::Thread { thread: 0 });
+    }
+
+    #[test]
     fn file_level_threads_lead_the_file() {
         let files = vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
-        let m = build_one(&files, Some(0));
+        let m = build_one(&files, Some(0), crate::model::diff::DiffMode::Unified);
         let out = annotate(
             &m,
             &files,
@@ -293,7 +324,7 @@ mod tests {
             loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n"),
             loaded("b.rs", "@@ -1 +1 @@\n-a\n+b\n"),
         ];
-        let m = build_one(&files, Some(0));
+        let m = build_one(&files, Some(0), crate::model::diff::DiffMode::Unified);
         let out = annotate(
             &m,
             &files,

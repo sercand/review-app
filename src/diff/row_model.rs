@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::github::files::LoadedFile;
+use crate::model::diff::{DiffMode, DiffRow, LineKind};
 
 /// The default height of a file header row.
 pub const HEADER_H: f32 = 30.0;
@@ -48,6 +49,19 @@ pub enum RowRef {
         hunk: u32,
         /// The index of the row in the hunk.
         row: u32,
+    },
+    /// One table row of split mode: the old-side row and the new-side row
+    /// that sit beside each other. Either side can be absent — the blank
+    /// half of an uneven removed/added run.
+    Pair {
+        /// The index of the file in `PrSession::files`.
+        file: u32,
+        /// The index of the hunk in the file's diff.
+        hunk: u32,
+        /// The index of the old-side row in the hunk, when it has one.
+        left: Option<u32>,
+        /// The index of the new-side row in the hunk, when it has one.
+        right: Option<u32>,
     },
     /// Expandable context before one hunk (Task 45).
     Gap {
@@ -148,7 +162,7 @@ impl RowModel {
     }
 }
 
-/// Build the row list for `files`.
+/// Build the row list for `files`, in unified layout.
 ///
 /// Per file: a header, then either the placeholder (GitHub sent no diff) or the
 /// hunks' lines, each preceded by a [`RowRef::Gap`] when the hunk does not
@@ -163,7 +177,7 @@ pub fn build(files: &[LoadedFile]) -> RowModel {
 
     for (file_idx, loaded) in files.iter().enumerate() {
         let start = model.rows.len();
-        push_file(&mut model, file_idx as u32, loaded);
+        push_file(&mut model, file_idx as u32, loaded, DiffMode::Unified);
         model.file_ranges.push(start..model.rows.len());
     }
 
@@ -176,8 +190,10 @@ pub fn build(files: &[LoadedFile]) -> RowModel {
 /// Rows are emitted only for `selected`; [`RowModel::file_ranges`] stays
 /// indexed by file — empty for every other file — so row references and
 /// per-file lookups keep working unchanged. `None`, or an index past the
-/// end of `files`, produces a model with no rows.
-pub fn build_one(files: &[LoadedFile], selected: Option<usize>) -> RowModel {
+/// end of `files`, produces a model with no rows. `mode` decides whether
+/// the hunk lines become [`RowRef::Line`] rows or paired
+/// [`RowRef::Pair`] rows.
+pub fn build_one(files: &[LoadedFile], selected: Option<usize>, mode: DiffMode) -> RowModel {
     let mut model = RowModel {
         rows: Vec::new(),
         file_ranges: vec![0..0; files.len()],
@@ -187,7 +203,7 @@ pub fn build_one(files: &[LoadedFile], selected: Option<usize>) -> RowModel {
 
     if let Some(file_idx) = selected.filter(|i| *i < files.len()) {
         let start = model.rows.len();
-        push_file(&mut model, file_idx as u32, &files[file_idx]);
+        push_file(&mut model, file_idx as u32, &files[file_idx], mode);
         model.file_ranges[file_idx] = start..model.rows.len();
     }
 
@@ -195,7 +211,7 @@ pub fn build_one(files: &[LoadedFile], selected: Option<usize>) -> RowModel {
 }
 
 /// Append one file's rows: header, then placeholder or hunk lines.
-fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile) {
+fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile, mode: DiffMode) {
     model.push(RowRef::FileHeader { file }, HEADER_H);
     match &loaded.diff {
         None => model.push(RowRef::Placeholder { file }, ROW_H),
@@ -211,19 +227,81 @@ fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile) {
                         ROW_H,
                     );
                 }
-                for row_idx in 0..hunk.rows.len() {
-                    model.push(
-                        RowRef::Line {
-                            file,
-                            hunk: hunk_idx,
-                            row: row_idx as u32,
-                        },
-                        ROW_H,
-                    );
+                match mode {
+                    DiffMode::Unified => {
+                        for row_idx in 0..hunk.rows.len() {
+                            model.push(
+                                RowRef::Line {
+                                    file,
+                                    hunk: hunk_idx,
+                                    row: row_idx as u32,
+                                },
+                                ROW_H,
+                            );
+                        }
+                    }
+                    DiffMode::Split => {
+                        for (left, right) in pair_indices(&hunk.rows) {
+                            model.push(
+                                RowRef::Pair {
+                                    file,
+                                    hunk: hunk_idx,
+                                    left,
+                                    right,
+                                },
+                                ROW_H,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Pair a hunk's rows the way split mode draws them: each run of removed
+/// rows followed by a run of added rows is zipped, the shorter side padded
+/// with `None`; context rows pair with themselves.
+///
+/// The index form of the same rule [`split_pairs`](crate::ui::widgets::diff_view::split_pairs)
+/// applies to row references.
+pub fn pair_indices(rows: &[DiffRow]) -> Vec<(Option<u32>, Option<u32>)> {
+    let mut pairs = Vec::new();
+    let mut index = 0usize;
+
+    while index < rows.len() {
+        match rows[index].kind {
+            LineKind::Context => {
+                pairs.push((Some(index as u32), Some(index as u32)));
+                index += 1;
+            }
+            LineKind::Removed => {
+                let removed_start = index;
+                while index < rows.len() && rows[index].kind == LineKind::Removed {
+                    index += 1;
+                }
+                let added_start = index;
+                while index < rows.len() && rows[index].kind == LineKind::Added {
+                    index += 1;
+                }
+                let removed_len = added_start - removed_start;
+                let added_len = index - added_start;
+                for offset in 0..removed_len.max(added_len) {
+                    pairs.push((
+                        (offset < removed_len).then(|| (removed_start + offset) as u32),
+                        (offset < added_len).then(|| (added_start + offset) as u32),
+                    ));
+                }
+            }
+            LineKind::Added => {
+                // An insertion with no deletion to sit beside.
+                pairs.push((None, Some(index as u32)));
+                index += 1;
+            }
+        }
+    }
+
+    pairs
 }
 
 /// The text to draw for one line: `text`, truncated at
@@ -257,7 +335,7 @@ mod tests {
             loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n"),
             loaded("b.rs", "@@ -1 +1 @@\n-a\n+b\n"),
         ];
-        let m = build_one(&files, Some(1));
+        let m = build_one(&files, Some(1), crate::model::diff::DiffMode::Unified);
         assert_eq!(m.file_ranges.len(), 2);
         assert!(m.file_ranges[0].is_empty());
         assert_eq!(
@@ -277,9 +355,37 @@ mod tests {
     #[test]
     fn build_one_without_a_selection_is_empty() {
         let files = vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
-        let m = build_one(&files, None);
+        let m = build_one(&files, None, crate::model::diff::DiffMode::Unified);
         assert!(m.rows.is_empty());
         assert_eq!(m.file_ranges, vec![0..0]);
+    }
+
+    #[test]
+    fn split_mode_pairs_removed_and_added_runs() {
+        use crate::model::diff::DiffMode;
+        let files = vec![loaded("a.rs", "@@ -1,4 +1,4 @@\n c\n-a\n-b\n+x\n d\n")];
+        let m = build_one(&files, Some(0), DiffMode::Split);
+        let pairs: Vec<_> = m
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                RowRef::Pair { left, right, .. } => Some((*left, *right)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(3)),
+                (Some(2), None),
+                (Some(4), Some(4))
+            ]
+        );
+        assert!(build_one(&files, Some(0), DiffMode::Unified)
+            .rows
+            .iter()
+            .all(|r| !matches!(r, RowRef::Pair { .. })));
     }
 
     #[test]
