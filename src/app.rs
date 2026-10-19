@@ -1302,6 +1302,7 @@ impl ReviewApp {
                 self.palette.open_now();
                 self.help_open = false;
             }
+            "find" => self.pr_detail.find_open = true,
             "settings" => self.open_settings(),
             "help" => self.help_open = !self.help_open,
             "close" => self.dispatch_close(),

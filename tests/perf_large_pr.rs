@@ -2,6 +2,7 @@ mod common;
 use common::synthetic_files;
 use gh_review_desktop::{
     diff::{highlight::*, row_model::*},
+    model::diff::DiffMode,
     state::{filters::*, viewed::ViewedSet},
 };
 use std::time::{Duration, Instant};
@@ -55,4 +56,22 @@ fn filtering_and_folder_state_are_fast() {
     let kept = apply(&files, &filters, &ViewedSet::default());
     assert!(!kept.is_empty());
     assert!(t.elapsed() < FRAME);
+}
+
+#[test]
+#[ignore = "wall-clock guardrail; run with `cargo test --release -- --ignored`"]
+fn selecting_a_huge_file_stays_within_frame_budget() {
+    let mut files = synthetic_files(1_500, 34);
+    // One 50k-line file, minified lines included.
+    files.push(synthetic_files(1, 50_000).remove(0));
+    let huge = files.len() - 1;
+    for mode in [DiffMode::Unified, DiffMode::Split] {
+        let t = Instant::now();
+        let model = build_one(&files, Some(huge), mode);
+        assert!(model.rows.len() >= 25_000);
+        assert!(t.elapsed() < FRAME, "{mode:?} build took {:?}", t.elapsed());
+        let t = Instant::now();
+        let _ = build_one(&files, Some(0), mode); // switching to a small file
+        assert!(t.elapsed() < Duration::from_millis(2));
+    }
 }

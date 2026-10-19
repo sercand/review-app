@@ -29,6 +29,11 @@ pub fn registry() -> Vec<ActionEntry> {
             keybinding: Some("Cmd+K"),
         },
         ActionEntry {
+            id: "find",
+            label: "Find in diff",
+            keybinding: Some("Cmd+F"),
+        },
+        ActionEntry {
             id: "settings",
             label: "Open settings",
             keybinding: None,
@@ -226,6 +231,7 @@ pub fn resolve_key(k: &KeyPress, text_focused: bool) -> Option<&'static str> {
     if k.command {
         return match k.key.as_str() {
             "k" | "K" => Some("palette"),
+            "f" | "F" => Some("find"),
             "Enter" => Some("submit_review"),
             _ => None,
         };
