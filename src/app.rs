@@ -207,6 +207,8 @@ impl ReviewApp {
             Event::PrFilesPage { .. } => {}
             Event::PrMetadataLoaded { .. } => {}
             Event::ThreadsLoaded { .. } => {}
+            Event::CommentPosted { .. } => {}
+            Event::CommentFailed { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its

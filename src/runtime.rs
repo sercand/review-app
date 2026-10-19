@@ -17,11 +17,12 @@ use crate::auth::device_http::{run_device_flow, HttpDeviceFlow};
 use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
 use crate::github::client::{endpoints_for, GithubClient, Me};
+use crate::github::comments::NewComment;
 use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
 use crate::github::metadata::PrMetadata;
-use crate::model::thread::ReviewThread;
+use crate::model::thread::{ReviewThread, ThreadComment};
 use crate::model::RepoRef;
 
 /// Identifies one open PR's session.
@@ -88,6 +89,20 @@ pub enum Command {
         repo: RepoRef,
         /// The PR number within the repository.
         number: u64,
+    },
+    /// Post an immediate review comment (spec §7.3).
+    PostComment {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The comment to post.
+        comment: NewComment,
+        /// The UI's local id for the pending comment, echoed by the result
+        /// events so the pending bubble can be replaced or rolled back.
+        optimistic_id: u64,
     },
 }
 
@@ -162,6 +177,25 @@ pub enum Event {
         session: SessionId,
         /// The threads, in API order, each with all its comments.
         threads: Vec<ReviewThread>,
+    },
+    /// An immediate comment was posted; `optimistic_id` names the pending
+    /// bubble it replaces.
+    CommentPosted {
+        /// The session that posted the comment.
+        session: SessionId,
+        /// The pending comment this result belongs to.
+        optimistic_id: u64,
+        /// The comment as GitHub created it.
+        comment: ThreadComment,
+    },
+    /// An immediate comment failed; the pending bubble is rolled back.
+    CommentFailed {
+        /// The session that posted the comment.
+        session: SessionId,
+        /// The pending comment this failure belongs to.
+        optimistic_id: u64,
+        /// The classified failure.
+        error: GhError,
     },
 }
 
@@ -467,6 +501,37 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 Ok(threads) => events.send(Event::ThreadsLoaded { session, threads }),
                 Err(error) => events.send(Event::Failed {
                     session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::PostComment {
+            session,
+            repo,
+            number,
+            comment,
+            optimistic_id,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A mutation: sent once, never retried; the optimistic bubble in
+            // the UI is replaced or rolled back by these two events.
+            match client.post_review_comment(&repo, number, &comment).await {
+                Ok(comment) => events.send(Event::CommentPosted {
+                    session,
+                    optimistic_id,
+                    comment,
+                }),
+                Err(error) => events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id,
                     error,
                 }),
             }
