@@ -646,6 +646,14 @@ impl ReviewApp {
                         }
                     }
                 }
+                DiffAction::ToggleHideWhitespace => {
+                    if let Some(session) = &mut self.session {
+                        session.toggle_hide_whitespace();
+                    }
+                    // Row indices changed, so any find match now points at a
+                    // different row (Task 48).
+                    self.pr_detail.diff.clear_find();
+                }
                 DiffAction::ExpandGap {
                     file,
                     before_hunk,

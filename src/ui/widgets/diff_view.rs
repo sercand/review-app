@@ -22,6 +22,7 @@ use egui_extras::{Column, TableBuilder};
 use crate::diff::annotate::rows_for_anchor;
 use crate::diff::expand::Expand;
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
+use crate::diff::options::{find_matches, next_match, prev_match};
 use crate::diff::row_model::{display_text, RowRef, HEADER_H, ROW_H};
 use crate::github::files::{anchor_path, display_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::CommentTarget;
@@ -45,7 +46,7 @@ pub enum DiffMode {
 }
 
 /// The diff surface's own UI state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiffViewState {
     /// The layout to draw.
     pub mode: DiffMode,
@@ -56,6 +57,18 @@ pub struct DiffViewState {
     /// The file tree sets this when a file is selected; [`render`] consumes it
     /// (takes it) so the surface scrolls once and then leaves the user alone.
     pub scroll_to: Option<u32>,
+    /// The find box's text (Task 48).
+    pub find_query: String,
+    /// The query [`Self::find_matches`] was computed for, so an edited query
+    /// jumps to its first match instead of advancing past it.
+    pub find_applied: String,
+    /// Row indices whose text contains `find_query`, in display order.
+    pub find_matches: Vec<usize>,
+    /// The match currently selected, as a row index.
+    pub find_current: Option<usize>,
+    /// A row the surface should scroll to on the next frame — the selected
+    /// find match, consumed by [`render`] like [`Self::scroll_to`].
+    pub scroll_to_row: Option<usize>,
 }
 
 impl Default for DiffViewState {
@@ -64,7 +77,24 @@ impl Default for DiffViewState {
             mode: DiffMode::Unified,
             wrap: false,
             scroll_to: None,
+            find_query: String::new(),
+            find_applied: String::new(),
+            find_matches: Vec::new(),
+            find_current: None,
+            scroll_to_row: None,
         }
+    }
+}
+
+impl DiffViewState {
+    /// Forget the find results. Row indices change whenever the row model is
+    /// rebuilt for an option change, so stale matches must not survive it
+    /// (Task 48).
+    pub fn clear_find(&mut self) {
+        self.find_applied = String::new();
+        self.find_matches = Vec::new();
+        self.find_current = None;
+        self.scroll_to_row = None;
     }
 }
 
@@ -79,6 +109,8 @@ pub enum DiffAction {
     ScrollToFile(u32),
     /// Fetch and locally diff a too-large file (Phase G).
     LoadLargeDiff(u32),
+    /// Flip the hide-whitespace-only-hunks option (Task 48).
+    ToggleHideWhitespace,
     /// Expand the omitted context before one hunk (Task 45).
     ExpandGap {
         /// The index of the file.
@@ -287,7 +319,7 @@ pub fn render(
         weak: ui.visuals().weak_text_color(),
     };
 
-    render_toolbar(ui, state);
+    render_toolbar(ui, session, state, actions);
 
     if session.row_model.rows.is_empty() {
         render_status(ui, session);
@@ -322,6 +354,11 @@ pub fn render(
         if let Some(range) = session.row_model.file_ranges.get(file as usize) {
             table = table.vertical_scroll_offset(session.row_model.offset_of(range.start));
         }
+    }
+    // A find match the toolbar just selected: jump to that exact row
+    // (Task 48).
+    if let Some(row) = state.scroll_to_row.take() {
+        table = table.vertical_scroll_offset(session.row_model.offset_of(row));
     }
 
     // The gutters must not clip: a file header is drawn in the first one and
@@ -808,8 +845,14 @@ fn render_placeholder(
     });
 }
 
-/// The unified/split and wrap controls above the surface.
-fn render_toolbar(ui: &mut egui::Ui, state: &mut DiffViewState) {
+/// The unified/split, wrap, hide-whitespace, and find controls above the
+/// surface (Task 48).
+fn render_toolbar(
+    ui: &mut egui::Ui,
+    session: &PrSession,
+    state: &mut DiffViewState,
+    actions: &mut Vec<DiffAction>,
+) {
     ui.horizontal(|ui| {
         if ui
             .selectable_label(state.mode == DiffMode::Unified, "Unified")
@@ -824,7 +867,81 @@ fn render_toolbar(ui: &mut egui::Ui, state: &mut DiffViewState) {
             state.mode = DiffMode::Split;
         }
         ui.checkbox(&mut state.wrap, "Wrap");
+
+        // The option lives on the session because hiding rebuilds the rows;
+        // the checkbox only reports the click.
+        let mut hide = session.hide_whitespace;
+        if ui
+            .checkbox(&mut hide, "Hide whitespace")
+            .on_hover_text("hide hunks whose changes are only whitespace")
+            .clicked()
+        {
+            actions.push(DiffAction::ToggleHideWhitespace);
+        }
+
+        ui.separator();
+        let find = egui::TextEdit::singleline(&mut state.find_query)
+            .hint_text("Find in diff")
+            .desired_width(160.0);
+        let response = ui.add(find);
+        let returned = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if returned {
+            let backwards = ui.input(|i| i.modifiers.shift);
+            search_diff(session, state, backwards);
+        }
+        if !state.find_query.is_empty() && state.find_applied == state.find_query {
+            if state.find_matches.is_empty() {
+                ui.weak("no matches");
+            } else if let Some(current) = state.find_current {
+                let position = state
+                    .find_matches
+                    .iter()
+                    .position(|m| *m == current)
+                    .unwrap_or(0);
+                ui.weak(format!("{} of {}", position + 1, state.find_matches.len()));
+            }
+        }
     });
+}
+
+/// Re-run the find over the diff's line rows and select the next (or, with
+/// `backwards`, previous) match, scrolling the surface to it (Task 48).
+///
+/// An edited query starts at its first (or last) match; repeating Enter on
+/// the same query walks the list, wrapping.
+pub fn search_diff(session: &PrSession, state: &mut DiffViewState, backwards: bool) {
+    let changed = state.find_applied != state.find_query;
+    state.find_applied = state.find_query.clone();
+    state.find_matches = find_matches(line_rows(session).into_iter(), &state.find_query);
+    state.find_current = if changed {
+        if backwards {
+            state.find_matches.last().copied()
+        } else {
+            state.find_matches.first().copied()
+        }
+    } else if backwards {
+        prev_match(&state.find_matches, state.find_current)
+    } else {
+        next_match(&state.find_matches, state.find_current)
+    };
+    state.scroll_to_row = state.find_current;
+}
+
+/// Every line row of the session's row model as `(row_index, text)` pairs in
+/// display order — the haystack [`find_matches`] searches (Task 48).
+pub fn line_rows(session: &PrSession) -> Vec<(usize, &str)> {
+    session
+        .row_model
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reference)| match reference {
+            RowRef::Line { file, hunk, row } => {
+                line_at(session, *file, *hunk, *row).map(|line| (index, line.text.as_str()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// What to show when there is no row to draw yet.
@@ -1005,7 +1122,7 @@ mod tests {
                 let mut state = DiffViewState {
                     mode,
                     wrap,
-                    scroll_to: None,
+                    ..Default::default()
                 };
                 let mut drafts = CommentDrafts::default();
                 let mut actions = Vec::new();
@@ -1066,6 +1183,34 @@ mod tests {
             ),
             "a file target has no side"
         );
+    }
+
+    #[test]
+    fn find_walks_the_line_rows_and_scrolls() {
+        let session = surface_session();
+        let mut state = DiffViewState {
+            find_query: "c".into(),
+            ..Default::default()
+        };
+        search_diff(&session, &mut state, false);
+        assert!(!state.find_matches.is_empty());
+        assert_eq!(state.find_current, state.find_matches.first().copied());
+        assert_eq!(
+            state.scroll_to_row, state.find_current,
+            "the match is scrolled to"
+        );
+        let first = state.find_current;
+        search_diff(&session, &mut state, false);
+        assert_ne!(
+            state.find_current, first,
+            "Enter on the same query advances"
+        );
+        search_diff(&session, &mut state, true);
+        assert_eq!(state.find_current, first, "Shift+Enter goes back");
+        state.find_query = "zzz-nothing".into();
+        search_diff(&session, &mut state, false);
+        assert!(state.find_matches.is_empty());
+        assert_eq!(state.find_current, None);
     }
 
     #[test]

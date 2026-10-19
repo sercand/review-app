@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
 use crate::diff::expand::{expand, gaps, Expand};
+use crate::diff::options::hide_whitespace_only;
 use crate::diff::row_model::{build, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::comments::NewComment;
@@ -21,6 +22,7 @@ use crate::github::files::{FileStatus, LoadedFile};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{review_payload, Review, ServerPendingComment};
 use crate::model::comment::{Anchor, CommentTarget};
+use crate::model::diff::FileDiff;
 use crate::model::review::{PendingError, PendingReview, ReviewEvent};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
@@ -131,6 +133,16 @@ pub struct PrSession {
     /// The PR's merge base, fetched once per session (Task 46): every
     /// too-large file's base blob is read at this commit.
     pub merge_base: Option<String>,
+    /// Whether whitespace-only hunks are hidden (Task 48). The row model
+    /// resolves line rows by hunk index, so hiding filters each file's diff
+    /// in place rather than only the rows built from it.
+    pub hide_whitespace: bool,
+    /// The unfiltered diffs stashed while whitespace is hidden, by file
+    /// index, so turning the option off restores exactly what was on screen.
+    original_diffs: HashMap<u32, FileDiff>,
+    /// Files already run through [`hide_whitespace_only`] since the option
+    /// last changed, so a rebuild never re-filters (or re-stashes) them.
+    filtered_files: std::collections::HashSet<u32>,
     /// The next locally allocated comment id; starts at 1 because 0 is the
     /// reserved "no optimistic bubble" sentinel.
     next_optimistic_id: u64,
@@ -246,6 +258,9 @@ impl PrSession {
             head_blobs: HashMap::new(),
             pending_expands: Vec::new(),
             merge_base: None,
+            hide_whitespace: false,
+            original_diffs: HashMap::new(),
+            filtered_files: std::collections::HashSet::new(),
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
@@ -532,6 +547,8 @@ impl PrSession {
         self.head_blobs.clear();
         self.pending_expands.clear();
         self.merge_base = None;
+        self.original_diffs.clear();
+        self.filtered_files.clear();
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -579,6 +596,9 @@ impl PrSession {
     /// of `build` in exactly the order they went in — so a comment event
     /// never collapses wrapped lines back to [`ROW_H`](crate::diff::row_model::ROW_H).
     pub fn rebuild_rows(&mut self) {
+        if self.hide_whitespace {
+            self.filter_whitespace();
+        }
         let items = self.inline_items();
         let measured: Vec<f32> = self
             .row_model
@@ -724,6 +744,59 @@ impl PrSession {
         let expanded = expand(&diff, &lines, gap, how);
         if let Some(loaded) = self.files.get_mut(file as usize) {
             loaded.diff = Some(expanded);
+        }
+        // The expanded rows may hide a whitespace-only change, so the file
+        // has to be filtered again on the next rebuild.
+        self.filtered_files.remove(&file);
+    }
+
+    /// Hide or show whitespace-only hunks (Task 48).
+    ///
+    /// Hiding filters every file's diff in place — line rows resolve hunks
+    /// by index, so the filtered diff must be the one the rows point at —
+    /// and stashes each original that changes; showing restores them. Row
+    /// indices change either way, so whatever the caller keys by them (the
+    /// diff view's find matches) must be cleared.
+    pub fn set_hide_whitespace(&mut self, hide: bool) {
+        if self.hide_whitespace == hide {
+            return;
+        }
+        self.hide_whitespace = hide;
+        if !hide {
+            for (index, diff) in std::mem::take(&mut self.original_diffs) {
+                if let Some(loaded) = self.files.get_mut(index as usize) {
+                    loaded.diff = Some(diff);
+                }
+            }
+            self.filtered_files.clear();
+        }
+        self.rebuild_rows();
+    }
+
+    /// Flip the hide-whitespace option (Task 48).
+    pub fn toggle_hide_whitespace(&mut self) {
+        let hide = !self.hide_whitespace;
+        self.set_hide_whitespace(hide);
+    }
+
+    /// Replace each not-yet-filtered file's diff with its
+    /// [`hide_whitespace_only`] form, stashing the original of every diff
+    /// that changes. Files pages that arrive while the option is on are
+    /// picked up here too, since [`PrSession::rebuild_rows`] calls this.
+    fn filter_whitespace(&mut self) {
+        for index in 0..self.files.len() {
+            let file = index as u32;
+            if !self.filtered_files.insert(file) {
+                continue;
+            }
+            let Some(diff) = self.files[index].diff.clone() else {
+                continue;
+            };
+            let filtered = hide_whitespace_only(&diff);
+            if filtered != diff {
+                self.original_diffs.entry(file).or_insert(diff);
+                self.files[index].diff = Some(filtered);
+            }
         }
     }
 
@@ -2140,5 +2213,49 @@ mod tests {
             matches!(&cmds[..], [Command::LoadLargeDiff { merge_base: Some(sha), .. }] if sha == "mb"),
             "the cached merge base rides along on the next large file"
         );
+    }
+
+    #[test]
+    fn hide_whitespace_toggle_filters_rows_and_restores_them() {
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![
+                loaded(
+                    "a.rs",
+                    "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n",
+                ),
+                loaded("b.rs", "@@ -1 +1 @@\n-let x = 1;\n+let x = 2;\n"),
+            ],
+            done: true,
+        });
+        let before = s.row_model.rows.len();
+
+        s.toggle_hide_whitespace();
+        assert!(s.hide_whitespace);
+        assert!(
+            s.files[0].diff.as_ref().unwrap().hunks.is_empty(),
+            "the whitespace-only file keeps no hunks"
+        );
+        assert_eq!(s.files[1].diff.as_ref().unwrap().hunks.len(), 1);
+        assert!(s.row_model.rows.len() < before);
+
+        // A page that arrives while the option is on is filtered too.
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("c.rs", "@@ -1,2 +1,2 @@\n fn c() {\n-\tx;\n+\tx;\n")],
+            done: true,
+        });
+        assert!(s.files[2].diff.as_ref().unwrap().hunks.is_empty());
+
+        s.toggle_hide_whitespace();
+        assert!(!s.hide_whitespace);
+        assert_eq!(s.files[0].diff.as_ref().unwrap().hunks.len(), 1);
+        assert_eq!(s.files[2].diff.as_ref().unwrap().hunks.len(), 1);
+        assert_eq!(s.row_model.rows.len(), before + 4);
     }
 }
