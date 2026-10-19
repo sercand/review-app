@@ -8,7 +8,7 @@
 //! session now on screen (the stale-event rule).
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::diff::row_model::{build, RowModel};
@@ -69,6 +69,14 @@ pub struct PrSession {
     pub collapsed_dirs: BTreeSet<String>,
     /// The last file selected in the tree, restored from the session file.
     pub last_opened_file: Option<String>,
+    /// The saved pending-review draft, loaded from the session file and
+    /// written back untouched so a session write never clobbers it.
+    /// Task 40 owns editing it.
+    pub draft: Option<serde_json::Value>,
+    /// The saved composer draft, loaded from the session file and written
+    /// back untouched so a session write never clobbers it.
+    /// Task 40 owns editing it.
+    pub composer_draft: Option<serde_json::Value>,
     /// The config root the session file lives under.
     root: PathBuf,
     /// Coalesces viewed/collapse changes into debounced writes.
@@ -87,14 +95,31 @@ impl PrSession {
         repo: RepoRef,
         number: u64,
     ) -> (PrSession, Vec<Command>) {
-        let root = crate::persist::config_root();
-        let (viewed, collapsed_dirs, last_opened_file) =
-            match session::load(&root, &host, &repo, number) {
-                Ok(Some(file)) => (file.viewed, file.collapsed_dirs, file.last_opened_file),
-                Ok(None) => (ViewedSet::default(), BTreeSet::new(), None),
+        Self::open_at(&crate::persist::config_root(), id, host, repo, number)
+    }
+
+    /// Open a PR against a specific config root: the real one in
+    /// [`PrSession::open`], a temporary one in tests.
+    pub fn open_at(
+        root: &Path,
+        id: SessionId,
+        host: String,
+        repo: RepoRef,
+        number: u64,
+    ) -> (PrSession, Vec<Command>) {
+        let (viewed, collapsed_dirs, last_opened_file, draft, composer_draft) =
+            match session::load(root, &host, &repo, number) {
+                Ok(Some(file)) => (
+                    file.viewed,
+                    file.collapsed_dirs,
+                    file.last_opened_file,
+                    file.draft,
+                    file.composer_draft,
+                ),
+                Ok(None) => (ViewedSet::default(), BTreeSet::new(), None, None, None),
                 Err(error) => {
                     tracing::warn!(%error, "could not read the PR session file");
-                    (ViewedSet::default(), BTreeSet::new(), None)
+                    (ViewedSet::default(), BTreeSet::new(), None, None, None)
                 }
             };
 
@@ -114,7 +139,9 @@ impl PrSession {
             filters: FilterState::default(),
             collapsed_dirs,
             last_opened_file,
-            root,
+            draft,
+            composer_draft,
+            root: root.to_path_buf(),
             writer: DebouncedWriter::default(),
         };
 
@@ -231,9 +258,11 @@ impl PrSession {
         SessionFile {
             head_sha: self.diff_head_sha.clone(),
             viewed: self.viewed.clone(),
-            // Filled by Task 40; a write here must not clobber a saved draft.
-            draft: None,
-            composer_draft: None,
+            // Round-tripped verbatim from the loaded file: Task 40 owns
+            // these values, so a debounced viewed/collapse write here must
+            // never clobber a saved draft.
+            draft: self.draft.clone(),
+            composer_draft: self.composer_draft.clone(),
             last_opened_file: self.last_opened_file.clone(),
             collapsed_dirs: self.collapsed_dirs.clone(),
         }
@@ -371,5 +400,53 @@ mod tests {
             .unwrap();
         assert!(saved.viewed.is_viewed(&a));
         assert!(saved.collapsed_dirs.contains("src"));
+    }
+
+    #[test]
+    fn session_writes_preserve_saved_drafts() {
+        use crate::test_support::{file, tempdir};
+        use std::time::Duration;
+
+        let dir = tempdir();
+        let draft = serde_json::json!({ "body": "review text" });
+        let composer_draft = serde_json::json!({ "target_path": "a.rs", "body": "wip" });
+        session::save(
+            dir.path(),
+            "github.com",
+            &repo(),
+            7,
+            &SessionFile {
+                draft: Some(draft.clone()),
+                composer_draft: Some(composer_draft.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
+        assert_eq!(s.draft.as_ref(), Some(&draft));
+        assert_eq!(s.composer_draft.as_ref(), Some(&composer_draft));
+
+        let a = file("src/a.rs");
+        s.viewed.set(&a, true);
+        let t0 = Instant::now();
+        s.mark_session_dirty(t0);
+        s.tick(t0 + Duration::from_millis(300));
+
+        let saved = crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .unwrap();
+        assert!(saved.viewed.is_viewed(&a), "the toggle was written");
+        assert_eq!(
+            saved.draft.as_ref(),
+            Some(&draft),
+            "a viewed write must not clobber the saved draft"
+        );
+        assert_eq!(
+            saved.composer_draft.as_ref(),
+            Some(&composer_draft),
+            "a viewed write must not clobber the saved composer draft"
+        );
     }
 }
