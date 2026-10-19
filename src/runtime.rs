@@ -119,6 +119,15 @@ pub enum Command {
         /// The reply body.
         body: String,
     },
+    /// Resolve or unresolve a review thread (spec §7.4).
+    SetThreadResolved {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The thread's GraphQL node id.
+        thread_id: String,
+        /// The state to move the thread to.
+        resolved: bool,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -220,6 +229,15 @@ pub enum Event {
         thread_id: String,
         /// The reply as GitHub created it.
         comment: ThreadComment,
+    },
+    /// A thread's resolved state changed, as GitHub confirmed it.
+    ThreadResolved {
+        /// The session that asked for the change.
+        session: SessionId,
+        /// The thread that changed.
+        thread_id: String,
+        /// The state the thread is now in.
+        resolved: bool,
     },
 }
 
@@ -589,6 +607,31 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 Err(error) => events.send(Event::CommentFailed {
                     session,
                     optimistic_id: NO_OPTIMISTIC_BUBBLE,
+                    error,
+                }),
+            }
+        }
+        Command::SetThreadResolved {
+            session,
+            thread_id,
+            resolved,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.set_thread_resolved(&thread_id, resolved).await {
+                Ok(is_resolved) => events.send(Event::ThreadResolved {
+                    session,
+                    thread_id,
+                    resolved: is_resolved,
+                }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
                     error,
                 }),
             }

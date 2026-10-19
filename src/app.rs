@@ -210,6 +210,7 @@ impl ReviewApp {
             Event::CommentPosted { .. } => {}
             Event::CommentFailed { .. } => {}
             Event::ReplyPosted { .. } => {}
+            Event::ThreadResolved { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its

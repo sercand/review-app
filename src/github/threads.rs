@@ -68,6 +68,29 @@ query($id: ID!, $after: String) {
 }
 "#;
 
+/// The mutation that resolves a review thread.
+pub const RESOLVE_MUTATION: &str = r#"
+mutation($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread { isResolved }
+  }
+}
+"#;
+
+/// The mutation that un-resolves a review thread.
+pub const UNRESOLVE_MUTATION: &str = r#"
+mutation($threadId: ID!) {
+  unresolveReviewThread(input: { threadId: $threadId }) {
+    thread { isResolved }
+  }
+}
+"#;
+
+/// The variables both resolve mutations take.
+pub fn resolve_vars(thread_id: &str) -> Value {
+    json!({ "threadId": thread_id })
+}
+
 /// A GraphQL connection's pagination fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageInfo {
@@ -135,6 +158,30 @@ impl GithubClient {
             threads.push(thread);
         }
         Ok(threads)
+    }
+
+    /// Resolve (`resolved`) or unresolve (`!resolved`) a review thread,
+    /// returning the state GitHub reports afterwards.
+    ///
+    /// A mutation: sent once through the non-retrying GraphQL transport.
+    pub async fn set_thread_resolved(
+        &self,
+        thread_id: &str,
+        resolved: bool,
+    ) -> Result<bool, GhError> {
+        let (mutation, field) = if resolved {
+            (RESOLVE_MUTATION, "resolveReviewThread")
+        } else {
+            (UNRESOLVE_MUTATION, "unresolveReviewThread")
+        };
+        let data: Value = self
+            .graphql_mutation(mutation, resolve_vars(thread_id))
+            .await?;
+        data.get(field)
+            .and_then(|result| result.get("thread"))
+            .and_then(|thread| thread.get("isResolved"))
+            .and_then(Value::as_bool)
+            .ok_or_else(|| GhError::Decode(format!("{field}: missing isResolved")))
     }
 }
 

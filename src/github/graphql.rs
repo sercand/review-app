@@ -68,18 +68,21 @@ impl GithubClient {
         variables: Value,
     ) -> Result<T, GhError> {
         let body = self.post_graphql_with_retry(query, &variables).await?;
-        let envelope: Value = serde_json::from_str(&body).map_err(decode)?;
+        decode_data(&body)
+    }
 
-        if let Some(errors) = envelope
-            .get("errors")
-            .and_then(Value::as_array)
-            .filter(|errors| !errors.is_empty())
-        {
-            return Err(graphql_error(errors));
-        }
-
-        let data = envelope.get("data").cloned().unwrap_or(Value::Null);
-        serde_json::from_value(data).map_err(decode)
+    /// Send one GraphQL mutation and deserialize its `data`, **without
+    /// retrying**: the single POST's outcome is the answer, whether it
+    /// succeeded, failed, or its fate is unknown.
+    ///
+    /// The `errors[]` handling is the same as [`GithubClient::graphql`].
+    pub async fn graphql_mutation<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<T, GhError> {
+        let body = self.post_graphql_once(query, &variables).await?;
+        decode_data(&body)
     }
 
     /// Search open PRs with `query`, returning the page after `after`.
@@ -132,6 +135,23 @@ impl GithubClient {
             }
         }
     }
+}
+
+/// Unwrap a GraphQL response body: a non-empty `errors[]` wins over `data`;
+/// otherwise `data` is deserialized.
+fn decode_data<T: DeserializeOwned>(body: &str) -> Result<T, GhError> {
+    let envelope: Value = serde_json::from_str(body).map_err(decode)?;
+
+    if let Some(errors) = envelope
+        .get("errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())
+    {
+        return Err(graphql_error(errors));
+    }
+
+    let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+    serde_json::from_value(data).map_err(decode)
 }
 
 /// Parse the `data` of a `SEARCH_PRS` response.
