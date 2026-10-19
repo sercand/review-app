@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::github::search::Scope;
+
 /// The cached identity of the signed-in account.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Account {
@@ -31,6 +33,9 @@ pub struct Settings {
     pub client_id: Option<String>,
     /// The cached account, or `None` when signed out.
     pub account: Option<Account>,
+    /// The scopes the PR list starts with.
+    #[serde(default)]
+    pub default_scopes: Vec<Scope>,
 }
 
 impl Default for Settings {
@@ -39,6 +44,7 @@ impl Default for Settings {
             host: "github.com".to_owned(),
             client_id: None,
             account: None,
+            default_scopes: vec![Scope::ReviewRequested, Scope::Assigned, Scope::Authored],
         }
     }
 }

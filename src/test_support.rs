@@ -34,3 +34,28 @@ macro_rules! fixture {
 pub fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("failed to create a temporary directory")
 }
+
+/// A repository reference in the `o/r` every unit test uses.
+pub fn repo() -> crate::model::RepoRef {
+    crate::model::RepoRef::new("o", "r")
+}
+
+/// A [`crate::model::pr::PrSummary`] in `o/r`: authored by `"a"`, not a draft,
+/// with no checks and no review decision, all timestamps equal, and no URL.
+pub fn pr_summary(number: u64, title: &str, comments: u32) -> crate::model::pr::PrSummary {
+    crate::model::pr::PrSummary {
+        repo: repo(),
+        number,
+        title: title.to_owned(),
+        author: "a".to_owned(),
+        draft: false,
+        updated_at: "2026-10-01T00:00:00Z".to_owned(),
+        created_at: "2026-09-01T00:00:00Z".to_owned(),
+        additions: 0,
+        deletions: 0,
+        comments,
+        ci: None,
+        review: None,
+        url: format!("https://github.com/o/r/pull/{number}"),
+    }
+}
