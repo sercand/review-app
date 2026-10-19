@@ -141,6 +141,8 @@ impl ReviewApp {
                 ..
             } => self.on_unauthorized(now),
             Event::Failed { error, .. } => self.toasts.push(error.to_string(), now),
+            // These are folded into the PR list reducer in Task 14.
+            Event::PrSearchPage { .. } | Event::PrSearchFailed { .. } => {}
         }
     }
 

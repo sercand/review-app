@@ -18,7 +18,7 @@ const API_VERSION: &str = "2022-11-28";
 /// The `Accept` value for REST requests.
 const REST_ACCEPT: &str = "application/vnd.github+json";
 /// How long to wait before each of the (at most three) read retries.
-const READ_BACKOFF: [Duration; 3] = [
+pub(crate) const READ_BACKOFF: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_millis(500),
     Duration::from_secs(1),
@@ -105,6 +105,12 @@ impl GithubClient {
     /// The endpoints this client talks to.
     pub fn endpoints(&self) -> &Endpoints {
         &self.endpoints
+    }
+
+    /// The underlying HTTP client, for callers that build their own requests
+    /// (the GraphQL transport). Its default headers are already installed.
+    pub(crate) fn http(&self) -> &Client {
+        &self.client
     }
 
     /// `GET` a REST path (or an absolute URL) as JSON.

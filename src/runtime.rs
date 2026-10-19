@@ -18,6 +18,7 @@ use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::error::GhError;
+use crate::github::graphql::SearchPage;
 
 /// Identifies one open PR's session.
 ///
@@ -47,6 +48,15 @@ pub enum Command {
         host: String,
         /// The token the user pasted.
         token: String,
+    },
+    /// Search open PRs for one query (one scope, one constraint).
+    SearchPrs {
+        /// The PR-list request generation that issued this search.
+        request: u64,
+        /// The search query to run.
+        query: String,
+        /// The `endCursor` to fetch the page after, when paging.
+        after: Option<String>,
     },
 }
 
@@ -79,6 +89,22 @@ pub enum Event {
     },
     /// Sign-in could not complete.
     AuthFailed(AuthFailure),
+    /// A PR search page arrived.
+    PrSearchPage {
+        /// The request generation this page belongs to.
+        request: u64,
+        /// The query that produced it.
+        query: String,
+        /// The parsed page.
+        page: SearchPage,
+    },
+    /// A PR search failed.
+    PrSearchFailed {
+        /// The request generation that failed.
+        request: u64,
+        /// The classified failure.
+        error: GhError,
+    },
 }
 
 /// Sends [`Event`]s from worker tasks to the UI thread.
@@ -239,6 +265,16 @@ impl ExecCtx {
         *self.write_client() = None;
     }
 
+    /// A clone of the installed client, or `None` before sign-in.
+    ///
+    /// Cloning is cheap: the underlying connection pool is refcounted.
+    pub fn client(&self) -> Option<GithubClient> {
+        self.client
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// The client lock for writing, recovered even if a holder panicked.
     fn write_client(&self) -> std::sync::RwLockWriteGuard<'_, Option<GithubClient>> {
         self.client
@@ -270,6 +306,28 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         }
         Command::SubmitPat { host, token } => {
             validate_and_sign_in(&ctx, &host, token, &events).await;
+        }
+        Command::SearchPrs {
+            request,
+            query,
+            after,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::PrSearchFailed {
+                    request,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.search_prs(&query, after.as_deref()).await {
+                Ok(page) => events.send(Event::PrSearchPage {
+                    request,
+                    query,
+                    page,
+                }),
+                Err(error) => events.send(Event::PrSearchFailed { request, error }),
+            }
         }
     }
 }

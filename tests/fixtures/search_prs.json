@@ -1,0 +1,42 @@
+{
+  "data": {
+    "search": {
+      "issueCount": 137,
+      "pageInfo": { "hasNextPage": true, "endCursor": "Y3Vyc29yOjI=" },
+      "nodes": [
+        {
+          "number": 12,
+          "title": "Add widget cache",
+          "isDraft": false,
+          "updatedAt": "2026-10-18T09:30:00Z",
+          "createdAt": "2026-10-01T11:00:00Z",
+          "additions": 40,
+          "deletions": 3,
+          "reviewDecision": "CHANGES_REQUESTED",
+          "totalCommentsCount": 4,
+          "url": "https://github.com/octo/repo/pull/12",
+          "author": { "login": "mona" },
+          "repository": { "nameWithOwner": "octo/repo" },
+          "commits": {
+            "last": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "ERROR" } } }] }
+          }
+        },
+        {},
+        {
+          "number": 13,
+          "title": "Draft: split the transport",
+          "isDraft": true,
+          "updatedAt": "2026-10-17T08:00:00Z",
+          "createdAt": "2026-10-02T12:00:00Z",
+          "additions": 7,
+          "deletions": 11,
+          "reviewDecision": null,
+          "totalCommentsCount": 0,
+          "url": "https://github.com/octo/other/pull/13",
+          "author": null,
+          "repository": { "nameWithOwner": "octo/other" }
+        }
+      ]
+    }
+  }
+}
