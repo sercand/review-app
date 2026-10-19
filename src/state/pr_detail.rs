@@ -22,7 +22,7 @@ use crate::model::comment::CommentTarget;
 use crate::model::review::{PendingError, PendingReview};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
-use crate::persist::session::{self, DebouncedWriter, SessionFile};
+use crate::persist::session::{self, ComposerDraft, DebouncedWriter, SessionFile};
 use crate::runtime::{Command, Event, SessionId, NO_OPTIMISTIC_BUBBLE};
 use crate::state::composer::{
     self, can_submit, fallback_comment, interpret_post_error, CommentMode, ComposerMsg,
@@ -107,7 +107,9 @@ pub struct PrSession {
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
     /// The live pending-review draft (Phase F submits it), pinned to one
-    /// commit while it has comments (spec §7.2).
+    /// commit while it has comments (spec §7.2). Restored from the session
+    /// file on open and saved immediately after every mutation; while it is
+    /// non-empty it owns the session file's `draft` field.
     pub pending: PendingReview,
     /// A line post rejected with a 422, awaiting the reviewer's decision
     /// on the file-level fallback.
@@ -121,14 +123,18 @@ pub struct PrSession {
     pub collapsed_dirs: BTreeSet<String>,
     /// The last file selected in the tree, restored from the session file.
     pub last_opened_file: Option<String>,
-    /// The saved pending-review draft, loaded from the session file and
-    /// written back untouched so a session write never clobbers it.
-    /// Task 40 owns editing it.
-    pub draft: Option<serde_json::Value>,
-    /// The saved composer draft, loaded from the session file and written
-    /// back untouched so a session write never clobbers it.
-    /// Task 40 owns editing it.
-    pub composer_draft: Option<serde_json::Value>,
+    /// The saved composer draft, restored on open; while `Some` it owns the
+    /// session file's `composer_draft` field. The composer UI (Phase F)
+    /// writes it through the debounced session write.
+    pub composer_draft: Option<ComposerDraft>,
+    /// A `draft` value on disk this build cannot parse as a `PendingReview`.
+    /// Written back verbatim so a session write never destroys a draft it
+    /// does not own; while the typed `pending` owns the field this is `None`.
+    raw_draft: Option<serde_json::Value>,
+    /// A `composer_draft` value on disk this build cannot parse as a
+    /// `ComposerDraft`; kept verbatim for the same reason as
+    /// [`Self::raw_draft`].
+    raw_composer_draft: Option<serde_json::Value>,
     /// The config root the session file lives under.
     root: PathBuf,
     /// Coalesces viewed/collapse changes into debounced writes.
@@ -159,21 +165,46 @@ impl PrSession {
         repo: RepoRef,
         number: u64,
     ) -> (PrSession, Vec<Command>) {
-        let (viewed, collapsed_dirs, last_opened_file, draft, composer_draft) =
-            match session::load(root, &host, &repo, number) {
-                Ok(Some(file)) => (
+        let empty = (
+            ViewedSet::default(),
+            BTreeSet::new(),
+            None,
+            PendingReview::default(),
+            None,
+            None,
+            None,
+        );
+        let (
+            viewed,
+            collapsed_dirs,
+            last_opened_file,
+            pending,
+            composer_draft,
+            raw_draft,
+            raw_composer_draft,
+        ) = match session::load(root, &host, &repo, number) {
+            Ok(Some(file)) => {
+                // A draft this build understands becomes live typed state;
+                // one it does not is preserved verbatim so a session write
+                // never destroys data it does not own.
+                let (pending, raw_draft) = restore_draft(file.draft);
+                let (composer_draft, raw_composer_draft) = restore_draft(file.composer_draft);
+                (
                     file.viewed,
                     file.collapsed_dirs,
                     file.last_opened_file,
-                    file.draft,
-                    file.composer_draft,
-                ),
-                Ok(None) => (ViewedSet::default(), BTreeSet::new(), None, None, None),
-                Err(error) => {
-                    tracing::warn!(%error, "could not read the PR session file");
-                    (ViewedSet::default(), BTreeSet::new(), None, None, None)
-                }
-            };
+                    pending,
+                    composer_draft,
+                    raw_draft,
+                    raw_composer_draft,
+                )
+            }
+            Ok(None) => empty,
+            Err(error) => {
+                tracing::warn!(%error, "could not read the PR session file");
+                empty
+            }
+        };
 
         let session = PrSession {
             id,
@@ -191,14 +222,15 @@ impl PrSession {
             filters: FilterState::default(),
             threads: Vec::new(),
             composer: ComposerState::default(),
-            pending: PendingReview::default(),
+            pending,
             fallback: None,
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
             last_opened_file,
-            draft,
             composer_draft,
+            raw_draft,
+            raw_composer_draft,
             root: root.to_path_buf(),
             writer: DebouncedWriter::default(),
         };
@@ -558,6 +590,7 @@ impl PrSession {
                     composer::reduce(&mut self.composer, ComposerMsg::Cancel);
                     self.rebuild_rows();
                     self.mark_session_dirty(now);
+                    self.save_pending_draft();
                 }
                 // The draft is pinned to another commit: keep the composer
                 // text and say so — submit or discard the pinned draft first
@@ -627,6 +660,7 @@ impl PrSession {
         self.pending.delete(local_id);
         self.rebuild_rows();
         self.mark_session_dirty(now);
+        self.save_pending_draft();
     }
 
     /// Post the 422 fallback: the same text as a file-level comment, as a
@@ -660,6 +694,21 @@ impl PrSession {
         self.writer.mark_dirty(now);
     }
 
+    /// Persist the pending-review draft now, atomically: a draft the reviewer
+    /// just wrote must never be waiting on the debounce window when a crash
+    /// or quit comes (spec §11), so every pending mutation calls this.
+    fn save_pending_draft(&self) {
+        if let Err(error) = session::save_draft(
+            &self.root,
+            &self.host,
+            &self.repo,
+            self.number,
+            &self.pending,
+        ) {
+            tracing::warn!(%error, "could not save the pending review draft");
+        }
+    }
+
     /// Write the session file once the debounce window has elapsed.
     ///
     /// Called once per frame; the writer coalesces a burst of toggles into one
@@ -682,11 +731,14 @@ impl PrSession {
         SessionFile {
             head_sha: self.diff_head_sha.clone(),
             viewed: self.viewed.clone(),
-            // Round-tripped verbatim from the loaded file: Task 40 owns
-            // these values, so a debounced viewed/collapse write here must
-            // never clobber a saved draft.
-            draft: self.draft.clone(),
-            composer_draft: self.composer_draft.clone(),
+            // The typed draft owns this field while it has content; a value
+            // this build could not parse is written back untouched, so a
+            // debounced viewed/collapse write never clobbers a saved draft.
+            draft: draft_field(&self.pending, self.raw_draft.as_ref()),
+            composer_draft: match &self.composer_draft {
+                Some(draft) => serde_json::to_value(draft).ok(),
+                None => self.raw_composer_draft.clone(),
+            },
             last_opened_file: self.last_opened_file.clone(),
             collapsed_dirs: self.collapsed_dirs.clone(),
         }
@@ -711,6 +763,35 @@ fn target_placement(target: &CommentTarget) -> Placement {
             side: anchor.side,
             line: anchor.line,
         },
+    }
+}
+
+/// Split a draft stored in the session file into the typed value this build
+/// understands and — when it does not understand it — the raw value kept
+/// verbatim, so a session write never destroys data it does not own.
+fn restore_draft<T: serde::de::DeserializeOwned + Default>(
+    raw: Option<serde_json::Value>,
+) -> (T, Option<serde_json::Value>) {
+    let Some(value) = raw else {
+        return (T::default(), None);
+    };
+    match serde_json::from_value::<T>(value.clone()) {
+        Ok(typed) => (typed, None),
+        Err(_) => (T::default(), Some(value)),
+    }
+}
+
+/// The `draft` field for a session write: the typed draft while it has
+/// content (an empty draft is stored as `None`), otherwise the raw value
+/// this build does not own, verbatim.
+fn draft_field(
+    pending: &PendingReview,
+    raw: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if pending.is_empty() {
+        raw.cloned()
+    } else {
+        serde_json::to_value(pending).ok()
     }
 }
 
@@ -751,7 +832,7 @@ mod tests {
     use super::*;
     use crate::github::error::GhError;
     use crate::runtime::{Command, Event, SessionId};
-    use crate::test_support::{line_anchor, loaded, meta, repo};
+    use crate::test_support::{line_anchor, loaded, meta, repo, tempdir};
 
     #[test]
     fn metadata_then_files_then_ready() {
@@ -916,8 +997,18 @@ mod tests {
         use std::time::Duration;
 
         let dir = tempdir();
+        // Two saved drafts, written before the typed model existed. The
+        // review draft cannot be parsed as a `PendingReview`, so the session
+        // must preserve it verbatim; the composer draft *is* a valid
+        // `ComposerDraft` (its `anchor` reads as `None`), so the typed model
+        // adopts it and must keep its content through a session write.
         let draft = serde_json::json!({ "body": "review text" });
         let composer_draft = serde_json::json!({ "target_path": "a.rs", "body": "wip" });
+        let adopted = ComposerDraft {
+            target_path: "a.rs".into(),
+            anchor: None,
+            body: "wip".into(),
+        };
         session::save(
             dir.path(),
             "github.com",
@@ -933,8 +1024,13 @@ mod tests {
 
         let (mut s, _) =
             PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
-        assert_eq!(s.draft.as_ref(), Some(&draft));
-        assert_eq!(s.composer_draft.as_ref(), Some(&composer_draft));
+        assert_eq!(s.raw_draft.as_ref(), Some(&draft));
+        assert!(
+            s.pending.is_empty(),
+            "a draft this build cannot parse is not adopted into the typed draft"
+        );
+        assert_eq!(s.composer_draft, Some(adopted.clone()));
+        assert!(s.raw_composer_draft.is_none());
 
         let a = file("src/a.rs");
         s.viewed.set(&a, true);
@@ -951,16 +1047,46 @@ mod tests {
             Some(&draft),
             "a viewed write must not clobber the saved draft"
         );
+        let written: ComposerDraft =
+            serde_json::from_value(saved.composer_draft.clone().expect("a composer draft"))
+                .expect("the written composer draft parses");
         assert_eq!(
-            saved.composer_draft.as_ref(),
-            Some(&composer_draft),
+            written, adopted,
             "a viewed write must not clobber the saved composer draft"
         );
     }
 
-    /// A session with one loaded file and a known head SHA.
-    fn loaded_session() -> PrSession {
-        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+    #[test]
+    fn the_session_restores_the_draft_and_saves_mutations_immediately() {
+        use crate::test_support::tempdir;
+
+        let dir = tempdir();
+        let mut p = PendingReview::default();
+        p.add(line_anchor("a.rs", 1), "keep me".into(), "sha1")
+            .unwrap();
+        session::save_draft(dir.path(), "github.com", &repo(), 7, &p).unwrap();
+
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
+        assert_eq!(s.pending, p, "the typed draft is restored on open");
+
+        // Deleting the last comment is persisted immediately — the empty
+        // draft is stored as `None` without waiting for the debounce.
+        let id = s.pending.comments[0].local_id;
+        s.delete_pending(id, Instant::now());
+        assert!(s.pending.commit_id.is_none());
+        assert!(session::load_draft(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A session with one loaded file and a known head SHA, backed by a
+    /// temporary config root: pending mutations save the draft immediately,
+    /// and a test must never write to the real one.
+    fn loaded_session() -> (PrSession, tempfile::TempDir) {
+        let dir = tempdir();
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
         s.on_event(&Event::PrMetadataLoaded {
             session: SessionId(1),
             meta: meta("sha1"),
@@ -970,7 +1096,7 @@ mod tests {
             files: vec![loaded("a.rs", "@@ -1,2 +1,2 @@\n-x\n+y\n z\n")],
             done: true,
         });
-        s
+        (s, dir)
     }
 
     fn comment(database_id: u64, body: &str) -> ThreadComment {
@@ -1004,7 +1130,7 @@ mod tests {
 
     #[test]
     fn refresh_clears_threads_and_asks_for_them_again() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         s.on_event(&Event::ThreadsLoaded {
             session: SessionId(1),
             threads: vec![anchored_thread("PRRT_1")],
@@ -1025,7 +1151,7 @@ mod tests {
 
     #[test]
     fn an_immediate_comment_shows_optimistically_then_confirms() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "hi");
         let cmds = s.submit_comment(CommentMode::Immediate, "me", Instant::now());
         assert!(
@@ -1054,7 +1180,7 @@ mod tests {
 
     #[test]
     fn a_failed_comment_rolls_back_and_restores_the_text() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "my lost words");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
         assert_eq!(s.threads.len(), 1);
@@ -1075,7 +1201,7 @@ mod tests {
 
     #[test]
     fn a_refresh_during_an_immediate_post_returns_the_text_to_the_composer() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "words at risk");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
         assert!(
@@ -1106,7 +1232,7 @@ mod tests {
 
     #[test]
     fn threads_loaded_during_an_immediate_post_returns_the_text_to_the_composer() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "still mine");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
 
@@ -1123,7 +1249,7 @@ mod tests {
 
     #[test]
     fn a_pending_comment_gets_a_row_and_can_be_removed() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "for the review");
         let cmds = s.submit_comment(CommentMode::Pending, "me", Instant::now());
         assert!(cmds.is_empty(), "pending comments post nothing yet");
@@ -1137,7 +1263,7 @@ mod tests {
 
     #[test]
     fn a_422_on_a_line_offers_the_file_level_fallback() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "this line moved");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
 
@@ -1194,7 +1320,7 @@ mod tests {
 
     #[test]
     fn a_server_error_keeps_the_text_but_offers_no_fallback() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "transient");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
         s.on_event(&Event::CommentFailed {
@@ -1208,7 +1334,7 @@ mod tests {
 
     #[test]
     fn dismissing_the_fallback_keeps_the_composer_text() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         open_composer(&mut s, "keep me");
         s.submit_comment(CommentMode::Immediate, "me", Instant::now());
         s.on_event(&Event::CommentFailed {
@@ -1224,7 +1350,7 @@ mod tests {
 
     #[test]
     fn reply_and_resolve_events_fold_into_their_threads() {
-        let mut s = loaded_session();
+        let (mut s, _dir) = loaded_session();
         s.on_event(&Event::ThreadsLoaded {
             session: SessionId(1),
             threads: vec![anchored_thread("PRRT_1")],
