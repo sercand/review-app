@@ -18,6 +18,7 @@ use crate::auth::DEFAULT_CLIENT_ID;
 use crate::diff::highlight::{HighlightCache, SyntectHighlighter};
 use crate::github::client::{GithubClient, Me};
 use crate::github::error::GhError;
+use crate::model::review::ReviewEvent;
 use crate::model::RepoRef;
 use crate::persist::config_root;
 use crate::persist::settings::Settings;
@@ -25,12 +26,13 @@ use crate::runtime::{
     event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
 };
 use crate::state::composer::{self, ComposerAction};
-use crate::state::pr_detail::PrSession;
+use crate::state::pr_detail::{start_submit, viewer_is_author, PrSession};
 use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
 use crate::ui::widgets::diff_view::DiffAction;
+use crate::ui::widgets::review_panel::ReviewAction;
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::toast::Toasts;
 
@@ -73,6 +75,10 @@ pub fn route(current: ScreenKind, event: &Event) -> ScreenKind {
             ..
         } => ScreenKind::Login,
         Event::CommentFailed {
+            error: GhError::Unauthorized,
+            ..
+        } => ScreenKind::Login,
+        Event::ReviewSubmitFailed {
             error: GhError::Unauthorized,
             ..
         } => ScreenKind::Login,
@@ -217,11 +223,20 @@ impl ReviewApp {
             Event::ThreadsLoaded { .. } => {}
             Event::ReviewsLoaded { .. } => {}
             Event::ServerPendingResolved { .. } => {}
-            // Task 44 folds these into the session (clearing the draft on
-            // success, keeping it on failure); the toast covers the failure
-            // surface meanwhile.
+            // The session folds both in through `apply_session_event`:
+            // success clears the draft and reloads threads and reviews,
+            // failure keeps the draft and records the error. The toast
+            // covers the failure surface.
             Event::ReviewSubmitted { .. } => {}
-            Event::ReviewSubmitFailed { error, .. } => self.toasts.push(error.to_string(), now),
+            Event::ReviewSubmitFailed { error, .. } => {
+                let unauthorized = matches!(error, GhError::Unauthorized);
+                self.toasts.push(error.to_string(), now);
+                if unauthorized {
+                    // Spec §6: a 401 anywhere ends the session; the draft
+                    // survives on disk (Review Focus #5).
+                    self.on_unauthorized(now);
+                }
+            }
             Event::CommentPosted { .. } => {}
             Event::ReplyPosted { .. } => {}
             Event::ThreadResolved { .. } => {}
@@ -470,12 +485,17 @@ impl ReviewApp {
     /// Without an open session there is nothing to draw — a 401 clears it — so
     /// the screen falls back to the list.
     fn render_pr_detail(&mut self, ui: &mut egui::Ui, now: Instant) {
+        let login = self.login();
         let Some(session) = &mut self.session else {
             self.screen = ScreenKind::PrList;
             return;
         };
 
-        // Flush any debounced session change whose window has elapsed.
+        // Snapshot the live composer into its persisted draft field (only
+        // this path writes that field, so a debounced whole-file write can
+        // never carry a stale composer), then flush any debounced session
+        // change whose window has elapsed.
+        session.sync_composer_draft(now);
         session.tick(now);
 
         let mut diff_actions = Vec::new();
@@ -485,11 +505,11 @@ impl ReviewApp {
             &mut self.pr_detail,
             &mut self.highlight_cache,
             &mut diff_actions,
+            &login,
         );
 
         self.apply_diff_actions(diff_actions, ui.ctx(), now);
 
-        let login = self.login();
         for action in actions {
             match action {
                 PrDetailAction::Back => self.screen = ScreenKind::PrList,
@@ -511,7 +531,93 @@ impl ReviewApp {
                         }
                     }
                 }
+                PrDetailAction::Review(action) => {
+                    for command in self.apply_review_action(action, &login, now) {
+                        self.worker.send(command);
+                    }
+                }
             }
+        }
+    }
+
+    /// Fold one review-panel control into the open session and return the
+    /// commands it produced.
+    ///
+    /// Draft mutations persist through the session (the draft is never left
+    /// waiting on a debounce, spec §11); Submit is gated on the panel's
+    /// view-model via [`start_submit`], and on the author rule the view-model
+    /// cannot see from the session alone.
+    fn apply_review_action(
+        &mut self,
+        action: ReviewAction,
+        login: &str,
+        now: Instant,
+    ) -> Vec<Command> {
+        let Some(session) = &mut self.session else {
+            return Vec::new();
+        };
+        match action {
+            ReviewAction::SetEvent(event) => {
+                session.set_pending_event(event);
+                Vec::new()
+            }
+            ReviewAction::SetBody(body) => {
+                session.set_pending_body(body);
+                Vec::new()
+            }
+            ReviewAction::EditComment(local_id, body) => {
+                session.edit_pending(local_id, body);
+                Vec::new()
+            }
+            ReviewAction::DeleteComment(local_id) => {
+                session.delete_pending(local_id, now);
+                Vec::new()
+            }
+            ReviewAction::Discard => {
+                session.discard_pending_review(now);
+                Vec::new()
+            }
+            ReviewAction::Submit => {
+                if viewer_is_author(session, login)
+                    && matches!(
+                        session.pending.event,
+                        ReviewEvent::Approve | ReviewEvent::RequestChanges
+                    )
+                {
+                    self.toasts.push(
+                        "you cannot approve or request changes on your own pull request".to_owned(),
+                        now,
+                    );
+                    return Vec::new();
+                }
+                start_submit(session).into_iter().collect()
+            }
+            ReviewAction::SubmitServerPending(event, body) => session
+                .server_pending
+                .as_ref()
+                .map(|(review, _)| {
+                    vec![Command::SubmitServerPending {
+                        session: session.id,
+                        repo: session.repo.clone(),
+                        number: session.number,
+                        review_id: review.id,
+                        event,
+                        body,
+                    }]
+                })
+                .unwrap_or_default(),
+            ReviewAction::DiscardServerPending => session
+                .server_pending
+                .as_ref()
+                .map(|(review, _)| {
+                    vec![Command::DeleteServerPending {
+                        session: session.id,
+                        repo: session.repo.clone(),
+                        number: session.number,
+                        review_id: review.id,
+                    }]
+                })
+                .unwrap_or_default(),
         }
     }
 

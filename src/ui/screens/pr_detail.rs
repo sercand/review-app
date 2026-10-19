@@ -16,11 +16,12 @@ use crate::github::files::PrFile;
 use crate::model::tree::build_tree;
 use crate::state::filters::{available_extensions, matches, without_hide_viewed, FilterState};
 use crate::state::folder_viewed::toggle_folder_viewed;
-use crate::state::pr_detail::PrSession;
+use crate::state::pr_detail::{head_moved_since_pin, viewer_is_author, PrSession};
 use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
 use crate::ui::widgets::filter_bar;
+use crate::ui::widgets::review_panel::{self, ReviewAction};
 use crate::ui::widgets::thread_view::CommentDrafts;
 
 /// The width the left pane starts at.
@@ -28,6 +29,9 @@ const LEFT_W: f32 = 240.0;
 
 /// The width the right pane starts at, when open.
 const RIGHT_W: f32 = 320.0;
+
+/// The height the review panel starts at.
+const REVIEW_H: f32 = 220.0;
 
 /// What the user asked of the detail screen beyond the diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +45,8 @@ pub enum PrDetailAction {
         /// Post the file-level comment, or keep editing the line one.
         accept: bool,
     },
+    /// A control the review panel reported (Task 44).
+    Review(ReviewAction),
 }
 
 /// The screen's own layout state, owned across frames by the app.
@@ -60,13 +66,15 @@ pub struct PrDetailState {
 /// Paint the whole screen, returning what the user asked of it.
 ///
 /// The diff's own actions are pushed onto `diff_actions` for the app to fold
-/// in; the screen's actions are returned.
+/// in; the screen's actions are returned. `login` is the signed-in user, so
+/// the review panel can apply the author rule.
 pub fn render(
     ui: &mut egui::Ui,
     session: &mut PrSession,
     state: &mut PrDetailState,
     cache: &mut HighlightCache,
     diff_actions: &mut Vec<DiffAction>,
+    login: &str,
 ) -> Vec<PrDetailAction> {
     let mut actions = Vec::new();
     let mut tree_actions = Vec::new();
@@ -100,6 +108,26 @@ pub fn render(
             ui.heading("Conversation");
             ui.label("the description and timeline land in Phase D");
         });
+
+    // The review panel sits under the diff, always visible: it is where the
+    // draft is edited and submitted (spec §7.2). Its actions ride out as
+    // screen actions for the app, which owns the session mutations.
+    let mut review_actions = Vec::new();
+    egui::Panel::bottom("pr-detail-review")
+        .resizable(true)
+        .default_size(REVIEW_H)
+        .show(ui, |ui| {
+            let inputs = review_panel::PanelInputs {
+                pending: &session.pending,
+                viewer_is_author: viewer_is_author(session, login),
+                server_pending: session.server_pending.is_some(),
+                head_moved_since_pin: head_moved_since_pin(session),
+            };
+            let vm = review_panel::review_panel_vm(&inputs);
+            let past = review_panel::reviews_vm(&session.reviews);
+            review_panel::render(ui, &vm, &mut session.pending, &past, &mut review_actions);
+        });
+    actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
 
     egui::CentralPanel::default().show(ui, |ui| {
         recompute_line_heights(ui, session, state);
@@ -369,7 +397,14 @@ mod tests {
         let mut diff_actions = Vec::new();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            actions = render(ui, &mut session, &mut state, &mut cache, &mut diff_actions);
+            actions = render(
+                ui,
+                &mut session,
+                &mut state,
+                &mut cache,
+                &mut diff_actions,
+                "me",
+            );
         });
 
         assert!(actions.is_empty());
@@ -411,7 +446,14 @@ mod tests {
         let mut diff_actions = Vec::new();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            actions = render(ui, &mut session, &mut state, &mut cache, &mut diff_actions);
+            actions = render(
+                ui,
+                &mut session,
+                &mut state,
+                &mut cache,
+                &mut diff_actions,
+                "me",
+            );
         });
         assert!(
             actions.is_empty(),

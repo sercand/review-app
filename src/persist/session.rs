@@ -82,6 +82,15 @@ pub fn save(
 
 /// The in-progress composer draft: the anchor and text of a comment the
 /// reviewer is writing but has not posted (spec §11).
+///
+/// The session file's `composer_draft` field is owned by the PR session's
+/// whole-file [`write_session`][crate::state::pr_detail::PrSession::write_session]
+/// path: the session snapshots its live composer into its in-memory
+/// `composer_draft` every frame (`sync_composer_draft`) and the debounced
+/// write persists it, with an empty composer stored as `None`. There is
+/// deliberately **no** standalone `save_composer_draft` here — a partial
+/// write of this field would race the whole-file write and clobber the
+/// fresher value with a stale in-memory one.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ComposerDraft {
     /// The file the composer is anchored in.
@@ -122,35 +131,6 @@ pub fn load_draft(
     number: u64,
 ) -> anyhow::Result<Option<PendingReview>> {
     let Some(draft) = load(root, host, repo, number)?.and_then(|file| file.draft) else {
-        return Ok(None);
-    };
-    Ok(Some(serde_json::from_value(draft)?))
-}
-
-/// Save the composer draft, immediately and atomically.
-///
-/// The session writes it through its [`DebouncedWriter`] — this function is
-/// the write itself, a read-modify-write so the other fields survive.
-pub fn save_composer_draft(
-    root: &Path,
-    host: &str,
-    repo: &RepoRef,
-    number: u64,
-    draft: &ComposerDraft,
-) -> anyhow::Result<()> {
-    let mut file = load(root, host, repo, number)?.unwrap_or_default();
-    file.composer_draft = Some(serde_json::to_value(draft)?);
-    save(root, host, repo, number, &file)
-}
-
-/// Load the composer draft, or `None` when none is saved.
-pub fn load_composer_draft(
-    root: &Path,
-    host: &str,
-    repo: &RepoRef,
-    number: u64,
-) -> anyhow::Result<Option<ComposerDraft>> {
-    let Some(draft) = load(root, host, repo, number)?.and_then(|file| file.composer_draft) else {
         return Ok(None);
     };
     Ok(Some(serde_json::from_value(draft)?))

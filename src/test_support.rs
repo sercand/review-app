@@ -151,12 +151,18 @@ pub fn range_anchor(path: &str, start: u32, end: u32) -> crate::model::comment::
 /// A [`crate::github::metadata::PrMetadata`] authored by `"author"` with the
 /// given head SHA, in `o/r` as PR #7.
 pub fn meta(head_sha: &str) -> crate::github::metadata::PrMetadata {
+    meta_by("author", head_sha)
+}
+
+/// A [`crate::github::metadata::PrMetadata`] authored by `author` with the
+/// given head SHA, in `o/r` as PR #7.
+pub fn meta_by(author: &str, head_sha: &str) -> crate::github::metadata::PrMetadata {
     crate::github::metadata::PrMetadata {
         node_id: "node".to_owned(),
         number: 7,
         title: "a pull request".to_owned(),
         body: String::new(),
-        author: "author".to_owned(),
+        author: author.to_owned(),
         state: "open".to_owned(),
         draft: false,
         base_ref: "main".to_owned(),
@@ -170,5 +176,17 @@ pub fn meta(head_sha: &str) -> crate::github::metadata::PrMetadata {
         labels: Vec::new(),
         milestone: None,
         html_url: "https://github.com/o/r/pull/7".to_owned(),
+    }
+}
+
+/// A [`crate::github::reviews::Review`] with id 1, author `"me"`, the given
+/// state, an empty body, and no submit time.
+pub fn review(state: crate::github::reviews::ReviewState) -> crate::github::reviews::Review {
+    crate::github::reviews::Review {
+        id: 1,
+        author: "me".to_owned(),
+        state,
+        body: String::new(),
+        submitted_at: None,
     }
 }

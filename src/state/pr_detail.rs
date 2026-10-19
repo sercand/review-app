@@ -18,9 +18,9 @@ use crate::github::comments::NewComment;
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
-use crate::github::reviews::{Review, ServerPendingComment};
-use crate::model::comment::CommentTarget;
-use crate::model::review::{PendingError, PendingReview};
+use crate::github::reviews::{review_payload, Review, ServerPendingComment};
+use crate::model::comment::{Anchor, CommentTarget};
+use crate::model::review::{PendingError, PendingReview, ReviewEvent};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
 use crate::persist::session::{self, ComposerDraft, DebouncedWriter, SessionFile};
@@ -31,6 +31,7 @@ use crate::state::composer::{
 };
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
+use crate::ui::widgets::review_panel::{review_panel_vm, sha7, PanelInputs};
 
 /// How far a session has got through loading its PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +213,7 @@ impl PrSession {
             }
         };
 
-        let session = PrSession {
+        let mut session = PrSession {
             id,
             host,
             repo: repo.clone(),
@@ -242,6 +243,21 @@ impl PrSession {
             root: root.to_path_buf(),
             writer: DebouncedWriter::default(),
         };
+
+        // A saved composer draft reopens the composer where the reviewer left
+        // it (spec §11). The empty→`None` rule means a stored draft always
+        // carries text, so restoring it can never reopen an empty composer —
+        // and the live composer matching its own draft is what keeps the
+        // per-frame [`PrSession::sync_composer_draft`] from clobbering it.
+        if let Some(draft) = &session.composer_draft {
+            session.composer.target = Some(match draft.anchor.clone() {
+                Some(anchor) => CommentTarget::Line(anchor),
+                None => CommentTarget::File {
+                    path: draft.target_path.clone(),
+                },
+            });
+            session.composer.body = draft.body.clone();
+        }
 
         let commands = vec![
             Command::LoadPrMetadata {
@@ -423,6 +439,13 @@ impl PrSession {
                     repo: self.repo.clone(),
                     number: self.number,
                 }]
+            }
+            Event::ReviewSubmitted { session, review } if *session == self.id => {
+                on_review_submitted(self, review.clone())
+            }
+            Event::ReviewSubmitFailed { session, error } if *session == self.id => {
+                on_submit_error(self, error.clone());
+                Vec::new()
             }
             Event::Failed {
                 session: Some(session),
@@ -619,23 +642,22 @@ impl PrSession {
             let CommentTarget::Line(anchor) = target else {
                 return Vec::new();
             };
-            let Some(commit_id) = self.diff_head_sha.clone() else {
+            if self.diff_head_sha.is_none() {
                 self.composer.error = Some("the diff is still loading".to_owned());
                 return Vec::new();
-            };
-            match self.pending.add(anchor, body.clone(), &commit_id) {
+            }
+            match add_pending(self, anchor, body.clone()) {
                 Ok(_) => {
                     composer::reduce(&mut self.composer, ComposerMsg::Cancel);
-                    self.rebuild_rows();
                     self.mark_session_dirty(now);
-                    self.save_pending_draft();
                 }
                 // The draft is pinned to another commit: keep the composer
-                // text and say so — submit or discard the pinned draft first
-                // (spec §7.2).
+                // text and say so — submit or discard the pinned draft first,
+                // and immediate comments stay available (spec §7.2).
                 Err(PendingError::PinnedToOtherCommit { pinned }) => {
                     self.composer.error = Some(format!(
-                        "the pending review is pinned to {pinned}; submit or discard it first"
+                        "submit or discard the draft written against {} first",
+                        sha7(&pinned)
                     ));
                 }
             }
@@ -699,6 +721,53 @@ impl PrSession {
         self.rebuild_rows();
         self.mark_session_dirty(now);
         self.save_pending_draft();
+    }
+
+    /// Replace the draft's summary body, persisting it immediately.
+    ///
+    /// The panel's text edit writes through to `pending` as the reviewer
+    /// types; this is the matching persist the reported `SetBody` action
+    /// triggers.
+    pub fn set_pending_body(&mut self, body: String) {
+        self.pending.set_body(body);
+        self.save_pending_draft();
+    }
+
+    /// Pick the verdict the draft submits with, persisting it immediately.
+    pub fn set_pending_event(&mut self, event: ReviewEvent) {
+        self.pending.set_event(event);
+        self.save_pending_draft();
+    }
+
+    /// Replace one pending comment's body, persisting the draft immediately.
+    pub fn edit_pending(&mut self, local_id: u64, body: String) {
+        self.pending.edit(local_id, body);
+        self.save_pending_draft();
+    }
+
+    /// Drop the whole draft — in memory and in the session file (the panel
+    /// has already asked the reviewer to confirm).
+    pub fn discard_pending_review(&mut self, now: Instant) {
+        self.pending.clear();
+        self.rebuild_rows();
+        self.mark_session_dirty(now);
+        self.save_pending_draft();
+    }
+
+    /// Snapshot the live composer into the persisted draft field, marking the
+    /// session dirty when it changed (spec §11).
+    ///
+    /// `write_session` owns the session file's `composer_draft` field, and
+    /// this is the only writer of the in-memory value; the app calls it once
+    /// per frame before [`PrSession::tick`], so a debounced whole-file write
+    /// can never carry a stale composer draft. An empty composer stores
+    /// `None`, never `Some(empty)`.
+    pub fn sync_composer_draft(&mut self, now: Instant) {
+        let draft = composer_draft_of(&self.composer);
+        if self.composer_draft != draft {
+            self.composer_draft = draft;
+            self.mark_session_dirty(now);
+        }
     }
 
     /// Post the 422 fallback: the same text as a file-level comment, as a
@@ -792,6 +861,128 @@ impl PrSession {
     }
 }
 
+/// Whether `viewer` wrote this PR; the author may not approve or request
+/// changes on it (spec §7.2). GitHub logins are case-insensitive.
+pub fn viewer_is_author(session: &PrSession, viewer: &str) -> bool {
+    session
+        .metadata
+        .as_ref()
+        .is_some_and(|meta| meta.author.eq_ignore_ascii_case(viewer))
+}
+
+/// Whether the head moved out from under the draft's pinned commit (Review
+/// Focus #7). The draft stays pinned either way — this only drives the
+/// panel's banner and the submit payload's `commit_id`.
+pub fn head_moved_since_pin(session: &PrSession) -> bool {
+    let Some(pinned) = &session.pending.commit_id else {
+        return false;
+    };
+    session
+        .metadata
+        .as_ref()
+        .is_some_and(|meta| &meta.head_sha != pinned)
+}
+
+/// Add a pending comment anchored to the diff on screen, persisting the
+/// draft immediately.
+///
+/// The pin is `diff_head_sha` — the commit the reviewer is actually looking
+/// at. When the draft is pinned elsewhere the error reaches the reviewer as
+/// "submit or discard the draft written against <sha7> first", and immediate
+/// comments stay available (Review Focus #7).
+pub fn add_pending(
+    session: &mut PrSession,
+    anchor: Anchor,
+    body: String,
+) -> Result<u64, PendingError> {
+    let Some(head) = session.diff_head_sha.clone() else {
+        // Nothing to pin to before the diff loads; report the pin the draft
+        // already has, if any, so the caller's message stays truthful.
+        return Err(PendingError::PinnedToOtherCommit {
+            pinned: session.pending.commit_id.clone().unwrap_or_default(),
+        });
+    };
+    let result = session.pending.add(anchor, body, &head);
+    if result.is_ok() {
+        session.rebuild_rows();
+        session.mark_session_dirty(Instant::now());
+        session.save_pending_draft();
+    }
+    result
+}
+
+/// The submit command for the draft, when the panel's view-model allows it;
+/// `None` otherwise (the panel disables Submit in exactly that case).
+///
+/// The payload is built here, at click time, so the contract GitHub sees is
+/// the one the reviewer confirmed.
+pub fn start_submit(session: &PrSession) -> Option<Command> {
+    let head_sha = session.diff_head_sha.clone()?;
+    let inputs = PanelInputs {
+        pending: &session.pending,
+        // The caller gates the verdict buttons on the author rule; GitHub
+        // rejects a verdict the author may not pick.
+        viewer_is_author: false,
+        server_pending: session.server_pending.is_some(),
+        head_moved_since_pin: head_moved_since_pin(session),
+    };
+    if !review_panel_vm(&inputs).submit_enabled {
+        return None;
+    }
+    Some(Command::SubmitReview {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+        payload: review_payload(&session.pending, &head_sha),
+    })
+}
+
+/// Fold a successful submit in: the draft GitHub just posted is dropped —
+/// in memory and on disk — the review is appended, and the threads and
+/// reviews are reloaded so the new comments render anchored (spec §7.2).
+pub fn on_review_submitted(session: &mut PrSession, review: Review) -> Vec<Command> {
+    session.pending.clear();
+    session.rebuild_rows();
+    session.save_pending_draft();
+    session.reviews.push(review);
+    vec![
+        Command::LoadThreads {
+            session: session.id,
+            repo: session.repo.clone(),
+            number: session.number,
+        },
+        Command::LoadReviews {
+            session: session.id,
+            repo: session.repo.clone(),
+            number: session.number,
+        },
+    ]
+}
+
+/// Fold a failed submit in: the draft is never lost (spec §11), only the
+/// error is recorded.
+pub fn on_submit_error(session: &mut PrSession, error: GhError) {
+    session.error = Some(error);
+}
+
+/// The persisted composer draft for the live composer; `None` when there is
+/// nothing to keep — no target, or a blank body (the empty→`None` rule).
+fn composer_draft_of(state: &ComposerState) -> Option<ComposerDraft> {
+    let target = state.target.as_ref()?;
+    if state.body.trim().is_empty() {
+        return None;
+    }
+    let (target_path, anchor) = match target {
+        CommentTarget::Line(anchor) => (anchor.path.clone(), Some(anchor.clone())),
+        CommentTarget::File { path } => (path.clone(), None),
+    };
+    Some(ComposerDraft {
+        target_path,
+        anchor,
+        body: state.body.clone(),
+    })
+}
+
 /// The placement a comment target implies, mirroring how
 /// [`place_thread`](crate::diff::annotate::place_thread) reads a thread.
 fn target_placement(target: &CommentTarget) -> Placement {
@@ -869,8 +1060,9 @@ fn optimistic_thread(target: &CommentTarget, id: u64, body: &str, author: &str) 
 mod tests {
     use super::*;
     use crate::github::error::GhError;
+    use crate::github::reviews::ReviewState;
     use crate::runtime::{Command, Event, SessionId};
-    use crate::test_support::{line_anchor, loaded, meta, repo, tempdir};
+    use crate::test_support::{line_anchor, loaded, meta, meta_by, repo, review, tempdir};
 
     #[test]
     fn metadata_then_files_then_ready() {
@@ -1420,5 +1612,164 @@ mod tests {
             resolved: false,
         });
         assert!(s.threads[0].is_resolved);
+    }
+
+    /// A session with metadata and one loaded file, backed by a temporary
+    /// config root: `add_pending` saves the draft immediately, and a test
+    /// must never write to the real one. (The brief's helper used
+    /// `PrSession::open`; `open_at` with a temp root is the same session
+    /// minus the real-config-root write, per the rule the `loaded_session`
+    /// helper above already follows.)
+    fn ready_session(head: &str) -> (PrSession, tempfile::TempDir) {
+        let dir = tempdir();
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta_by("me", head),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")],
+            done: true,
+        });
+        (s, dir)
+    }
+
+    #[test]
+    fn author_detection() {
+        let (s, _dir) = ready_session("sha1");
+        assert!(viewer_is_author(&s, "me"));
+        assert!(!viewer_is_author(&s, "other"));
+    }
+
+    #[test]
+    fn failure_keeps_pending_and_success_clears_it() {
+        let (mut s, dir) = ready_session("sha1");
+        add_pending(&mut s, line_anchor("a.rs", 1), "x".into()).unwrap();
+        on_submit_error(&mut s, GhError::Network("down".into()));
+        assert_eq!(s.pending.comments.len(), 1); // never lost
+        let cmds = on_review_submitted(&mut s, review(ReviewState::Commented));
+        assert!(s.pending.is_empty());
+        assert_eq!(s.reviews.len(), 1);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadThreads { .. })));
+        assert!(
+            session::load_draft(dir.path(), "github.com", &repo(), 7)
+                .unwrap()
+                .is_none(),
+            "the persisted copy goes with the draft"
+        );
+    }
+
+    #[test]
+    fn moved_head_keeps_the_draft_pinned() {
+        let (mut s, _dir) = ready_session("sha1");
+        add_pending(&mut s, line_anchor("a.rs", 1), "x".into()).unwrap();
+        s.refresh();
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta_by("me", "sha2"),
+        });
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+c\n")],
+            done: true,
+        });
+        assert!(head_moved_since_pin(&s));
+        assert!(add_pending(&mut s, line_anchor("a.rs", 1), "y".into()).is_err());
+        assert_eq!(s.pending.commit_id.as_deref(), Some("sha1"));
+    }
+
+    #[test]
+    fn unauthorized_never_drops_the_persisted_draft() {
+        use crate::auth::session::handle_unauthorized;
+        use crate::auth::store::{MemoryStore, TokenStore};
+        use crate::persist::settings::{Account, Settings};
+
+        let dir = tempdir();
+        let mut p = PendingReview::default();
+        p.add(line_anchor("a.rs", 1), "pending body".into(), "sha1")
+            .unwrap();
+        session::save_draft(dir.path(), "github.com", &repo(), 7, &p).unwrap();
+
+        let store = MemoryStore::default();
+        let settings = Settings {
+            account: Some(Account {
+                login: "me".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.set("github.com", "me", "tok").unwrap();
+        handle_unauthorized(&store, &settings).unwrap();
+        assert_eq!(store.get("github.com", "me").unwrap(), None);
+        assert_eq!(
+            session::load_draft(dir.path(), "github.com", &repo(), 7)
+                .unwrap()
+                .unwrap(),
+            p
+        );
+    }
+
+    /// The composer draft round trip: a typed composer survives the debounced
+    /// write, a later viewed-toggle write must not clobber it with a stale
+    /// in-memory value, and an empty composer stores `None`.
+    #[test]
+    fn the_composer_draft_survives_a_viewed_toggle_write() {
+        use std::time::Duration;
+
+        let (mut s, dir) = loaded_session();
+        open_composer(&mut s, "half-written");
+        let t0 = Instant::now();
+        s.sync_composer_draft(t0);
+        s.tick(t0 + Duration::from_millis(300));
+        let saved = crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .unwrap();
+        let written: ComposerDraft =
+            serde_json::from_value(saved.composer_draft.expect("a composer draft"))
+                .expect("the written composer draft parses");
+        assert_eq!(
+            written,
+            ComposerDraft {
+                target_path: "a.rs".into(),
+                anchor: Some(line_anchor("a.rs", 1)),
+                body: "half-written".into(),
+            },
+            "the composer draft round-trips"
+        );
+
+        // A viewed toggle's whole-file write must carry the same fresh value.
+        let a = crate::test_support::file("a.rs");
+        s.viewed.set(&a, true);
+        let t1 = Instant::now();
+        s.mark_session_dirty(t1);
+        s.tick(t1 + Duration::from_millis(300));
+        let saved = crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .unwrap();
+        assert!(saved.viewed.is_viewed(&a), "the toggle was written");
+        let written: ComposerDraft =
+            serde_json::from_value(saved.composer_draft.expect("a composer draft"))
+                .expect("the written composer draft parses");
+        assert_eq!(
+            written.body, "half-written",
+            "a viewed write must not clobber the composer draft"
+        );
+
+        // An empty composer stores `None`, never `Some(empty)`.
+        composer::reduce(&mut s.composer, ComposerMsg::Cancel);
+        let t2 = Instant::now();
+        s.sync_composer_draft(t2);
+        s.tick(t2 + Duration::from_millis(300));
+        let saved = crate::persist::session::load(dir.path(), "github.com", &repo(), 7)
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved.composer_draft.is_none(),
+            "an empty composer stores None"
+        );
     }
 }
