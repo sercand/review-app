@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-19-gh-review-desktop-design.md` (behaviour) and `docs/design/mockups/` (`styles.css`, `login.html`, `prs.html`, `pr.html`, `pr.js`): the visual source of truth. Open the mockups at `python3 -m http.server -d docs/design/mockups 8765` while working. `pr.html?file=<path>&view=unified` and `#settings`/`#palette` open specific states.
 
-**Prerequisite:** Tasks 1–54 of `docs/superpowers/plans/2026-10-19-gh-review-desktop.md` are complete. This plan restyles and reworks what those tasks built: Task 49's image viewer, Task 50's checks and commits, Task 51's metadata panel, Task 52's palette and `next_index`, and Task 53's `Theme`, `Layout` and settings window.
+**Prerequisite:** Tasks 1–54 of `docs/superpowers/plans/2026-10-19-gh-review-desktop.md` are complete. This plan was checked against the code at commit `2b5728d`. This plan restyles and reworks what those tasks built: Task 49's image viewer, Task 50's checks and commits, Task 51's metadata panel, Task 52's palette and `next_index`, and Task 53's `Theme`, `Layout` and settings window.
 
 ## Global Constraints
 
@@ -55,7 +55,7 @@
     - Text and status colours: `hyperlink_color = accent`, `warn_fg_color = pending`, `error_fg_color = bad`, `override_text_color = None`, `widgets.noninteractive.fg_stroke.color = text`.
     - Windows: `window_corner_radius = 10`, and `window_shadow` with offset `[0, 10]`, blur 30 and `Color32::from_black_alpha(115)`.
   - `pub fn style(base: egui::Style) -> egui::Style`: `item_spacing = (6, 4)`, `button_padding = (10, 4)`, `interact_size.y = 28`. Text styles: `Body` 13, `Button` 13, `Small` 11.5, `Monospace` 12.5, `Heading` 15.
-  - `app.rs`: each frame, compute `dark = settings.theme.resolve(ctx.system_theme() == Some(egui::Theme::Dark)) == egui::Theme::Dark`. When it differs from the last applied value, call `ctx.set_visuals(visuals(palette(dark), dark))`, call `ctx.set_style(style(..))`, and call `HighlightCache::set_theme(dark)` (Task 4).
+  - `app.rs`: in `ReviewApp::new`, register both themes once with `ctx.set_visuals_of(egui::Theme::Dark, visuals(&DARK, true))`, `ctx.set_visuals_of(egui::Theme::Light, visuals(&LIGHT, false))`, and `ctx.set_style_of(..)` for each, so the existing `ReviewApp::apply_theme` (which calls `ctx.set_theme` when `applied_theme` changes) switches between them. In `apply_theme`, when the resolved theme changes, also call `self.highlight_cache.set_theme(desired == egui::Theme::Dark)` (Task 4).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -101,7 +101,7 @@ fn visuals_follow_the_palette() {
 
 - [ ] **Step 2: Run tests to verify they fail** — `cargo test tokens_match_the_mockup text_tokens_are_readable_in_both_themes visuals_follow_the_palette`. Expected: FAIL to compile (`DARK` not found).
 
-- [ ] **Step 3: Implement** the palettes, `palette`, `palette_of`, `visuals`, `style`, and the per-frame application in `app.rs`. Replace every `ui.visuals().warn_fg_color` or ad-hoc colour in existing widgets with `palette_of(ui)` fields in the tasks that restyle them, not here.
+- [ ] **Step 3: Implement** the palettes, `palette`, `palette_of`, `visuals`, `style`, and the registration in `app.rs`. Replace every `ui.visuals().warn_fg_color` or ad-hoc colour in existing widgets with `palette_of(ui)` fields in the tasks that restyle them, not here.
 
 - [ ] **Step 4: Run tests to verify they pass** — same command. Expected: PASS.
 
@@ -210,8 +210,6 @@ fn every_icon_and_text_family_has_glyphs() {
     });
 }
 ```
-
-(If egui 0.37 exposes `has_glyph` through `ctx.fonts(..)` rather than `fonts_mut`, use that; the assertion is the same.)
 
 - [ ] **Step 2: Run tests to verify they fail** — `cargo test icon_codepoints_are_unique_private_use every_icon_and_text_family_has_glyphs`. Expected: FAIL to compile.
 
@@ -395,7 +393,7 @@ If one of the listed languages turns out not to be in `two-face` 0.5's extended 
 Selecting a file shows only that file. This replaces "scroll the whole PR to the file" (spec §9.2) and removes the cost of building, annotating and measuring every file's rows on large PRs.
 
 **Files:**
-- Modify: `src/diff/row_model.rs`, `src/state/pr_detail.rs`, `src/state/filters.rs` (`file_order`), `src/test_support.rs`, `src/ui/screens/pr_detail.rs`, `src/ui/widgets/diff_view.rs`, `src/app.rs` (the `j`/`k` dispatch from main-plan Task 52)
+- Modify: `src/diff/row_model.rs`, `src/diff/annotate.rs`, `src/state/pr_detail.rs`, `src/state/filters.rs` (`file_order`), `src/test_support.rs`, `src/ui/screens/pr_detail.rs`, `src/ui/widgets/diff_view.rs`, `src/app.rs` (`ReviewApp::step_file`)
 - Test: `src/diff/row_model.rs`, `src/state/pr_detail.rs` (`#[cfg(test)]`)
 
 **Interfaces:**
@@ -405,11 +403,12 @@ Selecting a file shows only that file. This replaces "scroll the whole PR to the
   - `PrSession` gains `pub current_file: Option<u32>`. `rebuild_rows` builds with `build_one` for `current_file`, or `RowModel::empty()` when it is `None`. `inline_items` keeps only items whose file is `current_file`. The composer stays in `self.composer` whatever file is shown.
   - `PrSession::select_file(&mut self, path: &str, now: Instant) -> Vec<Command>`:
     - Sets `current_file` and `last_opened_file`, calls `rebuild_rows`, and marks the session dirty.
-    - Returns `Command::LoadImages { session, file }` the first time an image file is selected; this replaces Task 49's "first visible header" trigger.
+    - Returns `self.load_images(file)` when `self.wants_images(file)` is true, so an image file starts loading as soon as it is selected. `wants_images` already de-duplicates, so the existing `DiffAction::LoadImages` emitted from the diff view stays harmless.
     - An unknown path is a no-op that returns an empty vec.
   - After `PrFilesPage { done: true }`, when `current_file` is `None`, select `last_opened_file` if it still exists, otherwise the first file in the tree's filtered order (`file_order` below).
-  - `pub fn file_order(files: &[PrFile], filters: &FilterState, viewed: &ViewedSet) -> Vec<u32>`, in `src/state/filters.rs`: file indices in the tree's display order (directories first, then by path), over the files that pass the filters. `j`/`k` and the footer use `next_index(&file_order(..), current_file, forward)`.
-  - Removed: `DiffViewState::scroll_to`, `sticky_file` and the sticky-header band, and `DiffAction::ScrollToFile`. Added: `DiffAction::SelectFile(u32)`. `TreeAction::SelectFile(path)` now calls `select_file`. Find (main-plan Task 48) searches only the current file's rows.
+  - `pub fn file_order(files: &[PrFile], filters: &FilterState, viewed: &ViewedSet) -> Vec<usize>`, in `src/state/filters.rs`: file indices in the tree's display order (directories first, then by path), over the files that pass the filters. It returns `usize` because main-plan Task 52's `next_index` takes `&[usize]`. `ReviewApp::step_file` replaces its own enumerate-and-filter order with `file_order`, uses `current_file` (as `usize`) as the cursor, and calls `select_file` instead of setting `scroll_to`; it keeps resetting `PrDetailState::hunk_row`.
+  - Removed: `DiffViewState::scroll_to`, `sticky_file` and the sticky-header band, and `DiffAction::ScrollToFile`. Added: `DiffAction::SelectFile(u32)`. `TreeAction::SelectFile(path)` in `apply_tree_action` now calls `select_file`. Find (`search_diff`/`line_rows`, main-plan Task 48) needs no change: it already walks `row_model.rows`, which now hold only the current file.
+  - Annotate without header rows: `Placement::AfterHeader` (file-level threads) inserts at the start of the file's rows, and `file_spans` must find a file's rows without relying on a `FileHeader` row.
   - Empty states, drawn in the centre pane with the Task 7 placeholder style:
     - No files: "This pull request has no changed files."
     - Every file filtered out, with no current file: "No files match these filters." plus a "Clear filters" button.
@@ -438,13 +437,13 @@ fn selecting_a_file_rebuilds_rows_and_keeps_the_composer() {
     let now = Instant::now();
     assert_eq!(s.current_file, Some(0));                              // first in tree order
     s.open_comment(CommentTarget::Line(line_anchor("a.rs", 1)));
-    s.composer.text = "half written".into();
+    s.composer.body = "half written".into();
     s.select_file("b.rs", now);
     assert_eq!(s.current_file, Some(1));
     assert!(!s.row_model.rows.contains(&RowRef::Composer));           // composer belongs to a.rs
     s.select_file("a.rs", now);
     assert!(s.row_model.rows.contains(&RowRef::Composer));
-    assert_eq!(s.composer.text, "half written");
+    assert_eq!(s.composer.body, "half written");
     assert!(s.select_file("missing.rs", now).is_empty());
     assert_eq!(s.current_file, Some(0));
 }
@@ -458,17 +457,26 @@ fn restores_the_last_opened_file_and_survives_empty_prs() {
     assert!(empty.row_model.rows.is_empty());
     assert_eq!(next_index(&file_order(&[], &FilterState::default(), &ViewedSet::default()), None, true), None);
 }
+
+// src/diff/annotate.rs
+#[test]
+fn file_level_threads_lead_a_header_less_file() {
+    let files = vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")];
+    let item = InlineItem { file: 0, placement: Placement::AfterHeader, row: RowRef::Thread { thread: 0 } };
+    let out = annotate(&build_one(&files, 0), &files, &[item]);
+    assert_eq!(out.rows[0], RowRef::Thread { thread: 0 });
+}
 ```
 
 `session_with(&[(path, patch)])` and `session_with_last_opened(files, path)` are new `test_support` helpers. They open a session, feed `PrMetadataLoaded` and one `PrFilesPage { done: true }`, and the second one seeds `last_opened_file` before the page arrives.
 
-- [ ] **Step 2: Run tests to verify they fail** — `cargo test build_one_holds_only_the_selected_file selecting_a_file_rebuilds_rows_and_keeps_the_composer restores_the_last_opened_file_and_survives_empty_prs`. Expected: FAIL to compile.
+- [ ] **Step 2: Run tests to verify they fail** — `cargo test build_one_holds_only_the_selected_file selecting_a_file_rebuilds_rows_and_keeps_the_composer restores_the_last_opened_file_and_survives_empty_prs file_level_threads_lead_a_header_less_file`. Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement** `build_one`, `file_order`, `current_file`, `select_file`, the initial selection, the empty states, and the removals listed above. Update the existing diff-view and annotate tests that relied on `FileHeader` rows or `sticky_file`. Keep `build` itself: the perf test and annotate tests still use it.
 
 - [ ] **Step 4: Run tests to verify they pass** — `cargo test`. Expected: PASS.
 
-- [ ] **Step 5: Commit** — `git add src/diff/row_model.rs src/state src/ui src/app.rs src/test_support.rs && git commit -m "feat: show one file at a time"`.
+- [ ] **Step 5: Commit** — `git add src/diff/row_model.rs src/diff/annotate.rs src/state src/ui src/app.rs src/test_support.rs && git commit -m "feat: show one file at a time"`.
 
 ---
 
@@ -572,15 +580,15 @@ fn layout_job_marks_exactly_the_changed_bytes() {
 - Consumes: Tasks 2, 3, 5, 6; main-plan Task 48 (find, hide whitespace) and Task 49 (`ImageMode`).
 - Produces:
   - `#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)] #[serde(default)] pub struct DiffPrefs { pub mode: DiffMode, pub wrap: bool, pub hide_whitespace: bool }`. The default is `Split`, `wrap: true`, `hide_whitespace: false`. `Settings` gains `pub diff: DiffPrefs`.
-  - Opening a PR seeds `PrSession::mode` and `DiffViewState { wrap, hide_whitespace }` from `settings.diff`. Every change writes back to `settings.diff` and saves settings through the debounced settings writer from main-plan Task 53. The choice therefore survives restarts and applies to every PR.
+  - Opening a PR seeds `PrSession::mode`, `DiffViewState::wrap`, and the session's whitespace filter (`PrSession::set_hide_whitespace`, from main-plan Task 48) from `settings.diff`. Every change writes back to `settings.diff` and saves settings through the debounced settings writer from main-plan Task 53. The choice therefore survives restarts and applies to every PR.
   - `pub enum HeaderKind { Text, Image, Binary, TooLarge }`.
   - `pub struct FileHeaderVm { pub dir: String /* "src/lib/data-tools/" or "" */, pub name: String, pub status: FileStatus, pub previous_name: Option<String>, pub additions: u32, pub deletions: u32, pub viewed: bool, pub kind: HeaderKind }` and `pub fn file_header_vm(f: &PrFile, viewed: bool) -> FileHeaderVm`.
-  - `pub enum FileHeaderAction { CopyPath, OpenInBrowser, CommentOnFile, ToggleViewed, SetMode(DiffMode), ToggleWrap, ToggleHideWhitespace, OpenFind, SetImageMode(ImageMode) }`.
+  - `pub enum FileHeaderAction { CopyPath, OpenInBrowser, CommentOnFile, ToggleViewed, SetMode(DiffMode), ToggleWrap, ToggleHideWhitespace, OpenFind, SetImageMode(ImageMode), ToggleRendered }`. `ToggleHideWhitespace` and `ToggleRendered` forward to the existing `DiffAction::ToggleHideWhitespace` and `DiffAction::ToggleRendered(file)`; `SetImageMode` writes `DiffViewState::image_mode`. This module replaces `diff_view::HeaderButton`, `header_buttons` and `render_file_header`; delete them and move their tests' assertions (every file kind offers "Comment on file") onto `file_header_vm`.
   - `pub fn render_header(ui, vm: &FileHeaderVm, mode: DiffMode, wrap: bool, hide_ws: bool, image_mode: ImageMode, actions: &mut Vec<FileHeaderAction>)`. It draws a 44 pt bar in `bg` with a bottom `line` stroke, in this order:
     1. File icon, then the path (`dir` in `muted`, `name` in `mono_bold`), then a copy icon button.
     2. A status pill ("Added" `ok`, "Modified" `warn`, "Removed" `bad`, "Renamed" `info`), "from {previous_name}" for renames, and `+N`/`−N` in mono for Text and TooLarge files.
     3. The spacer, then the controls for the kind:
-       - Text: a split/unified icon segment (`COLUMNS_2` "Split  S", `ROWS_2` "Unified  U"), a wrap toggle (`WRAP_TEXT`), hide whitespace (`PILCROW` "Hide whitespace-only changes"), and find (`SEARCH` "Find in file  ⌘F").
+       - Text: a split/unified icon segment (`COLUMNS_2` "Split  S", `ROWS_2` "Unified  U"), a wrap toggle (`WRAP_TEXT`), hide whitespace (`PILCROW` "Hide whitespace-only changes"), and find (`SEARCH` "Find in file  ⌘F"). SVG files add a "Text" / "Rendered" segment (`ToggleRendered`); while rendered, they show the Image controls instead.
        - Image: a text segment "2-up", "Swipe", "Onion skin".
        - Binary and TooLarge: no controls.
     4. A separator, then comment on file (`MESSAGE_SQUARE_PLUS`), open on GitHub (`EXTERNAL_LINK`), and a "Viewed" button with `SQUARE`/`SQUARE_CHECK` and a `V` key hint, filled `accent_soft` when viewed.
@@ -872,7 +880,7 @@ fn rows_carry_comment_and_pending_counts() {
 
 - [ ] **Step 2: Run tests to verify they fail** — `cargo test status_letters_and_progress_labels largest_first_orders_files_within_a_folder rows_carry_comment_and_pending_counts`. Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement** `comment_counts`, `TreeOrder`, `CollapseAll`, the helpers, and the row and progress drawing. The left pane's width persists through main-plan Task 53's `Layout::left_pane` (default 300, clamped to 220–560).
+- [ ] **Step 3: Implement** `comment_counts`, `TreeOrder`, `CollapseAll`, the helpers, and the row and progress drawing. The left pane's width already persists (`PrDetailState::left_pane` ↔ `Layout::left_pane`); change only its default to 300 and clamp it to 220–560.
 
 - [ ] **Step 4: Run tests to verify they pass** — `cargo test file_tree`. Expected: PASS.
 
@@ -892,7 +900,7 @@ fn rows_carry_comment_and_pending_counts() {
 **Interfaces:**
 - Consumes: Tasks 1–3, 5; main-plan Tasks 42–44 (`ReviewPanelVm`, `ReviewAction`), 50 (`CheckRun`, `CiState`), 52 (palette), 53 (`Theme`).
 - Produces:
-  - `pub struct TopBarVm { pub draft: bool, pub repo: String /* "otsimo/journey" */, pub number: u64, pub title: Option<String>, pub ci: Option<CiState>, pub pending: usize }` and `pub fn top_bar_vm(s: &PrSession) -> TopBarVm`. `ci` comes from Task 50's checks once they are loaded.
+  - `pub struct TopBarVm { pub draft: bool, pub repo: String /* "otsimo/journey" */, pub number: u64, pub title: Option<String>, pub ci: Option<CiState>, pub pending: usize }` and `pub fn top_bar_vm(s: &PrSession) -> TopBarVm`. `ci` is `s.combined_status.as_ref().and_then(|c| github::checks::ci_state(&s.check_runs, c))`, and `None` until the combined status has loaded, and the CI popover reuses `widgets::checks::render`.
   - `pub enum TopBarAction { Back, Palette, Refresh, ToggleTheme, Settings, ToggleDetails }`.
   - `pub fn next_theme(current: Theme, system_dark: bool) -> Theme`: Dark → Light, Light → Dark, and System → the opposite of what it currently resolves to.
   - Bar contents, left to right:
@@ -910,9 +918,9 @@ fn rows_carry_comment_and_pending_counts() {
        - "Request changes", "Needs work before merging; needs a summary"
        - Cards the author rule disallows are dimmed and show the existing reason.
     4. "{n} pending comments" with one row per comment: file icon, file name, `R99`/`L12`, and an excerpt.
-    5. A footer with a ghost danger "Discard" (keeping the existing confirmation) and a primary "Submit review" with a `⌘↵` hint.
-  - `pub struct PendingItemVm { pub path: String, pub name: String, pub line: String /* "R99" */, pub excerpt: String }` and `pub fn pending_items(p: &PendingReview) -> Vec<PendingItemVm>`. The excerpt is the body's first line, cut to 60 characters with "…" appended. Clicking an item selects the file (Task 5) and scrolls to the row from `RowModel::row_of_line(side, line) -> Option<usize>`, which is added to `row_model.rs`.
-  - Banners: full-width strips above the diff, with a `pending_soft` fill and `pending` text. The server-side pending review and moved-head messages move here from the old review panel, with their existing copy and buttons ("Submit it", "Discard it").
+    5. A footer with a ghost danger "Discard" (keeping the existing confirmation) and a primary "Submit review" with a `⌘↵` hint. The existing `write_blocked` rate-limit gating (spec §13) still disables Submit and shows its tooltip.
+  - `pub struct PendingItemVm { pub path: String, pub name: String, pub line: String /* "R99" */, pub excerpt: String }` and `pub fn pending_items(p: &PendingReview) -> Vec<PendingItemVm>`. The excerpt is the body's first line, cut to 60 characters with "…" appended. Clicking an item selects the file (Task 5) and sets the existing `DiffViewState::scroll_to_row` to `RowModel::row_of_line(..)`, which is added to `row_model.rs`.
+  - Banners: full-width strips above the diff, with a `pending_soft` fill and `pending` text. Every existing banner moves here with its copy and buttons: the pinned-commit and server-side pending banners from `review_panel` (including the server-pending verdict picker, "Submit it", "Discard it"), and the 3000-file banner from `diff_view` (`session.files_truncated`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -927,9 +935,9 @@ fn theme_toggle_flips_the_resolved_theme() {
 
 #[test]
 fn pending_items_label_lines_and_cut_excerpts() {
-    let mut p = PendingReview::default();
-    add_pending(&mut p, line_anchor("src/lib/data-tools/push.ts", 99), "Should the warning include the template id? It makes the toast actionable.\nsecond line".into());
-    let items = pending_items(&p);
+    let mut s = session_with(&[("src/lib/data-tools/push.ts", "@@ -99 +99 @@\n-a\n+b\n")]);
+    add_pending(&mut s, line_anchor("src/lib/data-tools/push.ts", 99), "Should the warning include the template id? It makes the toast actionable.\nsecond line".into()).unwrap();
+    let items = pending_items(&s.pending);
     assert_eq!(items[0].name, "push.ts");
     assert_eq!(items[0].line, "R99");
     assert_eq!(items[0].excerpt.chars().count(), 61);
@@ -946,11 +954,11 @@ fn row_of_line_finds_pairs_and_lines() {
 }
 ```
 
-(`row_of_line` takes `files` so it can resolve row numbers: `pub fn row_of_line(&self, files: &[LoadedFile], side: Side, line: u32) -> Option<usize>`. Use the existing `add_pending` from main-plan Task 39, adjusted to its real signature.)
+(`row_of_line` takes `files` so it can resolve row numbers: `pub fn row_of_line(&self, files: &[LoadedFile], side: Side, line: u32) -> Option<usize>`.)
 
 - [ ] **Step 2: Run tests to verify they fail** — `cargo test theme_toggle_flips_the_resolved_theme pending_items_label_lines_and_cut_excerpts row_of_line_finds_pairs_and_lines`. Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement** the top bar, the popover, the banners, `pending_items`, `row_of_line`, and the scroll-to-row in `diff_view` (`TableBuilder::scroll_to_row`). Remove the bottom panel. `⌘↵` (Task 52 `submit_review`) opens the popover when it is closed and submits when it is open.
+- [ ] **Step 3: Implement** the top bar, the popover, the banners, `pending_items` and `row_of_line`. Remove the bottom `pr-detail-review` panel and `REVIEW_H`. `⌘↵` (Task 52 `submit_review`) opens the popover when it is closed and submits when it is open.
 
 - [ ] **Step 4: Run tests to verify they pass** — `cargo test`. Expected: PASS, including the existing review-panel rule tests.
 
@@ -968,7 +976,8 @@ fn row_of_line_finds_pairs_and_lines() {
 - Consumes: Tasks 1, 2; main-plan Tasks 50, 51, 53.
 - Produces:
   - `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)] pub enum DetailsTab { #[default] Overview, Conversation, Commits, Checks }`. `Layout` gains `pub details_tab: DetailsTab`, saved like the other layout fields.
-  - `pub fn tab_counts(s: &PrSession) -> [Option<usize>; 4]`: Overview `None`, then the timeline length, the commit count and the check-run count, each `None` until that data has loaded.
+  - `pub fn tab_counts(s: &PrSession) -> [Option<usize>; 4]`: Overview `None`, then `Some` of the timeline length (`timeline(&s.reviews, &s.conversation)`), `s.commits.len()` and `s.check_runs.len()`. The session keeps these as plain `Vec`s, so an empty list shows no count rather than "0".
+  - Today `metadata_panel::render` draws everything in one scroll. Split its body into `render_overview`, `render_conversation`, `render_commits` and `render_checks`, each taking the existing `PanelInputs`, and let the pane draw the selected one.
   - The pane is 340 pt wide on a `surface` fill.
     - A tab strip: `FILE_TEXT` "Overview", then `MESSAGES_SQUARE`, `GIT_COMMIT_HORIZONTAL` and `CIRCLE_CHECK` icon tabs, each with a `faint` count and a tooltip naming the tab.
     - **Overview:** the title in `semibold` 15, then a key–value list with "Author" (avatar and login), "Branch" (`head` → `base` as mono chips), "Labels" (pills) and "Linked" (referenced issues as links). Then the description markdown, and "Reviewers" with state pills: "Requested" `warn` with `EYE`, "Approved" `ok`, "Changes requested" `bad`, "Commented" `muted`.
@@ -980,9 +989,11 @@ fn row_of_line_finds_pairs_and_lines() {
 
 ```rust
 #[test]
-fn tab_counts_appear_once_loaded() {
-    let s = session_with(&[("a.rs", "@@ -1 +1 @@\n-a\n+b\n")]);
-    assert_eq!(tab_counts(&s), [None, None, None, None]);
+fn tab_counts_follow_the_session() {
+    let mut s = session_with(&[("a.rs", "@@ -1 +1 @@\n-a\n+b\n")]);
+    assert_eq!(tab_counts(&s), [None, Some(0), Some(0), Some(0)]);
+    s.commits = parse_commits(fixture!("commits_page.json")).unwrap();
+    assert_eq!(tab_counts(&s)[2], Some(2));
 }
 
 // src/persist/settings.rs
@@ -996,9 +1007,9 @@ fn details_tab_round_trips() {
 }
 ```
 
-Extend `tab_counts_appear_once_loaded` with `CommitsLoaded` (2 commits) and `ChecksLoaded` (6 runs) events so it asserts `[None, Some(_), Some(2), Some(6)]`. Use the event shapes from main-plan Task 50.
+In the pane, a count of `Some(0)` is drawn as no count.
 
-- [ ] **Step 2: Run tests to verify they fail** — `cargo test tab_counts_appear_once_loaded details_tab_round_trips`. Expected: FAIL to compile.
+- [ ] **Step 2: Run tests to verify they fail** — `cargo test tab_counts_follow_the_session details_tab_round_trips`. Expected: FAIL to compile.
 
 - [ ] **Step 3: Implement** the enum, `tab_counts`, the tab strip, and the restyled sections.
 
@@ -1017,7 +1028,7 @@ Extend `tab_counts_appear_once_loaded` with `CommitsLoaded` (2 commits) and `Che
 **Interfaces:**
 - Consumes: Tasks 1–3, 7; main-plan Tasks 52, 53.
 - Produces:
-  - `Settings` gains `pub code_font_size: f32` (default 13.0; valid values 12.0, 13.0 and 14.0; anything else loads as 13.0). In `theme.rs`, `pub fn style(base, code_font_size: f32)` replaces Task 1's one-argument form and sets `Monospace` to that size. `ROW_H` stays 20, which fits 14 pt.
+  - `Settings` gains `pub code_font_size: f32` (default 13.0; valid values 12.0, 13.0 and 14.0; anything else loads as 13.0). `SettingsVm` (main-plan Task 53) gains `pub diff_mode: DiffMode` and `pub code_font_size: f32`, read by `settings_vm` and written by `SettingsVm::apply`. In `theme.rs`, `pub fn style(base, code_font_size: f32)` replaces Task 1's one-argument form and sets `Monospace` to that size. `ROW_H` stays 20, which fits 14 pt.
   - The settings window is 600 pt wide, with a header (`SETTINGS` "Settings" and an `X` close button) and a two-column grid of 130 pt labels. Each control keeps its natural width; the text fields fill the row. The rows:
     - "Account": avatar, login, "{host}, scopes {scopes joined with ' and '}", and a danger "Sign out" with `LOG_OUT`.
     - "Theme": a Dark / Light / System segment.

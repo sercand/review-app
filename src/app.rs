@@ -36,6 +36,7 @@ use crate::ui::command::{self, next_index, KeyPress};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
+use crate::ui::theme;
 use crate::ui::widgets::command_palette::{self, PaletteState};
 use crate::ui::widgets::diff_view::{DiffAction, DiffMode};
 use crate::ui::widgets::review_panel::ReviewAction;
@@ -216,6 +217,16 @@ impl ReviewApp {
         // The image diff viewer draws through `egui::Image` (Task 49); the
         // supported formats are the ones enabled on the `image` dependency.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Register both themed visuals and styles once so `apply_theme`'s
+        // `ctx.set_theme` switches between the mockup's dark and light looks.
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Dark, theme::visuals(&theme::DARK, true));
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Light, theme::visuals(&theme::LIGHT, false));
+        cc.egui_ctx
+            .set_style_of(egui::Theme::Dark, theme::style(egui::Style::default()));
+        cc.egui_ctx
+            .set_style_of(egui::Theme::Light, theme::style(egui::Style::default()));
 
         let config_dir = config_root();
         let settings = Settings::load_or_default(&config_dir);
