@@ -87,6 +87,34 @@ impl GithubClient {
         let meta = ResponseMeta::from_headers(status, &headers);
         Err(classify(&meta, &body, SystemTime::now()))
     }
+
+    /// `GET /repos/{o}/{r}/compare/{base}...{head}` → `merge_base_commit.sha`.
+    ///
+    /// The merge base is where a locally computed diff reads the base blob:
+    /// the common ancestor of the PR's base and head, so the diff matches
+    /// what GitHub itself would show (Task 46).
+    pub async fn merge_base(
+        &self,
+        repo: &RepoRef,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<String, GhError> {
+        #[derive(serde::Deserialize)]
+        struct Compare {
+            merge_base_commit: MergeBaseCommit,
+        }
+        #[derive(serde::Deserialize)]
+        struct MergeBaseCommit {
+            sha: String,
+        }
+
+        let path = format!(
+            "/repos/{}/{}/compare/{}...{}",
+            repo.owner, repo.name, base_sha, head_sha
+        );
+        let (compare, _link) = self.get_json::<Compare>(&path).await?;
+        Ok(compare.merge_base_commit.sha)
+    }
 }
 
 /// Map a transport failure to [`GhError::Network`].

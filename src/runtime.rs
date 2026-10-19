@@ -16,6 +16,7 @@ use crate::auth::device_flow::{AuthFailure, DeviceCode};
 use crate::auth::device_http::{run_device_flow, HttpDeviceFlow};
 use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
+use crate::diff::local::local_diff;
 use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::comments::NewComment;
 use crate::github::error::GhError;
@@ -23,6 +24,7 @@ use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{viewer_pending_review, Review, ServerPendingComment};
+use crate::model::diff::FileDiff;
 use crate::model::review::ReviewEvent;
 use crate::model::thread::{ReviewThread, ThreadComment};
 use crate::model::RepoRef;
@@ -180,6 +182,32 @@ pub enum Command {
         path: String,
         /// The head SHA the diff on screen belongs to.
         sha: String,
+    },
+    /// Diff a file GitHub sent no patch for against its base blob (Task 46).
+    ///
+    /// The executor fetches the merge base unless the session already knows
+    /// it (the merge base is cached per session), reads the base blob at the
+    /// merge base and the head blob at the head, and sends the local diff.
+    /// A side is `None` when the file has no blob on it: added files skip the
+    /// base, removed files skip the head, and renames read the base at
+    /// `previous_path`.
+    LoadLargeDiff {
+        /// The session that asked for the diff.
+        session: SessionId,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The repository the file lives in.
+        repo: RepoRef,
+        /// The PR's base SHA, one end of the compare request.
+        base_sha: String,
+        /// The head SHA the diff on screen belongs to.
+        head_sha: String,
+        /// The session's cached merge base, when it has one.
+        merge_base: Option<String>,
+        /// The path to read the base blob at, if this file has a base side.
+        base_path: Option<String>,
+        /// The path to read the head blob at, if this file has a head side.
+        head_path: Option<String>,
     },
     /// Submit a review built by [`crate::github::reviews::review_payload`]
     /// (spec §7.2).
@@ -345,6 +373,19 @@ pub enum Event {
         file: u32,
         /// The blob's text.
         text: String,
+    },
+    /// A locally computed diff for a too-large file arrived, along with the
+    /// merge base it was computed against so the session can cache it for
+    /// the next such file (Task 46).
+    LocalDiffReady {
+        /// The session that asked for the diff.
+        session: SessionId,
+        /// The index of the file in the session's file list.
+        file: u32,
+        /// The local diff, every row `origin: Local`.
+        diff: FileDiff,
+        /// The merge base the base blob was read at.
+        merge_base: String,
     },
 }
 
@@ -905,8 +946,84 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 }),
             }
         }
+        Command::LoadLargeDiff {
+            session,
+            file,
+            repo,
+            base_sha,
+            head_sha,
+            merge_base,
+            base_path,
+            head_path,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // The merge base is cached per session: the command carries it
+            // when the session has one, and the event hands it back for the
+            // next too-large file.
+            let merge_base = match merge_base {
+                Some(sha) => sha,
+                None => match client.merge_base(&repo, &base_sha, &head_sha).await {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        events.send(Event::Failed {
+                            session: Some(session),
+                            error,
+                        });
+                        return;
+                    }
+                },
+            };
+            // A missing side is not a failure: an added file has no base
+            // blob and a removed file no head blob, and diffing against the
+            // empty string is exactly what GitHub shows.
+            let base = match &base_path {
+                Some(path) => match client.file_content(&repo, path, &merge_base).await {
+                    Ok(text) => text,
+                    Err(error) => {
+                        events.send(Event::Failed {
+                            session: Some(session),
+                            error,
+                        });
+                        return;
+                    }
+                },
+                None => String::new(),
+            };
+            let head = match &head_path {
+                Some(path) => match client.file_content(&repo, path, &head_sha).await {
+                    Ok(text) => text,
+                    Err(error) => {
+                        events.send(Event::Failed {
+                            session: Some(session),
+                            error,
+                        });
+                        return;
+                    }
+                },
+                None => String::new(),
+            };
+
+            let diff = local_diff(&base, &head, LOCAL_DIFF_CONTEXT);
+            events.send(Event::LocalDiffReady {
+                session,
+                file,
+                diff,
+                merge_base,
+            });
+        }
     }
 }
+
+/// Unchanged lines kept around each change in a locally computed diff —
+/// GitHub's own context width for the patches it sends.
+const LOCAL_DIFF_CONTEXT: usize = 3;
 
 /// The [`Event::CommentFailed`] id for a failure that has no pending bubble
 /// to roll back — a thread reply, whose composer reports the failure itself.

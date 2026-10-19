@@ -243,6 +243,9 @@ impl ReviewApp {
             // The session caches the blob and applies the waiting expansion
             // through `apply_session_event` above; nothing else to do here.
             Event::HeadBlobLoaded { .. } => {}
+            // The session installs the local diff and caches the merge base
+            // through `apply_session_event` above.
+            Event::LocalDiffReady { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -634,9 +637,15 @@ impl ReviewApp {
         let login = self.login();
         for action in actions {
             match action {
-                DiffAction::ToggleViewed(_) => {}  // Phase D
-                DiffAction::ScrollToFile(_) => {}  // Phase D (file tree)
-                DiffAction::LoadLargeDiff(_) => {} // Phase G
+                DiffAction::ToggleViewed(_) => {} // Phase D
+                DiffAction::ScrollToFile(_) => {} // Phase D (file tree)
+                DiffAction::LoadLargeDiff(file) => {
+                    if let Some(session) = &mut self.session {
+                        for command in session.load_large_diff(file) {
+                            self.worker.send(command);
+                        }
+                    }
+                }
                 DiffAction::ExpandGap {
                     file,
                     before_hunk,

@@ -17,7 +17,7 @@ use crate::diff::row_model::{build, RowModel, RowRef};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::comments::NewComment;
 use crate::github::error::GhError;
-use crate::github::files::LoadedFile;
+use crate::github::files::{FileStatus, LoadedFile};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{review_payload, Review, ServerPendingComment};
 use crate::model::comment::{Anchor, CommentTarget};
@@ -128,6 +128,9 @@ pub struct PrSession {
     /// Expansion requests waiting on their file's head blob, as
     /// `(file, before_hunk, how)`.
     pending_expands: Vec<(u32, u32, Expand)>,
+    /// The PR's merge base, fetched once per session (Task 46): every
+    /// too-large file's base blob is read at this commit.
+    pub merge_base: Option<String>,
     /// The next locally allocated comment id; starts at 1 because 0 is the
     /// reserved "no optimistic bubble" sentinel.
     next_optimistic_id: u64,
@@ -242,6 +245,7 @@ impl PrSession {
             fallback: None,
             head_blobs: HashMap::new(),
             pending_expands: Vec::new(),
+            merge_base: None,
             next_optimistic_id: 1,
             optimistic: None,
             collapsed_dirs,
@@ -479,6 +483,21 @@ impl PrSession {
                 }
                 Vec::new()
             }
+            Event::LocalDiffReady {
+                session,
+                file,
+                diff,
+                merge_base,
+            } if *session == self.id => {
+                // Cache the merge base for the next too-large file, and put
+                // the local diff where the placeholder row will pick it up.
+                self.merge_base = Some(merge_base.clone());
+                if let Some(loaded) = self.files.get_mut(*file as usize) {
+                    loaded.diff = Some(diff.clone());
+                }
+                self.rebuild_rows();
+                Vec::new()
+            }
             Event::Failed {
                 session: Some(session),
                 error,
@@ -508,9 +527,11 @@ impl PrSession {
         self.threads.clear();
         self.restore_optimistic_to_composer();
         self.fallback = None;
-        // Blob caches are keyed by file index, which the reload invalidates.
+        // Blob caches are keyed by file index, which the reload invalidates;
+        // the merge base is re-derived against whatever head the reload finds.
         self.head_blobs.clear();
         self.pending_expands.clear();
+        self.merge_base = None;
         self.phase = LoadPhase::Header;
         self.error = None;
 
@@ -699,6 +720,43 @@ impl PrSession {
         if let Some(loaded) = self.files.get_mut(file as usize) {
             loaded.diff = Some(expanded);
         }
+    }
+
+    /// Ask for a local diff of a file GitHub sent no patch for (Task 46).
+    ///
+    /// The base blob is read at the merge base — at `previous_path` for a
+    /// rename, and not at all for an added file; the head blob is skipped
+    /// for a removed file. The session's cached merge base rides along when
+    /// it has one, so only the first too-large file pays for the compare.
+    pub fn load_large_diff(&mut self, file: u32) -> Vec<Command> {
+        let Some(loaded) = self.files.get(file as usize) else {
+            return Vec::new();
+        };
+        let Some(metadata) = self.metadata.as_ref() else {
+            return Vec::new();
+        };
+        let f = &loaded.file;
+        let (base_path, head_path) = match f.status {
+            FileStatus::Added => (None, Some(f.path.clone())),
+            FileStatus::Removed => (Some(f.path.clone()), None),
+            FileStatus::Renamed | FileStatus::Copied => {
+                (f.previous_path.clone(), Some(f.path.clone()))
+            }
+            _ => (Some(f.path.clone()), Some(f.path.clone())),
+        };
+        vec![Command::LoadLargeDiff {
+            session: self.id,
+            file,
+            repo: self.repo.clone(),
+            base_sha: metadata.base_sha.clone(),
+            head_sha: self
+                .diff_head_sha
+                .clone()
+                .unwrap_or_else(|| metadata.head_sha.clone()),
+            merge_base: self.merge_base.clone(),
+            base_path,
+            head_path,
+        }]
     }
 
     /// Open the composer for `target`, picking the mode GitHub would.
@@ -1940,5 +1998,53 @@ mod tests {
 
         // The blob is cached: a later expansion applies without a command.
         assert!(s.expand_gap(1, 0, Expand::All).is_empty());
+    }
+
+    #[test]
+    fn loading_a_large_diff_caches_the_merge_base_and_installs_the_diff() {
+        use crate::github::files::PatchState;
+        use crate::model::diff::FileDiff;
+
+        let (mut s, _dir) = loaded_session();
+        let mut huge = loaded("huge.json", "@@ -1 +1 @@\n-a\n+b\n");
+        huge.file.patch = None;
+        huge.file.patch_state = PatchState::TooLarge;
+        huge.diff = None;
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![huge],
+            done: true,
+        });
+
+        let cmds = s.load_large_diff(1);
+        assert!(
+            matches!(
+                &cmds[..],
+                [Command::LoadLargeDiff {
+                    file: 1,
+                    merge_base: None,
+                    ..
+                }]
+            ),
+            "the first large file asks with no merge base known yet"
+        );
+
+        s.on_event(&Event::LocalDiffReady {
+            session: SessionId(1),
+            file: 1,
+            diff: FileDiff { hunks: Vec::new() },
+            merge_base: "mb".into(),
+        });
+        assert_eq!(s.merge_base.as_deref(), Some("mb"));
+        assert!(
+            s.files[1].diff.is_some(),
+            "the local diff replaces the placeholder"
+        );
+
+        let cmds = s.load_large_diff(1);
+        assert!(
+            matches!(&cmds[..], [Command::LoadLargeDiff { merge_base: Some(sha), .. }] if sha == "mb"),
+            "the cached merge base rides along on the next large file"
+        );
     }
 }
