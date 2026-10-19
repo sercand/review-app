@@ -160,7 +160,6 @@ pub fn palette(dark: bool) -> &'static Palette {
     }
 }
 
-/// The palette that matches what the ui is currently painting on.
 /// The eight avatar fills (redesign mockup `.avatar`), indexed by login.
 /// They are identity colours, not theme-dependent surfaces, so they live
 /// beside the palette as fixed design tokens (Task 17 review).
@@ -178,6 +177,7 @@ pub const AVATAR_COLORS: [egui::Color32; 8] = [
 /// The initials drawn on an [`AVATAR_COLORS`] circle.
 pub const AVATAR_INK: egui::Color32 = egui::Color32::WHITE;
 
+/// The palette that matches what the ui is currently painting on.
 pub fn palette_of(ui: &egui::Ui) -> &'static Palette {
     palette(ui.visuals().dark_mode)
 }
