@@ -1345,6 +1345,28 @@ impl PrSession {
         self.save_pending_draft();
     }
 
+    /// Re-open the composer with a pending comment's anchor and text
+    /// (redesign Task 9): the pencil on a pending row. The pending comment
+    /// is dropped — submitting the composer re-adds the edited text, so the
+    /// draft never holds two copies of it.
+    pub fn edit_pending_via_composer(&mut self, local_id: u64, now: Instant) {
+        let Some(pending) = self
+            .pending
+            .comments
+            .iter()
+            .find(|p| p.local_id == local_id)
+        else {
+            return;
+        };
+        let target = CommentTarget::Line(pending.anchor.clone());
+        let body = pending.body.clone();
+        self.pending.delete(local_id);
+        self.open_comment(target);
+        self.composer.body = body;
+        self.mark_session_dirty(now);
+        self.save_pending_draft();
+    }
+
     /// Replace the draft's summary body, persisting it immediately.
     ///
     /// The panel's text edit writes through to `pending` as the reviewer

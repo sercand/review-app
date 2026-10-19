@@ -8,10 +8,16 @@
 //! fetched.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 
+use crate::model::review::PendingComment;
 use crate::model::thread::ReviewThread;
+use crate::ui::icons::{
+    icon_text, CIRCLE_CHECK, COPY, MESSAGES_SQUARE, MESSAGE_SQUARE_DASHED, PENCIL, TRASH_2,
+};
+use crate::ui::theme::palette_of;
 use crate::ui::widgets::markdown::{self, MarkdownDoc};
 
 /// One comment as the thread widget draws it.
@@ -88,6 +94,138 @@ pub fn avatar_initials(author: &str) -> String {
         .unwrap_or_else(|| "?".to_owned())
 }
 
+/// The eight avatar fills (redesign mockup `.avatar`), indexed by login.
+pub const AVATAR_COLORS: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(0x5b, 0x7e, 0xe5),
+    egui::Color32::from_rgb(0xc0, 0x62, 0x9b),
+    egui::Color32::from_rgb(0x3f, 0x9d, 0x8f),
+    egui::Color32::from_rgb(0xc4, 0x7a, 0x35),
+    egui::Color32::from_rgb(0x8a, 0x6b, 0xd1),
+    egui::Color32::from_rgb(0x4f, 0x97, 0xc9),
+    egui::Color32::from_rgb(0xb5, 0x53, 0x4f),
+    egui::Color32::from_rgb(0x6c, 0x9a, 0x3c),
+];
+
+/// The avatar fill for a login: a stable hash into [`AVATAR_COLORS`].
+pub fn avatar_color(login: &str) -> egui::Color32 {
+    let mut h: i32 = 0;
+    for byte in login.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(byte as i32);
+    }
+    AVATAR_COLORS[(h.unsigned_abs() % AVATAR_COLORS.len() as u32) as usize]
+}
+
+/// The initials avatar: a filled circle with white initials — 20 pt in
+/// compact rows, 28 pt in threads (mockup `.avatar`).
+pub fn avatar(ui: &mut egui::Ui, author: &str, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), size / 2.0, avatar_color(author));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        avatar_initials(author),
+        egui::FontId::proportional(size * 0.42),
+        egui::Color32::WHITE,
+    );
+}
+
+/// A GitHub `createdAt` stamp ("2026-10-01T00:00:00Z") as a relative
+/// ("3h ago") label; the raw stamp when it does not parse.
+pub fn relative_time(created_at: &str) -> String {
+    let Some(then) = parse_epoch_seconds(created_at) else {
+        return created_at.to_owned();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ago = now - then;
+    let (n, unit) = if ago < 60 {
+        (ago.max(0), "s")
+    } else if ago < 3600 {
+        (ago / 60, "m")
+    } else if ago < 86_400 {
+        (ago / 3600, "h")
+    } else if ago < 30 * 86_400 {
+        (ago / 86_400, "d")
+    } else if ago < 365 * 86_400 {
+        (ago / (30 * 86_400), "mo")
+    } else {
+        (ago / (365 * 86_400), "y")
+    };
+    format!("{n}{unit} ago")
+}
+
+/// The Unix seconds of a `YYYY-MM-DDTHH:MM:SSZ` stamp, via days-from-civil.
+fn parse_epoch_seconds(stamp: &str) -> Option<i64> {
+    let (date, rest) = stamp.split_once('T')?;
+    let time = rest.strip_suffix('Z')?;
+    let mut date_parts = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = match (date_parts.next()?, date_parts.next()?, date_parts.next()?) {
+        (Some(y), Some(m), Some(d)) => (y, m, d),
+        _ => return None,
+    };
+    let mut time_parts = time.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, min, s) = match (time_parts.next()?, time_parts.next()?, time_parts.next()?) {
+        (Some(h), Some(min), Some(s)) => (h, min, s),
+        _ => return None,
+    };
+    // Days from the Unix epoch, Howard Hinnant's civil-algorithm form.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468 + h * 3600 + min * 60 + s)
+}
+
+/// A ghost text button: transparent until hovered, then `accent_soft`
+/// (mockup `.btn.ghost`).
+fn ghost_button(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let palette = palette_of(ui);
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(text.into())
+                .small()
+                .color(palette.muted),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .corner_radius(6.0)
+        .min_size(egui::vec2(0.0, 24.0)),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(response.rect, 6.0, palette.accent_soft);
+    }
+    response
+}
+
+/// The pill of the mockup: small text on a soft fill.
+fn pill(ui: &mut egui::Ui, icon: char, text: &str, fg: egui::Color32, bg: egui::Color32) {
+    let galley = ui.painter().layout_no_wrap(
+        format!("{icon} {text}"),
+        egui::FontId::proportional(11.0),
+        fg,
+    );
+    let size = galley.size() + egui::vec2(12.0, 4.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, size.y / 2.0, bg);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, fg);
+}
+
+/// Where a thread draws: the signed-in user for the reply row's avatar,
+/// and the left margin — deeper in unified mode, where the line-number
+/// gutters stand in front.
+pub struct ThreadPlacement<'a> {
+    /// The signed-in user's login.
+    pub login: &'a str,
+    /// The frame's left margin.
+    pub indent: f32,
+}
+
 /// Draw one thread.
 ///
 /// `collapsed` shows only the summary line (outdated and resolved threads
@@ -100,11 +238,20 @@ pub fn render_thread(
     collapsed: bool,
     drafts: &mut CommentDrafts,
     actions: &mut Vec<ThreadAction>,
+    place: ThreadPlacement<'_>,
 ) {
+    let ThreadPlacement { login, indent } = place;
+    let palette = palette_of(ui);
     egui::Frame::new()
-        .inner_margin(8.0)
-        .corner_radius(6.0)
-        .fill(ui.visuals().faint_bg_color)
+        .inner_margin(egui::Margin {
+            left: indent as i8,
+            right: 14,
+            top: 10,
+            bottom: 10,
+        })
+        .corner_radius(10.0)
+        .fill(palette.bg)
+        .stroke(egui::Stroke::new(1.0, palette.line))
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("thread", thread.id.as_str()))
@@ -114,81 +261,116 @@ pub fn render_thread(
                         render_collapsed(ui, thread, vm, drafts);
                         return;
                     }
-                    render_expanded(ui, thread, vm, drafts, actions);
+                    render_expanded(ui, thread, vm, drafts, actions, login);
                 });
         });
 }
 
-/// The one-line summary an outdated or resolved thread shows.
+/// The one-line summary an outdated or resolved thread shows: the state,
+/// the root body's first characters, and a Show button.
 fn render_collapsed(
     ui: &mut egui::Ui,
     thread: &ReviewThread,
     vm: &[CommentVm],
     drafts: &mut CommentDrafts,
 ) {
+    let palette = palette_of(ui);
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.set_height(32.0);
         if thread.is_resolved {
-            ui.label(egui::RichText::new("Resolved").strong());
+            let author = vm.first().map_or("someone", |c| c.author.as_str());
+            ui.label(
+                egui::RichText::new(icon_text(CIRCLE_CHECK, &format!("Resolved by {author}")))
+                    .color(palette.ok),
+            );
+        } else {
+            ui.label(egui::RichText::new("Outdated").color(palette.faint));
         }
-        if thread.is_outdated {
-            ui.label(egui::RichText::new("Outdated").weak());
+        if let Some(root) = vm.first() {
+            let preview: String = root
+                .body_doc
+                .plain_text()
+                .chars()
+                .take(60)
+                .collect::<String>();
+            ui.label(egui::RichText::new(preview).color(palette.faint));
         }
-        let author = vm.first().map_or("someone", |c| c.author.as_str());
-        ui.label(format!(
-            "{author} · {} comment{}",
-            vm.len(),
-            if vm.len() == 1 { "" } else { "s" }
-        ));
-        if ui.button("Show thread").clicked() {
-            drafts.expanded.insert(thread.id.clone());
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ghost_button(ui, "Show").clicked() {
+                drafts.expanded.insert(thread.id.clone());
+            }
+        });
     });
 }
 
-/// The full thread: comments, resolve control, and the reply box.
+/// The full thread: bar, comments, and the reply row.
 fn render_expanded(
     ui: &mut egui::Ui,
     thread: &ReviewThread,
     vm: &[CommentVm],
     drafts: &mut CommentDrafts,
     actions: &mut Vec<ThreadAction>,
+    login: &str,
 ) {
+    let palette = palette_of(ui);
     // Reply and resolve address the thread by its GraphQL node id, and an
     // optimistic thread's id is local until a refresh confirms it, so both
     // controls stay hidden until then (the prefix matches `optimistic_thread`
     // in `state::pr_detail`).
     let confirmed = !thread.id.starts_with("optimistic-");
+
     ui.horizontal(|ui| {
-        if confirmed {
-            let label = if thread.is_resolved {
-                "Unresolve"
-            } else {
-                "Resolve"
-            };
-            if ui.button(label).clicked() {
-                actions.push(ThreadAction::ToggleResolved {
-                    thread_id: thread.id.clone(),
-                    resolved: !thread.is_resolved,
-                });
-            }
-        }
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.label(
+            egui::RichText::new(icon_text(
+                MESSAGES_SQUARE,
+                &format!(
+                    "{} comment{}",
+                    vm.len(),
+                    if vm.len() == 1 { "" } else { "s" }
+                ),
+            ))
+            .color(palette.muted),
+        );
         if thread.is_outdated {
-            ui.label(egui::RichText::new("outdated").weak());
+            ui.label(egui::RichText::new("outdated").color(palette.faint));
         }
-        if ui.button("Collapse").clicked() {
-            drafts.expanded.remove(&thread.id);
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ghost_button(ui, "Collapse").clicked() {
+                drafts.expanded.remove(&thread.id);
+            }
+            if confirmed {
+                let label = if thread.is_resolved {
+                    "Unresolve"
+                } else {
+                    "Resolve"
+                };
+                if ghost_button(ui, label).clicked() {
+                    actions.push(ThreadAction::ToggleResolved {
+                        thread_id: thread.id.clone(),
+                        resolved: !thread.is_resolved,
+                    });
+                }
+            }
+        });
     });
     ui.separator();
 
     for comment in vm {
         ui.horizontal(|ui| {
-            avatar(ui, &comment.author);
+            avatar(ui, &comment.author, 28.0);
+            ui.add_space(8.0);
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     ui.strong(&comment.author);
                     if !comment.created_at.is_empty() {
-                        ui.weak(&comment.created_at);
+                        ui.label(
+                            egui::RichText::new(relative_time(&comment.created_at))
+                                .small()
+                                .color(palette.faint),
+                        );
                     }
                 });
                 markdown::render(ui, &comment.body_doc);
@@ -199,7 +381,13 @@ fn render_expanded(
                         ..
                     } = block
                     {
-                        if ui.button("Copy suggestion").clicked() {
+                        if ui
+                            .add(egui::Button::new(egui::RichText::new(icon_text(
+                                COPY,
+                                "Copy suggestion",
+                            ))))
+                            .clicked()
+                        {
                             actions.push(ThreadAction::CopySuggestion(text.clone()));
                         }
                     }
@@ -220,40 +408,105 @@ fn render_expanded(
         return;
     };
     let key = thread.id.clone();
-    let draft = drafts.replies.entry(key.clone()).or_default();
-    let response = ui.add(
-        egui::TextEdit::singleline(draft)
-            .hint_text("Reply…")
-            .desired_width(280.0),
-    );
-    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    let clicked = ui
-        .add_enabled_ui(!draft.trim().is_empty(), |ui| ui.button("Reply").clicked())
-        .inner;
-    if (clicked || enter) && !draft.trim().is_empty() {
-        actions.push(ThreadAction::Reply {
-            thread_id: key.clone(),
-            root_comment_id,
-            body: draft.trim().to_owned(),
-        });
+    drafts.replies.entry(key.clone()).or_default();
+    let mut submitted = false;
+    ui.horizontal(|ui| {
+        avatar(ui, login, 20.0);
+        let draft = drafts
+            .replies
+            .get_mut(&key)
+            .expect("the draft slot was just opened");
+        let response = ui.add(
+            egui::TextEdit::singleline(draft)
+                .hint_text("Reply")
+                .desired_width((ui.available_width() - 92.0).max(120.0)),
+        );
+        let send = ghost_button(ui, "Reply");
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (send.clicked() || enter) && !draft.trim().is_empty() {
+            submitted = true;
+            actions.push(ThreadAction::Reply {
+                thread_id: key.clone(),
+                root_comment_id,
+                body: draft.trim().to_owned(),
+            });
+        }
+    });
+    if submitted {
         drafts.replies.remove(&key);
     }
 }
 
-/// The initials avatar: a filled circle with one letter.
-fn avatar(ui: &mut egui::Ui, author: &str) {
-    let size = 24.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let fill = ui.visuals().faint_bg_color;
-    let text = ui.visuals().strong_text_color();
-    ui.painter().circle_filled(rect.center(), size / 2.0, fill);
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        avatar_initials(author),
-        egui::FontId::proportional(11.0),
-        text,
-    );
+/// Draw one pending comment: the thread frame with a `pending` stroke, a
+/// "Pending" pill, and edit and delete controls (mockup `.thread.pending`).
+/// Every control reports itself as a [`PendingAction`].
+pub fn render_pending(
+    ui: &mut egui::Ui,
+    pending: &PendingComment,
+    login: &str,
+    indent: f32,
+    actions: &mut Vec<PendingAction>,
+) {
+    let palette = palette_of(ui);
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: indent as i8,
+            right: 14,
+            top: 10,
+            bottom: 10,
+        })
+        .corner_radius(10.0)
+        .fill(palette.bg)
+        .stroke(egui::Stroke::new(1.0, palette.pending))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                avatar(ui, login, 28.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.strong(login);
+                        pill(
+                            ui,
+                            MESSAGE_SQUARE_DASHED,
+                            "Pending",
+                            palette.pending,
+                            palette.pending_soft,
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let delete = crate::ui::icons::icon_button(ui, TRASH_2, "Delete");
+                            let edit = crate::ui::icons::icon_button(ui, PENCIL, "Edit");
+                            if edit.clicked() {
+                                actions.push(PendingAction::Edit {
+                                    local_id: pending.local_id,
+                                });
+                            }
+                            if delete.clicked() {
+                                actions.push(PendingAction::Delete {
+                                    local_id: pending.local_id,
+                                });
+                            }
+                        });
+                    });
+                    markdown::render(ui, &markdown::to_doc(&pending.body));
+                });
+            });
+        });
+}
+
+/// What the reviewer asked of a pending comment.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingAction {
+    /// Re-open the composer with this pending comment's text.
+    Edit {
+        /// The pending comment's local id.
+        local_id: u64,
+    },
+    /// Drop the pending comment from the draft review.
+    Delete {
+        /// The pending comment's local id.
+        local_id: u64,
+    },
 }
 
 #[cfg(test)]
@@ -310,6 +563,16 @@ mod tests {
         assert_eq!(avatar_initials(" 🎉party"), "P", "symbols are skipped");
     }
 
+    #[test]
+    fn avatar_colours_are_stable() {
+        assert_eq!(avatar_color("sercand"), avatar_color("sercand"));
+        assert!(AVATAR_COLORS.contains(&avatar_color("dogacanaydin")));
+        assert_eq!(
+            AVATAR_COLORS[0],
+            egui::Color32::from_hex("#5b7ee5").unwrap()
+        );
+    }
+
     /// The widget must paint an expanded thread — comments, resolve control,
     /// reply box — and the collapsed summary, without panicking and without
     /// inventing actions on its own.
@@ -330,8 +593,30 @@ mod tests {
         let mut drafts = CommentDrafts::default();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            render_thread(ui, &t, &vm, false, &mut drafts, &mut actions);
-            render_thread(ui, &t, &vm, true, &mut drafts, &mut actions);
+            render_thread(
+                ui,
+                &t,
+                &vm,
+                false,
+                &mut drafts,
+                &mut actions,
+                ThreadPlacement {
+                    login: "me",
+                    indent: 64.0,
+                },
+            );
+            render_thread(
+                ui,
+                &t,
+                &vm,
+                true,
+                &mut drafts,
+                &mut actions,
+                ThreadPlacement {
+                    login: "me",
+                    indent: 64.0,
+                },
+            );
         });
         assert!(actions.is_empty(), "an untouched thread emits no actions");
         assert!(
@@ -360,7 +645,18 @@ mod tests {
         let mut drafts = CommentDrafts::default();
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
-            render_thread(ui, &t, &vm, false, &mut drafts, &mut actions);
+            render_thread(
+                ui,
+                &t,
+                &vm,
+                false,
+                &mut drafts,
+                &mut actions,
+                ThreadPlacement {
+                    login: "me",
+                    indent: 64.0,
+                },
+            );
         });
         assert!(actions.is_empty(), "an untouched thread emits no actions");
         assert!(

@@ -19,6 +19,31 @@ pub struct MarkdownDoc {
     pub blocks: Vec<MdBlock>,
 }
 
+impl MarkdownDoc {
+    /// The document as plain text, blocks joined by spaces — for previews
+    /// and collapsed summaries.
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        for block in &self.blocks {
+            let piece = match block {
+                MdBlock::Paragraph(text) | MdBlock::Heading(_, text) | MdBlock::Quote(text) => {
+                    text.as_str()
+                }
+                MdBlock::Code { text, .. } => text.as_str(),
+                MdBlock::List(items) => {
+                    out.push_str(&items.join(" "));
+                    out.push(' ');
+                    continue;
+                }
+                MdBlock::Rule => "",
+            };
+            out.push_str(piece.trim());
+            out.push(' ');
+        }
+        out.trim().to_owned()
+    }
+}
+
 /// One block-level element of a [`MarkdownDoc`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum MdBlock {
@@ -119,28 +144,68 @@ pub fn render(ui: &mut egui::Ui, doc: &MarkdownDoc) {
     }
 }
 
-/// Draw one code block: a framed monospace body with a copy button, and a
-/// green frame plus a "Suggestion" tag for suggestion blocks.
+/// Draw one code block: a framed monospace body with a copy button. A
+/// suggestion block reads "Suggested change" with a copy icon over `add_bg`
+/// rows (mockup `.suggest`).
 fn render_code(ui: &mut egui::Ui, lang: &str, text: &str, suggestion: bool) {
-    let mut frame = egui::Frame::new()
+    let palette = crate::ui::theme::palette_of(ui);
+    if suggestion {
+        egui::Frame::new()
+            .inner_margin(0.0)
+            .corner_radius(6.0)
+            .fill(palette.bg)
+            .stroke(egui::Stroke::new(1.0, palette.line))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        egui::RichText::new(crate::ui::icons::icon_text(
+                            crate::ui::icons::FILE_DIFF,
+                            "Suggested change",
+                        ))
+                        .small()
+                        .color(palette.ok),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if crate::ui::icons::icon_button(ui, crate::ui::icons::COPY, "Copy")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(text.to_owned());
+                        }
+                    });
+                });
+                ui.separator();
+                for line in text.lines() {
+                    let rect = ui.available_rect_before_wrap();
+                    let height = ui.text_style_height(&egui::TextStyle::Monospace) + 2.0;
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(rect.left(), rect.top()),
+                            egui::vec2(ui.available_width(), height),
+                        ),
+                        0.0,
+                        palette.add_bg,
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("+ {line}"))
+                                .monospace()
+                                .size(12.0)
+                                .color(palette.text),
+                        )
+                        .selectable(false),
+                    );
+                }
+            });
+        return;
+    }
+    let frame = egui::Frame::new()
         .inner_margin(8.0)
         .corner_radius(6.0)
         .fill(ui.visuals().faint_bg_color);
-    if suggestion {
-        frame = frame.stroke(egui::Stroke::new(
-            1.5,
-            egui::Color32::from_rgb(46, 160, 67), // GitHub's suggestion green
-        ));
-    }
     frame.show(ui, |ui| {
         ui.horizontal(|ui| {
-            if suggestion {
-                ui.label(
-                    egui::RichText::new("Suggestion")
-                        .small()
-                        .color(egui::Color32::from_rgb(46, 160, 67)),
-                );
-            } else if !lang.is_empty() {
+            if !lang.is_empty() {
                 ui.label(egui::RichText::new(lang).small().weak());
             }
             if ui.button("Copy").clicked() {

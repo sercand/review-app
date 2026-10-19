@@ -31,7 +31,6 @@ use crate::ui::icons::{CHEVRONS_DOWN, CHEVRONS_UP, PLUS, UNFOLD_VERTICAL};
 use crate::ui::theme::palette_of;
 use crate::ui::widgets::comment_composer;
 use crate::ui::widgets::image_diff;
-use crate::ui::widgets::markdown;
 use crate::ui::widgets::thread_view::{self, CommentDrafts, ThreadAction};
 
 /// The width of one line-number gutter.
@@ -141,6 +140,13 @@ pub enum DiffAction {
         /// The pending comment's local id.
         local_id: u64,
     },
+    /// Re-open the composer with a pending comment's anchor and text
+    /// (redesign Task 9); the pending comment is dropped and re-added on
+    /// submit.
+    EditPending {
+        /// The pending comment's local id.
+        local_id: u64,
+    },
 }
 
 /// The height one line needs, in points.
@@ -228,6 +234,15 @@ pub fn line_at(session: &PrSession, file: u32, hunk: u32, row: u32) -> Option<&D
 /// controls live in the file header bar above (see
 /// [`crate::ui::widgets::file_header`]); the find box floats over the surface
 /// while [`DiffViewState::find_open`].
+/// Per-frame inputs the surface draws with: who is signed in, and the
+/// rate-limit tooltip for the composer's submit buttons (spec §13).
+pub struct SurfaceInputs<'a> {
+    /// The signed-in user's login.
+    pub login: &'a str,
+    /// `Some` while writes are disabled.
+    pub write_blocked: Option<&'a str>,
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     session: &mut PrSession,
@@ -235,8 +250,12 @@ pub fn render(
     cache: &mut HighlightCache,
     drafts: &mut CommentDrafts,
     actions: &mut Vec<DiffAction>,
-    write_blocked: Option<&str>,
+    inputs: SurfaceInputs<'_>,
 ) {
+    let SurfaceInputs {
+        login,
+        write_blocked,
+    } = inputs;
     let style = RowStyle {
         font_id: egui::TextStyle::Monospace.resolve(ui.style()),
         plain: ui.visuals().text_color(),
@@ -315,6 +334,7 @@ pub fn render(
         state,
         style: &style,
         write_blocked,
+        login,
     };
     // The heights are taken out first: the row closure reaches back into the
     // session mutably to draw composer and thread rows.
@@ -404,6 +424,8 @@ struct RowCtx<'a> {
     /// The rate-limit tooltip for the composer's Submit buttons (spec §13):
     /// `Some` while writes are disabled.
     write_blocked: Option<&'a str>,
+    /// The signed-in user, for the reply row's and pending rows' avatars.
+    login: &'a str,
 }
 
 /// How many columns `mode` lays out.
@@ -713,6 +735,12 @@ fn render_row(
         }
         RowRef::Thread { thread } => {
             let index = *thread;
+            let indent = if matches!(mode, DiffMode::Unified) {
+                64.0
+            } else {
+                14.0
+            };
+            let login = ctx.login;
             row.col(|ui| {
                 let Some(thread) = ctx.session.threads.get(index as usize) else {
                     return;
@@ -723,13 +751,27 @@ fn render_row(
                 let collapsed = (thread.is_outdated || thread.is_resolved)
                     && !drafts.expanded.contains(&thread.id);
                 let mut thread_actions = Vec::new();
-                thread_view::render_thread(ui, thread, &vm, collapsed, drafts, &mut thread_actions);
+                thread_view::render_thread(
+                    ui,
+                    thread,
+                    &vm,
+                    collapsed,
+                    drafts,
+                    &mut thread_actions,
+                    thread_view::ThreadPlacement { login, indent },
+                );
                 actions.extend(thread_actions.into_iter().map(DiffAction::Thread));
             });
             blank_rest(row, mode);
         }
         RowRef::Pending { local_id } => {
             let id = *local_id;
+            let indent = if matches!(mode, DiffMode::Unified) {
+                64.0
+            } else {
+                14.0
+            };
+            let login = ctx.login;
             row.col(|ui| {
                 let Some(pending) = ctx
                     .session
@@ -737,22 +779,22 @@ fn render_row(
                     .comments
                     .iter()
                     .find(|p| p.local_id == id)
+                    .cloned()
                 else {
                     return;
                 };
-                egui::Frame::new()
-                    .inner_margin(8.0)
-                    .corner_radius(6.0)
-                    .fill(ui.visuals().faint_bg_color)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Pending comment").small().weak());
-                            if ui.button("Remove").clicked() {
-                                actions.push(DiffAction::DeletePending { local_id: id });
-                            }
-                        });
-                        markdown::render(ui, &markdown::to_doc(&pending.body));
-                    });
+                let mut pending_actions = Vec::new();
+                thread_view::render_pending(ui, &pending, login, indent, &mut pending_actions);
+                for action in pending_actions {
+                    match action {
+                        thread_view::PendingAction::Edit { local_id } => {
+                            actions.push(DiffAction::EditPending { local_id });
+                        }
+                        thread_view::PendingAction::Delete { local_id } => {
+                            actions.push(DiffAction::DeletePending { local_id });
+                        }
+                    }
+                }
             });
             blank_rest(row, mode);
         }
@@ -1760,7 +1802,10 @@ mod tests {
                             &mut cache,
                             &mut drafts,
                             &mut actions,
-                            None,
+                            SurfaceInputs {
+                                login: "me",
+                                write_blocked: None,
+                            },
                         );
                     });
                     assert!(

@@ -1031,6 +1031,11 @@ impl ReviewApp {
                         session.delete_pending(local_id, now);
                     }
                 }
+                DiffAction::EditPending { local_id } => {
+                    if let Some(session) = &mut self.session {
+                        session.edit_pending_via_composer(local_id, now);
+                    }
+                }
                 DiffAction::Composer(action) => {
                     let commands = self.apply_composer_action(action, &login, now);
                     for command in commands {

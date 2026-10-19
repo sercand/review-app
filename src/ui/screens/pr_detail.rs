@@ -254,7 +254,10 @@ pub fn render(
             cache,
             &mut state.drafts,
             diff_actions,
-            write_blocked,
+            diff_view::SurfaceInputs {
+                login,
+                write_blocked,
+            },
         );
     });
 
