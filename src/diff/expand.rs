@@ -24,9 +24,9 @@ pub struct Gap {
 /// How much of a gap to reveal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Expand {
-    /// The `n` lines closest to the hunk, at the gap's top.
+    /// The `n` lines at the gap's bottom, adjacent to the hunk that follows.
     Up(u32),
-    /// The `n` lines closest to the hunk, at the gap's bottom.
+    /// The `n` lines at the gap's top, adjacent to the hunk that precedes.
     Down(u32),
     /// Everything the gap hides.
     All,
@@ -82,9 +82,11 @@ pub fn gaps(diff: &FileDiff, head_line_count: u32) -> Vec<Gap> {
 ///
 /// Row text and `new_no` come from `head_lines` (the head blob's lines, in
 /// order) and `old_no = new_no − gap.offset`, so expanded rows anchor exactly
-/// like patch rows. A gap before a hunk prepends to that hunk (and moves its
-/// start, so the UI's gap row shrinks or disappears); the tail gap appends to
-/// the last hunk, or becomes a hunk of its own when there is none.
+/// like patch rows. `Up` and `All` prepend to the following hunk (and move
+/// its start, so the UI's gap row shrinks or disappears); `Down` appends to
+/// the preceding hunk, keeping both hunks contiguous, or forms a hunk of its
+/// own above the first one. The tail gap appends to the last hunk, or becomes
+/// a hunk of its own when there is none.
 pub fn expand(diff: &FileDiff, head_lines: &[&str], gap: Gap, how: Expand) -> FileDiff {
     let mut out = diff.clone();
     let start = gap.new_start;
@@ -112,21 +114,46 @@ pub fn expand(diff: &FileDiff, head_lines: &[&str], gap: Gap, how: Expand) -> Fi
         .collect();
 
     let first_old = rows[0].old_no;
-    if (gap.before_hunk as usize) < out.hunks.len() {
-        let hunk = &mut out.hunks[gap.before_hunk as usize];
-        hunk.rows.splice(0..0, rows);
-        // The hunk now starts where the revealed context starts, so the UI's
-        // gap row shrinks — and disappears once line 1 is reached.
-        hunk.old_start = first_old.unwrap_or(hunk.old_start);
-        hunk.new_start = from;
-    } else if let Some(hunk) = out.hunks.last_mut() {
-        hunk.rows.extend(rows);
-    } else {
-        out.hunks.push(Hunk {
-            old_start: first_old.unwrap_or(1),
-            new_start: from,
-            rows,
-        });
+    let before = gap.before_hunk as usize;
+    match how {
+        // ↓ reveals the gap's top, adjacent to the PRECEDING hunk, so append
+        // the rows there: that hunk now runs up to `to` and stays contiguous,
+        // and the following hunk is left untouched. For the tail gap the
+        // "preceding" hunk is the last one, so this also covers expanding
+        // below everything.
+        Expand::Down(_) if before > 0 => out.hunks[before - 1].rows.extend(rows),
+        // ↓ above the first hunk (or a file with no patch rows) has no
+        // preceding hunk to grow, so the revealed block becomes its own,
+        // exactly as GitHub renders a down-expansion.
+        Expand::Down(_) => out.hunks.insert(
+            0,
+            Hunk {
+                old_start: first_old.unwrap_or(1),
+                new_start: from,
+                rows,
+            },
+        ),
+        // ↑ and "all" reveal the gap's bottom, adjacent to the FOLLOWING
+        // hunk: prepend there and move its start so the UI's gap row shrinks
+        // — and disappears once line 1 is reached.
+        _ if before < out.hunks.len() => {
+            let hunk = &mut out.hunks[before];
+            hunk.rows.splice(0..0, rows);
+            hunk.old_start = first_old.unwrap_or(hunk.old_start);
+            hunk.new_start = from;
+        }
+        // Tail gap: grow the last hunk, or start one when there is none.
+        _ => {
+            if let Some(hunk) = out.hunks.last_mut() {
+                hunk.rows.extend(rows);
+            } else {
+                out.hunks.push(Hunk {
+                    old_start: first_old.unwrap_or(1),
+                    new_start: from,
+                    rows,
+                });
+            }
+        }
     }
 
     out
@@ -189,5 +216,98 @@ mod tests {
         let up = expand(&diff, &head, head_gap, Expand::Up(2)); // last 2 lines above the hunk
         let first = &up.hunks[0].rows[0];
         assert_eq!((first.old_no, first.new_no), (Some(2), Some(2)));
+    }
+
+    const HEAD: [&str; 12] = [
+        "l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8", "l9", "l10", "l11", "l12",
+    ];
+
+    /// One-line hunks at new 4 and new 10, leaving gaps 1..3, 5..9 and 11..12.
+    fn two_hunks() -> FileDiff {
+        FileDiff {
+            hunks: parse_patch("@@ -4,1 +4,1 @@\n-l4\n+l4x\n@@ -10,1 +10,1 @@\n-l10\n+l10x\n")
+                .unwrap(),
+        }
+    }
+
+    /// Every hunk's `new_no`s run without a jump (Removed rows carry none).
+    fn assert_contiguous(diff: &FileDiff) {
+        for (index, hunk) in diff.hunks.iter().enumerate() {
+            let mut prev: Option<u32> = None;
+            for row in &hunk.rows {
+                if let Some(new_no) = row.new_no {
+                    if let Some(p) = prev {
+                        assert_eq!(
+                            new_no,
+                            p + 1,
+                            "hunk {index} jumps from new line {p} to {new_no}"
+                        );
+                    }
+                    prev = Some(new_no);
+                }
+            }
+        }
+    }
+
+    fn assert_unique_new_nos(diff: &FileDiff) {
+        let mut seen = std::collections::HashSet::new();
+        for row in diff.hunks.iter().flat_map(|h| &h.rows) {
+            if let Some(new_no) = row.new_no {
+                assert!(seen.insert(new_no), "new line {new_no} appears twice");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_down_expand_keeps_hunks_contiguous() {
+        let diff = two_hunks();
+        let mid = gaps(&diff, 12)
+            .into_iter()
+            .find(|gap| gap.before_hunk == 1)
+            .unwrap();
+        let out = expand(&diff, &HEAD, mid, Expand::Down(1));
+        assert_contiguous(&out);
+        assert_unique_new_nos(&out);
+
+        // The rest of the gap stays reachable: `gaps` still reports 6..9,
+        // so a second ↓ reveals the next chunk instead of duplicating rows.
+        let remaining = gaps(&out, 12)
+            .into_iter()
+            .find(|gap| gap.before_hunk == 1)
+            .expect("the hidden remainder is still a gap");
+        assert_eq!((remaining.new_start, remaining.new_end), (6, 9));
+
+        let out2 = expand(&out, &HEAD, remaining, Expand::Down(1));
+        assert_contiguous(&out2);
+        assert_unique_new_nos(&out2);
+        let revealed: Vec<u32> = out2
+            .hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .filter(|r| r.origin == RowOrigin::Expanded)
+            .map(|r| r.new_no.unwrap())
+            .collect();
+        assert_eq!(
+            revealed,
+            vec![5, 6],
+            "the two ↓ clicks reveal lines 5 and 6"
+        );
+    }
+
+    #[test]
+    fn down_expand_before_the_first_hunk_stands_alone() {
+        let diff = two_hunks();
+        let top = gaps(&diff, 12)[0]; // 1..3, above every hunk
+        let out = expand(&diff, &HEAD, top, Expand::Down(1));
+        assert_contiguous(&out);
+        assert_unique_new_nos(&out);
+
+        // The revealed line sits in its own block; the patch hunk keeps its
+        // rows, and the remaining 2..3 gap stays reachable before it.
+        let remaining = gaps(&out, 12)
+            .into_iter()
+            .find(|gap| gap.before_hunk == 1)
+            .expect("the hidden remainder is still a gap");
+        assert_eq!((remaining.new_start, remaining.new_end), (2, 3));
     }
 }

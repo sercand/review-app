@@ -659,7 +659,9 @@ impl PrSession {
     ///
     /// With the file's head blob already cached the expansion applies right
     /// away; otherwise the request is queued and the blob fetched. A repeat
-    /// click on the same gap while its blob is in flight asks once.
+    /// click on the same gap while its blob is in flight still asks once, but
+    /// the queued request widens to cover the later click — "all" after
+    /// "↑ 20" expands everything, not just the first request.
     pub fn expand_gap(&mut self, file: u32, before_hunk: u32, how: Expand) -> Vec<Command> {
         if !self
             .files
@@ -673,11 +675,14 @@ impl PrSession {
             self.rebuild_rows();
             return Vec::new();
         }
-        if self
+        if let Some(entry) = self
             .pending_expands
-            .iter()
-            .any(|(f, b, _)| *f == file && *b == before_hunk)
+            .iter_mut()
+            .find(|(f, b, _)| *f == file && *b == before_hunk)
         {
+            // Keep the dedupe — the blob is still fetched once — but let the
+            // wider request win so a later click is never swallowed.
+            entry.2 = wider_expand(entry.2, how);
             return Vec::new();
         }
         self.pending_expands.push((file, before_hunk, how));
@@ -1041,6 +1046,19 @@ pub fn head_moved_since_pin(session: &PrSession) -> bool {
         .metadata
         .as_ref()
         .is_some_and(|meta| &meta.head_sha != pinned)
+}
+
+/// The request that reveals at least as much of one gap as both `a` and `b`:
+/// `All` subsumes everything, a larger `n` subsumes a smaller one pointing
+/// the same way, and opposite directions fall back to `All` — the one single
+/// request covering both — so a queued click is widened, never dropped.
+fn wider_expand(a: Expand, b: Expand) -> Expand {
+    match (a, b) {
+        (Expand::All, _) | (_, Expand::All) => Expand::All,
+        (Expand::Up(x), Expand::Up(y)) => Expand::Up(x.max(y)),
+        (Expand::Down(x), Expand::Down(y)) => Expand::Down(x.max(y)),
+        _ => Expand::All,
+    }
 }
 
 /// Add a pending comment anchored to the diff on screen, persisting the
@@ -1998,6 +2016,82 @@ mod tests {
 
         // The blob is cached: a later expansion applies without a command.
         assert!(s.expand_gap(1, 0, Expand::All).is_empty());
+    }
+
+    #[test]
+    fn a_pending_all_upgrades_an_earlier_partial() {
+        use crate::diff::expand::Expand;
+        use crate::model::diff::RowOrigin;
+
+        let (mut s, _dir) = loaded_session();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("b.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n")],
+            done: true,
+        });
+
+        assert!(
+            matches!(
+                &s.expand_gap(1, 0, Expand::Up(1))[..],
+                [Command::ExpandContext { .. }]
+            ),
+            "the ↑ click asks for the head blob"
+        );
+        assert!(
+            s.expand_gap(1, 0, Expand::All).is_empty(),
+            "the later 'all' still asks for the blob only once"
+        );
+
+        s.on_event(&Event::HeadBlobLoaded {
+            session: SessionId(1),
+            file: 1,
+            text: "l1\nl2\nl3\nb\n c\n".into(),
+        });
+        let expanded: Vec<_> = s.files[1]
+            .diff
+            .as_ref()
+            .expect("the file has a diff")
+            .hunks
+            .iter()
+            .flat_map(|h| &h.rows)
+            .filter(|r| r.origin == RowOrigin::Expanded)
+            .collect();
+        assert_eq!(
+            expanded.len(),
+            3,
+            "the queued ↑ 1 is upgraded to the later 'all', not dropped"
+        );
+    }
+
+    #[test]
+    fn a_repeat_click_widens_the_queued_request() {
+        let (mut s, _dir) = loaded_session();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: vec![loaded("b.rs", "@@ -4,2 +4,2 @@\n-a\n+b\n c\n")],
+            done: true,
+        });
+
+        s.expand_gap(1, 0, Expand::Up(1));
+        assert!(s.expand_gap(1, 0, Expand::Up(2)).is_empty());
+        assert!(s.expand_gap(1, 0, Expand::All).is_empty());
+        assert!(
+            s.expand_gap(1, 0, Expand::Up(3)).is_empty(),
+            "an 'all' already queued is not narrowed back to ↑ 3"
+        );
+
+        s.on_event(&Event::HeadBlobLoaded {
+            session: SessionId(1),
+            file: 1,
+            text: "l1\nl2\nl3\nb\n c\n".into(),
+        });
+        assert!(
+            !s.row_model.rows.contains(&RowRef::Gap {
+                file: 1,
+                before_hunk: 0
+            }),
+            "the queued request stayed 'all': the whole gap is revealed"
+        );
     }
 
     #[test]
