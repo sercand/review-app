@@ -217,6 +217,8 @@ impl ReviewApp {
         // The image diff viewer draws through `egui::Image` (Task 49); the
         // supported formats are the ones enabled on the `image` dependency.
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Plex + JetBrains Mono + the Lucide icon font, before the first frame.
+        cc.egui_ctx.set_fonts(crate::ui::fonts::font_definitions());
         // Register both themed visuals and styles once so `apply_theme`'s
         // `ctx.set_theme` switches between the mockup's dark and light looks.
         cc.egui_ctx
@@ -1436,7 +1438,9 @@ pub fn run() -> eframe::Result<()> {
     install_panic_hook();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 700.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
