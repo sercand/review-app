@@ -1,0 +1,20 @@
+{
+  "id": 1,
+  "node_id": "PR_kw1",
+  "number": 7,
+  "title": "Add the thing",
+  "body": null,
+  "user": { "login": "octocat" },
+  "state": "open",
+  "draft": true,
+  "base": { "ref": "main", "sha": "sha_base" },
+  "head": { "ref": "feature/thing", "sha": "sha_head" },
+  "additions": 12,
+  "deletions": 4,
+  "changed_files": 3,
+  "requested_reviewers": [{ "login": "alice" }],
+  "requested_teams": [{ "slug": "core", "name": "Core" }],
+  "labels": [{ "name": "bug", "color": "d73a4a" }],
+  "milestone": null,
+  "html_url": "https://github.com/o/r/pull/7"
+}

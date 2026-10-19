@@ -20,6 +20,7 @@ use crate::github::client::{endpoints_for, GithubClient, Me};
 use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
+use crate::github::metadata::PrMetadata;
 use crate::model::RepoRef;
 
 /// Identifies one open PR's session.
@@ -69,9 +70,22 @@ pub enum Command {
         /// The PR number within the repository.
         number: u64,
     },
+    /// Load a PR's metadata (title, refs, head SHA, reviewers, labels).
+    LoadPrMetadata {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+    },
 }
 
 /// A result handed from the worker back to the UI.
+///
+/// `PrMetadataLoaded` carries the largest payload (`PrMetadata`). Later tasks
+/// match it as a concrete value, so the enum keeps it unboxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
     /// Reply to [`Command::Ping`].
@@ -124,6 +138,13 @@ pub enum Event {
         files: Vec<LoadedFile>,
         /// Whether this was the last page.
         done: bool,
+    },
+    /// A PR's metadata arrived.
+    PrMetadataLoaded {
+        /// The session that asked for the metadata.
+        session: SessionId,
+        /// The PR's metadata.
+        meta: PrMetadata,
     },
 }
 
@@ -388,6 +409,28 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                         return;
                     }
                 }
+            }
+        }
+        Command::LoadPrMetadata {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name);
+            match client.get_json::<PrMetadata>(&path).await {
+                Ok((meta, _link)) => events.send(Event::PrMetadataLoaded { session, meta }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
             }
         }
     }

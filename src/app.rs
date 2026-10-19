@@ -191,6 +191,7 @@ impl ReviewApp {
             }
             // The PR-detail screen folds these once it exists (Phase C).
             Event::PrFilesPage { .. } => {}
+            Event::PrMetadataLoaded { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
