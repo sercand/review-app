@@ -1,0 +1,81 @@
+{
+  "data": {
+    "reviewThreads": {
+      "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "c1"
+      },
+      "nodes": [
+        {
+          "id": "PRRT_kwDOA",
+          "isResolved": true,
+          "isOutdated": false,
+          "path": "src/a.rs",
+          "line": 12,
+          "startLine": 10,
+          "diffSide": "RIGHT",
+          "subjectType": "LINE",
+          "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": "cc2" },
+            "nodes": [
+              {
+                "databaseId": 1001,
+                "author": { "login": "mona", "avatarUrl": "https://avatars.githubusercontent.com/u/1?v=4" },
+                "body": "Please rename this.",
+                "createdAt": "2026-10-18T09:00:00Z"
+              },
+              {
+                "databaseId": 1002,
+                "author": { "login": "octocat", "avatarUrl": null },
+                "body": "Done.",
+                "createdAt": "2026-10-18T09:05:00Z"
+              }
+            ]
+          }
+        },
+        {
+          "id": "PRRT_kwDOB",
+          "isResolved": false,
+          "isOutdated": true,
+          "path": "src/b.rs",
+          "line": null,
+          "startLine": null,
+          "diffSide": null,
+          "subjectType": "LINE",
+          "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": [
+              {
+                "databaseId": 1003,
+                "author": { "login": "mona", "avatarUrl": null },
+                "body": "This line moved.",
+                "createdAt": "2026-10-18T10:00:00Z"
+              }
+            ]
+          }
+        },
+        {
+          "id": "PRRT_kwDOC",
+          "isResolved": false,
+          "isOutdated": false,
+          "path": "README.md",
+          "line": null,
+          "startLine": null,
+          "diffSide": null,
+          "subjectType": "FILE",
+          "comments": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": [
+              {
+                "databaseId": 1004,
+                "author": { "login": "mona", "avatarUrl": null },
+                "body": "Needs a license section.",
+                "createdAt": "2026-10-18T11:00:00Z"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

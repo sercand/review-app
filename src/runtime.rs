@@ -21,6 +21,7 @@ use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
 use crate::github::metadata::PrMetadata;
+use crate::model::thread::ReviewThread;
 use crate::model::RepoRef;
 
 /// Identifies one open PR's session.
@@ -72,6 +73,15 @@ pub enum Command {
     },
     /// Load a PR's metadata (title, refs, head SHA, reviewers, labels).
     LoadPrMetadata {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+    },
+    /// Load a PR's review threads (spec §7.4).
+    LoadThreads {
         /// The session that opened the PR.
         session: SessionId,
         /// The repository the PR lives in.
@@ -145,6 +155,13 @@ pub enum Event {
         session: SessionId,
         /// The PR's metadata.
         meta: PrMetadata,
+    },
+    /// A PR's review threads arrived.
+    ThreadsLoaded {
+        /// The session that asked for the threads.
+        session: SessionId,
+        /// The threads, in API order, each with all its comments.
+        threads: Vec<ReviewThread>,
     },
 }
 
@@ -427,6 +444,27 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             let path = format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name);
             match client.get_json::<PrMetadata>(&path).await {
                 Ok((meta, _link)) => events.send(Event::PrMetadataLoaded { session, meta }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::LoadThreads {
+            session,
+            repo,
+            number,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.review_threads(&repo, number).await {
+                Ok(threads) => events.send(Event::ThreadsLoaded { session, threads }),
                 Err(error) => events.send(Event::Failed {
                     session: Some(session),
                     error,

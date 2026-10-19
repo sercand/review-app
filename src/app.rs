@@ -206,6 +206,7 @@ impl ReviewApp {
             // Folded into the open session by `apply_session_event` above.
             Event::PrFilesPage { .. } => {}
             Event::PrMetadataLoaded { .. } => {}
+            Event::ThreadsLoaded { .. } => {}
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its

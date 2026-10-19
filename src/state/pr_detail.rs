@@ -15,6 +15,7 @@ use crate::diff::row_model::{build, RowModel};
 use crate::github::error::GhError;
 use crate::github::files::LoadedFile;
 use crate::github::metadata::PrMetadata;
+use crate::model::thread::ReviewThread;
 use crate::model::RepoRef;
 use crate::persist::session::{self, DebouncedWriter, SessionFile};
 use crate::runtime::{Command, Event, SessionId};
@@ -65,6 +66,8 @@ pub struct PrSession {
     pub viewed: ViewedSet,
     /// What the file tree is filtering the file list by.
     pub filters: FilterState,
+    /// The PR's review threads, once loaded (spec §7.4).
+    pub threads: Vec<ReviewThread>,
     /// The file-tree directories the reviewer has collapsed, by path.
     pub collapsed_dirs: BTreeSet<String>,
     /// The last file selected in the tree, restored from the session file.
@@ -86,9 +89,9 @@ pub struct PrSession {
 impl PrSession {
     /// Open a PR: build the session and the commands that start its load.
     ///
-    /// Only the metadata is requested here; the files are requested from
-    /// [`PrSession::on_event`] when the metadata arrives, so the diff on screen
-    /// and `diff_head_sha` are always the same commit.
+    /// The metadata and the review threads are requested here; the files are
+    /// requested from [`PrSession::on_event`] when the metadata arrives, so
+    /// the diff on screen and `diff_head_sha` are always the same commit.
     pub fn open(
         id: SessionId,
         host: String,
@@ -137,6 +140,7 @@ impl PrSession {
             head_moved: false,
             viewed,
             filters: FilterState::default(),
+            threads: Vec::new(),
             collapsed_dirs,
             last_opened_file,
             draft,
@@ -145,11 +149,20 @@ impl PrSession {
             writer: DebouncedWriter::default(),
         };
 
-        let commands = vec![Command::LoadPrMetadata {
-            session: id,
-            repo,
-            number,
-        }];
+        let commands = vec![
+            Command::LoadPrMetadata {
+                session: id,
+                repo: repo.clone(),
+                number,
+            },
+            // Threads are independent of the head SHA, so they load alongside
+            // the metadata rather than waiting for the files.
+            Command::LoadThreads {
+                session: id,
+                repo,
+                number,
+            },
+        ];
         (session, commands)
     }
 
@@ -197,6 +210,10 @@ impl PrSession {
                     self.phase = LoadPhase::Files;
                 }
 
+                Vec::new()
+            }
+            Event::ThreadsLoaded { session, threads } if *session == self.id => {
+                self.threads = threads.clone();
                 Vec::new()
             }
             Event::Failed {
@@ -288,7 +305,10 @@ mod tests {
     #[test]
     fn metadata_then_files_then_ready() {
         let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
-        assert!(matches!(&cmds[..], [Command::LoadPrMetadata { .. }]));
+        assert!(matches!(
+            &cmds[..],
+            [Command::LoadPrMetadata { .. }, Command::LoadThreads { .. }]
+        ));
         let cmds = s.on_event(&Event::PrMetadataLoaded {
             session: SessionId(1),
             meta: meta("sha1"),
@@ -310,6 +330,43 @@ mod tests {
         assert!(matches!(s.phase, LoadPhase::Ready));
         assert_eq!(s.row_model.file_ranges.len(), 2);
         assert_eq!(s.diff_head_sha.as_deref(), Some("sha1"));
+    }
+
+    #[test]
+    fn threads_load_into_the_session() {
+        use crate::model::thread::{ReviewThread, SubjectType};
+
+        let thread = || ReviewThread {
+            id: "PRRT_1".into(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "a.rs".into(),
+            line: Some(1),
+            start_line: None,
+            side: None,
+            subject_type: SubjectType::Line,
+            comments: Vec::new(),
+        };
+
+        let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadThreads { .. })));
+
+        s.on_event(&Event::ThreadsLoaded {
+            session: SessionId(2),
+            threads: vec![thread()],
+        });
+        assert!(
+            s.threads.is_empty(),
+            "a reply for another session is dropped"
+        );
+
+        s.on_event(&Event::ThreadsLoaded {
+            session: SessionId(1),
+            threads: vec![thread()],
+        });
+        assert_eq!(s.threads.len(), 1);
     }
 
     #[test]
