@@ -8,8 +8,11 @@
 //! [`BashSession`] on a PTY.
 //!
 //! On Unix, [`profile`] generates the OS-level sandbox policy (Seatbelt on
-//! macOS, bubblewrap on Linux) that the `exec` shell runs under.
+//! macOS, bubblewrap on Linux) that the `exec` shell runs under. Cross-platform,
+//! [`classify`] decides which agent shell commands run silently and which need
+//! user approval.
 
+mod approval;
 #[cfg(unix)]
 mod bash;
 mod env;
@@ -20,6 +23,7 @@ mod paths;
 mod profile;
 mod search;
 
+pub use approval::{Verdict, classify};
 #[cfg(unix)]
 pub use bash::BashSession;
 pub use env::{DENIED_ENV, EnvInput, Launch, agent_env};
