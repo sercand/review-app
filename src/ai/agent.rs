@@ -801,6 +801,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_check_continue_exhausts_the_allowance_then_finishes() {
+        let dir = crate::test_support::tempdir();
+        let cx = cx_in(&dir);
+        let run = cx.run.clone();
+        let checks = Arc::new(AtomicU32::new(0));
+        let counter = checks.clone();
+        let mut spec = base_spec(Registry::new(vec![]));
+        spec.on_finish = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            FinishCheck::Continue("keep going".to_string())
+        });
+        spec.max_finish_reminders = 2;
+        let llm = Arc::new(ScriptedLlm::new(
+            model(),
+            vec![
+                ScriptStep::Text("still thinking".into()),
+                ScriptStep::Text("almost there".into()),
+                ScriptStep::Text("stubborn as ever".into()),
+            ],
+        ));
+        let (ctl, _pause, _notes) = control();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let out = run_agent(
+            spec,
+            cx,
+            llm.clone() as Arc<dyn crate::ai::model::Llm>,
+            ctl,
+            tx,
+        )
+        .await;
+
+        assert_eq!(
+            out.stop,
+            AgentStop::Finished,
+            "an exhausted Continue allowance finishes; the caller records skips"
+        );
+        assert_eq!(out.turns, 3);
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            3,
+            "on_finish is asked on every tool-free turn"
+        );
+
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 3, "the third Continue stops the loop");
+        // The shared counter let exactly two reminders through; the third
+        // Continue found the allowance spent and was never pushed.
+        let reminders = requests[2]
+            .messages
+            .iter()
+            .filter(
+                |m| matches!(&m.content[..], [ContentBlock::Text { text }] if text == "keep going"),
+            )
+            .count();
+        assert_eq!(reminders, 2, "two reminder messages ride along, no more");
+        assert_eq!(
+            transcript_roles(&run),
+            vec!["assistant", "user", "assistant", "user", "assistant"],
+            "the two pushed reminders are persisted; the third Continue is not"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_finish_tool_gets_one_reminder_per_allowance_then_no_finish() {
         let dir = crate::test_support::tempdir();
         let cx = cx_in(&dir);
