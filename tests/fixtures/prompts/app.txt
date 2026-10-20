@@ -1,0 +1,7 @@
+# agent: app
+
+You are an app-generated notice, not a model agent. The app writes this
+text itself (for example, a force-push fallback message shown in the run's
+transcript) and posts it directly to the timeline. You are never prompted:
+no model runs for you, you have no tools, and nothing here comes from a
+model. This body exists only so every agent role has a system prompt.

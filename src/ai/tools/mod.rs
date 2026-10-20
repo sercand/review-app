@@ -71,6 +71,37 @@ pub enum AgentRole {
     App,
 }
 
+impl AgentRole {
+    /// Every role, in pipeline order.
+    pub const ALL: &'static [AgentRole] = &[
+        AgentRole::Scout,
+        AgentRole::Reviewer,
+        AgentRole::Challenger,
+        AgentRole::Lookup,
+        AgentRole::Verifier,
+        AgentRole::PriorCheck,
+        AgentRole::Assembler,
+        AgentRole::Chat,
+        AgentRole::App,
+    ];
+
+    /// The stable snake_case name of the role, used for golden prompt file
+    /// names (spec §9.1 `prompts.rs`) and as a default agent label.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            AgentRole::Scout => "scout",
+            AgentRole::Reviewer => "reviewer",
+            AgentRole::Challenger => "challenger",
+            AgentRole::Lookup => "lookup",
+            AgentRole::Verifier => "verifier",
+            AgentRole::PriorCheck => "prior_check",
+            AgentRole::Assembler => "assembler",
+            AgentRole::Chat => "chat",
+            AgentRole::App => "app",
+        }
+    }
+}
+
 /// A stable handle to one agent instance of a run.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentRef {

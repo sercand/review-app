@@ -12,6 +12,7 @@ pub mod events;
 pub mod interaction;
 pub mod llm;
 pub mod model;
+pub mod prompts;
 pub mod review;
 pub mod snapshot;
 pub mod store;
