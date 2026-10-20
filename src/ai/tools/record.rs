@@ -214,6 +214,13 @@ fn check_diff_line(
     }
     let side_name = side_name(side);
     let nearest = nearest_lines(diff_lines, side, line);
+    if nearest.is_empty() {
+        return Err(ToolOutput::error(format!(
+            "{field} {line} is not a commentable {side_name} line in the diff for {path}; \
+             no {side_name}-side lines exist in this file's diff — \
+             anchor on the side that has lines"
+        )));
+    }
     let nearest: Vec<String> = nearest.iter().map(u32::to_string).collect();
     Err(ToolOutput::error(format!(
         "{field} {line} is not a commentable {side_name} line in the diff for {path}; \
@@ -552,6 +559,27 @@ mod tests {
         assert!(out.is_error, "{:?}", out.parts);
         let t = text(&out);
         assert!(t.contains("10") && t.contains("12"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn anchor_on_a_side_without_lines_says_so() {
+        // A pure deletion: the diff has LEFT lines only.
+        let file = test_support::loaded("a.rs", "@@ -5,2 +5,0 @@\n-gone5\n-gone6\n");
+        let ctx = ctx(vec![file], &[]);
+
+        // The default RIGHT side has no lines: the error says so rather than
+        // listing an empty nearest set.
+        let out = call(&ctx, "record_finding", finding_input("a.rs", 5)).await;
+        assert!(out.is_error, "{:?}", out.parts);
+        let t = text(&out);
+        assert!(t.contains("no RIGHT-side lines exist"), "{t}");
+        assert!(!t.contains("nearest"), "{t}");
+
+        // The side that has lines still anchors fine.
+        let mut input = finding_input("a.rs", 5);
+        input["side"] = json!("LEFT");
+        let out = call(&ctx, "record_finding", input).await;
+        assert!(!out.is_error, "{}", text(&out));
     }
 
     #[tokio::test]

@@ -309,8 +309,14 @@ impl RunState {
 
     /// Store a new finding as [`FindingState::Draft`] and return its id.
     ///
-    /// Persists first, so the returned id is a real row id.
+    /// Persists first, so the returned id is a real row id. Evidence is
+    /// required here, not just in the tool: `RunState` is the single writer
+    /// and the verifier or pipeline may call it directly (spec §5.4).
     pub fn add_finding(&self, f: NewFinding) -> anyhow::Result<i64> {
+        anyhow::ensure!(
+            !f.evidence.is_empty(),
+            "finding requires at least one evidence entry"
+        );
         let mut finding = Finding {
             id: 0,
             run_id: self.run_id,
@@ -549,6 +555,21 @@ mod tests {
                 file: "src/a.rs".to_string(),
                 item: "empty-input".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn add_finding_requires_evidence() {
+        let (store, session, _run, state, _rx) = run_state();
+        let mut finding = line_finding();
+        finding.evidence.clear();
+
+        let err = state.add_finding(finding).unwrap_err().to_string();
+        assert!(err.contains("evidence"), "{err}");
+        assert!(state.findings().is_empty(), "the cache is untouched");
+        assert!(
+            store.finding_list(session).unwrap().is_empty(),
+            "the store is untouched"
         );
     }
 
