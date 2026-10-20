@@ -18,17 +18,22 @@ BUILD_NUMBER="${BUILD_NUMBER:-$(git -C "$ROOT" rev-list --count HEAD 2>/dev/null
 
 DIST_DIR="${DIST_DIR:-$ROOT/target/dist}"
 ARCHIVE_PATH="$DIST_DIR/$BIN_NAME-$VERSION.xcarchive"
+# Distributables, without extension: notarize.sh writes .dmg and .zip.
+DIST_BASE="$DIST_DIR/${APP_NAME// /-}-$VERSION"
 ICON_SVG="$ROOT/assets/app-icon/AppIcon.svg"
 ICNS_PATH="$ROOT/assets/app-icon/AppIcon.icns"
 
-# Signing identity: the first "Developer ID Application" in the keychain unless
+# Apple developer team that signs and notarizes releases.
+TEAM_ID="${TEAM_ID:-8SWC36YF9N}"
+
+# Signing identity: the team's "Developer ID Application" certificate unless
 # set. Distribution outside the App Store needs a Developer ID certificate.
 SIGN_IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null |
-    awk -F'"' '/Developer ID Application/ { print $2; exit }')}"
+    awk -F'"' -v team="($TEAM_ID)" '/Developer ID Application/ && index($2, team) { print $2; exit }')}"
 
 # notarytool keychain profile, created once with:
 #   xcrun notarytool store-credentials gh-review-notary \
-#       --apple-id <apple-id> --team-id <team-id> --password <app-specific-password>
+#       --apple-id <apple-id> --team-id 8SWC36YF9N --password <app-specific-password>
 NOTARY_PROFILE="${NOTARY_PROFILE:-gh-review-notary}"
 
 log() { printf '==> %s\n' "$*"; }

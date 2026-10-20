@@ -9,16 +9,16 @@ Outputs land in `target/dist/`.
 
 ## One-time setup
 
-- A **Developer ID Application** certificate in the login keychain. The scripts
-  pick the first one they find. To choose one, set
-  `SIGN_IDENTITY="Developer ID Application: … (TEAMID)"`.
+- A **Developer ID Application** certificate for team `8SWC36YF9N` in the login
+  keychain. To sign with another team, set `TEAM_ID`, or set `SIGN_IDENTITY` to
+  the certificate's full name.
 - Both Rust targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
 - Notarization credentials, saved as a keychain profile (create the
   app-specific password at appleid.apple.com):
 
   ```sh
   xcrun notarytool store-credentials gh-review-notary \
-      --apple-id <apple-id> --team-id <TEAMID> --password <app-specific-password>
+      --apple-id <apple-id> --team-id 8SWC36YF9N --password <app-specific-password>
   ```
 
 ## Icon

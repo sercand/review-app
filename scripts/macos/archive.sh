@@ -17,7 +17,7 @@ source "$(dirname "$0")/common.sh"
 
 TARGETS="${TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
 
-[ -n "$SIGN_IDENTITY" ] || die "no \"Developer ID Application\" identity in the keychain; set SIGN_IDENTITY"
+[ -n "$SIGN_IDENTITY" ] || die "no \"Developer ID Application\" identity for team $TEAM_ID in the keychain; set TEAM_ID or SIGN_IDENTITY"
 for target in $TARGETS; do
     rustup target list --installed | grep -qx "$target" ||
         die "missing Rust target $target; run: rustup target add $target"
@@ -143,6 +143,10 @@ $(for a in $archs; do printf '            <string>%s</string>\n' "$a"; done)
     <string>$APP_NAME</string>
     <key>SchemeName</key>
     <string>$BIN_NAME</string>
+    <key>GitCommit</key>
+    <string>$(git -C "$ROOT" rev-parse HEAD)</string>
+    <key>GitDirty</key>
+    <$([ -z "$(git -C "$ROOT" status --porcelain)" ] && echo false || echo true)/>
 </dict>
 </plist>
 EOF

@@ -10,7 +10,7 @@
 # certificate):
 #
 #   xcrun notarytool store-credentials gh-review-notary \
-#       --apple-id <apple-id> --team-id <team-id> --password <app-specific-password>
+#       --apple-id <apple-id> --team-id 8SWC36YF9N --password <app-specific-password>
 #
 # Environment (see common.sh): NOTARY_PROFILE, SIGN_IDENTITY.
 set -euo pipefail
@@ -18,9 +18,14 @@ source "$(dirname "$0")/common.sh"
 
 app="$ARCHIVE_PATH/Products/Applications/$APP_NAME.app"
 [ -d "$app" ] || die "no archive at ${ARCHIVE_PATH#"$ROOT/"}; run scripts/macos/archive.sh first"
-[ -n "$SIGN_IDENTITY" ] || die "no \"Developer ID Application\" identity in the keychain; set SIGN_IDENTITY"
+[ -n "$SIGN_IDENTITY" ] || die "no \"Developer ID Application\" identity for team $TEAM_ID in the keychain; set TEAM_ID or SIGN_IDENTITY"
 
-base="$DIST_DIR/${APP_NAME// /-}-$VERSION"
+# Fail before uploading anything if the credentials profile is missing.
+xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1 ||
+    die "notarytool profile \"$NOTARY_PROFILE\" is missing or invalid; create it with:
+  xcrun notarytool store-credentials $NOTARY_PROFILE --apple-id <apple-id> --team-id $TEAM_ID"
+
+base="$DIST_BASE"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
