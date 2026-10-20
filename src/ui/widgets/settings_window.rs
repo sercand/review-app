@@ -203,6 +203,10 @@ impl SettingsVm {
     /// [`AiVm::validate`]); nothing is written in that case. The API keys in
     /// [`ProviderVm::key_input`] never reach `s` — they ride
     /// [`SettingsAction::SetLlmKey`] into the keychain instead.
+    ///
+    /// A default model whose provider is not among the written providers is
+    /// dropped (`models.default = None`), so the file never names an endpoint
+    /// that does not exist.
     pub fn apply(self, s: &mut Settings) -> Result<bool, String> {
         self.ai.validate()?;
         let host_changed = self.host != s.host;
@@ -218,11 +222,18 @@ impl SettingsVm {
             .into_iter()
             .map(|provider| provider.settings)
             .collect();
-        // An all-empty model is "not configured", so a default settings file
-        // never grows an empty `[ai.models.default]` table.
-        s.ai.models.default = (!self.ai.default_model.provider.trim().is_empty()
-            || !self.ai.default_model.model.trim().is_empty())
-        .then_some(self.ai.default_model);
+        // Spec §10: a default model is only configured when it names an
+        // endpoint that exists. Removing the last provider must not leave
+        // `[ai.models.default]` naming it, and an all-empty model is "not
+        // configured" too, so a default settings file never grows an empty
+        // table.
+        let model = self.ai.default_model;
+        let configured = !model.provider.trim().is_empty()
+            && s.ai
+                .providers
+                .iter()
+                .any(|provider| provider.name == model.provider);
+        s.ai.models.default = configured.then_some(model);
         s.ai.repos = self.ai.repos;
         Ok(host_changed)
     }
@@ -520,6 +531,19 @@ fn rule(ui: &mut egui::Ui) {
     ui.add_space(8.0);
 }
 
+/// Keep one text buffer per repo: a missing buffer is filled from that
+/// repo's own `commands`/`prepare` — never with an empty draft, which the
+/// write-back below would then persist — and buffers for deleted repos are
+/// dropped.
+#[cfg(unix)]
+fn sync_drafts(ai: &AiVm, drafts: &mut Vec<RepoDraft>) {
+    while drafts.len() < ai.repos.len() {
+        let index = drafts.len();
+        drafts.push(RepoDraft::for_repo(&ai.repos[index]));
+    }
+    drafts.truncate(ai.repos.len());
+}
+
 /// The Settings window's AI section (spec §10): providers, the default model,
 /// and the per-repository settings. `actions` receives "Test connection" asks;
 /// Save emits the keys and the apply (see [`render`]).
@@ -531,12 +555,7 @@ fn ai_section(
     actions: &mut Vec<SettingsAction>,
 ) {
     let p = theme::palette_of(ui);
-    // One buffer per repo: a hand-built VM (or a list edited elsewhere) may
-    // disagree with the app's drafts.
-    while drafts.len() < ai.repos.len() {
-        drafts.push(RepoDraft::default());
-    }
-    drafts.truncate(ai.repos.len());
+    sync_drafts(ai, drafts);
 
     let screen_height = ui.ctx().viewport_rect().height();
     egui::ScrollArea::vertical()
@@ -553,11 +572,18 @@ fn ai_section(
             ai_repos(ui, ai, drafts);
             // The text areas are authoritative for the lists they edit;
             // applying reads them back through `ai.repos`.
-            for (repo, draft) in ai.repos.iter_mut().zip(drafts.iter()) {
-                repo.commands = RepoDraft::lines(&draft.commands);
-                repo.prepare = RepoDraft::lines(&draft.prepare);
-            }
+            flush_drafts(ai, drafts);
         });
+}
+
+/// Copy the text areas back into `ai.repos`, so `Apply` sees the current
+/// command lists rather than what the window opened with.
+#[cfg(unix)]
+fn flush_drafts(ai: &mut AiVm, drafts: &[RepoDraft]) {
+    for (repo, draft) in ai.repos.iter_mut().zip(drafts) {
+        repo.commands = RepoDraft::lines(&draft.commands);
+        repo.prepare = RepoDraft::lines(&draft.prepare);
+    }
 }
 
 /// One provider box: name, API, base URL, key, Remove. Add provider sits in
@@ -640,7 +666,13 @@ fn ai_providers(ui: &mut egui::Ui, ai: &mut AiVm) {
         ui.add_space(4.0);
     }
     if let Some(index) = remove {
-        ai.providers.remove(index);
+        let removed = ai.providers.remove(index);
+        // A default model that named the removed endpoint has nowhere to
+        // route: clear the section here instead of showing a name that is
+        // gone (`apply` drops such a model too, as a safety net).
+        if ai.default_model.provider == removed.settings.name {
+            ai.default_model = ModelSettings::default();
+        }
     }
 }
 
@@ -1174,6 +1206,48 @@ mod tests {
             settings.ai.models.default.is_none(),
             "an unconfigured model stays out of settings.toml"
         );
+    }
+
+    /// Regression (review finding 1): removing the provider the default model
+    /// routes through must not persist a dangling `[ai.models.default]`.
+    ///
+    /// `apply` drops it (rather than erroring): the window's Remove button
+    /// already clears the section, so this is the last line of defence and
+    /// must never block saving unrelated settings.
+    #[test]
+    fn a_default_model_without_its_provider_is_dropped() {
+        let mut settings = ai_settings();
+        assert!(settings.ai.models.default.is_some());
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.providers.clear(); // the removed provider still names the model
+        assert!(!vm.apply(&mut settings).unwrap());
+        assert!(
+            settings.ai.models.default.is_none(),
+            "the file must not name a provider that is gone"
+        );
+        assert!(settings.ai.providers.is_empty());
+    }
+
+    /// Regression (review finding 2): a missing text buffer is refilled from
+    /// the repo itself, so the write-back cannot blank its commands.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_draft_is_filled_from_the_repo_instead_of_blanking_it() {
+        let before = ai_settings();
+        let mut ai = settings_vm(&before, &|_| false).ai;
+        let mut drafts = Vec::new();
+        sync_drafts(&ai, &mut drafts);
+        assert_eq!(drafts.len(), ai.repos.len());
+        assert_eq!(drafts[0].commands, "cargo test\ncargo clippy");
+        assert_eq!(drafts[0].prepare, "cargo fetch");
+        flush_drafts(&mut ai, &drafts);
+        assert_eq!(ai.repos[0].commands, before.ai.repos[0].commands);
+        assert_eq!(ai.repos[0].prepare, before.ai.repos[0].prepare);
+
+        // Extra buffers (a repo was just removed) are dropped, not written.
+        drafts.push(RepoDraft::default());
+        sync_drafts(&ai, &mut drafts);
+        assert_eq!(drafts.len(), ai.repos.len());
     }
 
     #[test]

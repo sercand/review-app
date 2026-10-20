@@ -421,11 +421,17 @@ impl ReviewApp {
             // through `apply_session_event` above (Task 51).
             Event::ConversationLoaded { .. } => {}
             // Spec §10: the Settings window's AI section shows the outcome.
-            // The probe may outlive the window (a Save closes it), so the
-            // result reopens it rather than vanish.
+            // The VM outlives a closed window, so the result lands there
+            // without stealing the window back over whatever screen the user
+            // moved on to; a closed window gets a toast instead.
             Event::AiProviderTested { provider, result } => {
-                if !self.settings_window.open {
-                    self.open_settings();
+                let window_open = self.settings_window.open;
+                if !window_open {
+                    let outcome = match &result {
+                        Ok(model) => format!("connected — {model} answered"),
+                        Err(error) => error.clone(),
+                    };
+                    self.toasts.push(format!("{provider} test: {outcome}"), now);
                 }
                 self.settings_window
                     .vm
