@@ -25,10 +25,10 @@ pub enum Verdict {
 /// "for this review" (the caller concatenates them). A segment runs when its
 /// first word is in the read-only allowlist, when it is `git` with a read-only
 /// subcommand, or when its normalized text matches an `allowed` entry exactly
-/// or as a whole-word prefix. Shell constructs that can hide execution or
-/// writes — command/process substitution, heredocs, leading `VAR=value`
-/// assignments, unbalanced quotes, output redirection outside `/dev/null` and
-/// `$TMPDIR` — always ask.
+/// or as a whole-word prefix (approval also overrides wrappers and a leading
+/// `VAR=value`). Shell constructs that can hide execution or writes —
+/// command/process substitution, heredocs, unbalanced quotes, output
+/// redirection outside `/dev/null` and `$TMPDIR` — always ask.
 pub fn classify(command: &str, allowed: &[String]) -> Verdict {
     let segments = match tokenize(command) {
         Ok(segments) => segments,
@@ -91,8 +91,8 @@ const GIT_SUBCOMMANDS: [&str; 13] = [
 
 /// Whether one segment (a `Run`-eligible unit between separators) fails, with
 /// the reason why. Checks run conservative-first: hidden-execution constructs
-/// and assignments ask even for an allowed command; explicit approval beats
-/// the wrapper list.
+/// ask even for an allowed command; explicit approval beats the wrapper list
+/// and a leading assignment.
 fn segment_verdict(segment: &[Tok], allowed: &[String]) -> Option<String> {
     for tok in segment {
         match tok {
@@ -111,12 +111,12 @@ fn segment_verdict(segment: &[Tok], allowed: &[String]) -> Option<String> {
     let Some(&first) = words.first() else {
         return None; // only safe redirections, nothing to execute
     };
-    if is_assignment(first) {
-        return Some("variable assignment".to_string());
-    }
     let normalized = words.join(" ");
     if is_allowed(&normalized, allowed) {
         return None;
+    }
+    if is_assignment(first) {
+        return Some("variable assignment".to_string());
     }
     if WRAPPERS.contains(&first) {
         return Some(format!("wrapper command {first}"));
@@ -271,9 +271,14 @@ impl Tokenizer {
     }
 
     /// Consume a `>` or `&>` opener: a word of pure digits directly before it
-    /// is the file descriptor, not an argument.
+    /// is the file descriptor, not an argument — but only when no redirect
+    /// target is pending; `> 2>` redirects to a file named `2`.
     fn start_redir(&mut self) {
-        if self.in_word && !self.word.is_empty() && self.word.bytes().all(|b| b.is_ascii_digit()) {
+        let io_number = self.in_word
+            && !self.expect_target
+            && !self.word.is_empty()
+            && self.word.bytes().all(|b| b.is_ascii_digit());
+        if io_number {
             self.word.clear();
             self.in_word = false;
         } else {
@@ -617,5 +622,24 @@ mod tests {
     #[test]
     fn input_redirection_is_read_only() {
         assert_eq!(classify("grep foo < file", &[]), Verdict::Run);
+    }
+
+    #[test]
+    fn digit_target_glued_to_next_redirect_asks() {
+        // bash reads `> 2>` as a redirect to a file named `2`, not an fd.
+        asks("ls > 2> /dev/null", &[]);
+        asks("ls > 2&> /dev/null", &[]);
+        assert_eq!(classify("ls > /dev/null", &[]), Verdict::Run);
+        assert_eq!(
+            classify("cargo test 2>&1 | tail -50", &allowed()),
+            Verdict::Run
+        );
+    }
+
+    #[test]
+    fn allowed_beats_leading_assignment() {
+        let allowed = ["FOO=1 cargo test".to_string()];
+        assert_eq!(classify("FOO=1 cargo test", &allowed), Verdict::Run);
+        asks("FOO=1 cargo test $(evil)", &allowed);
     }
 }
