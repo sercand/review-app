@@ -693,6 +693,25 @@ async fn git_log_and_show_work_on_a_temp_repo() {
     assert!(text(&out).contains("+two"), "{}", text(&out));
     assert!(!text(&out).contains("+bee"), "{}", text(&out));
 
+    // The checkout root as a path means the whole tree: no empty pathspec, no error.
+    for (name, input, want) in [
+        (
+            "git_diff",
+            json!({"range": "HEAD~1..HEAD", "path": "."}),
+            "+bee",
+        ),
+        ("git_log", json!({"path": "."}), "second commit"),
+        (
+            "git_show",
+            json!({"rev": "HEAD", "path": "."}),
+            "second commit",
+        ),
+    ] {
+        let out = call(&host, name, input).await;
+        assert!(!out.is_error, "{name}: {}", text(&out));
+        assert!(text(&out).contains(want), "{name}: {}", text(&out));
+    }
+
     // Option injection is refused before git runs.
     let out = call(&host, "git_show", json!({"rev": "--output=/tmp/x"})).await;
     assert!(out.is_error);
@@ -720,9 +739,12 @@ async fn git_diff_path_outside_repo_is_rejected() {
         "{}",
         text(&out)
     );
-    // A path cannot smuggle an option either.
-    let out = call(&host, "git_diff", json!({"range": "HEAD", "path": "-p"})).await;
-    assert!(out.is_error, "{}", text(&out));
+    // A path cannot smuggle an option either: not raw, and not through `./` or `..`.
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    for path in ["-p", "./-p", "sub/../-p"] {
+        let out = call(&host, "git_diff", json!({"range": "HEAD", "path": path})).await;
+        assert!(out.is_error, "{path}: {}", text(&out));
+    }
     let out = call(&host, "git_log", json!({"path": "../x"})).await;
     assert!(out.is_error);
 }

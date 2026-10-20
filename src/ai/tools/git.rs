@@ -75,14 +75,8 @@ impl Tool for GitShow {
             "--no-show-signature".to_owned(),
         ];
         args.push(rev);
-        if let Some(path) = non_empty(input.path) {
-            match repo_path(cx, &path) {
-                Ok(path) => {
-                    args.push("--".to_owned());
-                    args.push(path);
-                }
-                Err(out) => return out,
-            }
+        if let Err(out) = push_path(&mut args, cx, input.path) {
+            return out;
         }
         run(cx, args).await
     }
@@ -143,14 +137,8 @@ impl Tool for GitLog {
             "-n".to_owned(),
             n.to_string(),
         ];
-        if let Some(path) = non_empty(input.path) {
-            match repo_path(cx, &path) {
-                Ok(path) => {
-                    args.push("--".to_owned());
-                    args.push(path);
-                }
-                Err(out) => return out,
-            }
+        if let Err(out) = push_path(&mut args, cx, input.path) {
+            return out;
         }
         run(cx, args).await
     }
@@ -210,14 +198,8 @@ impl Tool for GitDiff {
             "--no-textconv".to_owned(),
         ];
         args.push(range);
-        if let Some(path) = non_empty(input.path) {
-            match repo_path(cx, &path) {
-                Ok(path) => {
-                    args.push("--".to_owned());
-                    args.push(path);
-                }
-                Err(out) => return out,
-            }
+        if let Err(out) = push_path(&mut args, cx, input.path) {
+            return out;
         }
         run(cx, args).await
     }
@@ -280,14 +262,30 @@ fn non_empty(path: Option<String>) -> Option<String> {
     path.map(|p| p.trim().to_owned()).filter(|p| !p.is_empty())
 }
 
-/// The checkout-relative, slash-separated form of a tool input path.
+/// Appends `-- <path>` to `args` for an input path, or nothing when there is no path
+/// or it resolves to the checkout root itself (which means "the whole tree").
+fn push_path(args: &mut Vec<String>, cx: &ToolCx, path: Option<String>) -> Result<(), ToolOutput> {
+    let Some(path) = non_empty(path) else {
+        return Ok(());
+    };
+    let Some(path) = repo_path(cx, &path)? else {
+        return Ok(());
+    };
+    args.push("--".to_owned());
+    args.push(path);
+    Ok(())
+}
+
+/// The checkout-relative, slash-separated form of a tool input path, or `None` when
+/// it is the checkout root (no pathspec: the tool acts on the whole tree).
 ///
-/// A leading `-` is refused so a path can never be read as an option, and every
-/// path is resolved through [`Root`] (symlinks followed, `..` applied, whole-segment
-/// containment) so it cannot leave the checkout. A path a newer revision deleted is
-/// still accepted: [`Root::resolve_new`] applies the same containment without
-/// requiring the file to exist.
-fn repo_path(cx: &ToolCx, path: &str) -> Result<String, ToolOutput> {
+/// A leading `-` is refused so a path can never be read as an option — both before
+/// and after resolution, since `./-p` or `sub/../-p` can hide one from the raw check.
+/// Every path is resolved through [`Root`] (symlinks followed, `..` applied,
+/// whole-segment containment) so it cannot leave the checkout. A path a newer revision
+/// deleted is still accepted: [`Root::resolve_new`] applies the same containment
+/// without requiring the file to exist.
+fn repo_path(cx: &ToolCx, path: &str) -> Result<Option<String>, ToolOutput> {
     if path.starts_with('-') {
         return Err(ToolOutput::error(format!(
             "path must not start with '-': {path}"
@@ -303,7 +301,18 @@ fn repo_path(cx: &ToolCx, path: &str) -> Result<String, ToolOutput> {
         },
         Err(e) => return Err(ToolOutput::error(e.to_string())),
     };
-    Ok(root.relative(&resolved))
+    let relative = root.relative(&resolved);
+    // The root itself: an empty pathspec is an error to git, and `-- .` is equivalent
+    // to no path at all, so leave the argument off.
+    if relative.is_empty() {
+        return Ok(None);
+    }
+    if relative.starts_with('-') {
+        return Err(ToolOutput::error(format!(
+            "path resolves to an option: {relative}"
+        )));
+    }
+    Ok(Some(relative))
 }
 
 /// Runs `git` in the checkout root with `args` and returns its stdout.
