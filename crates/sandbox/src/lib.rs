@@ -7,8 +7,8 @@
 //! `exec` shell is unrestricted by design. On Unix, `exec` drives a persistent
 //! [`BashSession`] on a PTY.
 //!
-//! An OS-level sandbox (seatbelt etc.) is not part of this crate yet; it arrives
-//! with the agent runtime.
+//! On Unix, [`profile`] generates the OS-level sandbox policy (Seatbelt on
+//! macOS, bubblewrap on Linux) that the `exec` shell runs under.
 
 #[cfg(unix)]
 mod bash;
@@ -16,6 +16,8 @@ mod env;
 mod files;
 mod ops;
 mod paths;
+#[cfg(unix)]
+mod profile;
 mod search;
 
 #[cfg(unix)]
@@ -27,3 +29,8 @@ pub use ops::{
     MAX_GREP, OUTPUT_CAP, OpError, SandboxOps,
 };
 pub use paths::Root;
+#[cfg(unix)]
+pub use profile::{
+    SandboxPolicy, SandboxUnavailable, bwrap_args, default_deny_read, default_write_paths,
+    sandboxed_launch, seatbelt_profile,
+};
