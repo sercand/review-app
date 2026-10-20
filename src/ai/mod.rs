@@ -4,6 +4,7 @@
 //! (`review-sandbox`) has no Windows backend yet, so the whole AI surface is
 //! gated the same way.
 
+pub mod checklist;
 pub mod checkout;
 pub mod context;
 pub mod interaction;

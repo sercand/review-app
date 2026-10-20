@@ -2033,6 +2033,7 @@ dependencies = [
  "eframe",
  "egui_extras",
  "egui_kittest",
+ "globset",
  "ignore",
  "image",
  "keyring",
