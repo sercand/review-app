@@ -411,6 +411,7 @@ mod tests {
             allowed: Arc::new(Mutex::new(Vec::new())),
             for_review: Arc::new(Mutex::new(Vec::new())),
             snapshot,
+            context: None,
         };
         (dir, cx)
     }

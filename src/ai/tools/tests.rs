@@ -74,6 +74,7 @@ fn ctx_with(
         allowed: Arc::new(std::sync::Mutex::new(Vec::new())),
         for_review: Arc::new(std::sync::Mutex::new(Vec::new())),
         snapshot: None,
+        context: None,
     }
 }
 
@@ -1103,7 +1104,8 @@ fn tool_definitions_have_valid_schemas() {
             "gh_pr_files",
             "gh_pr_patch",
             "gh_threads",
-            "gh_checks"
+            "gh_checks",
+            "load_skill"
         ]
     );
     for t in &tools {
@@ -1131,6 +1133,7 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(req("gh_pr_patch"), ["path"]);
     assert!(req("gh_threads").is_empty());
     assert!(req("gh_checks").is_empty());
+    assert_eq!(req("load_skill"), ["name"]);
     let props = |name: &str| -> Vec<String> {
         let mut v: Vec<String> = tool(name).definition().input_schema["properties"]
             .as_object()
@@ -1155,6 +1158,7 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(props("gh_pr_patch"), ["path"]);
     assert_eq!(props("gh_threads"), ["path"]);
     assert!(props("gh_checks").is_empty());
+    assert_eq!(props("load_skill"), ["name"]);
 }
 
 /// The registry hands out every definition in order, and looks a tool up by name.
@@ -1178,6 +1182,7 @@ fn registry_definitions_and_lookup() {
     assert!(registry.get("gh_pr_patch").is_some());
     assert!(registry.get("gh_threads").is_some());
     assert!(registry.get("gh_checks").is_some());
+    assert!(registry.get("load_skill").is_some());
     assert!(registry.get("edit_file").is_none());
     assert!(registry.get("").is_none());
 }

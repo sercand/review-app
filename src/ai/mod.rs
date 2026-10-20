@@ -5,6 +5,7 @@
 //! gated the same way.
 
 pub mod checkout;
+pub mod context;
 pub mod interaction;
 pub mod llm;
 pub mod snapshot;

@@ -1,7 +1,8 @@
 //! The review agent's read-only repo tools: `bash`, `read_file`, `glob`,
-//! `grep`, `list_dir`, `asset_stats`, `git_show`/`git_log`/`git_diff` and the
-//! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`,
-//! with mono's names and schemas where they exist, run against any
+//! `grep`, `list_dir`, `asset_stats`, `git_show`/`git_log`/`git_diff`, the
+//! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`
+//! and the context-backed `load_skill`, with mono's names and schemas where
+//! they exist, run against any
 //! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
 //! temp-dir host in tests). The git tools run `git` directly in the checkout,
 //! so they work even when `bash` is blocked; the `gh_*` tools read
@@ -23,6 +24,7 @@ mod gh;
 mod git;
 mod inspect;
 mod search;
+mod skills;
 mod truncate;
 
 #[cfg(test)]
@@ -149,6 +151,15 @@ pub struct ToolCx {
     /// PR has loaded. The `gh_*` tools then return an error rather than
     /// guessing, and nothing else reads this field.
     pub snapshot: Option<Arc<crate::ai::snapshot::PrSnapshot>>,
+    /// The repo's own instructions — `.github/REVIEW.md`, the instruction
+    /// files and the skills index — gathered by
+    /// [`crate::ai::context::load_repo_context`] from the checkout before the
+    /// run starts.
+    ///
+    /// `None` means no repo context is attached — tool tests, and runs started
+    /// before the checkout was scanned. `load_skill` then returns an error
+    /// rather than guessing, and nothing else reads this field.
+    pub context: Option<Arc<crate::ai::context::RepoContext>>,
 }
 
 impl ToolCx {
@@ -256,6 +267,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(gh::GhPrPatch),
         Arc::new(gh::GhThreads),
         Arc::new(gh::GhChecks),
+        Arc::new(skills::LoadSkill),
     ]
 }
 
