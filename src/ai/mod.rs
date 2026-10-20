@@ -10,6 +10,7 @@ pub mod context;
 pub mod events;
 pub mod interaction;
 pub mod llm;
+pub mod model;
 pub mod review;
 pub mod snapshot;
 pub mod store;
