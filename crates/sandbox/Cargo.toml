@@ -1,0 +1,37 @@
+[package]
+name = "review-sandbox"
+description = "Project-root-confined file ops, glob, grep and a persistent bash on a PTY behind the SandboxOps trait."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+async-trait = "0.1.92"
+globset = "0.4.20"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.33"
+rand = "0.9"
+secrecy = "0.10.3"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio-util = "0.7.20"
+tracing = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+tempfile = "3.27"
+nix = { version = "0.31", default-features = false, features = ["signal", "fs"] }
+portable-pty = "0.9"
+
+[dev-dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+tempfile = "3.27"
