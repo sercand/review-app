@@ -129,9 +129,18 @@ fn parse_checks(markdown: &str) -> Vec<RepoCheck> {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') {
             let hashes = trimmed.chars().take_while(|c| *c == '#').count();
-            let heading = trimmed[hashes..].trim();
-            in_checks = hashes == 2 && !seen_checks && heading.eq_ignore_ascii_case("checks");
-            seen_checks |= in_checks;
+            if in_checks {
+                // Only a level-2 heading ends the section; `#` and `###`+
+                // headings are ordinary lines — and not bullets, so the loop
+                // simply skips them.
+                if hashes == 2 {
+                    in_checks = false;
+                }
+            } else {
+                let heading = trimmed[hashes..].trim();
+                in_checks = hashes == 2 && !seen_checks && heading.eq_ignore_ascii_case("checks");
+                seen_checks |= in_checks;
+            }
             continue;
         }
         if !in_checks {
@@ -399,6 +408,13 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn only_a_level_two_heading_closes_the_checks_section() {
+        let checks = parse_checks("## Checks\n- A\n### Bugs\n- B\n## Other\n- C\n");
+        let texts: Vec<&str> = checks.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, ["A", "B"]);
     }
 
     #[test]
