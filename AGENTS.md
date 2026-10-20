@@ -10,8 +10,8 @@ CI (`.github/workflows/ci.yml`) runs these on Linux, macOS and Windows; all must
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo test --release -- --ignored          # perf guardrail (tests/perf_large_pr.rs), Linux CI only
 ```
 

@@ -160,11 +160,10 @@ fn parse_sso_url(value: &str) -> Option<String> {
 /// GitHub's human-readable `message` for an error body, falling back to the raw
 /// body when it is not JSON.
 fn message_or_body(body: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(message) = value.get("message").and_then(|message| message.as_str()) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(message) = value.get("message").and_then(|message| message.as_str()) {
             return message.to_owned();
         }
-    }
     body.trim().to_owned()
 }
 

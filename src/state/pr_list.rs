@@ -233,15 +233,14 @@ fn accept(state: &mut PrListState, query: &str, page: SearchPage) {
                 item.scopes.push(scope.clone());
             }
             state.items.push(item);
-        } else if !scope.is_empty() {
-            if let Some(existing) = state
+        } else if !scope.is_empty()
+            && let Some(existing) = state
                 .items
                 .iter_mut()
                 .find(|item| (item.repo.id(), item.number) == key)
             {
                 union_scope(&mut existing.scopes, &scope);
             }
-        }
     }
 
     state.awaiting.remove(query);

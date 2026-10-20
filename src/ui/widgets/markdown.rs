@@ -384,20 +384,18 @@ impl Builder {
                 }
             }
             TagEnd::TableCell => {
-                if let Some(cell) = self.cell.take() {
-                    if let Some(row) = self.row.as_mut() {
+                if let Some(cell) = self.cell.take()
+                    && let Some(row) = self.row.as_mut() {
                         row.push(cell.trim().to_owned());
                     }
-                }
             }
             TagEnd::TableRow | TagEnd::TableHead => {
                 // Tables have no block of their own: each row becomes a
                 // paragraph of `cell | cell`.
-                if let Some(row) = self.row.take() {
-                    if !row.is_empty() {
+                if let Some(row) = self.row.take()
+                    && !row.is_empty() {
                         self.blocks.push(MdBlock::Paragraph(row.join(" | ")));
                     }
-                }
             }
             _ => {}
         }

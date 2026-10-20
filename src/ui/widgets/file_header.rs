@@ -354,17 +354,15 @@ fn kind_controls(
     }
     let show_diff_controls = matches!(vm.kind, HeaderKind::Text)
         || (matches!(vm.kind, HeaderKind::Image) && !rendered && is_svg(vm));
-    if is_svg(vm) {
-        if let Some(want_rendered) = segmented(
+    if is_svg(vm)
+        && let Some(want_rendered) = segmented(
             ui,
             rendered,
             &[Seg::text(true, "Rendered"), Seg::text(false, "Text")],
-        ) {
-            if want_rendered != rendered {
+        )
+            && want_rendered != rendered {
                 actions.push(FileHeaderAction::ToggleRendered);
             }
-        }
-    }
     if show_diff_controls {
         if icon_button(ui, SEARCH, &icons::key_hint("Find in file  ⌘F")).clicked() {
             actions.push(FileHeaderAction::OpenFind);
@@ -385,11 +383,10 @@ fn kind_controls(
                 Seg::icon(DiffMode::Unified, ROWS_2, "Unified  U"),
                 Seg::icon(DiffMode::Split, COLUMNS_2, "Split  S"),
             ],
-        ) {
-            if wanted != mode {
+        )
+            && wanted != mode {
                 actions.push(FileHeaderAction::SetMode(wanted));
             }
-        }
     }
 }
 

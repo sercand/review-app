@@ -642,11 +642,10 @@ where
                     let events = events.clone();
                     let task = tokio::spawn(handler(command, events.clone()));
                     tokio::spawn(async move {
-                        if let Err(join_error) = task.await {
-                            if join_error.is_panic() {
+                        if let Err(join_error) = task.await
+                            && join_error.is_panic() {
                                 events.send(Event::WorkerPanicked(panic_message(join_error)));
                             }
-                        }
                     });
                 }
             });

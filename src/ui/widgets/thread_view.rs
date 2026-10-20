@@ -403,8 +403,7 @@ fn render_expanded(
                         text,
                         ..
                     } = block
-                    {
-                        if ui
+                        && ui
                             .add(egui::Button::new(egui::RichText::new(icon_text(
                                 COPY,
                                 "Copy suggestion",
@@ -413,7 +412,6 @@ fn render_expanded(
                         {
                             actions.push(ThreadAction::CopySuggestion(text.clone()));
                         }
-                    }
                 }
             });
         });

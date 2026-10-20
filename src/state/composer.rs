@@ -156,11 +156,10 @@ pub fn reduce(state: &mut ComposerState, msg: ComposerMsg) {
         ComposerMsg::SetSide(side) => {
             // Only a single-line anchor can switch sides (spec §7.3): a
             // range's `start_side` must keep equaling `side`.
-            if let Some(CommentTarget::Line(anchor)) = state.target.as_mut() {
-                if anchor.start_line.is_none() {
+            if let Some(CommentTarget::Line(anchor)) = state.target.as_mut()
+                && anchor.start_line.is_none() {
                     anchor.side = side;
                 }
-            }
         }
         ComposerMsg::SetBody(body) => state.body = body,
         ComposerMsg::SetMode(mode) => {

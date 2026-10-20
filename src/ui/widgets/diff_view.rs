@@ -1325,8 +1325,8 @@ fn code_cell(
     // The hover plus button: only while the pointer is over the cell. The
     // cell's rect, not `response.hovered()`, decides: the button takes the
     // hover from the cell, which would hide it again before it is clicked.
-    if ui.rect_contains_pointer(rect) {
-        if let Some(target) = target {
+    if ui.rect_contains_pointer(rect)
+        && let Some(target) = target {
             let plus = egui::Rect::from_center_size(
                 egui::pos2(rect.left() + 11.0, mid),
                 egui::vec2(18.0, 18.0),
@@ -1347,7 +1347,6 @@ fn code_cell(
                 return Some(target);
             }
         }
-    }
     None
 }
 

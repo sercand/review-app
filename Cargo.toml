@@ -1,7 +1,12 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
 [package]
 name = "gh-review-desktop"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.99"
 license = "MIT"
 
 [dependencies]

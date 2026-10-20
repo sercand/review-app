@@ -419,11 +419,10 @@ impl PrSession {
             Event::PrMetadataLoaded { session, meta } if *session == self.id => {
                 // The head is only "moved" once we have a diff to compare it
                 // against; the first load has nothing to invalidate.
-                if let Some(shown) = &self.diff_head_sha {
-                    if shown != &meta.head_sha {
+                if let Some(shown) = &self.diff_head_sha
+                    && shown != &meta.head_sha {
                         self.head_moved = true;
                     }
-                }
                 self.metadata = Some(meta.clone());
                 self.phase = LoadPhase::Files;
 
@@ -808,13 +807,12 @@ impl PrSession {
     /// placeholder thread is gone and its result event has nothing to roll
     /// back.
     fn restore_optimistic_to_composer(&mut self) {
-        if let Some(post) = self.optimistic.take() {
-            if self.composer.body.is_empty() {
+        if let Some(post) = self.optimistic.take()
+            && self.composer.body.is_empty() {
                 self.composer.target = Some(post.target);
                 self.composer.body = post.body;
                 self.composer.mode = CommentMode::Immediate;
             }
-        }
     }
 
     /// Re-derive the row model from the files plus the current threads,
@@ -915,11 +913,10 @@ impl PrSession {
         );
         let mut heights = measured.into_iter();
         for index in 0..model.rows.len() {
-            if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. }) {
-                if let Some(height) = heights.next() {
+            if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. })
+                && let Some(height) = heights.next() {
                     model.set_height(index, height);
                 }
-            }
         }
         self.row_model = model;
     }
@@ -949,15 +946,14 @@ impl PrSession {
                 });
             }
         }
-        if let Some(target) = &self.composer.target {
-            if let Some(file) = self.file_of(target) {
+        if let Some(target) = &self.composer.target
+            && let Some(file) = self.file_of(target) {
                 items.push(InlineItem {
                     file,
                     placement: target_placement(target),
                     row: RowRef::Composer,
                 });
             }
-        }
         items
     }
 
@@ -1190,11 +1186,10 @@ impl PrSession {
                 self.filtered_files.remove(&file);
             }
         } else {
-            if let Some(loaded) = self.files.get_mut(file as usize) {
-                if let Some(diff) = loaded.diff.take() {
+            if let Some(loaded) = self.files.get_mut(file as usize)
+                && let Some(diff) = loaded.diff.take() {
                     self.svg_diffs.insert(file, diff);
                 }
-            }
             self.rendered_svg.insert(file);
         }
         self.rebuild_rows();

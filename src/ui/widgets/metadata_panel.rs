@@ -142,11 +142,10 @@ fn render_tab_strip(ui: &mut egui::Ui, tab: &mut DetailsTab, counts: [Option<usi
                 })
                 .corner_radius(6.0);
             let response = ui.add(button).on_hover_text(label);
-            if let Some(Some(count)) = counts.get(index).copied() {
-                if count > 0 {
+            if let Some(Some(count)) = counts.get(index).copied()
+                && count > 0 {
                     ui.label(RichText::new(count.to_string()).color(p.faint).size(11.0));
                 }
-            }
             if response.clicked() {
                 *tab = value;
             }

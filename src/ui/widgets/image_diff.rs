@@ -172,11 +172,10 @@ pub fn render(
 fn render_fallback(ui: &mut egui::Ui, browser_url: Option<&str>) -> f32 {
     let row = ui.horizontal(|ui| {
         ui.label("Binary file not shown");
-        if let Some(url) = browser_url {
-            if ui.button("Open in browser").clicked() {
+        if let Some(url) = browser_url
+            && ui.button("Open in browser").clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_owned()));
             }
-        }
     });
     row.response.rect.height()
 }
@@ -243,11 +242,10 @@ fn draw_swipe(
         ui.scope_id().with("swipe-divider"),
         egui::Sense::drag(),
     );
-    if response.dragged() {
-        if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+    if response.dragged()
+        && let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
             *swipe = swipe_split((pointer.x - rect.min.x) / rect.width().max(1.0));
         }
-    }
     ui.painter().line_segment(
         [
             egui::pos2(divider_x, rect.min.y),

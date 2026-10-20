@@ -965,8 +965,8 @@ impl ReviewApp {
                         self.settings.merge_method = method;
                         self.save_settings(now);
                     }
-                    if let Some(session) = &mut self.session {
-                        if let Some(command) =
+                    if let Some(session) = &mut self.session
+                        && let Some(command) =
                             crate::state::pr_detail::start_merge(session, method, title, message)
                         {
                             // The popover's in-flight half: the button rests
@@ -974,7 +974,6 @@ impl ReviewApp {
                             session.merging = true;
                             self.worker.send(command);
                         }
-                    }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),
                 PrDetailAction::OpenInBrowser => {
@@ -1049,8 +1048,8 @@ impl ReviewApp {
                     .iter()
                     .find(|thread| thread.id == thread_id)
                     .map(|thread| (thread.path.clone(), thread.side, thread.line));
-                if let Some((path, side, line)) = anchor {
-                    if let Some(index) = session.files.iter().position(|l| l.file.path == path) {
+                if let Some((path, side, line)) = anchor
+                    && let Some(index) = session.files.iter().position(|l| l.file.path == path) {
                         session.select_file(index);
                         let row = side.zip(line).and_then(|(side, line)| {
                             session.row_model.row_of_line(&session.files, side, line)
@@ -1058,7 +1057,6 @@ impl ReviewApp {
                         // A file-level thread sits at the top of the file.
                         self.pr_detail.diff.scroll_to_row = Some(row.unwrap_or(0));
                     }
-                }
                 Vec::new()
             }
             ReviewAction::LocatePending(local_id) => {
@@ -1069,8 +1067,8 @@ impl ReviewApp {
                     .iter()
                     .find(|comment| comment.local_id == local_id)
                     .map(|comment| comment.anchor.clone());
-                if let Some(anchor) = anchor {
-                    if let Some(index) = session
+                if let Some(anchor) = anchor
+                    && let Some(index) = session
                         .files
                         .iter()
                         .position(|l| l.file.path == anchor.path)
@@ -1084,7 +1082,6 @@ impl ReviewApp {
                             self.pr_detail.diff.scroll_to_row = Some(row);
                         }
                     }
-                }
                 Vec::new()
             }
             ReviewAction::Discard => {
@@ -1379,11 +1376,10 @@ impl ReviewApp {
             }
         });
         for press in &presses {
-            if let Some(action) = command::resolve_key(press, text_focused) {
-                if global_key_allowed(action, text_focused) {
+            if let Some(action) = command::resolve_key(press, text_focused)
+                && global_key_allowed(action, text_focused) {
                     self.dispatch(action, now);
                 }
-            }
         }
     }
 
@@ -1522,13 +1518,12 @@ impl ReviewApp {
             self.pr_detail.filter_bar.popover_open = false;
             return;
         }
-        if let Some(session) = &mut self.session {
-            if session.composer.target.is_some() {
+        if let Some(session) = &mut self.session
+            && session.composer.target.is_some() {
                 composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
                 session.rebuild_rows();
                 return;
             }
-        }
         self.close_detail();
     }
 
@@ -1592,11 +1587,10 @@ impl ReviewApp {
             FileHeaderAction::OpenFind => self.pr_detail.find_open = true,
             FileHeaderAction::SetImageMode(mode) => self.pr_detail.diff.image_mode = mode,
             FileHeaderAction::ToggleRendered => {
-                if let Some(session) = &mut self.session {
-                    if let Some(index) = session.current_file().map(|(index, _)| index as u32) {
+                if let Some(session) = &mut self.session
+                    && let Some(index) = session.current_file().map(|(index, _)| index as u32) {
                         session.toggle_rendered_svg(index);
                     }
-                }
             }
         }
     }

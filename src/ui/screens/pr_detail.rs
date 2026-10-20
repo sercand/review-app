@@ -280,11 +280,10 @@ pub fn render(
     // Only capture while open: the close animation slides the panel through
     // every smaller width on its way out, and none of those are the size the
     // user chose.
-    if state.right_open {
-        if let Some(right) = right {
+    if state.right_open
+        && let Some(right) = right {
             state.right_pane = right.response.rect.width();
         }
-    }
 
     // The review draft is edited and submitted from the top bar's popover
     // now (Task 12); the banners it used to carry moved to the strip above

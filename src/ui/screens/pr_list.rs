@@ -259,9 +259,9 @@ fn handle_shortcuts(
         form.sort_open = false;
         ui.memory_mut(|mem| mem.request_focus(filter_id));
     }
-    if enter && !form.repo_open && !form.sort_open && focused != Some(filter_id) {
-        if let Some((repo_id, number)) = state.selected.clone() {
-            if let Some(pr) = state
+    if enter && !form.repo_open && !form.sort_open && focused != Some(filter_id)
+        && let Some((repo_id, number)) = state.selected.clone()
+            && let Some(pr) = state
                 .items
                 .iter()
                 .find(|pr| pr.repo.id() == repo_id && pr.number == number)
@@ -271,8 +271,6 @@ fn handle_shortcuts(
                     number,
                 });
             }
-        }
-    }
 }
 
 /// The two toolbar rows: scope chips with counts on top, then the repository
