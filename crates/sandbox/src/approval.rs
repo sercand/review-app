@@ -21,14 +21,16 @@ pub enum Verdict {
 
 /// Decide whether `command` may run silently or must be approved.
 ///
-/// `allowed` is the repo's configured commands plus commands the user approved
-/// "for this review" (the caller concatenates them). A segment runs when its
-/// first word is in the read-only allowlist, when it is `git` with a read-only
-/// subcommand, or when its normalized text matches an `allowed` entry exactly
-/// or as a whole-word prefix (approval also overrides wrappers and a leading
-/// `VAR=value`). Shell constructs that can hide execution or writes —
-/// command/process substitution, heredocs, unbalanced quotes, output
-/// redirection outside `/dev/null` and `$TMPDIR` — always ask.
+/// `allowed` is the repo's configured commands only: approvals the user grants
+/// "for this review" are remembered by the caller as exact lines and checked
+/// before this function runs, so they are never prefix-matched here. A segment
+/// runs when its first word is in the read-only allowlist, when it is `git`
+/// with a read-only subcommand, or when its normalized text matches an
+/// `allowed` entry exactly or as a whole-word prefix (an explicitly allowed
+/// entry also overrides wrappers and a leading `VAR=value`). Shell constructs
+/// that can hide execution or writes — command/process substitution, heredocs,
+/// unbalanced quotes, output redirection outside `/dev/null` and `$TMPDIR` —
+/// always ask.
 pub fn classify(command: &str, allowed: &[String]) -> Verdict {
     let segments = match tokenize(command) {
         Ok(segments) => segments,

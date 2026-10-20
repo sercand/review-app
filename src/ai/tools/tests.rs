@@ -350,6 +350,40 @@ async fn for_review_never_grants_a_bare_wrapper() {
     );
 }
 
+#[tokio::test]
+async fn for_review_preserves_whitespace_inside_quotes() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "sh -c 'echo  hi'"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert_eq!(remembered(&cx), ["sh -c 'echo  hi'"]);
+
+    // No decision is queued: the scripted user denies. Spaces inside the quotes
+    // are command text, so this is a different line.
+    let out = bash(&cx, json!({"command": "sh -c 'echo hi'"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert_eq!(interaction.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn for_review_preserves_newlines_inside_quotes() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "sh -c 'echo a'"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert_eq!(remembered(&cx), ["sh -c 'echo a'"]);
+
+    // A newline inside the quotes separates two commands inside `sh -c`; it is
+    // not formatting. No decision is queued, so this asks and is denied.
+    let out = bash(&cx, json!({"command": "sh -c 'echo\na'"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert_eq!(interaction.calls().len(), 2);
+}
+
 /// A 1×1 PNG, encoded by the `image` crate.
 fn png_1x1() -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());

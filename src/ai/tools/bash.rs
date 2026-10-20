@@ -134,8 +134,97 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     }
 }
 
-/// The line "for this review" remembers: runs of whitespace collapsed, every
-/// other character — quotes, escapes, globs — kept verbatim.
+/// The line "for this review" remembers.
+///
+/// Outside quotes every run of whitespace becomes one space and leading and
+/// trailing whitespace is dropped. Inside quotes — and after a backslash
+/// escape, which applies outside quotes and inside double quotes (inside single
+/// quotes it is literal) — characters are copied verbatim, whitespace included.
+/// Quote and backslash characters are kept, so the result is still the line the
+/// user approved.
+///
+/// Whitespace inside quotes is command text, not formatting: collapsing it
+/// would make `sh -c 'echo  hi'` and `sh -c 'echo hi'` one approved line, and
+/// would turn a newline inside `sh -c '…'` into a plain space.
 fn normalized_line(command: &str) -> String {
-    command.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut pending_space = false;
+    for c in command.chars() {
+        if let Some(open) = quote {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' && open == '"' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        if escaped {
+            // A backslash escapes exactly one character: keep both verbatim and
+            // do not read the character as a separator or a quote.
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            c if c.is_whitespace() => pending_space = true,
+            '\'' | '"' | '\\' => {
+                flush_space(&mut out, &mut pending_space);
+                out.push(c);
+                if c == '\\' {
+                    escaped = true;
+                } else {
+                    quote = Some(c);
+                }
+            }
+            c => {
+                flush_space(&mut out, &mut pending_space);
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Writes the pending collapsed space, unless the output is empty (which trims
+/// leading whitespace; a pending space at the end is simply never written).
+fn flush_space(out: &mut String, pending_space: &mut bool) {
+    if std::mem::replace(pending_space, false) && !out.is_empty() {
+        out.push(' ');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalized_line;
+
+    #[test]
+    fn normalization_collapses_only_unquoted_whitespace() {
+        assert_eq!(
+            normalized_line("  a   'b  c'\n\"d  e\""),
+            "a 'b  c' \"d  e\""
+        );
+        assert_eq!(normalized_line("touch  a"), "touch a");
+        assert_eq!(normalized_line("  touch a  "), "touch a");
+        // Quoted whitespace is command text: these are different lines.
+        assert_eq!(normalized_line("sh -c 'echo  hi'"), "sh -c 'echo  hi'");
+        assert_ne!(
+            normalized_line("sh -c 'echo  hi'"),
+            normalized_line("sh -c 'echo hi'")
+        );
+        assert_ne!(
+            normalized_line("sh -c 'echo\na'"),
+            normalized_line("sh -c 'echo a'")
+        );
+        // Escaped whitespace is literal too, inside and outside quotes.
+        assert_eq!(normalized_line("echo a\\  b"), "echo a\\  b");
+        assert_ne!(normalized_line("echo a\\ b"), normalized_line("echo a b"));
+        assert_eq!(normalized_line("echo \"a  b\""), "echo \"a  b\"");
+        // An escaped quote is not a quote: the following text stays unquoted.
+        assert_eq!(normalized_line("echo \\' a   b"), "echo \\' a b");
+    }
 }
