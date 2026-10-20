@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use super::{
     AgentRef, AgentRole, IMAGE_MAX_SIDE, MAX_TOOL_OUTPUT, Registry, Tool, ToolCx, ToolOutput, all,
-    is_forbidden_tool_name, truncate_middle,
+    is_forbidden_tool_name, truncate_middle, validate_rev,
 };
 
 fn tool(name: &str) -> Arc<dyn Tool> {
@@ -503,6 +503,230 @@ async fn glob_and_grep_tools_format() {
     assert!(out.is_error);
 }
 
+/// A noise-like 2000×2000 PNG: large enough that its bytes dwarf a 10×10 one.
+fn noisy_png(w: u32, h: u32) -> image::RgbImage {
+    image::RgbImage::from_fn(w, h, |x, y| {
+        let v = ((x / 3) ^ (y / 5)) as u8;
+        image::Rgb([v, v.wrapping_add(85), v.wrapping_add(170)])
+    })
+}
+
+#[tokio::test]
+async fn asset_stats_compares_with_siblings() {
+    let (dir, host) = host();
+    std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+    for name in ["a.png", "b.png", "c.png"] {
+        image::RgbImage::from_pixel(10, 10, image::Rgb([10, 20, 30]))
+            .save(dir.path().join("assets").join(name))
+            .unwrap();
+    }
+    noisy_png(2000, 2000)
+        .save(dir.path().join("assets/big.png"))
+        .unwrap();
+
+    let out = call(&host, "asset_stats", json!({"path": "assets/big.png"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let v: Value = serde_json::from_str(text(&out)).unwrap();
+    assert_eq!(v["path"], "assets/big.png");
+    assert_eq!(v["format"], "png");
+    assert_eq!(v["width"], 2000);
+    assert_eq!(v["height"], 2000);
+    assert_eq!(v["siblings"]["count"], 3);
+    assert_eq!(v["siblings"]["median_width"], 10);
+    assert_eq!(v["siblings"]["median_height"], 10);
+    assert_eq!(
+        v["siblings"]["max_bytes"].as_u64().unwrap(),
+        std::fs::metadata(dir.path().join("assets/a.png"))
+            .unwrap()
+            .len()
+    );
+    assert!(v["ratio_to_median"].as_f64().unwrap() > 10.0, "{v}");
+    assert_eq!(
+        v["bytes"].as_u64().unwrap(),
+        std::fs::metadata(dir.path().join("assets/big.png"))
+            .unwrap()
+            .len()
+    );
+
+    // A non-image has no dimensions; its format comes from the extension. A zero
+    // median (empty files) gives a null ratio rather than a division by zero.
+    std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+    std::fs::write(dir.path().join("more.txt"), "").unwrap();
+    let out = call(&host, "asset_stats", json!({"path": "notes.txt"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let v: Value = serde_json::from_str(text(&out)).unwrap();
+    assert_eq!(v["format"], "txt");
+    assert_eq!(v["width"], Value::Null);
+    assert_eq!(v["height"], Value::Null);
+    assert_eq!(v["siblings"]["count"], 1);
+    assert_eq!(v["siblings"]["median_bytes"], 0);
+    assert_eq!(v["siblings"]["median_width"], Value::Null);
+    assert_eq!(v["ratio_to_median"], Value::Null);
+
+    let out = call(&host, "asset_stats", json!({"path": "missing.png"})).await;
+    assert!(out.is_error);
+    let out = call(&host, "asset_stats", json!({"path": "assets"})).await;
+    assert!(out.is_error);
+    let out = call(&host, "asset_stats", json!({"path": "../outside.png"})).await;
+    assert!(out.is_error);
+}
+
+#[tokio::test]
+async fn list_dir_reports_sizes_and_kinds() {
+    let (dir, host) = host();
+    std::fs::create_dir_all(dir.path().join("assets/sub")).unwrap();
+    std::fs::write(dir.path().join("assets/a.rs"), "fn main").unwrap();
+    std::fs::write(dir.path().join("assets/z.txt"), "abc").unwrap();
+
+    let out = call(&host, "list_dir", json!({"path": "assets"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let lines: Vec<&str> = text(&out).lines().collect();
+    assert_eq!(lines.len(), 3, "{}", text(&out));
+    assert_eq!(lines[0], "a.rs\t7\tfile");
+    assert!(lines[1].starts_with("sub\t"), "{}", lines[1]);
+    assert!(lines[1].ends_with("\tdir"), "{}", lines[1]);
+    assert_eq!(lines[2], "z.txt\t3\tfile");
+
+    // The checkout root itself is the default for an empty path.
+    let out = call(&host, "list_dir", json!({"path": ""})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("assets\t"), "{}", text(&out));
+
+    std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+    let out = call(&host, "list_dir", json!({"path": "empty"})).await;
+    assert!(!out.is_error);
+    assert_eq!(text(&out), "(empty directory)");
+
+    // Past 500 entries the rest are counted, not listed.
+    std::fs::create_dir_all(dir.path().join("bulk")).unwrap();
+    for i in 0..505 {
+        std::fs::write(dir.path().join(format!("bulk/f{i:03}.txt")), "").unwrap();
+    }
+    let out = call(&host, "list_dir", json!({"path": "bulk"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let t = text(&out);
+    assert_eq!(t.lines().count(), 501, "{}", &t[t.len() - 40..]);
+    assert!(t.ends_with("\n[5 more]"), "{}", &t[t.len() - 40..]);
+
+    let out = call(&host, "list_dir", json!({"path": "missing"})).await;
+    assert!(out.is_error);
+    let out = call(&host, "list_dir", json!({"path": "../outside"})).await;
+    assert!(out.is_error);
+}
+
+#[test]
+fn validate_rev_rejects_option_injection() {
+    for r in ["--output=/tmp/x", "-p", "a b", "HEAD;rm", ""] {
+        assert!(validate_rev(r).is_err(), "{r}");
+    }
+    for r in ["HEAD~2", "abc123", "origin/main", "HEAD@{1}", "v1.2.3^{}"] {
+        assert!(validate_rev(r).is_ok(), "{r}");
+    }
+}
+
+/// Runs git in `dir` for test setup, failing the test on any error.
+fn git_setup(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn git_log_and_show_work_on_a_temp_repo() {
+    let (dir, host) = host();
+    git_setup(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    git_setup(dir.path(), &["add", "."]);
+    git_setup(dir.path(), &["commit", "-q", "-m", "first commit"]);
+    std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "bee\n").unwrap();
+    git_setup(dir.path(), &["add", "."]);
+    git_setup(dir.path(), &["commit", "-q", "-m", "second commit"]);
+
+    let out = call(&host, "git_log", json!({})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let lines: Vec<&str> = text(&out).lines().collect();
+    assert_eq!(lines.len(), 2, "{}", text(&out));
+    assert!(lines[0].contains("second commit"), "{}", text(&out));
+    assert!(lines[1].contains("first commit"), "{}", text(&out));
+
+    // n caps the list; a path limits it to commits that touched the file.
+    let out = call(&host, "git_log", json!({"n": 1})).await;
+    assert!(!out.is_error);
+    assert_eq!(text(&out).lines().count(), 1, "{}", text(&out));
+    let out = call(&host, "git_log", json!({"path": "b.txt"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    let log = text(&out);
+    assert!(log.contains("second commit"), "{log}");
+    assert!(!log.contains("first commit"), "{log}");
+
+    // git_show prints a commit with its patch.
+    let out = call(&host, "git_show", json!({"rev": "HEAD"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("second commit"), "{}", text(&out));
+    assert!(text(&out).contains("+bee"), "{}", text(&out));
+    // With a path, only that path's part of the commit.
+    let out = call(&host, "git_show", json!({"rev": "HEAD", "path": "b.txt"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("+bee"), "{}", text(&out));
+    assert!(!text(&out).contains("+two"), "{}", text(&out));
+
+    let out = call(&host, "git_diff", json!({"range": "HEAD~1..HEAD"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("+two"), "{}", text(&out));
+    assert!(text(&out).contains("+bee"), "{}", text(&out));
+    let out = call(
+        &host,
+        "git_diff",
+        json!({"range": "HEAD~1..HEAD", "path": "a.txt"}),
+    )
+    .await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("+two"), "{}", text(&out));
+    assert!(!text(&out).contains("+bee"), "{}", text(&out));
+
+    // Option injection is refused before git runs.
+    let out = call(&host, "git_show", json!({"rev": "--output=/tmp/x"})).await;
+    assert!(out.is_error);
+    assert!(text(&out).contains("rev"), "{}", text(&out));
+    // A rev git does not know is a tool error, not a panic or a success.
+    let out = call(&host, "git_show", json!({"rev": "no-such-rev"})).await;
+    assert!(out.is_error, "{}", text(&out));
+    // A mixed range (`a..b...c`) is refused.
+    let out = call(&host, "git_diff", json!({"range": "HEAD~1..HEAD..HEAD"})).await;
+    assert!(out.is_error);
+}
+
+#[tokio::test]
+async fn git_diff_path_outside_repo_is_rejected() {
+    let (dir, host) = host();
+    git_setup(dir.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    git_setup(dir.path(), &["add", "."]);
+    git_setup(dir.path(), &["commit", "-q", "-m", "first commit"]);
+
+    let out = call(&host, "git_diff", json!({"range": "HEAD", "path": "../x"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).contains("escapes the project root"),
+        "{}",
+        text(&out)
+    );
+    // A path cannot smuggle an option either.
+    let out = call(&host, "git_diff", json!({"range": "HEAD", "path": "-p"})).await;
+    assert!(out.is_error, "{}", text(&out));
+    let out = call(&host, "git_log", json!({"path": "../x"})).await;
+    assert!(out.is_error);
+}
+
 #[test]
 fn truncate_middle_keeps_head_and_tail() {
     assert_eq!(truncate_middle("short", 10), "short");
@@ -543,7 +767,20 @@ fn truncate_middle_keeps_head_and_tail() {
 fn tool_definitions_have_valid_schemas() {
     let tools = all();
     let names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
-    assert_eq!(names, ["bash", "read_file", "glob", "grep"]);
+    assert_eq!(
+        names,
+        [
+            "bash",
+            "read_file",
+            "glob",
+            "grep",
+            "list_dir",
+            "asset_stats",
+            "git_show",
+            "git_log",
+            "git_diff"
+        ]
+    );
     for t in &tools {
         let def = t.definition();
         assert!(!def.description.is_empty());
@@ -559,6 +796,11 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(req("read_file"), ["path"]);
     assert_eq!(req("glob"), ["pattern"]);
     assert_eq!(req("grep"), ["pattern"]);
+    assert_eq!(req("list_dir"), ["path"]);
+    assert_eq!(req("asset_stats"), ["path"]);
+    assert_eq!(req("git_show"), ["rev"]);
+    assert!(req("git_log").is_empty());
+    assert_eq!(req("git_diff"), ["range"]);
     let props = |name: &str| -> Vec<String> {
         let mut v: Vec<String> = tool(name).definition().input_schema["properties"]
             .as_object()
@@ -573,6 +815,11 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(props("read_file"), ["limit", "offset", "path"]);
     assert_eq!(props("glob"), ["directory", "pattern"]);
     assert_eq!(props("grep"), ["directory", "glob", "pattern"]);
+    assert_eq!(props("list_dir"), ["path"]);
+    assert_eq!(props("asset_stats"), ["path"]);
+    assert_eq!(props("git_show"), ["path", "rev"]);
+    assert_eq!(props("git_log"), ["n", "path"]);
+    assert_eq!(props("git_diff"), ["path", "range"]);
 }
 
 /// The registry hands out every definition in order, and looks a tool up by name.
@@ -586,6 +833,11 @@ fn registry_definitions_and_lookup() {
     assert!(registry.get("read_file").is_some());
     assert!(registry.get("glob").is_some());
     assert!(registry.get("grep").is_some());
+    assert!(registry.get("list_dir").is_some());
+    assert!(registry.get("asset_stats").is_some());
+    assert!(registry.get("git_show").is_some());
+    assert!(registry.get("git_log").is_some());
+    assert!(registry.get("git_diff").is_some());
     assert!(registry.get("edit_file").is_none());
     assert!(registry.get("").is_none());
 }
@@ -601,8 +853,18 @@ fn registry_has_no_write_or_merge_tools() {
             "{name} is a write or merge tool; the review agent is read-only"
         );
     }
-    // The four read-only tools every agent needs are there.
-    for required in ["bash", "read_file", "glob", "grep"] {
+    // The read-only tools every agent needs are there.
+    for required in [
+        "bash",
+        "read_file",
+        "glob",
+        "grep",
+        "list_dir",
+        "asset_stats",
+        "git_show",
+        "git_log",
+        "git_diff",
+    ] {
         assert!(
             names.iter().any(|n| n == required),
             "missing {required}: {names:?}"

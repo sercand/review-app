@@ -1,7 +1,9 @@
-//! The review agent's read-only repo tools: `bash`, `read_file`, `glob` and
-//! `grep`, with mono's names, schemas and messages, run against any
+//! The review agent's read-only repo tools: `bash`, `read_file`, `glob`,
+//! `grep`, `list_dir`, `asset_stats` and `git_show`/`git_log`/`git_diff`, with
+//! mono's names and schemas where they exist, run against any
 //! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
-//! temp-dir host in tests).
+//! temp-dir host in tests). The git tools run `git` directly in the checkout,
+//! so they work even when `bash` is blocked.
 //!
 //! Every text result is cut to [`MAX_TOOL_OUTPUT`] bytes by [`truncate_middle`].
 //! Bad input and failed sandbox ops are tool errors (`is_error`) that carry the
@@ -15,6 +17,8 @@
 
 mod bash;
 mod files;
+mod git;
+mod inspect;
 mod search;
 mod truncate;
 
@@ -29,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
+pub use git::validate_rev;
 pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};
 
 /// Which kind of agent a tool call belongs to.
@@ -168,6 +173,11 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(files::ReadFile),
         Arc::new(search::Glob),
         Arc::new(search::Grep),
+        Arc::new(inspect::ListDir),
+        Arc::new(inspect::AssetStats),
+        Arc::new(git::GitShow),
+        Arc::new(git::GitLog),
+        Arc::new(git::GitDiff),
     ]
 }
 
