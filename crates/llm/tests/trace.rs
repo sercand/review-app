@@ -9,9 +9,7 @@ use std::{
 
 use common::*;
 use futures::StreamExt;
-use review_llm::{
-    ApiType, ChatRole, Client, ClientConfig, LLM, LLMConfig, RetryPolicy, StreamEvent,
-};
+use review_llm::{ApiType, Client, ClientConfig, RetryPolicy, StreamEvent};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
@@ -70,12 +68,6 @@ async fn unary_calls_on_every_api() {
         .respond_with(ResponseTemplate::new(200).set_body_json(resp.clone()))
         .mount(&server)
         .await;
-    Mock::given(path("/v1/decisions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(read_json("decisions/decide.response.json")),
-        )
-        .mount(&server)
-        .await;
     let t = trace_file("unary");
     client(&server.uri(), ApiType::AnthropicMessages, &t)
         .generate(text())
@@ -85,13 +77,9 @@ async fn unary_calls_on_every_api() {
         .generate(text())
         .await
         .unwrap();
-    client(&server.uri(), ApiType::Decisions, &t)
-        .decide(decide())
-        .await
-        .unwrap();
 
     let l = lines(&t);
-    assert_eq!(l.len(), 3);
+    assert_eq!(l.len(), 2);
     let a = &l[0];
     assert_eq!(a["api"], "anthropic_messages");
     assert_eq!(a["provider"], "mock");
@@ -127,20 +115,12 @@ async fn unary_calls_on_every_api() {
         read_json("responses/text.request.json")
     );
     assert_eq!(r["response"]["body"], resp);
-
-    let d = &l[2];
-    assert_eq!(d["api"], "decisions");
-    assert_eq!(d["request"]["headers"]["authorization"], "[redacted]");
-    assert_eq!(
-        d["request"]["body"],
-        read_json("decisions/decide.request.json")
-    );
 }
 
 #[tokio::test]
 async fn one_line_per_attempt_with_the_same_call_id() {
     for (api, p) in [
-        (ApiType::Decisions, "/v1/decisions"),
+        (ApiType::AnthropicMessages, "/v1/messages"),
         (ApiType::OpenaiResponses, "/v1/responses"),
     ] {
         let server = MockServer::start().await;
@@ -150,7 +130,9 @@ async fn one_line_per_attempt_with_the_same_call_id() {
             .mount(&server)
             .await;
         let ok = match api {
-            ApiType::Decisions => read_json("decisions/decide.response.json"),
+            ApiType::AnthropicMessages => {
+                json!({"content": [], "stop_reason": "end_turn", "usage": {}})
+            }
             _ => json!({"status": "completed", "output": [], "usage": {}}),
         };
         Mock::given(path(p))
@@ -159,10 +141,7 @@ async fn one_line_per_attempt_with_the_same_call_id() {
             .await;
         let t = trace_file(&format!("retry-{api}"));
         let c = client(&server.uri(), api, &t);
-        match api {
-            ApiType::Decisions => drop(c.decide(decide()).await.unwrap()),
-            _ => drop(c.generate(text()).await.unwrap()),
-        }
+        drop(c.generate(text()).await.unwrap());
         let l = lines(&t);
         assert_eq!(l.len(), 3, "{api}");
         let attempts: Vec<_> = l.iter().map(|x| x["attempt"].as_u64().unwrap()).collect();
@@ -223,11 +202,11 @@ async fn streams_record_their_events() {
 #[tokio::test]
 async fn transport_errors_have_no_response() {
     let t = trace_file("transport");
-    let mut cfg = ClientConfig::new(ApiType::Decisions, SecretString::from(KEY))
+    let mut cfg = ClientConfig::new(ApiType::AnthropicMessages, SecretString::from(KEY))
         .base_url("http://127.0.0.1:9".parse().unwrap());
     cfg.retry = RetryPolicy::none();
     cfg.trace = Some(t.clone());
-    assert!(Client::new(cfg).unwrap().decide(decide()).await.is_err());
+    assert!(Client::new(cfg).unwrap().generate(text()).await.is_err());
     let l = lines(&t);
     assert_eq!(l.len(), 1);
     assert!(l[0]["response"].is_null());
@@ -262,22 +241,6 @@ async fn key_in_error_bodies_and_headers_is_redacted() {
 #[tokio::test]
 async fn unwritable_trace_path_never_fails_the_call() {
     let server = MockServer::start().await;
-    Mock::given(path("/v1/decisions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(read_json("decisions/decide.response.json")),
-        )
-        .mount(&server)
-        .await;
-    let bad = PathBuf::from("/dev/null/not-a-dir/trace.jsonl");
-    client(&server.uri(), ApiType::Decisions, &bad)
-        .decide(decide())
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn role_handles_record_their_role() {
-    let server = MockServer::start().await;
     Mock::given(path("/v1/messages"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -285,30 +248,9 @@ async fn role_handles_record_their_role() {
         )
         .mount(&server)
         .await;
-    let cfg: LLMConfig = toml::from_str(&format!(
-        r#"
-[providers.edge]
-base_url = "{}"
-apis = ["anthropic_messages"]
-[defaults]
-chat = {{ provider = "edge", model = "m" }}
-"#,
-        server.uri()
-    ))
-    .unwrap();
-    let t = trace_file("role");
-    let llm = LLM::from_config(&cfg, |_| Some(SecretString::from(KEY)))
-        .unwrap()
-        .with_trace(&t);
-    let mut req = text();
-    req.model = None;
-    llm.chat(ChatRole::Vision)
-        .unwrap()
-        .generate(req)
+    let bad = PathBuf::from("/dev/null/not-a-dir/trace.jsonl");
+    client(&server.uri(), ApiType::AnthropicMessages, &bad)
+        .generate(text())
         .await
         .unwrap();
-    let l = lines(&t);
-    assert_eq!(l[0]["role"], "vision");
-    assert_eq!(l[0]["from_default"], true);
-    assert_eq!(l[0]["model"], "m");
 }

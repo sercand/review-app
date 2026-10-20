@@ -16,7 +16,7 @@ use reqwest::header::HeaderMap;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Value, json};
 
-use crate::{ApiType, Role};
+use crate::ApiType;
 
 /// An open trace file, shared by every client that traces to the same path.
 struct Sink {
@@ -72,8 +72,6 @@ pub(crate) struct TraceCall {
     api: ApiType,
     provider: String,
     model: String,
-    role: Option<Role>,
-    from_default: bool,
     stream: bool,
     attempts: AtomicU32,
     /// A stream opened inside an HTTP service, waiting for its events (OpenAI path).
@@ -103,24 +101,13 @@ fn call_id() -> String {
 }
 
 impl TraceCall {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        trace: &Trace,
-        api: ApiType,
-        provider: &str,
-        model: &str,
-        role: Option<Role>,
-        from_default: bool,
-        stream: bool,
-    ) -> Self {
+    pub fn new(trace: &Trace, api: ApiType, provider: &str, model: &str, stream: bool) -> Self {
         Self {
             trace: trace.clone(),
             call_id: call_id(),
             api,
             provider: provider.to_owned(),
             model: model.to_owned(),
-            role,
-            from_default,
             stream,
             attempts: AtomicU32::new(0),
             pending: Mutex::new(None),
@@ -183,8 +170,6 @@ impl TraceCall {
             "api": self.api,
             "provider": self.provider,
             "model": self.model,
-            "role": self.role,
-            "from_default": self.from_default,
             "stream": self.stream,
             "latency_ms": latency,
             "request": {
@@ -300,7 +285,7 @@ mod tests {
             sink: None,
             key: SecretString::from("sk-secret"),
         };
-        let call = TraceCall::new(&trace, ApiType::Decisions, "p", "m", None, false, false);
+        let call = TraceCall::new(&trace, ApiType::AnthropicMessages, "p", "m", false);
         let mut h = HeaderMap::new();
         h.insert(
             "authorization",

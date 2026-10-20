@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use review_llm::{
-    ContentBlock, DecideRequest, GenerateRequest, Image, Message, Question, Reply, StopReason,
-    Tool, ToolChoice, ToolResultPart,
+    ContentBlock, GenerateRequest, Image, Message, Reply, StopReason, Tool, ToolChoice,
+    ToolResultPart,
 };
 use serde_json::{Value, json};
 
@@ -190,39 +190,6 @@ pub fn chat_cases() -> Vec<(&'static str, GenerateRequest)> {
     ]
 }
 
-/// Three question types on one image.
-pub fn decide() -> DecideRequest {
-    let mut r = DecideRequest::new(
-        vec![Message::user(vec![
-            ContentBlock::text("Goal: start Level 1. The screenshot shows the current screen."),
-            ContentBlock::Image(red_png()),
-        ])],
-        vec![
-            Question::predicate("is_red", "Is the screen mostly red?"),
-            Question::choice(
-                "next_action",
-                "Which action moves toward the goal?",
-                [
-                    ("tap:btn_level_1", "Tap the 'Level 1' button"),
-                    ("wait", "Wait for the screen to change"),
-                    ("ask_planner", "None of these fits"),
-                ],
-            ),
-            Question::score(
-                "ui_glitch",
-                "How broken does the UI look?",
-                [
-                    ("Clean", "No visual problems"),
-                    ("Minor glitch", "Cosmetic issue, still usable"),
-                    ("Severe", "Broken layout or unreadable UI"),
-                ],
-            ),
-        ],
-    );
-    r.model = Some(MODEL.into());
-    r
-}
-
 // ---- per-case checks on a reply ----
 
 pub fn check_text(reply: &Reply) {
@@ -276,27 +243,4 @@ pub fn check_case(name: &str, reply: &Reply) {
         "tool_result_image" => check_image(reply),
         other => panic!("unknown case {other}"),
     }
-}
-
-// ---- the kedis-studio Decisions experiment ----
-
-/// Step 7 of kedis-studio run `DecisionAgentRuns/20261015-160411`: the parent gate asks for
-/// a year of birth and the goal says to type 1, 9, 9, 9. The screenshot carries set-of-marks
-/// letters; `B` is the keypad's `1`.
-pub fn kedis_step07() -> DecideRequest {
-    let recorded = read_json("decisions/kedis_step07.request.json");
-    let text = recorded["input"][0]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let jpg = std::fs::read(fixtures().join("decisions/kedis_step07.jpg")).unwrap();
-    let mut req = DecideRequest::new(
-        vec![Message::user(vec![
-            ContentBlock::text(text),
-            ContentBlock::Image(Image::from_bytes("image/jpeg", &jpg)),
-        ])],
-        serde_json::from_value(recorded["questions"].clone()).unwrap(),
-    );
-    req.model = Some(MODEL.into());
-    req
 }

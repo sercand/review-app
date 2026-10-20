@@ -1,6 +1,6 @@
 [package]
 name = "review-llm"
-description = "LLM clients for Anthropic Messages, OpenAI Responses and `/v1/decisions` behind neutral types: typed role routing, image and video input, history trimming, a trace file and tool definitions."
+description = "LLM clients for Anthropic Messages and OpenAI Responses behind neutral types: image and video input, history trimming, a trace file and tool definitions."
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
@@ -32,5 +32,4 @@ tower = { version = "0.5.3", default-features = false }
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]
-toml = "1.1"
 wiremock = "0.6.5"

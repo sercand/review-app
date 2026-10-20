@@ -1,4 +1,4 @@
-//! JSON and SSE POSTs with retries, shared by the in-crate Anthropic and Decisions clients.
+//! JSON and SSE POSTs with retries, shared by the in-crate API clients.
 
 use std::{
     sync::{Arc, Mutex},

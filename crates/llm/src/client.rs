@@ -11,8 +11,7 @@ use secrecy::SecretString;
 use url::Url;
 
 use crate::{
-    ApiType, CallMeta, DecideRequest, Decision, Error, GenerateRequest, Kind, Reply, Result, Role,
-    StreamEvent, anthropic, decisions,
+    ApiType, CallMeta, Error, GenerateRequest, Reply, Result, StreamEvent, anthropic,
     http::header_map,
     openai,
     retry::RetryPolicy,
@@ -20,7 +19,6 @@ use crate::{
 };
 
 const CHAT_TIMEOUT: Duration = Duration::from_secs(120);
-const DECISIONS_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_IDLE: Duration = Duration::from_secs(60);
 
 /// How to reach one API of one provider.
@@ -29,11 +27,10 @@ pub struct ClientConfig {
     /// Provider name, recorded in [`CallMeta`].
     pub provider: String,
     pub api: ApiType,
-    /// Root URL, with or without a trailing `/v1`. `None` uses the vendor default; required
-    /// for `decisions`.
+    /// Root URL, with or without a trailing `/v1`. `None` uses the vendor default.
     pub base_url: Option<Url>,
     pub api_key: SecretString,
-    /// Total request timeout. Default: 10s for `decisions`, 120s for chat.
+    /// Total request timeout. Default: 120s.
     pub timeout: Option<Duration>,
     /// No event for this long fails a stream. Default 60s.
     pub stream_idle_timeout: Option<Duration>,
@@ -49,6 +46,7 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    /// A config for `api` with its key; `provider` defaults to the API name.
     pub fn new(api: ApiType, api_key: SecretString) -> Self {
         Self {
             provider: api.as_str().to_owned(),
@@ -64,6 +62,7 @@ impl ClientConfig {
         }
     }
 
+    /// Sets the root URL the client appends `/v1/...` to.
     pub fn base_url(mut self, url: Url) -> Self {
         self.base_url = Some(url);
         self
@@ -71,13 +70,11 @@ impl ClientConfig {
 }
 
 enum Inner {
-    Anthropic(anthropic::Client),
+    Anthropic(Box<anthropic::Client>),
     OpenAi(Box<openai::Client>),
-    Decisions(decisions::Client),
 }
 
-/// One wire API on one provider: `generate` and `generate_stream` for chat APIs, `decide`
-/// for `decisions`. Cheap to clone.
+/// One wire API on one provider: `generate` and `generate_stream`. Cheap to clone.
 #[derive(Clone)]
 pub struct Client {
     provider: Arc<str>,
@@ -96,20 +93,12 @@ impl fmt::Debug for Client {
     }
 }
 
-/// The role a call is made for, when it comes through a role handle.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Tag {
-    pub role: Option<Role>,
-    pub from_default: bool,
-}
-
 /// Per-call data for [`CallMeta`] and the trace.
 pub(crate) struct CallCtx {
     pub provider: Arc<str>,
     pub api: ApiType,
     pub model: String,
     pub started: Instant,
-    pub tag: Tag,
     pub trace: Option<Arc<TraceCall>>,
 }
 
@@ -119,8 +108,6 @@ impl CallCtx {
             api: self.api,
             provider: self.provider.to_string(),
             model: self.model.clone(),
-            role: self.tag.role,
-            from_default: self.tag.from_default,
             latency: self.started.elapsed(),
         }
     }
@@ -137,28 +124,20 @@ fn api_root(url: &str) -> String {
 }
 
 impl Client {
+    /// Builds the client for the API named by `cfg`.
     pub fn new(cfg: ClientConfig) -> Result<Self> {
         let base = match (&cfg.base_url, cfg.api) {
             (Some(u), _) => api_root(u.as_str()),
             (None, ApiType::AnthropicMessages) => anthropic::DEFAULT_BASE_URL.to_owned(),
             (None, ApiType::OpenaiResponses) => openai::DEFAULT_BASE_URL.to_owned(),
-            (None, ApiType::Decisions) => {
-                return Err(Error::Config(format!(
-                    "provider `{}`: decisions needs a base_url",
-                    cfg.provider
-                )));
-            }
         };
-        let timeout = cfg.timeout.unwrap_or(match cfg.api.kind() {
-            Kind::Chat => CHAT_TIMEOUT,
-            Kind::Decision => DECISIONS_TIMEOUT,
-        });
+        let timeout = cfg.timeout.unwrap_or(CHAT_TIMEOUT);
         let idle = cfg.stream_idle_timeout.unwrap_or(STREAM_IDLE);
         let headers: Vec<(String, String)> = cfg.headers.clone().into_iter().collect();
         let key = cfg.api_key.clone();
         let trace = cfg.trace.as_deref().map(|p| Trace::new(p, key.clone()));
         let inner = match cfg.api {
-            ApiType::AnthropicMessages => Inner::Anthropic(anthropic::Client::new(
+            ApiType::AnthropicMessages => Inner::Anthropic(Box::new(anthropic::Client::new(
                 &base,
                 header_map(&headers)?,
                 cfg.api_key,
@@ -166,7 +145,7 @@ impl Client {
                 idle,
                 cfg.retry,
                 cfg.resolver.clone(),
-            )?),
+            )?)),
             ApiType::OpenaiResponses => Inner::OpenAi(Box::new(openai::Client::new(
                 &base,
                 &headers,
@@ -176,14 +155,6 @@ impl Client {
                 cfg.retry,
                 cfg.resolver.clone(),
             )?)),
-            ApiType::Decisions => Inner::Decisions(decisions::Client::new(
-                &base,
-                header_map(&headers)?,
-                cfg.api_key,
-                timeout,
-                cfg.retry,
-                cfg.resolver,
-            )?),
         };
         Ok(Self {
             provider: cfg.provider.into(),
@@ -200,73 +171,51 @@ impl Client {
         self
     }
 
+    /// The API this client speaks.
     pub fn api(&self) -> ApiType {
         self.api
     }
 
+    /// The provider name recorded in [`CallMeta`].
     pub fn provider(&self) -> &str {
         &self.provider
     }
 
-    fn ctx(&self, model: Option<&str>, tag: Tag, stream: bool) -> Result<CallCtx> {
+    fn ctx(&self, model: Option<&str>, stream: bool) -> Result<CallCtx> {
         let model = model
             .ok_or_else(|| Error::InvalidRequest("model is not set".into()))?
             .to_owned();
-        let trace = self.trace.as_ref().map(|t| {
-            Arc::new(TraceCall::new(
-                t,
-                self.api,
-                &self.provider,
-                &model,
-                tag.role,
-                tag.from_default,
-                stream,
-            ))
-        });
+        let trace = self
+            .trace
+            .as_ref()
+            .map(|t| Arc::new(TraceCall::new(t, self.api, &self.provider, &model, stream)));
         Ok(CallCtx {
             provider: self.provider.clone(),
             api: self.api,
             model,
             started: Instant::now(),
-            tag,
             trace,
         })
     }
 
-    fn unsupported(&self, op: &'static str) -> Error {
-        Error::Unsupported { api: self.api, op }
-    }
-
+    /// Sends a chat request and returns the full reply.
     pub async fn generate(&self, req: GenerateRequest) -> Result<Reply> {
-        self.generate_as(req, Tag::default()).await
-    }
-
-    pub(crate) async fn generate_as(&self, req: GenerateRequest, tag: Tag) -> Result<Reply> {
-        let ctx = self.ctx(req.model.as_deref(), tag, false)?;
+        let ctx = self.ctx(req.model.as_deref(), false)?;
         match &*self.inner {
             Inner::Anthropic(c) => c.generate(&req, ctx).await,
             Inner::OpenAi(c) => c.generate(&req, ctx).await,
-            Inner::Decisions(_) => Err(self.unsupported("generate")),
         }
     }
 
+    /// Streams a chat request as [`StreamEvent`]s.
     pub fn generate_stream(&self, req: GenerateRequest) -> BoxStream<'static, Result<StreamEvent>> {
-        self.generate_stream_as(req, Tag::default())
-    }
-
-    pub(crate) fn generate_stream_as(
-        &self,
-        req: GenerateRequest,
-        tag: Tag,
-    ) -> BoxStream<'static, Result<StreamEvent>> {
         let this = self.clone();
         futures::stream::once(async move {
             let opened = async {
-                let ctx = this.ctx(req.model.as_deref(), tag, true)?;
+                let ctx = this.ctx(req.model.as_deref(), true)?;
                 match &*this.inner {
                     Inner::Anthropic(c) => c.generate_stream(&req, ctx).await,
                     Inner::OpenAi(c) => c.generate_stream(&req, ctx).await,
-                    Inner::Decisions(_) => Err(this.unsupported("generate_stream")),
                 }
             }
             .await;
@@ -277,18 +226,6 @@ impl Client {
         })
         .flatten()
         .boxed()
-    }
-
-    pub async fn decide(&self, req: DecideRequest) -> Result<Decision> {
-        self.decide_as(req, Tag::default()).await
-    }
-
-    pub(crate) async fn decide_as(&self, req: DecideRequest, tag: Tag) -> Result<Decision> {
-        let Inner::Decisions(c) = &*self.inner else {
-            return Err(self.unsupported("decide"));
-        };
-        let ctx = self.ctx(req.model.as_deref(), tag, false)?;
-        c.decide(&req, ctx).await
     }
 }
 

@@ -1,15 +1,13 @@
 //! Wire shapes from the vendor docs that the recording engine doesn't emit: Anthropic
 //! thinking signatures and refusals, OpenAI `encrypted_content`, refusals and incomplete
-//! replies, unknown blocks, and decision refusals.
+//! replies, and unknown blocks.
 
 mod common;
 
 use common::*;
 use review_llm::{
-    Answer, ApiType, ContentBlock, Error, GenerateRequest, Message, StopReason,
-    wire::{
-        anthropic_reply, anthropic_request, decisions_reply, responses_reply, responses_request,
-    },
+    ApiType, ContentBlock, Error, GenerateRequest, Message, StopReason,
+    wire::{anthropic_reply, anthropic_request, responses_reply, responses_request},
 };
 use serde_json::json;
 
@@ -217,28 +215,6 @@ fn reasoning_maps_to_thinking_budget_and_effort() {
 }
 
 #[test]
-fn decision_refusal_and_missing_answer() {
-    let req = decide();
-    let d = decisions_reply(
-        &req,
-        &json!({"answers": [
-            {"type": "refusal", "name": "is_red"},
-            {"type": "choice", "name": "next_action", "choice": "wait", "probabilities": [], "confidence": 0.4},
-            {"type": "score", "name": "ui_glitch", "score": 0.2, "probabilities": [], "confidence": 0.9}
-        ]}),
-    )
-    .unwrap();
-    assert!(matches!(d.get("is_red"), Some(Answer::Refusal { .. })));
-
-    let err = decisions_reply(
-        &req,
-        &json!({"answers": [{"type": "refusal", "name": "is_red"}]}),
-    )
-    .unwrap_err();
-    assert!(matches!(err, Error::MissingAnswer { name } if name == "next_action"));
-}
-
-#[test]
 fn missing_model_is_invalid() {
     let mut req = text();
     req.model = None;
@@ -260,7 +236,7 @@ fn clip() -> review_llm::Video {
 }
 
 #[test]
-fn video_goes_as_input_video_on_responses_and_decisions() {
+fn video_goes_as_input_video_on_responses() {
     let v = clip();
     let req = model(GenerateRequest::new(vec![
         Message::user(vec![
@@ -287,14 +263,6 @@ fn video_goes_as_input_video_on_responses_and_decisions() {
         json!({"type": "input_video", "video_url": v.data_url()})
     );
     assert!(!r.to_string().contains("__review_llm_input_video__"));
-
-    let mut d = decide();
-    d.input[0].content.push(ContentBlock::Video(v.clone()));
-    let w = review_llm::wire::decisions_request(&d).unwrap();
-    assert_eq!(
-        w["input"][0]["content"][2],
-        json!({"type": "input_video", "video_url": v.data_url()})
-    );
 }
 
 #[test]

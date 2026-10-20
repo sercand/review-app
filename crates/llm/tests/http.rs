@@ -1,5 +1,5 @@
-//! Client behaviour against a mock server: paths, auth, SSE, retries, timeouts, role handles,
-//! and keys never leaking.
+//! Client behaviour against a mock server: paths, auth, SSE, retries, timeouts, and keys
+//! never leaking.
 
 mod common;
 
@@ -8,11 +8,11 @@ use std::{collections::BTreeMap, time::Duration};
 use common::*;
 use futures::StreamExt;
 use review_llm::{
-    ApiType, ChatRole, Client, ClientConfig, ContentBlock, DecisionRole, Error, LLM, LLMConfig,
-    Result, RetryPolicy, StopReason, StreamEvent,
+    ApiType, Client, ClientConfig, ContentBlock, Error, Result, RetryPolicy, StopReason,
+    StreamEvent,
 };
 use secrecy::SecretString;
-use serde_json::{Value, json};
+use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, header, method, path},
@@ -229,61 +229,21 @@ async fn responses_stream_text() {
 }
 
 #[tokio::test]
-async fn decisions_decide() {
-    let server = MockServer::start().await;
-    Mock::given(path("/v1/decisions"))
-        .and(header("authorization", format!("Bearer {KEY}").as_str()))
-        .and(body_json(read_json("decisions/decide.request.json")))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(read_json("decisions/decide.response.json")),
-        )
-        .mount(&server)
-        .await;
-    let d = client(&server, ApiType::Decisions)
-        .decide(decide())
-        .await
-        .unwrap();
-    assert_eq!(d.answers.len(), 3);
-    assert_eq!(d.meta.api, ApiType::Decisions);
-}
-
-#[tokio::test]
-async fn unsupported_operations() {
-    let server = MockServer::start().await;
-    let chat = client(&server, ApiType::AnthropicMessages);
-    assert!(matches!(
-        chat.decide(decide()).await,
-        Err(Error::Unsupported { op: "decide", .. })
-    ));
-    let dec = client(&server, ApiType::Decisions);
-    assert!(matches!(
-        dec.generate(text()).await,
-        Err(Error::Unsupported { op: "generate", .. })
-    ));
-    let mut s = dec.generate_stream(text());
-    assert!(matches!(
-        s.next().await,
-        Some(Err(Error::Unsupported { .. }))
-    ));
-    assert!(s.next().await.is_none());
-}
-
-#[tokio::test]
 async fn retries_429_with_retry_after_then_succeeds() {
     let server = MockServer::start().await;
-    Mock::given(path("/v1/decisions"))
+    Mock::given(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    Mock::given(path("/v1/decisions"))
+    Mock::given(path("/v1/messages"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(read_json("decisions/decide.response.json")),
+            ResponseTemplate::new(200).set_body_json(read_json("anthropic/text.response.json")),
         )
         .mount(&server)
         .await;
-    client(&server, ApiType::Decisions)
-        .decide(decide())
+    client(&server, ApiType::AnthropicMessages)
+        .generate(text())
         .await
         .unwrap();
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
@@ -363,133 +323,20 @@ async fn stream_is_not_retried_after_first_event() {
 #[tokio::test]
 async fn request_timeout() {
     let server = MockServer::start().await;
-    Mock::given(path("/v1/decisions"))
+    Mock::given(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
         .mount(&server)
         .await;
-    let mut cfg = ClientConfig::new(ApiType::Decisions, SecretString::from(KEY))
+    let mut cfg = ClientConfig::new(ApiType::AnthropicMessages, SecretString::from(KEY))
         .base_url(server.uri().parse().unwrap());
     cfg.timeout = Some(Duration::from_millis(50));
     cfg.retry = RetryPolicy::none();
     let err = Client::new(cfg)
         .unwrap()
-        .decide(decide())
+        .generate(text())
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err:?}");
-}
-
-fn llm_config(server: &MockServer) -> LLMConfig {
-    toml::from_str(&format!(
-        r#"
-[providers.edge]
-base_url = "{uri}"
-apis = ["openai_responses", "anthropic_messages", "decisions"]
-
-[defaults]
-chat = {{ provider = "edge", api = "anthropic_messages", model = "default-chat", max_tokens = 777 }}
-decision = {{ provider = "edge", model = "default-decision" }}
-
-[roles]
-agent = {{ provider = "edge", api = "openai_responses", model = "agent-model" }}
-"#,
-        uri = server.uri()
-    ))
-    .unwrap()
-}
-
-fn key_for(name: &str) -> Option<SecretString> {
-    (name == "edge").then(|| SecretString::from(KEY))
-}
-
-#[tokio::test]
-async fn llm_role_handles_fill_model_and_defaults() {
-    let server = MockServer::start().await;
-    let reply = |model: &str| json!({"content": [{"type": "text", "text": "hi"}], "model": model, "stop_reason": "end_turn", "usage": {}});
-    Mock::given(path("/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(reply("default-chat")))
-        .mount(&server)
-        .await;
-    Mock::given(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"status": "completed", "output": [], "usage": {}})),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(path("/v1/decisions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(read_json("decisions/decide.response.json")),
-        )
-        .mount(&server)
-        .await;
-    let llm = LLM::from_config(&llm_config(&server), key_for).unwrap();
-    assert!(!format!("{llm:?}").contains(KEY));
-
-    // vision: no role entry, uses the chat default
-    let mut req = text();
-    req.model = None;
-    req.max_tokens = None;
-    let vision = llm.chat(ChatRole::Vision).unwrap();
-    let r = vision.generate(req.clone()).await.unwrap();
-    assert_eq!(r.meta.role, Some(ChatRole::Vision.into()));
-    assert!(r.meta.from_default);
-    assert_eq!(r.meta.model, "default-chat");
-
-    // agent: its own entry on the Responses API
-    let agent = llm.chat(ChatRole::Agent).unwrap();
-    assert_eq!(agent.api(), ApiType::OpenaiResponses);
-    let r = agent.generate(req).await.unwrap();
-    assert!(!r.meta.from_default);
-    assert_eq!(r.meta.model, "agent-model");
-
-    let d = llm.decision(DecisionRole::DecideFast).unwrap();
-    let mut dreq = decide();
-    dreq.model = None;
-    let dec = d.decide(dreq).await.unwrap();
-    assert_eq!(dec.meta.model, "default-decision");
-    assert_eq!(dec.meta.role, Some(DecisionRole::DecideFast.into()));
-
-    let reqs = server.received_requests().await.unwrap();
-    let body = |p: &str| -> Value {
-        serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == p).unwrap().body).unwrap()
-    };
-    assert_eq!(
-        body("/v1/messages")["max_tokens"],
-        777,
-        "role default fills max_tokens"
-    );
-    assert_eq!(body("/v1/messages")["model"], "default-chat");
-    assert_eq!(body("/v1/responses")["model"], "agent-model");
-    assert_eq!(body("/v1/decisions")["model"], "default-decision");
-}
-
-#[test]
-fn llm_missing_key_and_unconfigured_role() {
-    let server_uri = "http://127.0.0.1:9";
-    let cfg: LLMConfig = toml::from_str(&format!(
-        r#"
-[providers.edge]
-base_url = "{server_uri}"
-apis = ["decisions"]
-[roles]
-decide = {{ provider = "edge", model = "m" }}
-"#
-    ))
-    .unwrap();
-    let err = LLM::from_config(&cfg, |_| None).unwrap_err();
-    assert!(matches!(err, Error::MissingKey { provider } if provider == "edge"));
-
-    let llm = LLM::from_config(&cfg, key_for).unwrap();
-    llm.decision(DecisionRole::Decide).unwrap();
-    assert!(matches!(
-        llm.decision(DecisionRole::DecideFast),
-        Err(Error::RoleNotConfigured { role }) if role == "decide-fast"
-    ));
-    assert!(matches!(
-        llm.chat(ChatRole::Agent),
-        Err(Error::RoleNotConfigured { .. })
-    ));
 }
 
 #[test]
@@ -499,31 +346,6 @@ fn keys_never_appear_in_debug() {
     assert!(!format!("{cfg:?}").contains(KEY));
     let c = Client::new(cfg).unwrap();
     assert!(!format!("{c:?}").contains(KEY));
-}
-
-#[test]
-fn llm_reads_key_from_api_key_file() {
-    let dir = std::env::temp_dir().join(format!("review-llm-http-key-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("key");
-    std::fs::write(&file, format!("{KEY}\n")).unwrap();
-    let cfg: LLMConfig = toml::from_str(&format!(
-        r#"
-[providers.edge]
-base_url = "http://127.0.0.1:9"
-apis = ["decisions"]
-api_key_env = "QA_LLM_TEST_SURELY_UNSET"
-api_key_file = "{}"
-[defaults]
-decision = {{ provider = "edge", model = "m" }}
-"#,
-        file.display()
-    ))
-    .unwrap();
-    let llm = LLM::from_config(&cfg, |_| None).unwrap();
-    llm.decision(DecisionRole::Decide).unwrap();
-    assert!(!format!("{llm:?} {cfg:?}").contains(KEY));
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -544,14 +366,6 @@ async fn base_url_with_v1_is_not_doubled() {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(path("/v1/decisions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(read_json("decisions/decide.response.json")),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
         let base: url::Url = format!("{}{suffix}", server.uri()).parse().unwrap();
         let make = |api| {
             let mut cfg = ClientConfig::new(api, SecretString::from(KEY)).base_url(base.clone());
@@ -566,7 +380,6 @@ async fn base_url_with_v1_is_not_doubled() {
             .generate(text())
             .await
             .unwrap();
-        make(ApiType::Decisions).decide(decide()).await.unwrap();
         // `expect(1)` on each mock is verified when the server drops.
     }
 }

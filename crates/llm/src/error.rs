@@ -1,20 +1,12 @@
-use crate::ApiType;
-
 /// Everything that can go wrong in `review-llm`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Invalid or inconsistent `[llm]` configuration.
+    /// Invalid or inconsistent client configuration.
     #[error("llm config: {0}")]
     Config(String),
-    /// The role has no entry and its kind has no default.
-    #[error("llm role `{role}` is not configured and there is no default for its kind")]
-    RoleNotConfigured { role: String },
     /// The key resolver returned no key for a provider that is in use.
     #[error("no API key for llm provider `{provider}`")]
     MissingKey { provider: String },
-    /// The method is not served by this client's API.
-    #[error("`{op}` is not supported by the {api} API")]
-    Unsupported { api: ApiType, op: &'static str },
     /// The request failed the checks before sending.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -34,9 +26,6 @@ pub enum Error {
     /// Unparseable wire JSON, SSE, or tool-input JSON.
     #[error("decode: {0}")]
     Decode(String),
-    /// A decision reply has no answer for a question.
-    #[error("decision reply has no answer for question `{name}`")]
-    MissingAnswer { name: String },
     /// `Reply::single_tool_use` found a refusal, no call, or several calls.
     #[error("tool call: {0}")]
     ToolCall(String),

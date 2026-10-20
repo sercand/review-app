@@ -6,9 +6,9 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ApiType, Error, Result, Role, Video};
+use crate::{ApiType, Error, Result, Video};
 
-/// A chat request. `model` is filled in by a [`crate::ChatModel`] handle when left unset.
+/// A chat request. `model` is required; [`crate::Client::generate`] fails when it is unset.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub model: Option<String>,
@@ -85,7 +85,7 @@ pub enum ContentBlock {
         text: String,
     },
     Image(Image),
-    /// A video clip. Sent to Responses and Decisions as `input_video`; Anthropic has none.
+    /// A video clip. Sent to Responses as `input_video`; Anthropic has none.
     Video(Video),
     ToolUse {
         id: String,
@@ -232,16 +232,12 @@ pub struct Usage {
     pub reasoning: u64,
 }
 
-/// What actually served a call (#90).
+/// What actually served a call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallMeta {
     pub api: ApiType,
     pub provider: String,
     pub model: String,
-    /// Set when the call went through a role handle.
-    pub role: Option<Role>,
-    /// The role had no entry and used its kind's default.
-    pub from_default: bool,
     #[serde(with = "duration_ms")]
     pub latency: Duration,
 }
@@ -370,8 +366,6 @@ mod tests {
                 api: ApiType::AnthropicMessages,
                 provider: "p".into(),
                 model: "m".into(),
-                role: None,
-                from_default: false,
                 latency: Duration::ZERO,
             },
         }

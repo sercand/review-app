@@ -5,8 +5,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use review_llm::{
-    ApiType, Client, ClientConfig, DecideRequest, Error, GenerateRequest, Message, Question,
-    RetryPolicy,
+    ApiType, Client, ClientConfig, Error, GenerateRequest, Message, RetryPolicy,
     dns::{Addrs, BlockedHost, Name, Resolve, Resolver, Resolving},
 };
 use secrecy::SecretString;
@@ -82,16 +81,6 @@ async fn resolver_decides_where_requests_go() {
         );
         assert!(!e.is_fallback_eligible(), "{e:?}");
     }
-    let mut d = DecideRequest::new(
-        vec![Message::user_text("ping")],
-        vec![Question::predicate("q", "yes?")],
-    );
-    d.model = Some("m".into());
-    let e = client(ApiType::Decisions, "evil.test", &server)
-        .decide(d)
-        .await
-        .unwrap_err();
-    assert!(matches!(&e, Error::BlockedHost(_)), "{e:?}");
     // Refused before any connection, and not retried.
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
