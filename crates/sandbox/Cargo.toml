@@ -22,7 +22,7 @@ ignore = "0.4.33"
 rand = "0.9"
 secrecy = "0.10.3"
 thiserror = "2.0"
-tokio = { version = "1.53", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio = { version = "1.53", features = ["sync", "time", "macros", "rt-multi-thread", "process"] }
 tokio-util = "0.7.20"
 tracing = "0.1"
 
