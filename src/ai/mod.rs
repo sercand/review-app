@@ -5,3 +5,4 @@
 //! gated the same way.
 
 pub mod llm;
+pub mod store;
