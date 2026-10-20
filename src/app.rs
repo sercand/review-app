@@ -420,9 +420,19 @@ impl ReviewApp {
             // The session folds the conversation into its timeline input
             // through `apply_session_event` above (Task 51).
             Event::ConversationLoaded { .. } => {}
-            // The Settings screen shows the outcome; the UI wiring is
-            // Task 12, so nothing consumes it here yet.
-            Event::AiProviderTested { .. } => {}
+            // Spec §10: the Settings window's AI section shows the outcome.
+            // The probe may outlive the window (a Save closes it), so the
+            // result reopens it rather than vanish.
+            Event::AiProviderTested { provider, result } => {
+                if !self.settings_window.open {
+                    self.open_settings();
+                }
+                self.settings_window
+                    .vm
+                    .ai
+                    .test_results
+                    .insert(provider, result);
+            }
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -594,13 +604,23 @@ impl ReviewApp {
     }
 
     /// Open the settings window on a fresh copy of the current settings.
+    ///
+    /// The AI section's "stored" marks come from a pure keychain probe:
+    /// whether a key exists, never what it is.
     fn open_settings(&mut self) {
-        self.settings_window.open_with(&self.settings);
+        let store = self.store.clone();
+        self.settings_window.open_with(&self.settings, &|provider| {
+            crate::auth::store::llm_key(store.as_ref(), provider)
+                .ok()
+                .flatten()
+                .is_some()
+        });
     }
 
     /// Fold the settings window's actions in: Save persists (and a host
     /// change ends the session, since the stored token belongs to the old
-    /// host), and Sign out rides the existing sign-out flow (RULING R10).
+    /// host), a typed AI key goes to the keychain, Test connection asks the
+    /// worker, and Sign out rides the existing sign-out flow (RULING R10).
     fn apply_settings_actions(
         &mut self,
         actions: Vec<SettingsAction>,
@@ -610,7 +630,17 @@ impl ReviewApp {
         for action in actions {
             match action {
                 SettingsAction::Apply(vm) => {
-                    let host_changed = vm.apply(&mut self.settings);
+                    let host_changed = match vm.apply(&mut self.settings) {
+                        Ok(host_changed) => host_changed,
+                        Err(error) => {
+                            // The window keeps Save disabled on invalid input,
+                            // so this is the defensive path; still say why
+                            // nothing was saved.
+                            self.toasts
+                                .push(format!("settings not saved: {error}"), now);
+                            continue;
+                        }
+                    };
                     self.save_settings(now);
                     // The code font size lives in the styles; re-register
                     // both so the next frame picks it up (Task 14).
@@ -629,6 +659,23 @@ impl ReviewApp {
                         self.toasts
                             .push("host changed, please sign in again".to_owned(), now);
                     }
+                }
+                // Spec §10: API keys live only in the keychain. The key is
+                // never logged and never written to `settings.toml`.
+                SettingsAction::SetLlmKey { provider, key } => {
+                    if let Err(error) =
+                        crate::auth::store::set_llm_key(self.store.as_ref(), &provider, &key)
+                    {
+                        tracing::warn!(%error, %provider, "could not store the LLM API key");
+                        self.toasts.push(
+                            format!("could not store the key for {provider}: {error}"),
+                            now,
+                        );
+                    }
+                }
+                SettingsAction::TestProvider { provider, model } => {
+                    self.worker
+                        .send(Command::AiTestProvider { provider, model });
                 }
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }

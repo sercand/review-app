@@ -5,13 +5,19 @@
 //! [`SettingsAction`] for the app to persist. It is also the only way to
 //! **sign out** — the button rides the app's existing sign-out flow.
 
+use std::collections::BTreeMap;
+
 use eframe::egui::{self, Frame, Margin, RichText};
 
 use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_label, segmented, toggle_chip};
+#[cfg(unix)]
+use crate::ui::components::{Tone, pill};
+#[cfg(unix)]
+use eframe::egui::{Popup, PopupCloseBehavior};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
-use crate::persist::settings::Settings;
+use crate::persist::settings::{ModelSettings, ProviderSettings, RepoAiSettings, Settings};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::thread_view::avatar;
 use crate::ui::{fonts, icons, theme};
@@ -43,6 +49,8 @@ pub struct SettingsVm {
     pub diff_mode: DiffMode,
     /// The code font size: 12, 13 or 14 (Task 14).
     pub code_font_size: f32,
+    /// The `[ai]` table's editable copy (spec §10).
+    pub ai: AiVm,
 }
 
 impl Default for SettingsVm {
@@ -54,12 +62,112 @@ impl Default for SettingsVm {
             theme: Theme::default(),
             diff_mode: DiffMode::Split,
             code_font_size: 13.0,
+            ai: AiVm::default(),
         }
     }
 }
 
+/// The Settings window's working copy of the `[ai]` table (spec §10).
+///
+/// The API keys are the one thing here that is *not* settings: a
+/// [`ProviderVm::key_input`] is handed to the app as a
+/// [`SettingsAction::SetLlmKey`] and lives in the keychain from then on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AiVm {
+    /// The configured endpoints, in display order.
+    pub providers: Vec<ProviderVm>,
+    /// The main review/chat model. Empty provider and model mean "not
+    /// configured"; applying then clears `models.default`.
+    pub default_model: ModelSettings,
+    /// The per-repository AI settings.
+    pub repos: Vec<RepoAiSettings>,
+    /// The latest "Test connection" outcome per provider name.
+    pub test_results: BTreeMap<String, Result<String, String>>,
+}
+
+impl AiVm {
+    /// The provider named `name`, if it is configured.
+    #[cfg(unix)]
+    fn provider(&self, name: &str) -> Option<&ProviderSettings> {
+        self.providers
+            .iter()
+            .map(|provider| &provider.settings)
+            .find(|provider| provider.name == name)
+    }
+
+    /// Reject what [`SettingsVm::apply`] cannot write: provider names key the
+    /// keychain entry and the model's routing, so they must be non-empty and
+    /// unique.
+    fn validate(&self) -> Result<(), String> {
+        for (index, provider) in self.providers.iter().enumerate() {
+            let name = &provider.settings.name;
+            if name.trim().is_empty() {
+                return Err(format!("provider {} has an empty name", index + 1));
+            }
+            if self.providers[..index]
+                .iter()
+                .any(|other| other.settings.name == *name)
+            {
+                return Err(format!(
+                    "provider names must be unique: {name} is used twice"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One provider row: its persisted settings plus the key being typed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProviderVm {
+    /// The provider as it will be written back to `settings.toml`.
+    pub settings: ProviderSettings,
+    /// A key the user typed this session. Never written to `settings.toml`;
+    /// non-empty on Save means "store it in the keychain".
+    pub key_input: String,
+    /// Whether the keychain already holds a key for `settings.name`. A pure
+    /// probe: the key itself never reaches the VM.
+    pub key_stored: bool,
+}
+
+/// The one-per-line text areas of one repository row.
+///
+/// The buffers live beside [`AiVm::repos`] rather than inside it so a
+/// half-typed line — a trailing newline, say — survives the frame instead of
+/// being re-split out of [`RepoAiSettings::commands`] every time.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RepoDraft {
+    /// The `commands` box, one command per line.
+    pub commands: String,
+    /// The `prepare` box, one command per line.
+    pub prepare: String,
+}
+
+impl RepoDraft {
+    /// The draft for `repo`: its lists joined one per line.
+    fn for_repo(repo: &RepoAiSettings) -> RepoDraft {
+        RepoDraft {
+            commands: repo.commands.join("\n"),
+            prepare: repo.prepare.join("\n"),
+        }
+    }
+
+    /// Split a text area back into list entries: trimmed, empty lines dropped.
+    #[cfg(unix)]
+    fn lines(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
 /// The working copy the window starts from.
-pub fn settings_vm(s: &Settings) -> SettingsVm {
+///
+/// `has_key` is the pure keychain probe the AI section uses to show "stored":
+/// it answers whether a key exists, never what it is.
+pub fn settings_vm(s: &Settings, has_key: &dyn Fn(&str) -> bool) -> SettingsVm {
     SettingsVm {
         host: s.host.clone(),
         client_id: s.client_id.clone().unwrap_or_default(),
@@ -67,6 +175,21 @@ pub fn settings_vm(s: &Settings) -> SettingsVm {
         theme: s.theme,
         diff_mode: s.diff.mode,
         code_font_size: s.code_font_size,
+        ai: AiVm {
+            providers: s
+                .ai
+                .providers
+                .iter()
+                .map(|provider| ProviderVm {
+                    settings: provider.clone(),
+                    key_input: String::new(),
+                    key_stored: has_key(&provider.name),
+                })
+                .collect(),
+            default_model: s.ai.models.default.clone().unwrap_or_default(),
+            repos: s.ai.repos.clone(),
+            test_results: BTreeMap::new(),
+        },
     }
 }
 
@@ -75,7 +198,13 @@ impl SettingsVm {
     ///
     /// Returns `true` when the host changed: the stored token belongs to the
     /// old host, so the app must end the session and ask for sign-in again.
-    pub fn apply(self, s: &mut Settings) -> bool {
+    ///
+    /// Errors when the AI section cannot be written (see
+    /// [`AiVm::validate`]); nothing is written in that case. The API keys in
+    /// [`ProviderVm::key_input`] never reach `s` — they ride
+    /// [`SettingsAction::SetLlmKey`] into the keychain instead.
+    pub fn apply(self, s: &mut Settings) -> Result<bool, String> {
+        self.ai.validate()?;
         let host_changed = self.host != s.host;
         s.host = self.host;
         s.client_id = (!self.client_id.is_empty()).then_some(self.client_id);
@@ -83,7 +212,19 @@ impl SettingsVm {
         s.theme = self.theme;
         s.diff.mode = self.diff_mode;
         s.code_font_size = self.code_font_size;
-        host_changed
+        s.ai.providers = self
+            .ai
+            .providers
+            .into_iter()
+            .map(|provider| provider.settings)
+            .collect();
+        // An all-empty model is "not configured", so a default settings file
+        // never grows an empty `[ai.models.default]` table.
+        s.ai.models.default = (!self.ai.default_model.provider.trim().is_empty()
+            || !self.ai.default_model.model.trim().is_empty())
+        .then_some(self.ai.default_model);
+        s.ai.repos = self.ai.repos;
+        Ok(host_changed)
     }
 }
 
@@ -94,12 +235,16 @@ pub struct SettingsWindowState {
     pub open: bool,
     /// The working copy being edited.
     pub vm: SettingsVm,
+    /// The repo text areas' buffers, one per `vm.ai.repos` entry, in order.
+    pub drafts: Vec<RepoDraft>,
 }
 
 impl SettingsWindowState {
-    /// Open the window on a fresh copy of `settings`.
-    pub fn open_with(&mut self, settings: &Settings) {
-        self.vm = settings_vm(settings);
+    /// Open the window on a fresh copy of `settings`, with `has_key` probing
+    /// the keychain for the AI section's "stored" marks.
+    pub fn open_with(&mut self, settings: &Settings, has_key: &dyn Fn(&str) -> bool) {
+        self.vm = settings_vm(settings, has_key);
+        self.drafts = self.vm.ai.repos.iter().map(RepoDraft::for_repo).collect();
         self.open = true;
     }
 
@@ -113,8 +258,22 @@ impl SettingsWindowState {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsAction {
     /// Persist these edited settings (the app saves; a host change ends the
-    /// session).
+    /// session). Errors when the AI section is invalid.
     Apply(SettingsVm),
+    /// Store `key` for `provider` in the keychain, never in the settings file.
+    SetLlmKey {
+        /// The provider name the key belongs to.
+        provider: String,
+        /// The key as typed, in this action only.
+        key: String,
+    },
+    /// Run the "Test connection" probe against `provider` with `model`.
+    TestProvider {
+        /// The endpoint to dial.
+        provider: ProviderSettings,
+        /// The model to probe with.
+        model: ModelSettings,
+    },
     /// Sign out through the app's existing sign-out flow.
     SignOut,
 }
@@ -287,9 +446,35 @@ pub fn render(
                     .show(ui);
             });
 
+            // Spec §10: the AI section is Unix-only for now (the LLM stack
+            // is); elsewhere the VM keeps `ai` untouched and applies it back
+            // verbatim.
+            #[cfg(unix)]
+            {
+                rule(ui);
+                ai_section(ui, &mut state.vm.ai, &mut state.drafts, actions);
+            }
+
             rule(ui);
+            let valid = state.vm.ai.validate().is_ok();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Btn::new(BtnKind::Primary, "Save").show(ui).clicked() {
+                let save = Btn::new(BtnKind::Primary, "Save").enabled(valid).show(ui);
+                let save = if valid {
+                    save
+                } else {
+                    save.on_hover_text("fix the AI providers before saving")
+                };
+                if save.clicked() {
+                    // A typed key goes to the keychain, never into the
+                    // settings the next action carries.
+                    for provider in &state.vm.ai.providers {
+                        if !provider.key_input.is_empty() {
+                            actions.push(SettingsAction::SetLlmKey {
+                                provider: provider.settings.name.clone(),
+                                key: provider.key_input.clone(),
+                            });
+                        }
+                    }
                     actions.push(SettingsAction::Apply(state.vm.clone()));
                     close = true;
                 }
@@ -333,6 +518,471 @@ fn rule(ui: &mut egui::Ui) {
     ui.painter()
         .hline(rect.x_range(), rect.center().y, (1.0, p.line));
     ui.add_space(8.0);
+}
+
+/// The Settings window's AI section (spec §10): providers, the default model,
+/// and the per-repository settings. `actions` receives "Test connection" asks;
+/// Save emits the keys and the apply (see [`render`]).
+#[cfg(unix)]
+fn ai_section(
+    ui: &mut egui::Ui,
+    ai: &mut AiVm,
+    drafts: &mut Vec<RepoDraft>,
+    actions: &mut Vec<SettingsAction>,
+) {
+    let p = theme::palette_of(ui);
+    // One buffer per repo: a hand-built VM (or a list edited elsewhere) may
+    // disagree with the app's drafts.
+    while drafts.len() < ai.repos.len() {
+        drafts.push(RepoDraft::default());
+    }
+    drafts.truncate(ai.repos.len());
+
+    let screen_height = ui.ctx().viewport_rect().height();
+    egui::ScrollArea::vertical()
+        .max_height((screen_height - 560.0).clamp(140.0, 560.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ai_providers(ui, ai);
+            if let Err(error) = ai.validate() {
+                ui.label(RichText::new(error).size(12.0).color(p.bad));
+            }
+            ui.add_space(6.0);
+            ai_model(ui, ai, actions);
+            ui.add_space(6.0);
+            ai_repos(ui, ai, drafts);
+            // The text areas are authoritative for the lists they edit;
+            // applying reads them back through `ai.repos`.
+            for (repo, draft) in ai.repos.iter_mut().zip(drafts.iter()) {
+                repo.commands = RepoDraft::lines(&draft.commands);
+                repo.prepare = RepoDraft::lines(&draft.prepare);
+            }
+        });
+}
+
+/// One provider box: name, API, base URL, key, Remove. Add provider sits in
+/// the heading.
+#[cfg(unix)]
+fn ai_providers(ui: &mut egui::Ui, ai: &mut AiVm) {
+    let p = theme::palette_of(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Providers").font(fonts::semibold(13.0)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if Btn::new(BtnKind::Default, "Add provider")
+                .icon(icons::PLUS)
+                .show(ui)
+                .clicked()
+            {
+                let name = unique_provider_name(&ai.providers);
+                // The first endpoint is the obvious default model route.
+                if ai.default_model.provider.is_empty() {
+                    ai.default_model.provider = name.clone();
+                }
+                ai.providers.push(ProviderVm {
+                    settings: ProviderSettings {
+                        name,
+                        ..ProviderSettings::default()
+                    },
+                    ..ProviderVm::default()
+                });
+            }
+        });
+    });
+    if ai.providers.is_empty() {
+        ui.label(
+            RichText::new("No endpoints yet. Add one to run AI reviews.")
+                .size(12.0)
+                .color(p.muted),
+        );
+    }
+
+    let mut remove = None;
+    for (index, provider) in ai.providers.iter_mut().enumerate() {
+        Frame::new()
+            .fill(p.bg)
+            .corner_radius(8.0)
+            .stroke((1.0, p.line))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    Field::new(&mut provider.settings.name)
+                        .hint("name")
+                        .width(140.0)
+                        .show(ui);
+                    api_combo(ui, &mut provider.settings.api);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Btn::new(BtnKind::Danger, "Remove")
+                            .icon(icons::TRASH_2)
+                            .show(ui)
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                Field::new(&mut provider.settings.base_url)
+                    .icon(icons::GLOBE)
+                    .hint("base URL (vendor default when empty)")
+                    .width(400.0)
+                    .show(ui);
+                ui.horizontal(|ui| {
+                    Field::new(&mut provider.key_input)
+                        .icon(icons::KEY_ROUND)
+                        .password(true)
+                        .hint("API key (stored in the keychain)")
+                        .width(300.0)
+                        .show(ui);
+                    if provider.key_stored {
+                        pill(ui, Some(icons::CHECK), "stored", Tone::Ok);
+                    }
+                });
+            });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        ai.providers.remove(index);
+    }
+}
+
+/// A name no configured provider uses: `provider-<n>`.
+#[cfg(unix)]
+fn unique_provider_name(providers: &[ProviderVm]) -> String {
+    let mut index = providers.len() + 1;
+    loop {
+        let name = format!("provider-{index}");
+        if !providers.iter().any(|p| p.settings.name == name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+/// The API combo: exactly the two protocols this build speaks, plus the
+/// current (possibly unsupported, hand-edited) value as its label.
+#[cfg(unix)]
+fn api_combo(ui: &mut egui::Ui, api: &mut crate::persist::settings::LlmApi) {
+    use crate::persist::settings::LlmApi;
+    let button = combo_button(ui, api_label(*api), 180.0);
+    Popup::from_toggle_button_response(&button).show(|ui| {
+        ui.set_min_width(180.0);
+        for candidate in [LlmApi::AnthropicMessages, LlmApi::OpenaiResponses] {
+            if ui
+                .selectable_label(*api == candidate, api_label(candidate))
+                .clicked()
+            {
+                *api = candidate;
+            }
+        }
+    });
+}
+
+/// The display name of one API protocol.
+#[cfg(unix)]
+fn api_label(api: crate::persist::settings::LlmApi) -> &'static str {
+    use crate::persist::settings::LlmApi;
+    match api {
+        LlmApi::AnthropicMessages => "Anthropic",
+        LlmApi::OpenaiResponses => "OpenAI",
+        LlmApi::Unsupported => "Unsupported",
+    }
+}
+
+/// The default model: provider, model id, its limits, the reasoning effort,
+/// and the Test connection probe.
+#[cfg(unix)]
+fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>) {
+    use crate::persist::settings::ReasoningLevel;
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new("Default model").font(fonts::semibold(13.0)));
+    let names: Vec<String> = ai
+        .providers
+        .iter()
+        .map(|provider| provider.settings.name.clone())
+        .collect();
+    ui.horizontal(|ui| {
+        let current = if ai.default_model.provider.is_empty() {
+            "provider".to_owned()
+        } else {
+            ai.default_model.provider.clone()
+        };
+        let button = combo_button(ui, &current, 190.0);
+        Popup::from_toggle_button_response(&button).show(|ui| {
+            ui.set_min_width(190.0);
+            if names.is_empty() {
+                ui.label(RichText::new("no providers yet").color(p.muted));
+            }
+            for name in &names {
+                if ui
+                    .selectable_label(ai.default_model.provider == *name, name)
+                    .clicked()
+                {
+                    ai.default_model.provider = name.clone();
+                }
+            }
+        });
+        Field::new(&mut ai.default_model.model)
+            .hint("model id")
+            .width(220.0)
+            .show(ui);
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Context").size(12.0).color(p.muted));
+        ui.add(
+            egui::DragValue::new(&mut ai.default_model.context_window)
+                .speed(1_000.0)
+                .range(1_000..=2_000_000),
+        );
+        ui.label(RichText::new("Max output").size(12.0).color(p.muted));
+        ui.add(
+            egui::DragValue::new(&mut ai.default_model.max_tokens)
+                .speed(128.0)
+                .range(1..=200_000),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Reasoning").size(12.0).color(p.muted));
+        let levels: [Seg<'_, Option<ReasoningLevel>>; 4] = [
+            Seg::text(None, "Model default"),
+            Seg::text(Some(ReasoningLevel::Low), "Low"),
+            Seg::text(Some(ReasoningLevel::Medium), "Medium"),
+            Seg::text(Some(ReasoningLevel::High), "High"),
+        ];
+        if let Some(level) = segmented(ui, ai.default_model.reasoning, &levels) {
+            ai.default_model.reasoning = level;
+        }
+    });
+    ui.horizontal(|ui| {
+        let provider = ai.provider(&ai.default_model.provider).cloned();
+        let ready = provider.is_some() && !ai.default_model.model.trim().is_empty();
+        let clicked = Btn::new(BtnKind::Default, "Test connection")
+            .icon(icons::CHECK_CHECK)
+            .enabled(ready)
+            .show(ui)
+            .clicked();
+        if clicked && let Some(provider) = provider {
+            actions.push(SettingsAction::TestProvider {
+                provider,
+                model: ai.default_model.clone(),
+            });
+        }
+        match ai.test_results.get(&ai.default_model.provider) {
+            Some(Ok(model)) => {
+                ui.label(RichText::new(format!("connected — {model} answered")).color(p.ok));
+            }
+            Some(Err(error)) => {
+                let width = ui.available_width();
+                elided_label(ui, error, egui::FontId::proportional(12.0), p.bad, width);
+            }
+            None => {
+                ui.label(RichText::new("not tested").size(12.0).color(p.faint));
+            }
+        }
+    });
+}
+
+/// The per-repository settings: the checkout path (with a folder picker) and
+/// the two command lists as one-per-line text areas.
+#[cfg(unix)]
+fn ai_repos(ui: &mut egui::Ui, ai: &mut AiVm, drafts: &mut Vec<RepoDraft>) {
+    let p = theme::palette_of(ui);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Repositories").font(fonts::semibold(13.0)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if Btn::new(BtnKind::Default, "Add repository")
+                .icon(icons::PLUS)
+                .show(ui)
+                .clicked()
+            {
+                ai.repos.push(RepoAiSettings::default());
+                drafts.push(RepoDraft::default());
+            }
+        });
+    });
+    if ai.repos.is_empty() {
+        ui.label(
+            RichText::new("No repositories yet; AI review only needs one for checkouts.")
+                .size(12.0)
+                .color(p.muted),
+        );
+    }
+
+    let mut remove = None;
+    for (index, repo) in ai.repos.iter_mut().enumerate() {
+        Frame::new()
+            .fill(p.bg)
+            .corner_radius(8.0)
+            .stroke((1.0, p.line))
+            .inner_margin(Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    Field::new(&mut repo.repo)
+                        .icon(icons::GITHUB)
+                        .hint("host/owner/name")
+                        .width(300.0)
+                        .show(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Btn::new(BtnKind::Danger, "Remove")
+                            .icon(icons::TRASH_2)
+                            .show(ui)
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    let mut text = repo.path.display().to_string();
+                    let edited = Field::new(&mut text)
+                        .icon(icons::FOLDER)
+                        .hint("/path/to/checkout")
+                        .width(300.0)
+                        .show(ui);
+                    if edited.changed() {
+                        repo.path = std::path::PathBuf::from(text);
+                    }
+                    folder_picker(ui, &mut repo.path);
+                });
+                if let Some(draft) = drafts.get_mut(index) {
+                    text_area(
+                        ui,
+                        "Commands (one per line)",
+                        &mut draft.commands,
+                        "cargo test",
+                    );
+                    text_area(
+                        ui,
+                        "Prepare, outside the sandbox (one per line)",
+                        &mut draft.prepare,
+                        "cargo fetch",
+                    );
+                }
+            });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        ai.repos.remove(index);
+        if index < drafts.len() {
+            drafts.remove(index);
+        }
+    }
+}
+
+/// A one-per-line text area in the window's field style.
+#[cfg(unix)]
+fn text_area(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new(label).size(12.0).color(p.muted));
+    let frame = Frame::new()
+        .fill(p.bg)
+        .corner_radius(6.0)
+        .stroke((1.0, p.line))
+        .inner_margin(6);
+    ui.add(
+        egui::TextEdit::multiline(text)
+            .frame(frame)
+            .desired_rows(2)
+            .desired_width(400.0)
+            .hint_text(hint),
+    );
+}
+
+/// The folder picker: a Browse button whose popup walks the directories. A
+/// click on a folder selects it *and* descends into it, so the path field is
+/// the picker's whole state; clicking outside closes it.
+#[cfg(unix)]
+fn folder_picker(ui: &mut egui::Ui, path: &mut std::path::PathBuf) {
+    let p = theme::palette_of(ui);
+    let button = Btn::new(BtnKind::Default, "Browse")
+        .icon(icons::FOLDER)
+        .show(ui);
+    Popup::from_toggle_button_response(&button)
+        .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(320.0);
+            let current = if path.is_dir() {
+                path.clone()
+            } else {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+            };
+            if let Some(parent) = current.parent()
+                && ui.button(".. up").clicked()
+            {
+                *path = parent.to_path_buf();
+            }
+            ui.label(
+                RichText::new(current.display().to_string())
+                    .size(12.0)
+                    .color(p.muted),
+            );
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&current)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|entry| entry.is_dir())
+                .filter(|entry| {
+                    !entry
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                })
+                .collect();
+            entries.sort();
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .show(ui, |ui| {
+                    for entry in entries {
+                        let name = entry
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if ui.selectable_label(false, format!("{name}/")).clicked() {
+                            *path = entry;
+                        }
+                    }
+                });
+        });
+}
+
+/// A field-styled combobox button (mockup `.combo`): the current value and an
+/// up/down chevron, `width` wide.
+#[cfg(unix)]
+fn combo_button(ui: &mut egui::Ui, value: &str, width: f32) -> egui::Response {
+    let p = theme::palette_of(ui);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, crate::ui::components::CONTROL_H),
+        egui::Sense::click(),
+    );
+    let stroke = if response.hovered() { p.muted } else { p.line };
+    ui.painter().rect(
+        rect,
+        6.0,
+        p.bg,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let cy = rect.center().y;
+    ui.painter().text(
+        egui::pos2(rect.right() - 8.0, cy),
+        egui::Align2::RIGHT_CENTER,
+        icons::CHEVRONS_UP_DOWN,
+        egui::FontId::proportional(14.0),
+        p.muted,
+    );
+    let galley = crate::ui::components::elided_galley(
+        ui,
+        value,
+        egui::FontId::proportional(13.0),
+        p.text,
+        rect.width() - 34.0,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 8.0, cy - galley.size().y / 2.0),
+        galley,
+        p.text,
+    );
+    response
 }
 
 /// The account's second line: the host and its scopes, named when there are
@@ -388,7 +1038,7 @@ mod tests {
         let dir = tempdir();
         let settings = Settings::load_or_default(dir.path());
         let mut state = SettingsWindowState::default();
-        state.open_with(&settings);
+        state.open_with(&settings, &|_| false);
         let mut actions = Vec::new();
         egui::__run_test_ui(|ui| {
             render(
@@ -413,7 +1063,7 @@ mod tests {
         settings.host = "ghe.example.com".into();
         settings.client_id = Some("cid".into());
         let mut state = SettingsWindowState::default();
-        state.open_with(&settings);
+        state.open_with(&settings, &|_| false);
         assert_eq!(state.vm.host, "ghe.example.com");
         assert_eq!(state.vm.client_id, "cid");
         assert_eq!(state.vm.theme, Theme::System);
@@ -426,15 +1076,116 @@ mod tests {
             login: "octocat".into(),
             ..Default::default()
         });
-        let mut vm = settings_vm(&settings);
+        let mut vm = settings_vm(&settings, &|_| false);
         vm.theme = Theme::Dark;
         vm.default_scopes = vec![Scope::Mentions];
-        assert!(!vm.apply(&mut settings));
+        assert!(!vm.apply(&mut settings).unwrap());
         assert_eq!(settings.theme, Theme::Dark);
         assert_eq!(settings.default_scopes, vec![Scope::Mentions]);
         assert!(
             settings.account.is_some(),
             "apply never touches the account"
+        );
+    }
+
+    /// A settings value with one provider, one default model and one repo.
+    fn ai_settings() -> Settings {
+        use crate::persist::settings::{
+            LlmApi, ModelSettings, ProviderSettings, ReasoningLevel, RepoAiSettings,
+        };
+        let mut s = Settings::default();
+        s.ai.providers = vec![ProviderSettings {
+            name: "work".into(),
+            api: LlmApi::AnthropicMessages,
+            base_url: "https://llm.example.com".into(),
+            headers: BTreeMap::new(),
+        }];
+        s.ai.models.default = Some(ModelSettings {
+            provider: "work".into(),
+            model: "model-id".into(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            reasoning: Some(ReasoningLevel::Medium),
+        });
+        s.ai.repos = vec![RepoAiSettings {
+            repo: "github.com/owner/name".into(),
+            path: "/Users/me/src/owner/name".into(),
+            commands: vec!["cargo test".into(), "cargo clippy".into()],
+            prepare: vec!["cargo fetch".into()],
+            ..RepoAiSettings::default()
+        }];
+        s
+    }
+
+    #[test]
+    fn ai_vm_round_trips_through_apply() {
+        let mut settings = ai_settings();
+        let before = settings.ai.clone();
+        let vm = settings_vm(&settings, &|_| false);
+        assert_eq!(vm.ai.providers.len(), 1);
+        assert_eq!(vm.ai.repos.len(), 1);
+        // Touch nothing: the VM must already describe the same `[ai]` table.
+        assert!(!vm.apply(&mut settings).unwrap());
+        assert_eq!(settings.ai, before);
+    }
+
+    #[test]
+    fn apply_emits_no_key_into_settings() {
+        let mut settings = ai_settings();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.providers[0].key_input = "sekrit".into();
+        vm.apply(&mut settings).unwrap();
+        let raw = toml::to_string(&settings).unwrap();
+        assert!(
+            !raw.contains("sekrit"),
+            "the key never reaches settings.toml"
+        );
+        assert!(!raw.contains("key_input"));
+    }
+
+    #[test]
+    fn duplicate_provider_names_are_rejected() {
+        let mut settings = ai_settings();
+        let mut vm = settings_vm(&settings, &|_| false);
+        let duplicate = vm.ai.providers[0].clone();
+        vm.ai.providers.push(duplicate);
+        let error = vm.clone().apply(&mut settings).unwrap_err();
+        assert!(error.contains("unique"), "unexpected error: {error}");
+        assert_eq!(
+            settings.ai.providers.len(),
+            1,
+            "a rejected apply writes nothing"
+        );
+
+        // An empty name is rejected too.
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.providers[0].settings.name = "  ".into();
+        let error = vm.apply(&mut settings).unwrap_err();
+        assert!(error.contains("empty"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn an_empty_model_clears_the_default() {
+        let mut settings = ai_settings();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.default_model = crate::persist::settings::ModelSettings::default();
+        vm.apply(&mut settings).unwrap();
+        assert!(
+            settings.ai.models.default.is_none(),
+            "an unconfigured model stays out of settings.toml"
+        );
+    }
+
+    #[test]
+    fn key_stored_reflects_the_keychain_probe() {
+        let settings = ai_settings();
+        let stored = settings_vm(&settings, &|name| name == "work");
+        assert!(stored.ai.providers[0].key_stored);
+        let missing = settings_vm(&settings, &|_| false);
+        assert!(!missing.ai.providers[0].key_stored);
+        assert!(
+            missing.ai.providers[0].key_input.is_empty(),
+            "the probe never exposes the key itself"
         );
     }
 }

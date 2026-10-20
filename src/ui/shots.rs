@@ -27,8 +27,18 @@ const SIZE: [f32; 2] = [1440.0, 900.0];
 
 /// A harness set up the way `ReviewApp::new` sets up the real context.
 fn harness<'a>(dark: bool, app: impl FnMut(&mut egui::Ui) + 'a) -> Harness<'a> {
+    harness_sized(dark, SIZE, app)
+}
+
+/// A harness on a canvas of `size`, for a window taller than a screen (the
+/// settings window's AI section scrolls, so its shot needs the room).
+fn harness_sized<'a>(
+    dark: bool,
+    size: [f32; 2],
+    app: impl FnMut(&mut egui::Ui) + 'a,
+) -> Harness<'a> {
     Harness::builder()
-        .with_size(SIZE)
+        .with_size(size)
         .with_theme(if dark {
             egui::Theme::Dark
         } else {
@@ -45,8 +55,15 @@ fn harness<'a>(dark: bool, app: impl FnMut(&mut egui::Ui) + 'a) -> Harness<'a> {
 }
 
 /// Run a few frames (popups and fonts settle) and write the PNG.
-fn save(mut h: Harness<'_>, name: &str) {
-    h.run_steps(4);
+fn save(h: Harness<'_>, name: &str) {
+    save_after(h, name, 4);
+}
+
+/// [`save`] after `steps` frames: a window whose layout feeds back into its
+/// own height (a scroll area sized from the viewport) needs a frame or two
+/// more to settle.
+fn save_after(mut h: Harness<'_>, name: &str, steps: usize) {
+    h.run_steps(steps);
     let image = h.render().expect("render");
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-shots");
     std::fs::create_dir_all(&dir).unwrap();
@@ -380,7 +397,7 @@ fn shots() {
         save(h, &format!("login-{t}"));
 
         let mut win = SettingsWindowState::default();
-        win.open_with(&settings);
+        win.open_with(&settings, &|_| false);
         let scopes: Vec<String> = [
             "admin:org",
             "gist",
@@ -420,5 +437,75 @@ fn shots() {
             );
         });
         save(h, &format!("settings-{t}"));
+
+        // The AI section (spec §10), rendered only on Unix like the feature.
+        #[cfg(unix)]
+        {
+            let mut ai = SettingsWindowState::default();
+            ai.open_with(&ai_shot_settings(), &|name| name == "work");
+            ai.vm
+                .ai
+                .test_results
+                .insert("work".to_owned(), Ok("model-id".to_owned()));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let scopes_ai: Vec<String> =
+                ["repo", "read:org"].iter().map(|s| s.to_string()).collect();
+            let h = harness_sized(dark, [1440.0, 1200.0], move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut ai,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_ai,
+                    }),
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-{t}"), 10);
+        }
     }
+}
+
+/// The settings the AI shot opens with: one provider, a default model and one
+/// repository.
+#[cfg(unix)]
+fn ai_shot_settings() -> Settings {
+    use crate::persist::settings::{
+        LlmApi, ModelSettings, ProviderSettings, ReasoningLevel, RepoAiSettings,
+    };
+    let mut settings = Settings::default();
+    settings.ai.providers = vec![ProviderSettings {
+        name: "work".into(),
+        api: LlmApi::AnthropicMessages,
+        base_url: "https://llm.example.com".into(),
+        headers: Default::default(),
+    }];
+    settings.ai.models.default = Some(ModelSettings {
+        provider: "work".into(),
+        model: "model-id".into(),
+        context_window: 200_000,
+        max_tokens: 8192,
+        reasoning: Some(ReasoningLevel::Medium),
+    });
+    settings.ai.repos = vec![RepoAiSettings {
+        repo: "github.com/owner/name".into(),
+        path: "/Users/me/src/owner/name".into(),
+        commands: vec!["cargo test".into(), "cargo clippy --all-targets".into()],
+        prepare: vec!["cargo fetch".into()],
+        ..RepoAiSettings::default()
+    }];
+    settings
 }
