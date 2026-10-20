@@ -25,9 +25,9 @@ const CHECKLIST: &str = r##"- `intent` — Compare the change with the brief's i
 - `api_surface` — Public APIs, schemas, migrations, config keys, env vars, docs: changed consistently and compatibly?
 - `security` — Untrusted input, injection, authz checks, secrets in code or logs.
 - `performance` — Work in loops (I/O, queries, allocations), unbounded growth, N+1.
-- `assets` — For images and other binaries: compare size, dimensions, and format with the siblings in the same folder (via `asset_stats`).
+- `assets` — For images and other binaries: compare size, dimensions, and format with the siblings in the same folder (via `asset_stats`, §6.3).
 - `ci` — Explain failed checks that belong to this group; don't repeat linter output. Only report something CI *didn't* catch, or explain the root cause of a failure.
-- `repo:*` — Repo-specific items from `.github/REVIEW.md`; do what each one says.
+- `repo:*` — Items from `.github/REVIEW.md` (§6.6).
 "##;
 
 /// The good/bad finding example pair every reviewer-type prompt ends with
@@ -498,6 +498,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The prompt checklist can never drift from the app's own checklist
+    /// again: every [`crate::ai::checklist::builtin_items`] instruction must
+    /// appear verbatim in the reviewer prompt, and the `repo:*` row must be
+    /// the spec §5.3 sentence. The spec table is the single source.
+    #[test]
+    fn checklist_block_matches_builtin_items() {
+        let prompt = system_prompt(AgentRole::Reviewer, "reviewer 1");
+        for item in crate::ai::checklist::builtin_items() {
+            assert!(
+                prompt.contains(&item.instruction),
+                "the reviewer prompt checklist drifted from builtin_items: \
+                 item `{}` says {:?}",
+                item.id,
+                item.instruction
+            );
+        }
+        assert!(
+            prompt.contains("Items from `.github/REVIEW.md` (§6.6)."),
+            "the repo:* row must quote the spec §5.3 sentence"
+        );
     }
 
     /// No prompt exceeds the size guard (task brief: keep each under ~120

@@ -27,9 +27,9 @@ compare against. Do exactly that:
 - `api_surface` — Public APIs, schemas, migrations, config keys, env vars, docs: changed consistently and compatibly?
 - `security` — Untrusted input, injection, authz checks, secrets in code or logs.
 - `performance` — Work in loops (I/O, queries, allocations), unbounded growth, N+1.
-- `assets` — For images and other binaries: compare size, dimensions, and format with the siblings in the same folder (via `asset_stats`).
+- `assets` — For images and other binaries: compare size, dimensions, and format with the siblings in the same folder (via `asset_stats`, §6.3).
 - `ci` — Explain failed checks that belong to this group; don't repeat linter output. Only report something CI *didn't* catch, or explain the root cause of a failure.
-- `repo:*` — Repo-specific items from `.github/REVIEW.md`; do what each one says.
+- `repo:*` — Items from `.github/REVIEW.md` (§6.6).
 
 ## Findings
 
