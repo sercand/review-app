@@ -420,6 +420,9 @@ impl ReviewApp {
             // The session folds the conversation into its timeline input
             // through `apply_session_event` above (Task 51).
             Event::ConversationLoaded { .. } => {}
+            // The Settings screen shows the outcome; the UI wiring is
+            // Task 12, so nothing consumes it here yet.
+            Event::AiProviderTested { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {

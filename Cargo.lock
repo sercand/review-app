@@ -2028,6 +2028,9 @@ dependencies = [
  "pulldown-cmark",
  "raw-window-handle",
  "reqwest",
+ "review-llm",
+ "review-sandbox",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",
@@ -2040,6 +2043,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "two-face",
+ "url",
  "wiremock",
 ]
 

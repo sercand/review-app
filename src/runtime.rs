@@ -12,6 +12,9 @@ use std::time::Duration;
 
 use tokio::task::JoinError;
 
+#[cfg(unix)]
+use secrecy::SecretString;
+
 use crate::auth::DEFAULT_SCOPE;
 use crate::auth::device_flow::{AuthFailure, DeviceCode};
 use crate::auth::device_http::{HttpDeviceFlow, run_device_flow};
@@ -314,6 +317,16 @@ pub enum Command {
         /// at click time.
         payload: serde_json::Value,
     },
+    /// Test one configured LLM provider's connection (spec §10).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiProviderTested`],
+    /// keyed by provider name.
+    AiTestProvider {
+        /// The provider to dial.
+        provider: crate::persist::settings::ProviderSettings,
+        /// The model to probe with.
+        model: crate::persist::settings::ModelSettings,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -537,6 +550,16 @@ pub enum Event {
         base: ImageBlob,
         /// The head side, read at the diff's head SHA.
         head: ImageBlob,
+    },
+    /// The result of a [`Command::AiTestProvider`]: `Ok` carries the model
+    /// that answered, `Err` a display-safe message (the API key is never in
+    /// it).
+    AiProviderTested {
+        /// The [`crate::persist::settings::ProviderSettings::name`] that was
+        /// tested.
+        provider: String,
+        /// The model that served the probe, or why the probe failed.
+        result: Result<String, String>,
     },
 }
 
@@ -1211,6 +1234,38 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             match client.merge_pr(&repo, number, &payload).await {
                 Ok(result) => events.send(Event::PrMerged { session, result }),
                 Err(error) => events.send(Event::MergeFailed { session, error }),
+            }
+        }
+        Command::AiTestProvider { provider, model } => {
+            // Not PR-scoped, so no SessionId: the event names the provider.
+            // Reads only, and the client applies its own retry policy.
+            let name = provider.name.clone();
+            #[cfg(unix)]
+            {
+                let result = match crate::auth::store::llm_key(&*ctx.store, &name) {
+                    Ok(Some(key)) => {
+                        match crate::ai::llm::build_client(&provider, SecretString::from(key)) {
+                            Ok(client) => crate::ai::llm::test_connection(&client, &model).await,
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    Ok(None) => Err(format!("no API key stored for {name}")),
+                    Err(error) => Err(error.to_string()),
+                };
+                events.send(Event::AiProviderTested {
+                    provider: name,
+                    result,
+                });
+            }
+            // The LLM stack is Unix-only for now (see `crate::ai`); the
+            // command still answers so the Settings UI never hangs.
+            #[cfg(not(unix))]
+            {
+                let _ = (provider, model);
+                events.send(Event::AiProviderTested {
+                    provider: name,
+                    result: Err("AI review is not available on this platform".to_owned()),
+                });
             }
         }
         Command::ExpandContext {
