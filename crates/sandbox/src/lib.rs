@@ -12,6 +12,7 @@
 
 #[cfg(unix)]
 mod bash;
+mod env;
 mod files;
 mod ops;
 mod paths;
@@ -19,6 +20,7 @@ mod search;
 
 #[cfg(unix)]
 pub use bash::BashSession;
+pub use env::{DENIED_ENV, EnvInput, Launch, agent_env};
 pub use files::LocalHost;
 pub use ops::{
     DEFAULT_EXEC_TIMEOUT, Entry, ExecOutput, GrepMatch, Listing, MAX_FILE_BYTES, MAX_GLOB,

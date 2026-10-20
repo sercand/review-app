@@ -8,6 +8,7 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use crate::bash::BashSession;
+use crate::env::Launch;
 
 use crate::{
     Entry, ExecOutput, GrepMatch, Listing, MAX_FILE_BYTES, OpError, Root, SandboxOps, search,
@@ -19,15 +20,27 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct LocalHost {
     root: Root,
+    /// The shell `exec` starts (lazily, on Unix); kept on every platform so the
+    /// API is uniform even though only Unix consumes it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    launch: Launch,
     #[cfg(unix)]
     shell: Arc<tokio::sync::Mutex<Option<BashSession>>>,
 }
 
 impl LocalHost {
-    /// A host over `dir`, canonicalized once.
+    /// A host over `dir`, canonicalized once, whose shell starts from
+    /// [`Launch::host`] (the host env minus the scrubbed vars).
     pub fn new(dir: &Path) -> std::io::Result<LocalHost> {
+        Self::with_launch(dir, Launch::host())
+    }
+
+    /// A host over `dir`, canonicalized once, whose shell starts from `launch`:
+    /// program, args and a complete environment (see [`Launch`]).
+    pub fn with_launch(dir: &Path, launch: Launch) -> std::io::Result<LocalHost> {
         Ok(LocalHost {
             root: Root::new(dir)?,
+            launch,
             #[cfg(unix)]
             shell: Arc::default(),
         })
@@ -199,7 +212,7 @@ impl SandboxOps for LocalHost {
         let session = match &mut *shell {
             Some(s) => s,
             None => shell.insert(
-                BashSession::start(self.root.path())
+                BashSession::start_with(self.root.path(), &self.launch)
                     .map_err(|e| OpError::Io(format!("starting bash: {e}")))?,
             ),
         };

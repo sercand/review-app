@@ -27,6 +27,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::env::Launch;
 use crate::{ExecOutput, OUTPUT_CAP, OpError};
 
 /// Run once when the shell starts: no echo (stty needs the terminal, so no
@@ -191,12 +192,6 @@ fn write_command(path: &Path, command: &str) -> std::io::Result<()> {
     f.write_all(command.as_bytes())
 }
 
-/// Whether the env var `key` is kept from the shell: every `OTSIMOQA_*` and `TMOUT`.
-fn is_scrubbed(key: &std::ffi::OsStr) -> bool {
-    let key = key.as_encoded_bytes();
-    key.starts_with(b"OTSIMOQA_") || key == b"TMOUT"
-}
-
 /// `p` as a single-quoted shell word.
 fn shell_quote(p: &Path) -> String {
     format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"))
@@ -276,9 +271,18 @@ impl Drop for InFlight<'_> {
 }
 
 impl BashSession {
-    /// Starts `bash --noprofile --norc` on a new PTY in `cwd`, with the host env plus
-    /// `PS1= PS2= TERM=dumb`, and sends the setup line.
+    /// Starts `bash --noprofile --norc` on a new PTY in `cwd`, with the host env
+    /// minus the scrubbed vars (see [`Launch::host`]) plus `PS1= PS2= TERM=dumb`,
+    /// and sends the setup line.
     pub fn start(cwd: &Path) -> std::io::Result<BashSession> {
+        Self::start_with(cwd, &Launch::host())
+    }
+
+    /// Starts the shell described by `launch` on a new PTY in `cwd`: the child
+    /// begins from an empty environment plus `launch.env`, gets `launch.args`
+    /// followed by `--noprofile --norc` and `PS1= PS2= TERM=dumb`, and the setup
+    /// line is sent.
+    pub fn start_with(cwd: &Path, launch: &Launch) -> std::io::Result<BashSession> {
         // Before the shell exists, so a failure here leaks nothing.
         let cmd_dir = command_dir()?;
         let cmd_file = cmd_dir.path().join("cmd");
@@ -290,14 +294,14 @@ impl BashSession {
                 pixel_height: 0,
             })
             .map_err(io)?;
-        let mut cmd = CommandBuilder::new("bash");
+        let mut cmd = CommandBuilder::new(&launch.program);
+        // The shell sees exactly what `launch` grants it: nothing is inherited from
+        // this process, so host credentials can never leak in.
+        cmd.env_clear();
+        cmd.args(&launch.args);
         cmd.args(["--noprofile", "--norc"]);
-        // The agent's shell must not see the host's credentials (`OTSIMOQA_TOKEN`, …),
-        // nor a `TMOUT` that would end an idle shell behind the session's back.
-        for (key, _) in std::env::vars_os() {
-            if is_scrubbed(&key) {
-                cmd.env_remove(&key);
-            }
+        for (key, value) in &launch.env {
+            cmd.env(key, value);
         }
         cmd.env("PS1", "");
         cmd.env("PS2", "");
