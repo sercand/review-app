@@ -171,37 +171,41 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     ]
 }
 
-/// Names a tool may not have: they would write to GitHub or to the checkout.
+/// Fragments a tool name may not contain: each names a write or merge action.
 ///
-/// A name is forbidden when it equals one of these or starts with one plus `_`
-/// (so `merge`, `merge_pr` and `resolve_thread` are all out).
+/// Matched case-insensitively as substrings, so `merge`, `merge_pr`, `auto_merge`
+/// and `Post_Comment` are all out.
 #[cfg(test)]
-const FORBIDDEN_TOOL_NAMES: [&str; 8] = [
+const FORBIDDEN_TOOL_FRAGMENTS: [&str; 6] = [
     "merge",
     "approve",
-    "post_review",
-    "submit_review",
+    "post",
     "resolve",
     "edit_file",
     "write_file",
-    "create_comment",
 ];
 
-/// The local draft tool (Task 14): its name starts with a forbidden one, but it
+/// A GitHub review submission. It is forbidden too, matched the same way, with one
+/// ruled exception below.
+#[cfg(test)]
+const FORBIDDEN_SUBMIT_REVIEW: &str = "submit_review";
+
+/// The local draft tool (Task 14): its name contains a forbidden fragment, but it
 /// posts nothing — it fills a draft the app shows the user for approval.
 #[cfg(test)]
 const LOCAL_DRAFT_TOOL: &str = "submit_review_draft";
 
-/// Whether `name` is a write or merge tool (see [`FORBIDDEN_TOOL_NAMES`]).
+/// Whether `name` is a write or merge tool (see [`FORBIDDEN_TOOL_FRAGMENTS`]).
 #[cfg(test)]
 fn is_forbidden_tool_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     if name == LOCAL_DRAFT_TOOL {
         return false;
     }
-    FORBIDDEN_TOOL_NAMES.iter().any(|bad| {
-        name.strip_prefix(bad)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
-    })
+    name.contains(FORBIDDEN_SUBMIT_REVIEW)
+        || FORBIDDEN_TOOL_FRAGMENTS
+            .iter()
+            .any(|bad| name.contains(bad))
 }
 
 /// Parses a tool's input, or the tool error to return.

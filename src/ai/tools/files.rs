@@ -92,25 +92,30 @@ impl Tool for ReadFile {
 }
 
 /// `content` as `cat -n` style lines from `offset` for at most `limit` lines, with a
-/// trailing `[showing lines a-b of N]` whenever that is not the whole file.
+/// trailing `[showing lines a-b of N]` whenever that is not the whole file. An empty
+/// file is `(empty file)`, never an empty text part (providers reject those).
 fn numbered(content: &str, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
     let lines: Vec<&str> = content.lines().collect();
     let total = lines.len();
-    let start = offset.unwrap_or(1);
-    if start == 0 {
-        return Err("offset must be 1 or more (lines are 1-based)".to_string());
-    }
+    let start = match offset {
+        Some(0) => return Err("offset must be 1 or more (lines are 1-based)".to_string()),
+        Some(offset) => {
+            if offset > total {
+                let plural = if total == 1 { "line" } else { "lines" };
+                return Err(format!(
+                    "offset {offset} is past the end of the file ({total} {plural})"
+                ));
+            }
+            offset
+        }
+        None => 1,
+    };
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
     if limit == 0 {
         return Err("limit must be 1 or more".to_string());
     }
     if total == 0 {
-        return Ok(String::new());
-    }
-    if start > total {
-        return Err(format!(
-            "offset {start} is past the end of the file ({total} lines)"
-        ));
+        return Ok("(empty file)".to_string());
     }
     let end = total.min(start.saturating_add(limit - 1));
     let body = lines[start - 1..end]

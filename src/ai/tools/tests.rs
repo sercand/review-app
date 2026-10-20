@@ -228,6 +228,24 @@ async fn read_file_offset_past_end_is_an_error() {
     assert!(out.is_error);
     assert!(text(&out).contains("past the end"), "{}", text(&out));
 
+    // An empty file: a plain read says so, while any offset is past the end.
+    std::fs::write(dir.path().join("empty.txt"), "").unwrap();
+    let out = call(&host, "read_file", json!({"path": "empty.txt"})).await;
+    assert!(!out.is_error);
+    assert_eq!(text(&out), "(empty file)");
+    let out = call(
+        &host,
+        "read_file",
+        json!({"path": "empty.txt", "offset": 1}),
+    )
+    .await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).contains("past the end of the file (0 lines)"),
+        "{}",
+        text(&out)
+    );
+
     // A zero offset or limit is rejected rather than read as "the start" or "nothing".
     for input in [
         json!({"path": "ten.txt", "offset": 0}),
@@ -300,7 +318,7 @@ async fn read_file_scales_large_images_and_rejects_broken_ones() {
     for (path, want) in [
         ("x.gif", "     1\tjust text"),
         ("y.webp", "<binary>7 bytes</binary>"),
-        ("anim.gif", ""),
+        ("anim.gif", "(empty file)"),
     ] {
         let out = call(&host, "read_file", json!({"path": path})).await;
         assert!(!out.is_error, "{path}");
@@ -591,20 +609,24 @@ fn registry_has_no_write_or_merge_tools() {
         );
     }
 
-    // The rule itself: exact names and prefixed variants are forbidden, while the
-    // local draft tool Task 14 adds is allowed by name.
+    // The rule itself: any name carrying a write or merge fragment is forbidden,
+    // case-insensitively, while the local draft tool Task 14 adds is allowed.
     for bad in [
         "merge",
         "merge_pr",
+        "auto_merge",
         "approve",
         "approve_pr",
+        "post",
         "post_review",
+        "post_comment",
+        "Post_Comment",
         "submit_review",
+        "Submit_Review",
         "resolve",
         "resolve_thread",
         "edit_file",
         "write_file",
-        "create_comment",
     ] {
         assert!(is_forbidden_tool_name(bad), "{bad} should be forbidden");
     }
