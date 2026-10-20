@@ -627,6 +627,10 @@ impl ReviewApp {
     /// change ends the session, since the stored token belongs to the old
     /// host), a typed AI key goes to the keychain, Test connection asks the
     /// worker, and Sign out rides the existing sign-out flow (RULING R10).
+    ///
+    /// Save is emitted before any key action: a rejected apply stops the loop,
+    /// so a key is never stored for settings that were not saved. A successful
+    /// apply also clears the keys of removed/renamed providers.
     fn apply_settings_actions(
         &mut self,
         actions: Vec<SettingsAction>,
@@ -636,18 +640,52 @@ impl ReviewApp {
         for action in actions {
             match action {
                 SettingsAction::Apply(vm) => {
+                    // A removed or renamed provider must not leave its key
+                    // behind in the keychain (§10), or re-adding the name
+                    // would silently reuse a stale credential.
+                    let old_names: Vec<String> = self
+                        .settings
+                        .ai
+                        .providers
+                        .iter()
+                        .map(|provider| provider.name.clone())
+                        .collect();
                     let host_changed = match vm.apply(&mut self.settings) {
                         Ok(host_changed) => host_changed,
                         Err(error) => {
                             // The window keeps Save disabled on invalid input,
                             // so this is the defensive path; still say why
-                            // nothing was saved.
+                            // nothing was saved. Stop here: nothing is
+                            // persisted, so no key in a later action may be
+                            // stored either.
                             self.toasts
                                 .push(format!("settings not saved: {error}"), now);
-                            continue;
+                            return;
                         }
                     };
                     self.save_settings(now);
+                    let new_names: Vec<String> = self
+                        .settings
+                        .ai
+                        .providers
+                        .iter()
+                        .map(|provider| provider.name.clone())
+                        .collect();
+                    // Best-effort, exactly like storing a key: the settings
+                    // are already saved, so a keychain failure is a toast.
+                    for name in settings_window::removed_provider_names(&old_names, &new_names) {
+                        if let Err(error) =
+                            crate::auth::store::clear_llm_key(self.store.as_ref(), &name)
+                        {
+                            tracing::warn!(
+                                %error,
+                                %name,
+                                "could not clear the removed LLM API key"
+                            );
+                            self.toasts
+                                .push(format!("could not clear the key for {name}: {error}"), now);
+                        }
+                    }
                     // The code font size lives in the styles; re-register
                     // both so the next frame picks it up (Task 14).
                     theme::install(ctx, self.settings.code_font_size);

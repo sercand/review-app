@@ -91,7 +91,7 @@ CREATE TABLE ai_checkout (
     original_ref TEXT NOT NULL,
     stash_sha    TEXT,
     head_sha     TEXT NOT NULL,
-    state        TEXT NOT NULL CHECK (state IN ('started', 'active', 'restored', 'failed'))
+    state        TEXT NOT NULL CHECK (state IN ('started', 'active', 'restored', 'failed', 'superseded'))
 );
 "#;
 
@@ -155,8 +155,17 @@ pub enum CheckoutState {
     Active,
     /// The original ref (and stash, if any) was restored.
     Restored,
-    /// Restore failed; the tree may still be on the PR head.
+    /// Restore failed. The tree may still be on the PR head or hold
+    /// uncommitted work, so recovery (§7.3) must call
+    /// [`restore`](super::checkout::restore) with `discard = false` first:
+    /// that returns [`NeedsDecision`](super::checkout::CheckoutError::NeedsDecision)
+    /// instead of discarding stray changes.
     Failed,
+    /// Terminal: this row was replaced by a newer row for the same PR, which
+    /// inherited its original ref and stash. Never a lock holder and never a
+    /// recovery target — restoring it too would apply the same stash twice
+    /// and `reset --hard` over the work the replacement's restore applied.
+    Superseded,
 }
 
 impl CheckoutState {
@@ -167,6 +176,7 @@ impl CheckoutState {
             CheckoutState::Active => "active",
             CheckoutState::Restored => "restored",
             CheckoutState::Failed => "failed",
+            CheckoutState::Superseded => "superseded",
         }
     }
 
@@ -177,6 +187,7 @@ impl CheckoutState {
             "active" => Ok(CheckoutState::Active),
             "restored" => Ok(CheckoutState::Restored),
             "failed" => Ok(CheckoutState::Failed),
+            "superseded" => Ok(CheckoutState::Superseded),
             _ => anyhow::bail!("unrecognised checkout state {raw:?}"),
         }
     }
@@ -364,14 +375,20 @@ impl Store {
         Ok(())
     }
 
-    /// The newest checkout of `repo_path` still in `Started` or `Active`
-    /// state — the per-repo lock (§4 step 2). The path is compared exactly
-    /// as stored; callers must pass the same `PathBuf` they began with.
+    /// The newest checkout of `repo_path` still in `Started`, `Active` or
+    /// `Failed` state — the per-repo lock (§4 step 2). The path is compared
+    /// exactly as stored; callers must pass the same `PathBuf` they began
+    /// with.
+    ///
+    /// A `Failed` row may still hold the tree (a stash-push or restore
+    /// failure leaves it on the PR head or with the user's changes in place),
+    /// so callers must treat it as held. `Superseded` and `Restored` never
+    /// hold.
     pub fn checkout_holding(&self, repo_path: &Path) -> anyhow::Result<Option<CheckoutRecord>> {
         let raw = self.conn().query_row(
             &format!(
                 "SELECT id, {CHECKOUT_COLUMNS} FROM ai_checkout
-                     WHERE repo_path = ?1 AND state IN ('started', 'active')
+                     WHERE repo_path = ?1 AND state IN ('started', 'active', 'failed')
                      ORDER BY id DESC LIMIT 1"
             ),
             rusqlite::params![repo_path.to_string_lossy()],
@@ -384,14 +401,19 @@ impl Store {
         }
     }
 
-    /// All checkouts still in `Started` or `Active` state, oldest first —
-    /// the crash-recovery list (§7.3).
+    /// All checkouts still in `Started`, `Active` or `Failed` state, oldest
+    /// first — the crash-recovery list (§7.3).
+    ///
+    /// `Failed` is included because it is written exactly when recovery is
+    /// needed. `Superseded` rows are excluded: a newer row for the same PR
+    /// inherited their stash and original ref, so listing both would let a
+    /// second restore discard the work the first one applied.
     pub fn checkouts_unrestored(&self) -> anyhow::Result<Vec<CheckoutRecord>> {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, {CHECKOUT_COLUMNS} FROM ai_checkout
-                 WHERE state IN ('started', 'active')
+                 WHERE state IN ('started', 'active', 'failed')
                  ORDER BY id"
             ))
             .context("preparing unrestored checkouts query")?;
@@ -499,8 +521,68 @@ mod tests {
         assert_eq!(held.state, CheckoutState::Active);
         assert_eq!(held.stash_sha.as_deref(), Some("stash42"));
 
+        // A Failed row may still hold the tree, so it is both the lock holder
+        // and a recovery target (§7.3).
+        store.checkout_set_state(id, CheckoutState::Failed).unwrap();
+        let held = store
+            .checkout_holding(&path)
+            .unwrap()
+            .expect("a failed row still holds");
+        assert_eq!(held.state, CheckoutState::Failed);
+        let unrestored = store.checkouts_unrestored().unwrap();
+        assert_eq!(unrestored.len(), 1);
+        assert_eq!(unrestored[0].id, id);
+        assert_eq!(unrestored[0].stash_sha.as_deref(), Some("stash42"));
+
         store
             .checkout_set_state(id, CheckoutState::Restored)
+            .unwrap();
+        assert!(store.checkout_holding(&path).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+    }
+
+    #[test]
+    fn superseded_checkouts_are_neither_locks_nor_recovery_targets() {
+        let store = Store::open_in_memory().unwrap();
+        let path = PathBuf::from("/repos/thing");
+
+        let id = store
+            .checkout_begin(&record(
+                "/repos/thing",
+                OriginalRef::Branch("main".to_string()),
+            ))
+            .unwrap();
+        store.checkout_set_stash(id, "stash42").unwrap();
+        store
+            .checkout_set_state(id, CheckoutState::Superseded)
+            .unwrap();
+
+        // Its replacement carries the same stash and original ref; listing the
+        // old row too would apply that stash twice.
+        let mut replacement = record("/repos/thing", OriginalRef::Branch("main".to_string()));
+        replacement.stash_sha = Some("stash42".to_string());
+        let new_id = store.checkout_begin(&replacement).unwrap();
+
+        let held = store
+            .checkout_holding(&path)
+            .unwrap()
+            .expect("new row holds");
+        assert_eq!(held.id, new_id);
+        let unrestored = store.checkouts_unrestored().unwrap();
+        assert_eq!(unrestored.len(), 1);
+        assert_eq!(unrestored[0].id, new_id);
+
+        // The superseded row round-trips as `superseded` …
+        let state: String = store
+            .conn()
+            .query_row("SELECT state FROM ai_checkout WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "superseded");
+        // … and is absent from both queries even once the replacement is done.
+        store
+            .checkout_set_state(new_id, CheckoutState::Restored)
             .unwrap();
         assert!(store.checkout_holding(&path).unwrap().is_none());
         assert!(store.checkouts_unrestored().unwrap().is_empty());

@@ -88,6 +88,11 @@ pub enum CheckoutError {
         "the working tree has changes made during the review; discard them or leave the checkout as is"
     )]
     NeedsDecision(Vec<String>),
+    /// The repository changed while the checkout was being confirmed: the
+    /// plan's snapshot of the working tree or `HEAD` no longer matches.
+    /// Nothing was stashed, recorded or touched — confirm again.
+    #[error("the repository changed since the checkout was confirmed; confirm again")]
+    PlanStale,
     /// The SQLite checkout record could not be written.
     #[error("could not record the checkout: {0}")]
     Store(#[from] anyhow::Error),
@@ -299,6 +304,35 @@ pub fn plan_checkout(
     })
 }
 
+/// Whether `plan`'s snapshot still describes the repository: the dirty flag
+/// (untracked files included) and the original ref must be unchanged since
+/// [`plan_checkout`] built it. Any mismatch is [`CheckoutError::PlanStale`];
+/// a failed probe (e.g. `HEAD` went missing) counts as one too.
+fn check_plan_current(plan: &CheckoutPlan) -> Result<(), CheckoutError> {
+    let dirty = !git(&plan.repo_path, &["status", "--porcelain"])?
+        .trim()
+        .is_empty();
+    if dirty != plan.dirty {
+        return Err(CheckoutError::PlanStale);
+    }
+    let unchanged = match &plan.original {
+        OriginalRef::Branch(name) => git(
+            &plan.repo_path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .ok()
+        .is_some_and(|current| current.trim() == name.as_str()),
+        OriginalRef::Detached(sha) => git(&plan.repo_path, &["rev-parse", "HEAD"])
+            .ok()
+            .is_some_and(|current| current.trim() == sha.as_str()),
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(CheckoutError::PlanStale)
+    }
+}
+
 /// Run the plan (spec §7.1): record `Started` → stash (if dirty) and note
 /// its SHA → fetch → detached checkout → verify `HEAD` → `Active`.
 ///
@@ -318,11 +352,20 @@ pub fn plan_checkout(
 ///   their work in `git stash list`. Restoring here would `reset --hard`
 ///   with `stash_sha == None` and orphan the work inside the stash.
 ///
-/// Same-PR retry: when the store still holds a `Started`/`Active` record
-/// for the *same* PR (a retry after a failed attempt), that row is marked
-/// `Failed` (superseded) and both its stash SHA and its `original` ref are
+/// The plan is re-checked against the repository before anything happens: a
+/// confirmation dialog may have been open while the user edited a clean tree
+/// (which [`abort_failed_checkout`] would then `reset --hard` away) or
+/// cleaned a dirty one (making `git stash push` a no-op and `stash@{0}` an
+/// unrelated entry). On any mismatch this returns
+/// [`CheckoutError::PlanStale`] without stashing, inserting a row or touching
+/// the tree.
+///
+/// Same-PR retry: when the store still holds a `Started`/`Active`/`Failed`
+/// record for the *same* PR (a retry after a failed attempt), that row is
+/// marked `Superseded` and both its stash SHA and its `original` ref are
 /// carried into the new record, so the repo lock, the user's stash and the
-/// real pre-checkout state move to the new row instead of leaking. The
+/// real pre-checkout state move to the new row instead of leaking. A
+/// superseded row is neither a lock holder nor a recovery target. The
 /// `original` is only taken over when this plan's `original` is
 /// `Detached(pr.head_sha)`, i.e. the retry starts from our own previous
 /// checkout; otherwise the plan's value describes a genuine user state.
@@ -333,6 +376,9 @@ pub fn execute_checkout(
     pr: &PrTarget,
     store: &Store,
 ) -> Result<CheckoutRecord, CheckoutError> {
+    // The dialog may have been open a while: verify the snapshot it showed
+    // still describes the repository BEFORE anything is recorded or changed.
+    check_plan_current(plan)?;
     let repo = plan.repo_path.clone();
     // A same-PR record still held means this is a retry: supersede it below.
     let superseded = store
@@ -371,7 +417,7 @@ pub fn execute_checkout(
         // Move the lock over only after the new row exists; if the
         // supersede write fails, back out the new row and report.
         if let Err(e) = store
-            .checkout_set_state(old.id, CheckoutState::Failed)
+            .checkout_set_state(old.id, CheckoutState::Superseded)
             .map_err(CheckoutError::Store)
         {
             let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
@@ -986,7 +1032,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
-        assert!(store.checkout_holding(&rec.repo_path).unwrap().is_none());
+        // A Failed row still holds the tree and is a recovery target.
+        let held = store
+            .checkout_holding(&rec.repo_path)
+            .unwrap()
+            .expect("a failed row still holds");
+        assert_eq!(held.state, CheckoutState::Failed);
+        let unrestored = store.checkouts_unrestored().unwrap();
+        assert_eq!(unrestored.len(), 1);
+        assert_eq!(unrestored[0].id, rec.id);
     }
 
     #[test]
@@ -1055,7 +1109,8 @@ mod tests {
             "no stash was created"
         );
 
-        // The single record is Failed and no longer holds the repo.
+        // The single record is Failed and still holds the tree; recovery
+        // (§7.3) can see it, even though no stash was created.
         let conn = rusqlite::Connection::open(&db).unwrap();
         let states: Vec<String> = conn
             .prepare("SELECT state FROM ai_checkout")
@@ -1065,7 +1120,69 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(states, vec!["failed".to_string()]);
-        assert!(store.checkout_holding(&rec_path(&clone)).unwrap().is_none());
+        let held = store
+            .checkout_holding(&rec_path(&clone))
+            .unwrap()
+            .expect("a failed row still holds the tree");
+        assert_eq!(held.state, CheckoutState::Failed);
+        let unrestored = store.checkouts_unrestored().unwrap();
+        assert_eq!(unrestored.len(), 1);
+        assert_eq!(unrestored[0].state, CheckoutState::Failed);
+        assert_eq!(unrestored[0].pr_number, pr.number);
+    }
+
+    #[test]
+    fn a_clean_plan_with_a_new_untracked_file_is_stale_and_records_nothing() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        assert!(!plan.dirty);
+
+        // The user edits the clean tree while the confirmation dialog is
+        // open. `abort_failed_checkout` would `reset --hard` these away.
+        write_file(&clone.join("stray.txt"), "typed during the dialog\n");
+        let err = execute_checkout(&plan, &pr, &store).expect_err("plan is stale");
+        assert!(
+            matches!(err, CheckoutError::PlanStale),
+            "expected PlanStale, got {err:?}"
+        );
+
+        // Nothing was recorded, stashed or touched.
+        assert!(store.checkout_holding(&plan.repo_path).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(clone.join("stray.txt")).unwrap(),
+            "typed during the dialog\n"
+        );
+        assert_eq!(gitx(&clone, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert!(gitx(&clone, &["stash", "list"]).is_empty());
+    }
+
+    #[test]
+    fn a_dirty_plan_cleaned_before_execution_is_stale_and_records_nothing() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        write_file(&clone.join("a.txt"), "mine\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        assert!(plan.dirty);
+
+        // The user reverts their edits while the dialog is open. Proceeding
+        // would make `git stash push` a no-op and `stash@{0}` unrelated.
+        gitx(&clone, &["checkout", "--", "a.txt"]);
+        let err = execute_checkout(&plan, &pr, &store).expect_err("plan is stale");
+        assert!(
+            matches!(err, CheckoutError::PlanStale),
+            "expected PlanStale, got {err:?}"
+        );
+
+        assert!(store.checkout_holding(&plan.repo_path).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+        assert!(
+            gitx(&clone, &["stash", "list"]).is_empty(),
+            "a stale plan must not stash"
+        );
+        assert_eq!(std::fs::read_to_string(clone.join("a.txt")).unwrap(), "a\n");
+        assert_eq!(gitx(&clone, &["symbolic-ref", "--short", "HEAD"]), "main");
     }
 
     #[test]
@@ -1087,7 +1204,8 @@ mod tests {
         assert_eq!(second.stash_sha.as_deref(), Some(stash_sha.as_str()));
         assert_eq!(gitx(&clone, &["rev-parse", "HEAD"]), pr.head_sha);
 
-        // The old row was superseded (Failed); the new row holds the lock.
+        // The old row was superseded; the new row holds the lock and is the
+        // only recovery target, since it inherited the stash.
         let conn = rusqlite::Connection::open(&db).unwrap();
         let old_state: String = conn
             .query_row(
@@ -1096,12 +1214,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(old_state, "failed");
+        assert_eq!(old_state, "superseded");
         let held = store
             .checkout_holding(&second.repo_path)
             .unwrap()
             .expect("new row holds");
         assert_eq!(held.id, second.id);
+        let unrestored = store.checkouts_unrestored().unwrap();
+        assert_eq!(unrestored.len(), 1, "only the replacement is recoverable");
+        assert_eq!(unrestored[0].id, second.id);
 
         // Restoring the new record brings the user's work back, drops the
         // carried stash, and leaves nothing unrestored.

@@ -11,7 +11,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use review_sandbox::{EnvInput, LocalHost, SandboxOps, SandboxPolicy, agent_env, sandboxed_launch};
+use review_sandbox::{
+    EnvInput, LocalHost, SandboxOps, SandboxPolicy, SandboxUnavailable, agent_env, sandboxed_launch,
+};
 
 const T: Duration = Duration::from_secs(30);
 
@@ -88,9 +90,18 @@ fn sandboxed() -> anyhow::Result<Option<Sand>> {
     })?;
     let launch = match sandboxed_launch(&policy, env) {
         Ok(l) => l,
-        Err(e) => {
+        // Only the genuinely unavailable environments may skip: a broken
+        // fixture must fail the run instead of turning the guarantees green.
+        Err(
+            e @ (SandboxUnavailable::NoBwrap
+            | SandboxUnavailable::BwrapBroken(_)
+            | SandboxUnavailable::Unsupported),
+        ) => {
             println!("skipping: {e}");
             return Ok(None);
+        }
+        Err(e @ SandboxUnavailable::Policy(_)) => {
+            anyhow::bail!("the sandbox policy could not be built: {e}");
         }
     };
     let host = LocalHost::with_launch(&repo, launch)?;

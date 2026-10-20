@@ -104,6 +104,11 @@ impl AiVm {
             if name.trim().is_empty() {
                 return Err(format!("provider {} has an empty name", index + 1));
             }
+            // The name keys the keychain account (`llm:<name>`) and the
+            // model's routing, so it must be stored exactly as typed.
+            if name != name.trim() {
+                return Err("provider names cannot start or end with spaces".to_owned());
+            }
             if self.providers[..index]
                 .iter()
                 .any(|other| other.settings.name == *name)
@@ -237,6 +242,39 @@ impl SettingsVm {
         s.ai.repos = self.ai.repos;
         Ok(host_changed)
     }
+}
+
+/// The provider names `before` had and `after` does not: the keychain
+/// accounts (`llm:<name>`) a successful apply leaves orphaned. The app clears
+/// them so re-adding the name cannot silently reuse an old credential.
+pub fn removed_provider_names(before: &[String], after: &[String]) -> Vec<String> {
+    before
+        .iter()
+        .filter(|name| !after.contains(name))
+        .cloned()
+        .collect()
+}
+
+/// The actions Save emits: the apply first, then one [`SettingsAction::SetLlmKey`]
+/// per typed key. Every `key_input` is cleared in `vm` before it is cloned, so
+/// the key rides only in the emitted actions — never in the apply's settings.
+fn save_actions(vm: &mut SettingsVm) -> Vec<SettingsAction> {
+    let keys: Vec<(String, String)> = vm
+        .ai
+        .providers
+        .iter()
+        .filter(|provider| !provider.key_input.is_empty())
+        .map(|provider| (provider.settings.name.clone(), provider.key_input.clone()))
+        .collect();
+    for provider in &mut vm.ai.providers {
+        provider.key_input.clear();
+    }
+    let mut actions = vec![SettingsAction::Apply(vm.clone())];
+    actions.extend(
+        keys.into_iter()
+            .map(|(provider, key)| SettingsAction::SetLlmKey { provider, key }),
+    );
+    actions
 }
 
 /// The window's state across frames, owned by the app.
@@ -476,17 +514,10 @@ pub fn render(
                     save.on_hover_text("fix the AI providers before saving")
                 };
                 if save.clicked() {
-                    // A typed key goes to the keychain, never into the
-                    // settings the next action carries.
-                    for provider in &state.vm.ai.providers {
-                        if !provider.key_input.is_empty() {
-                            actions.push(SettingsAction::SetLlmKey {
-                                provider: provider.settings.name.clone(),
-                                key: provider.key_input.clone(),
-                            });
-                        }
-                    }
-                    actions.push(SettingsAction::Apply(state.vm.clone()));
+                    // Apply comes first (the app stops on a rejected apply,
+                    // so a key is never stored for unsaved settings), then
+                    // the typed keys, which ride only in these actions.
+                    actions.extend(save_actions(&mut state.vm));
                     close = true;
                 }
                 if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
@@ -783,9 +814,19 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
             ai.default_model.reasoning = level;
         }
     });
+    let current = ai.default_model.provider.clone();
+    let provider = ai.provider(&current).cloned();
+    let model = ai.default_model.model.clone();
+    let key_stored = ai
+        .providers
+        .iter()
+        .any(|p| p.settings.name == current && p.key_stored);
+    let key_typed = ai
+        .providers
+        .iter()
+        .any(|p| p.settings.name == current && !p.key_input.is_empty());
     ui.horizontal(|ui| {
-        let provider = ai.provider(&ai.default_model.provider).cloned();
-        let ready = provider.is_some() && !ai.default_model.model.trim().is_empty();
+        let ready = test_connection_ready(provider.is_some(), &model, key_stored, key_typed);
         let clicked = Btn::new(BtnKind::Default, "Test connection")
             .icon(icons::CHECK_CHECK)
             .enabled(ready)
@@ -797,7 +838,15 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
                 model: ai.default_model.clone(),
             });
         }
-        match ai.test_results.get(&ai.default_model.provider) {
+        // A typed key is enough to probe, but it is only stored on Save.
+        if ready && key_typed && !key_stored {
+            ui.label(
+                RichText::new("uses the key above without saving")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        }
+        match ai.test_results.get(&current) {
             Some(Ok(model)) => {
                 ui.label(RichText::new(format!("connected — {model} answered")).color(p.ok));
             }
@@ -810,6 +859,19 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
             }
         }
     });
+}
+
+/// Whether "Test connection" may run: the provider exists, a model id is
+/// entered, and there is a key to try — stored in the keychain or typed in
+/// this session (a typed key probes without being saved).
+#[cfg(unix)]
+fn test_connection_ready(
+    provider_exists: bool,
+    model: &str,
+    key_stored: bool,
+    key_typed: bool,
+) -> bool {
+    provider_exists && !model.trim().is_empty() && (key_stored || key_typed)
 }
 
 /// The per-repository settings: the checkout path (with a folder picker) and
@@ -1248,6 +1310,84 @@ mod tests {
         drafts.push(RepoDraft::default());
         sync_drafts(&ai, &mut drafts);
         assert_eq!(drafts.len(), ai.repos.len());
+    }
+
+    #[test]
+    fn removed_provider_names_lists_what_a_rename_or_remove_orphaned() {
+        let before = vec!["work".to_string(), "home".to_string()];
+        assert_eq!(
+            removed_provider_names(&before, &["work".to_string()]),
+            vec!["home".to_string()]
+        );
+        // A rename is a remove plus an add: the old name is cleared.
+        assert_eq!(
+            removed_provider_names(&["work".to_string()], &["office".to_string()]),
+            vec!["work".to_string()]
+        );
+        assert!(removed_provider_names(&before, &before).is_empty());
+        assert!(removed_provider_names(&[], &before).is_empty());
+    }
+
+    #[test]
+    fn save_emits_the_apply_first_and_clears_the_typed_keys() {
+        let settings = ai_settings();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.providers[0].key_input = "sekrit".into();
+
+        let actions = save_actions(&mut vm);
+
+        assert_eq!(actions.len(), 2, "one apply and one key: {actions:?}");
+        match &actions[0] {
+            SettingsAction::Apply(applied) => {
+                assert_eq!(applied.ai.providers.len(), 1);
+                assert!(
+                    applied.ai.providers.iter().all(|p| p.key_input.is_empty()),
+                    "the apply must not carry the key"
+                );
+            }
+            other => panic!("the apply must come first, got {other:?}"),
+        }
+        assert_eq!(
+            actions[1],
+            SettingsAction::SetLlmKey {
+                provider: "work".into(),
+                key: "sekrit".into(),
+            }
+        );
+        assert!(
+            vm.ai.providers[0].key_input.is_empty(),
+            "the VM no longer holds the typed key"
+        );
+    }
+
+    #[test]
+    fn provider_names_with_surrounding_spaces_are_rejected() {
+        let mut settings = ai_settings();
+        let before = settings.ai.clone();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.providers[0].settings.name = " work".into();
+        let error = vm.apply(&mut settings).unwrap_err();
+        assert!(error.contains("spaces"), "unexpected error: {error}");
+        assert_eq!(settings.ai, before, "a rejected apply writes nothing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_connection_needs_a_provider_model_and_key() {
+        assert!(
+            test_connection_ready(true, "model", true, false),
+            "stored key"
+        );
+        assert!(
+            test_connection_ready(true, "model", false, true),
+            "a typed key may probe without saving"
+        );
+        assert!(
+            !test_connection_ready(true, "model", false, false),
+            "no key at all"
+        );
+        assert!(!test_connection_ready(false, "model", true, true));
+        assert!(!test_connection_ready(true, "  ", true, false));
     }
 
     #[test]
