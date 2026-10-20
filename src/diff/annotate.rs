@@ -381,12 +381,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outdated.placement, Placement::EndOfFile);
-        assert!(place_thread(
-            &thread("other.rs", Some(1), Side::Right, SubjectType::Line),
-            3,
-            &files
-        )
-        .is_none());
+        assert!(
+            place_thread(
+                &thread("other.rs", Some(1), Side::Right, SubjectType::Line),
+                3,
+                &files
+            )
+            .is_none()
+        );
 
         let model = annotate(&build(&files), &files, &[right]);
         let pos = model

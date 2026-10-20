@@ -15,7 +15,7 @@ use syntect::highlighting::ScopeSelectors;
 use syntect::highlighting::{Color, FontStyle, StyleModifier, Theme, ThemeItem};
 use syntect::parsing::SyntaxSet;
 
-use crate::ui::theme::{palette, Palette};
+use crate::ui::theme::{Palette, palette};
 
 /// One run of identically styled text inside a line.
 ///

@@ -19,11 +19,7 @@ pub const UNDER_TITLE_BAR: bool = cfg!(target_os = "macos");
 
 /// The width kept free at the strip's left for the traffic lights.
 pub fn leading_inset() -> f32 {
-    if UNDER_TITLE_BAR {
-        78.0
-    } else {
-        8.0
-    }
+    if UNDER_TITLE_BAR { 78.0 } else { 8.0 }
 }
 
 /// Draw the title bar as a top panel and lay `add` out in it, left to

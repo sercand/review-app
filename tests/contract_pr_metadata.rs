@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gh_review_desktop::auth::store::MemoryStore;
 use gh_review_desktop::model::RepoRef;
-use gh_review_desktop::runtime::{event_channel, execute, Command, Event, ExecCtx, SessionId};
+use gh_review_desktop::runtime::{Command, Event, ExecCtx, SessionId, event_channel, execute};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

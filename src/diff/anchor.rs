@@ -6,7 +6,7 @@
 
 use std::ops::RangeInclusive;
 
-use crate::github::files::{anchor_path, PrFile};
+use crate::github::files::{PrFile, anchor_path};
 use crate::model::comment::Anchor;
 use crate::model::diff::{DiffRow, Hunk, Side};
 

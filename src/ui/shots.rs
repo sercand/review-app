@@ -71,14 +71,110 @@ type PrRow<'a> = (
 
 fn pr_list_state() -> PrListState {
     let rows: [PrRow; 8] = [
-        ("Performance: fix long-session memory leaks and top bar, gallery and loading costs", "otsimo/kedis-studio", 2298, "Cem-Celik", Some(ReviewDecision::ReviewRequired), false, Some(CiState::Success), 142, 57, 0, "2026-10-19T12:52:48Z"),
-        ("Gallery: stop pixel posters from showing up twice after a push notification", "otsimo/kedis-studio", 2300, "Cem-Celik", Some(ReviewDecision::ReviewRequired), false, Some(CiState::Pending), 3, 0, 0, "2026-10-19T12:47:52Z"),
-        ("Flux3 klein", "sercand/shiso-llm", 44, "sercand", None, false, Some(CiState::Success), 13170, 184, 0, "2026-10-18T13:26:30Z"),
-        ("qwen4exp: serve NVIDIA's Qwen3.8-Flash-Next FP4-Local (MXFP8/NVFP4/CSF), FP8 KV, draft-head fixes", "sercand/shiso-llm", 43, "sercand", None, false, Some(CiState::Failure), 34429, 1535, 0, "2026-10-18T08:03:58Z"),
-        ("Upgrade Piknik v5", "otsimo/kedis-studio", 2297, "gozdecoban", Some(ReviewDecision::ReviewRequired), false, Some(CiState::Success), 47, 336, 0, "2026-10-16T14:36:51Z"),
-        ("Add Sago DevUI debug menu improvements bundle", "otsimo/kedis-studio", 1902, "egealtar", Some(ReviewDecision::ChangesRequested), false, Some(CiState::Success), 1381, 0, 11, "2026-08-25T09:14:16Z"),
-        ("Add Edit Mode unit tests for Storage, App, and Ranking (149 tests)", "otsimo/kedis-studio", 1731, "tayfunotsimo", Some(ReviewDecision::ChangesRequested), true, None, 3518, 37, 10, "2026-07-10T07:50:21Z"),
-        ("Resolve: \"Webstore: Adding premium-status-change and billing history support\"", "otsimo/mono", 1218, "sinantomruk", Some(ReviewDecision::Approved), false, Some(CiState::Success), 813, 22, 5, "2023-10-06T07:53:53Z"),
+        (
+            "Performance: fix long-session memory leaks and top bar, gallery and loading costs",
+            "otsimo/kedis-studio",
+            2298,
+            "Cem-Celik",
+            Some(ReviewDecision::ReviewRequired),
+            false,
+            Some(CiState::Success),
+            142,
+            57,
+            0,
+            "2026-10-19T12:52:48Z",
+        ),
+        (
+            "Gallery: stop pixel posters from showing up twice after a push notification",
+            "otsimo/kedis-studio",
+            2300,
+            "Cem-Celik",
+            Some(ReviewDecision::ReviewRequired),
+            false,
+            Some(CiState::Pending),
+            3,
+            0,
+            0,
+            "2026-10-19T12:47:52Z",
+        ),
+        (
+            "Flux3 klein",
+            "sercand/shiso-llm",
+            44,
+            "sercand",
+            None,
+            false,
+            Some(CiState::Success),
+            13170,
+            184,
+            0,
+            "2026-10-18T13:26:30Z",
+        ),
+        (
+            "qwen4exp: serve NVIDIA's Qwen3.8-Flash-Next FP4-Local (MXFP8/NVFP4/CSF), FP8 KV, draft-head fixes",
+            "sercand/shiso-llm",
+            43,
+            "sercand",
+            None,
+            false,
+            Some(CiState::Failure),
+            34429,
+            1535,
+            0,
+            "2026-10-18T08:03:58Z",
+        ),
+        (
+            "Upgrade Piknik v5",
+            "otsimo/kedis-studio",
+            2297,
+            "gozdecoban",
+            Some(ReviewDecision::ReviewRequired),
+            false,
+            Some(CiState::Success),
+            47,
+            336,
+            0,
+            "2026-10-16T14:36:51Z",
+        ),
+        (
+            "Add Sago DevUI debug menu improvements bundle",
+            "otsimo/kedis-studio",
+            1902,
+            "egealtar",
+            Some(ReviewDecision::ChangesRequested),
+            false,
+            Some(CiState::Success),
+            1381,
+            0,
+            11,
+            "2026-08-25T09:14:16Z",
+        ),
+        (
+            "Add Edit Mode unit tests for Storage, App, and Ranking (149 tests)",
+            "otsimo/kedis-studio",
+            1731,
+            "tayfunotsimo",
+            Some(ReviewDecision::ChangesRequested),
+            true,
+            None,
+            3518,
+            37,
+            10,
+            "2026-07-10T07:50:21Z",
+        ),
+        (
+            "Resolve: \"Webstore: Adding premium-status-change and billing history support\"",
+            "otsimo/mono",
+            1218,
+            "sinantomruk",
+            Some(ReviewDecision::Approved),
+            false,
+            Some(CiState::Success),
+            813,
+            22,
+            5,
+            "2023-10-06T07:53:53Z",
+        ),
     ];
     let mut state = PrListState::default();
     state.items = rows
@@ -95,12 +191,14 @@ fn pr_list_state() -> PrListState {
                 s.additions = add;
                 s.deletions = del;
                 s.updated_at = updated.into();
-                s.scopes = vec![if author == "sercand" {
-                    "authored"
-                } else {
-                    "review-requested"
-                }
-                .into()];
+                s.scopes = vec![
+                    if author == "sercand" {
+                        "authored"
+                    } else {
+                        "review-requested"
+                    }
+                    .into(),
+                ];
                 s
             },
         )

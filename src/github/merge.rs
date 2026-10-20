@@ -2,7 +2,7 @@
 //! repository's merge-method allow flags.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;

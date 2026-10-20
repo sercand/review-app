@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use crate::github::files::{FileStatus, PrFile};
-use crate::model::tree::{build_tree, TreeNode};
+use crate::model::tree::{TreeNode, build_tree};
 use crate::state::viewed::ViewedSet;
 
 /// What the left pane is filtering the file list by.

@@ -93,11 +93,7 @@ pub fn folder_icon_name(name: &str, open: bool) -> &'static str {
         ".github" => ("folder-github", "folder-github-open"),
         _ => ("folder", "folder-open"),
     };
-    if open {
-        open_name
-    } else {
-        closed
-    }
+    if open { open_name } else { closed }
 }
 
 /// Every name [`file_icon_name`] and [`folder_icon_name`] can return, open

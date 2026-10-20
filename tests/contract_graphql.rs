@@ -3,7 +3,7 @@ mod common;
 use common::client;
 use gh_review_desktop::github::error::GhError;
 use serde_json::json;
-use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::*};
 
 #[tokio::test]
 async fn graphql_rate_limit_error_maps_to_rate_limited() {

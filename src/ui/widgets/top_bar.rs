@@ -6,7 +6,7 @@ use eframe::egui::{self, Layout, Popup, PopupCloseBehavior, RichText};
 
 use crate::ui::components::{Btn, BtnKind};
 
-use crate::github::checks::{ci_state, CheckRun, CombinedStatus};
+use crate::github::checks::{CheckRun, CombinedStatus, ci_state};
 use crate::model::pr::CiState;
 use crate::state::pr_detail::PrSession;
 use crate::ui::widgets::checks;

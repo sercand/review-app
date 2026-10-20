@@ -4,7 +4,7 @@
 mod common;
 
 use common::client;
-use gh_review_desktop::github::merge::{merge_payload, MergeMethod, MergeRequest};
+use gh_review_desktop::github::merge::{MergeMethod, MergeRequest, merge_payload};
 use gh_review_desktop::model::RepoRef;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};

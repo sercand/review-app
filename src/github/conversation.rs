@@ -46,9 +46,10 @@ pub fn referenced_issues(body: &str) -> Vec<IssueRef> {
     let mut found: Vec<IssueRef> = Vec::new();
     for (hash, _) in body.match_indices('#') {
         if let Some(issue) = reference_at(body, hash)
-            && !found.contains(&issue) {
-                found.push(issue);
-            }
+            && !found.contains(&issue)
+        {
+            found.push(issue);
+        }
     }
     found
 }

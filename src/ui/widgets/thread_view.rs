@@ -15,7 +15,7 @@ use eframe::egui;
 use crate::model::review::PendingComment;
 use crate::model::thread::ReviewThread;
 use crate::ui::icons::{
-    icon_text, CIRCLE_CHECK, COPY, MESSAGES_SQUARE, MESSAGE_SQUARE_DASHED, PENCIL, TRASH_2,
+    CIRCLE_CHECK, COPY, MESSAGE_SQUARE_DASHED, MESSAGES_SQUARE, PENCIL, TRASH_2, icon_text,
 };
 use crate::ui::theme::palette_of;
 use crate::ui::widgets::markdown::{self, MarkdownDoc};
@@ -409,9 +409,9 @@ fn render_expanded(
                                 "Copy suggestion",
                             ))))
                             .clicked()
-                        {
-                            actions.push(ThreadAction::CopySuggestion(text.clone()));
-                        }
+                    {
+                        actions.push(ThreadAction::CopySuggestion(text.clone()));
+                    }
                 }
             });
         });

@@ -5,15 +5,15 @@
 
 use eframe::egui::{self, Color32, Frame, Margin, RichText};
 
-use crate::github::checks::{ci_state, CheckRun, CombinedStatus};
+use crate::github::checks::{CheckRun, CombinedStatus, ci_state};
 use crate::github::commits::Commit;
-use crate::github::conversation::{referenced_issues, ConversationComment, IssueRef};
+use crate::github::conversation::{ConversationComment, IssueRef, referenced_issues};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{Review, ReviewState};
-use crate::model::pr::CiState;
 use crate::model::RepoRef;
+use crate::model::pr::CiState;
 use crate::state::pr_detail::PrSession;
-use crate::ui::widgets::review_panel::{reviews_vm, sha7, ReviewVm};
+use crate::ui::widgets::review_panel::{ReviewVm, reviews_vm, sha7};
 use crate::ui::widgets::thread_view::{avatar, relative_time};
 use crate::ui::widgets::{checks, commit_list, markdown};
 use crate::ui::{fonts, icons, theme};
@@ -143,9 +143,10 @@ fn render_tab_strip(ui: &mut egui::Ui, tab: &mut DetailsTab, counts: [Option<usi
                 .corner_radius(6.0);
             let response = ui.add(button).on_hover_text(label);
             if let Some(Some(count)) = counts.get(index).copied()
-                && count > 0 {
-                    ui.label(RichText::new(count.to_string()).color(p.faint).size(11.0));
-                }
+                && count > 0
+            {
+                ui.label(RichText::new(count.to_string()).color(p.faint).size(11.0));
+            }
             if response.clicked() {
                 *tab = value;
             }

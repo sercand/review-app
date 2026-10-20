@@ -7,13 +7,13 @@
 //! and no `submitted_at`; its comments come from a separate endpoint.
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
+use crate::model::RepoRef;
 use crate::model::diff::Side;
 use crate::model::review::{PendingReview, ReviewEvent};
-use crate::model::RepoRef;
 
 /// The state a review is in, as GitHub reports it.
 #[derive(Clone, Debug, PartialEq)]

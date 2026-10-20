@@ -153,11 +153,7 @@ pub const LIGHT: Palette = Palette {
 
 /// The palette for a dark-mode flag.
 pub fn palette(dark: bool) -> &'static Palette {
-    if dark {
-        &DARK
-    } else {
-        &LIGHT
-    }
+    if dark { &DARK } else { &LIGHT }
 }
 
 /// The eight avatar fills (redesign mockup `.avatar`), indexed by login.
@@ -268,7 +264,7 @@ mod tests {
     use super::*;
     use crate::github::search::Scope;
     use crate::persist::settings::Settings;
-    use crate::ui::widgets::settings_window::{settings_vm, SettingsVm};
+    use crate::ui::widgets::settings_window::{SettingsVm, settings_vm};
 
     #[test]
     fn theme_resolves_system_and_vm_round_trips() {

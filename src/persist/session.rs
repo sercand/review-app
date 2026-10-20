@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::RepoRef;
 use crate::model::comment::Anchor;
 use crate::model::review::PendingReview;
-use crate::model::RepoRef;
 use crate::state::viewed::ViewedSet;
 
 /// How long a [`DebouncedWriter`] waits after the last change before flushing.
@@ -172,8 +172,8 @@ impl DebouncedWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::review::{PendingReview, ReviewEvent};
     use crate::model::RepoRef;
+    use crate::model::review::{PendingReview, ReviewEvent};
     use crate::state::viewed::ViewedSet;
     use crate::test_support::{file, line_anchor, repo, tempdir};
     use std::time::{Duration, Instant};
@@ -192,8 +192,10 @@ mod tests {
             ..Default::default()
         };
         save(dir.path(), "github.com", &r, 7, &s).unwrap();
-        assert!(session_path(dir.path(), "github.com", &r, 7)
-            .ends_with("sessions/github.com/octo/repo/7.json"));
+        assert!(
+            session_path(dir.path(), "github.com", &r, 7)
+                .ends_with("sessions/github.com/octo/repo/7.json")
+        );
         assert_eq!(load(dir.path(), "github.com", &r, 7).unwrap().unwrap(), s);
         assert!(load(dir.path(), "ghe.acme.io", &r, 7).unwrap().is_none()); // hosts never collide
     }

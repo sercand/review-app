@@ -11,27 +11,27 @@ use std::time::{Instant, SystemTime};
 
 use eframe::egui;
 
+use crate::auth::DEFAULT_CLIENT_ID;
 use crate::auth::device_flow::{self, AuthFailure, AuthState};
 use crate::auth::session::{complete_login, handle_unauthorized, restore_token, sign_out};
 use crate::auth::store::{KeyringStore, TokenStore};
-use crate::auth::DEFAULT_CLIENT_ID;
 use crate::diff::highlight::{HighlightCache, SyntectHighlighter};
 use crate::diff::row_model::RowRef;
 use crate::github::client::{GithubClient, Me};
 use crate::github::error::GhError;
+use crate::model::RepoRef;
 use crate::model::comment::CommentTarget;
 use crate::model::review::ReviewEvent;
-use crate::model::RepoRef;
 use crate::persist::config_root;
 use crate::persist::session::DebouncedWriter;
 use crate::persist::settings::Settings;
 use crate::runtime::{
-    event_channel, execute, spawn_worker, Command, Event, EventReceiver, ExecCtx, SessionId, Worker,
+    Command, Event, EventReceiver, ExecCtx, SessionId, Worker, event_channel, execute, spawn_worker,
 };
 use crate::state::composer::{self, ComposerAction};
-use crate::state::pr_detail::{start_submit, viewer_is_author, PrSession};
-use crate::state::pr_list::{load_more, reduce, PrListMsg, PrListState};
-use crate::ui::command::{self, next_index, KeyPress};
+use crate::state::pr_detail::{PrSession, start_submit, viewer_is_author};
+use crate::state::pr_list::{PrListMsg, PrListState, load_more, reduce};
+use crate::ui::command::{self, KeyPress, next_index};
 use crate::ui::screens::login::{self, LoginAction, LoginForm};
 use crate::ui::screens::pr_detail::{self, PrDetailAction, PrDetailState};
 use crate::ui::screens::pr_list::{self, PrListAction, PrListForm};
@@ -968,12 +968,12 @@ impl ReviewApp {
                     if let Some(session) = &mut self.session
                         && let Some(command) =
                             crate::state::pr_detail::start_merge(session, method, title, message)
-                        {
-                            // The popover's in-flight half: the button rests
-                            // until GitHub answers.
-                            session.merging = true;
-                            self.worker.send(command);
-                        }
+                    {
+                        // The popover's in-flight half: the button rests
+                        // until GitHub answers.
+                        session.merging = true;
+                        self.worker.send(command);
+                    }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),
                 PrDetailAction::OpenInBrowser => {
@@ -1049,14 +1049,15 @@ impl ReviewApp {
                     .find(|thread| thread.id == thread_id)
                     .map(|thread| (thread.path.clone(), thread.side, thread.line));
                 if let Some((path, side, line)) = anchor
-                    && let Some(index) = session.files.iter().position(|l| l.file.path == path) {
-                        session.select_file(index);
-                        let row = side.zip(line).and_then(|(side, line)| {
-                            session.row_model.row_of_line(&session.files, side, line)
-                        });
-                        // A file-level thread sits at the top of the file.
-                        self.pr_detail.diff.scroll_to_row = Some(row.unwrap_or(0));
-                    }
+                    && let Some(index) = session.files.iter().position(|l| l.file.path == path)
+                {
+                    session.select_file(index);
+                    let row = side.zip(line).and_then(|(side, line)| {
+                        session.row_model.row_of_line(&session.files, side, line)
+                    });
+                    // A file-level thread sits at the top of the file.
+                    self.pr_detail.diff.scroll_to_row = Some(row.unwrap_or(0));
+                }
                 Vec::new()
             }
             ReviewAction::LocatePending(local_id) => {
@@ -1072,16 +1073,16 @@ impl ReviewApp {
                         .files
                         .iter()
                         .position(|l| l.file.path == anchor.path)
+                {
+                    session.select_file(index);
+                    if let Some(row) =
+                        session
+                            .row_model
+                            .row_of_line(&session.files, anchor.side, anchor.line)
                     {
-                        session.select_file(index);
-                        if let Some(row) =
-                            session
-                                .row_model
-                                .row_of_line(&session.files, anchor.side, anchor.line)
-                        {
-                            self.pr_detail.diff.scroll_to_row = Some(row);
-                        }
+                        self.pr_detail.diff.scroll_to_row = Some(row);
                     }
+                }
                 Vec::new()
             }
             ReviewAction::Discard => {
@@ -1377,9 +1378,10 @@ impl ReviewApp {
         });
         for press in &presses {
             if let Some(action) = command::resolve_key(press, text_focused)
-                && global_key_allowed(action, text_focused) {
-                    self.dispatch(action, now);
-                }
+                && global_key_allowed(action, text_focused)
+            {
+                self.dispatch(action, now);
+            }
         }
     }
 
@@ -1519,11 +1521,12 @@ impl ReviewApp {
             return;
         }
         if let Some(session) = &mut self.session
-            && session.composer.target.is_some() {
-                composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
-                session.rebuild_rows();
-                return;
-            }
+            && session.composer.target.is_some()
+        {
+            composer::reduce(&mut session.composer, composer::ComposerMsg::Cancel);
+            session.rebuild_rows();
+            return;
+        }
         self.close_detail();
     }
 
@@ -1588,9 +1591,10 @@ impl ReviewApp {
             FileHeaderAction::SetImageMode(mode) => self.pr_detail.diff.image_mode = mode,
             FileHeaderAction::ToggleRendered => {
                 if let Some(session) = &mut self.session
-                    && let Some(index) = session.current_file().map(|(index, _)| index as u32) {
-                        session.toggle_rendered_svg(index);
-                    }
+                    && let Some(index) = session.current_file().map(|(index, _)| index as u32)
+                {
+                    session.toggle_rendered_svg(index);
+                }
             }
         }
     }

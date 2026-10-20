@@ -14,8 +14,8 @@ use eframe::egui::{self, Align, Color32, Layout, Rect, RichText, ScrollArea, Sen
 
 use crate::github::files::{FileStatus, PrFile};
 use crate::model::tree::TreeNode;
-use crate::state::filters::{ordered_children, status_group, FilterState, TreeOrder};
-use crate::state::folder_viewed::{folder_state, TriState};
+use crate::state::filters::{FilterState, TreeOrder, ordered_children, status_group};
+use crate::state::folder_viewed::{TriState, folder_state};
 use crate::state::viewed::ViewedSet;
 use crate::ui::{file_icons, fonts, icons, theme};
 

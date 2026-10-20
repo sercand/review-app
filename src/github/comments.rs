@@ -5,13 +5,13 @@
 //! a file-level comment carries `subject_type: "file"` and no coordinates at
 //! all. Posting is a mutation, so it is sent once and never retried.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
+use crate::model::RepoRef;
 use crate::model::comment::CommentTarget;
 use crate::model::thread::ThreadComment;
-use crate::model::RepoRef;
 
 /// A comment the reviewer is posting now: its body, the commit it is anchored
 /// to, and what it is attached to (spec §7.3).

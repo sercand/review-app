@@ -11,7 +11,7 @@ use egui::{Popup, PopupCloseBehavior, RichText, UiBuilder};
 
 use crate::github::search::{Scope, ScopeConstraint, Sort};
 use crate::model::RepoRef;
-use crate::state::pr_list::{counter_label, visible_items, PrListMsg, PrListState};
+use crate::state::pr_list::{PrListMsg, PrListState, counter_label, visible_items};
 use crate::ui::widgets::pr_row;
 use crate::ui::{icons, theme};
 
@@ -259,18 +259,21 @@ fn handle_shortcuts(
         form.sort_open = false;
         ui.memory_mut(|mem| mem.request_focus(filter_id));
     }
-    if enter && !form.repo_open && !form.sort_open && focused != Some(filter_id)
+    if enter
+        && !form.repo_open
+        && !form.sort_open
+        && focused != Some(filter_id)
         && let Some((repo_id, number)) = state.selected.clone()
-            && let Some(pr) = state
-                .items
-                .iter()
-                .find(|pr| pr.repo.id() == repo_id && pr.number == number)
-            {
-                actions.push(PrListAction::Open {
-                    repo: pr.repo.clone(),
-                    number,
-                });
-            }
+        && let Some(pr) = state
+            .items
+            .iter()
+            .find(|pr| pr.repo.id() == repo_id && pr.number == number)
+    {
+        actions.push(PrListAction::Open {
+            repo: pr.repo.clone(),
+            number,
+        });
+    }
 }
 
 /// The two toolbar rows: scope chips with counts on top, then the repository

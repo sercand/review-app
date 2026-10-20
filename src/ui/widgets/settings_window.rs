@@ -7,7 +7,7 @@
 
 use eframe::egui::{self, Frame, Margin, RichText};
 
-use crate::ui::components::{elided_label, segmented, toggle_chip, Btn, BtnKind, Field, Seg};
+use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_label, segmented, toggle_chip};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;

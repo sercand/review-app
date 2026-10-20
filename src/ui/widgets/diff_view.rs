@@ -16,18 +16,18 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::diff::annotate::{row_coordinate, rows_for_anchor};
-use crate::diff::expand::{gaps, Expand};
-use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
-use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
+use crate::diff::expand::{Expand, gaps};
+use crate::diff::highlight::{HighlightCache, HighlightSpan, syntax_for_path};
+use crate::diff::image::{ImageBlob, ImageKind, ImageMode, image_kind};
 use crate::diff::options::{find_matches, next_match, prev_match};
 use crate::diff::row_model::{
-    display_text, pair_indices, RowModel, RowRef, HEADER_H, HUNK_H, ROW_H,
+    HEADER_H, HUNK_H, ROW_H, RowModel, RowRef, display_text, pair_indices,
 };
 use crate::diff::word::word_diff;
-use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
+use crate::github::files::{LoadedFile, PatchState, PrFile, anchor_path};
 use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffRow, LineKind, Side};
-use crate::state::composer::{anchor_warning, ComposerAction};
+use crate::state::composer::{ComposerAction, anchor_warning};
 use crate::state::pr_detail::{LoadPhase, PrSession};
 use crate::ui::icons::{CHEVRONS_DOWN, CHEVRONS_UP, PLUS, UNFOLD_VERTICAL};
 use crate::ui::theme::palette_of;
@@ -1326,27 +1326,28 @@ fn code_cell(
     // cell's rect, not `response.hovered()`, decides: the button takes the
     // hover from the cell, which would hide it again before it is clicked.
     if ui.rect_contains_pointer(rect)
-        && let Some(target) = target {
-            let plus = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 11.0, mid),
-                egui::vec2(18.0, 18.0),
-            );
-            let id = ui.make_persistent_id(("diff-plus", rect.min.x as i32, rect.min.y as i32));
-            let button = ui.interact(plus, id, egui::Sense::click());
-            ui.painter().rect_filled(plus, 4.0, palette.accent);
-            ui.painter().text(
-                plus.center(),
-                egui::Align2::CENTER_CENTER,
-                PLUS.to_string(),
-                egui::FontId::proportional(12.0),
-                palette.accent_ink,
-            );
-            let clicked = button.clicked();
-            button.on_hover_text("Comment on line");
-            if clicked {
-                return Some(target);
-            }
+        && let Some(target) = target
+    {
+        let plus = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 11.0, mid),
+            egui::vec2(18.0, 18.0),
+        );
+        let id = ui.make_persistent_id(("diff-plus", rect.min.x as i32, rect.min.y as i32));
+        let button = ui.interact(plus, id, egui::Sense::click());
+        ui.painter().rect_filled(plus, 4.0, palette.accent);
+        ui.painter().text(
+            plus.center(),
+            egui::Align2::CENTER_CENTER,
+            PLUS.to_string(),
+            egui::FontId::proportional(12.0),
+            palette.accent_ink,
+        );
+        let clicked = button.clicked();
+        button.on_hover_text("Comment on line");
+        if clicked {
+            return Some(target);
         }
+    }
     None
 }
 
@@ -1924,15 +1925,19 @@ mod tests {
         session.open_comment(CommentTarget::File {
             path: "src/a.rs".into(),
         });
-        assert!(session
-            .row_model
-            .rows
-            .contains(&RowRef::Thread { thread: 0 }));
-        assert!(session
-            .row_model
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowRef::Pending { .. })));
+        assert!(
+            session
+                .row_model
+                .rows
+                .contains(&RowRef::Thread { thread: 0 })
+        );
+        assert!(
+            session
+                .row_model
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowRef::Pending { .. }))
+        );
         assert!(session.row_model.rows.contains(&RowRef::Composer));
 
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new(true)));

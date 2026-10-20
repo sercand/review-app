@@ -5,9 +5,9 @@
 mod common;
 
 use common::client;
-use gh_review_desktop::github::reviews::{review_payload, ReviewState};
-use gh_review_desktop::model::review::{PendingReview, ReviewEvent};
+use gh_review_desktop::github::reviews::{ReviewState, review_payload};
 use gh_review_desktop::model::RepoRef;
+use gh_review_desktop::model::review::{PendingReview, ReviewEvent};
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

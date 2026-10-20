@@ -11,17 +11,17 @@ use eframe::egui;
 use std::time::Instant;
 
 use crate::diff::highlight::HighlightCache;
-use crate::diff::row_model::{display_text, RowRef, ROW_H};
+use crate::diff::row_model::{ROW_H, RowRef, display_text};
 use crate::github::client::endpoints_for;
 use crate::github::files::PrFile;
 use crate::model::tree::build_tree;
-use crate::state::filters::{matches, without_hide_viewed, FilterState};
+use crate::state::filters::{FilterState, matches, without_hide_viewed};
 use crate::state::folder_viewed::toggle_folder_viewed;
-use crate::state::pr_detail::{head_moved_since_pin, viewer_is_author, PrSession};
+use crate::state::pr_detail::{PrSession, head_moved_since_pin, viewer_is_author};
 use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_header::{self, FileHeaderAction, FooterAction as FileFooterAction};
-use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
+use crate::ui::widgets::file_tree::{self, TreeAction, flatten_visible};
 use crate::ui::widgets::filter_bar;
 use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::metadata_panel;
@@ -281,9 +281,10 @@ pub fn render(
     // every smaller width on its way out, and none of those are the size the
     // user chose.
     if state.right_open
-        && let Some(right) = right {
-            state.right_pane = right.response.rect.width();
-        }
+        && let Some(right) = right
+    {
+        state.right_pane = right.response.rect.width();
+    }
 
     // The review draft is edited and submitted from the top bar's popover
     // now (Task 12); the banners it used to carry moved to the strip above

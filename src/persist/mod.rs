@@ -22,9 +22,10 @@ pub fn config_root() -> PathBuf {
 /// Parent directories are created as needed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");

@@ -12,14 +12,14 @@ use std::time::Duration;
 
 use tokio::task::JoinError;
 
-use crate::auth::device_flow::{AuthFailure, DeviceCode};
-use crate::auth::device_http::{run_device_flow, HttpDeviceFlow};
-use crate::auth::store::TokenStore;
 use crate::auth::DEFAULT_SCOPE;
+use crate::auth::device_flow::{AuthFailure, DeviceCode};
+use crate::auth::device_http::{HttpDeviceFlow, run_device_flow};
+use crate::auth::store::TokenStore;
 use crate::diff::image::{ImageBlob, MAX_IMAGE_BYTES};
 use crate::diff::local::local_diff;
 use crate::github::checks::{CheckRun, CombinedStatus};
-use crate::github::client::{endpoints_for, GithubClient, Me};
+use crate::github::client::{GithubClient, Me, endpoints_for};
 use crate::github::comments::NewComment;
 use crate::github::commits::Commit;
 use crate::github::conversation::ConversationComment;
@@ -28,11 +28,11 @@ use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
 use crate::github::merge::{MergeResult, RepoSettings};
 use crate::github::metadata::PrMetadata;
-use crate::github::reviews::{viewer_pending_review, Review, ServerPendingComment};
+use crate::github::reviews::{Review, ServerPendingComment, viewer_pending_review};
+use crate::model::RepoRef;
 use crate::model::diff::FileDiff;
 use crate::model::review::ReviewEvent;
 use crate::model::thread::{ReviewThread, ThreadComment};
-use crate::model::RepoRef;
 
 /// Identifies one open PR's session.
 ///
@@ -643,9 +643,10 @@ where
                     let task = tokio::spawn(handler(command, events.clone()));
                     tokio::spawn(async move {
                         if let Err(join_error) = task.await
-                            && join_error.is_panic() {
-                                events.send(Event::WorkerPanicked(panic_message(join_error)));
-                            }
+                            && join_error.is_panic()
+                        {
+                            events.send(Event::WorkerPanicked(panic_message(join_error)));
+                        }
                     });
                 }
             });
@@ -1425,8 +1426,8 @@ async fn validate_and_sign_in(ctx: &ExecCtx, host: &str, token: String, events: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]

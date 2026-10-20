@@ -11,8 +11,8 @@ use serde::Deserialize;
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
-use crate::model::pr::CiState;
 use crate::model::RepoRef;
+use crate::model::pr::CiState;
 
 /// One check run, as the check-runs endpoint lists it.
 #[derive(Clone, Debug, PartialEq)]

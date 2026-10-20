@@ -6,12 +6,12 @@
 //! comment pages fetched through `node(id:)` and appended, so every thread
 //! arrives complete.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
-use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 use crate::model::RepoRef;
+use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
 
 /// The GraphQL document that lists one page of a PR's review threads.
 ///

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 use crate::github::error::GhError;
 use crate::github::graphql::SearchPage;
-use crate::github::search::{build_queries, Scope, ScopeConstraint, Sort};
+use crate::github::search::{Scope, ScopeConstraint, Sort, build_queries};
 use crate::model::pr::PrSummary;
 use crate::runtime::Command;
 
@@ -238,9 +238,9 @@ fn accept(state: &mut PrListState, query: &str, page: SearchPage) {
                 .items
                 .iter_mut()
                 .find(|item| (item.repo.id(), item.number) == key)
-            {
-                union_scope(&mut existing.scopes, &scope);
-            }
+        {
+            union_scope(&mut existing.scopes, &scope);
+        }
     }
 
     state.awaiting.remove(query);

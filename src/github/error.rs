@@ -161,9 +161,10 @@ fn parse_sso_url(value: &str) -> Option<String> {
 /// body when it is not JSON.
 fn message_or_body(body: &str) -> String {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(message) = value.get("message").and_then(|message| message.as_str()) {
-            return message.to_owned();
-        }
+        && let Some(message) = value.get("message").and_then(|message| message.as_str())
+    {
+        return message.to_owned();
+    }
     body.trim().to_owned()
 }
 

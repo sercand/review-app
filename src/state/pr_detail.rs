@@ -11,11 +11,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
-use crate::diff::expand::{expand, gaps, Expand};
-use crate::diff::image::{image_kind, image_sources, image_uri, ImageBlob, ImageKind};
+use crate::diff::annotate::{InlineItem, Placement, annotate, place_thread, rows_for_anchor};
+use crate::diff::expand::{Expand, expand, gaps};
+use crate::diff::image::{ImageBlob, ImageKind, image_kind, image_sources, image_uri};
 use crate::diff::options::hide_whitespace_only;
-use crate::diff::row_model::{build_one, RowModel, RowRef};
+use crate::diff::row_model::{RowModel, RowRef, build_one};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::comments::NewComment;
@@ -24,21 +24,21 @@ use crate::github::conversation::ConversationComment;
 use crate::github::error::GhError;
 use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
-use crate::github::reviews::{review_payload, Review, ServerPendingComment};
+use crate::github::reviews::{Review, ServerPendingComment, review_payload};
+use crate::model::RepoRef;
 use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffMode, FileDiff};
 use crate::model::review::{PendingError, PendingReview, ReviewEvent};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
-use crate::model::RepoRef;
 use crate::persist::session::{self, ComposerDraft, DebouncedWriter, SessionFile};
-use crate::runtime::{Command, Event, SessionId, NO_OPTIMISTIC_BUBBLE};
+use crate::runtime::{Command, Event, NO_OPTIMISTIC_BUBBLE, SessionId};
 use crate::state::composer::{
-    self, can_submit, fallback_comment, interpret_post_error, CommentMode, ComposerMsg,
-    ComposerState, PostOutcome,
+    self, CommentMode, ComposerMsg, ComposerState, PostOutcome, can_submit, fallback_comment,
+    interpret_post_error,
 };
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
-use crate::ui::widgets::review_panel::{review_panel_vm, sha7, PanelInputs};
+use crate::ui::widgets::review_panel::{PanelInputs, review_panel_vm, sha7};
 
 /// How far a session has got through loading its PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -420,9 +420,10 @@ impl PrSession {
                 // The head is only "moved" once we have a diff to compare it
                 // against; the first load has nothing to invalidate.
                 if let Some(shown) = &self.diff_head_sha
-                    && shown != &meta.head_sha {
-                        self.head_moved = true;
-                    }
+                    && shown != &meta.head_sha
+                {
+                    self.head_moved = true;
+                }
                 self.metadata = Some(meta.clone());
                 self.phase = LoadPhase::Files;
 
@@ -808,11 +809,12 @@ impl PrSession {
     /// back.
     fn restore_optimistic_to_composer(&mut self) {
         if let Some(post) = self.optimistic.take()
-            && self.composer.body.is_empty() {
-                self.composer.target = Some(post.target);
-                self.composer.body = post.body;
-                self.composer.mode = CommentMode::Immediate;
-            }
+            && self.composer.body.is_empty()
+        {
+            self.composer.target = Some(post.target);
+            self.composer.body = post.body;
+            self.composer.mode = CommentMode::Immediate;
+        }
     }
 
     /// Re-derive the row model from the files plus the current threads,
@@ -914,9 +916,10 @@ impl PrSession {
         let mut heights = measured.into_iter();
         for index in 0..model.rows.len() {
             if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. })
-                && let Some(height) = heights.next() {
-                    model.set_height(index, height);
-                }
+                && let Some(height) = heights.next()
+            {
+                model.set_height(index, height);
+            }
         }
         self.row_model = model;
     }
@@ -947,13 +950,14 @@ impl PrSession {
             }
         }
         if let Some(target) = &self.composer.target
-            && let Some(file) = self.file_of(target) {
-                items.push(InlineItem {
-                    file,
-                    placement: target_placement(target),
-                    row: RowRef::Composer,
-                });
-            }
+            && let Some(file) = self.file_of(target)
+        {
+            items.push(InlineItem {
+                file,
+                placement: target_placement(target),
+                row: RowRef::Composer,
+            });
+        }
         items
     }
 
@@ -1187,9 +1191,10 @@ impl PrSession {
             }
         } else {
             if let Some(loaded) = self.files.get_mut(file as usize)
-                && let Some(diff) = loaded.diff.take() {
-                    self.svg_diffs.insert(file, diff);
-                }
+                && let Some(diff) = loaded.diff.take()
+            {
+                self.svg_diffs.insert(file, diff);
+            }
             self.rendered_svg.insert(file);
         }
         self.rebuild_rows();
@@ -1903,9 +1908,10 @@ mod tests {
             session: SessionId(1),
             meta: meta("sha1"),
         });
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadPrFiles { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadPrFiles { .. }))
+        );
         s.on_event(&Event::PrFilesPage {
             session: SessionId(1),
             files: vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")],
@@ -2173,9 +2179,10 @@ mod tests {
         };
 
         let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadThreads { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. }))
+        );
 
         s.on_event(&Event::ThreadsLoaded {
             session: SessionId(2),
@@ -2412,9 +2419,11 @@ mod tests {
         let id = s.pending.comments[0].local_id;
         s.delete_pending(id, Instant::now());
         assert!(s.pending.commit_id.is_none());
-        assert!(session::load_draft(dir.path(), "github.com", &repo(), 7)
-            .unwrap()
-            .is_none());
+        assert!(
+            session::load_draft(dir.path(), "github.com", &repo(), 7)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A session with one loaded file and a known head SHA, backed by a
@@ -2540,9 +2549,11 @@ mod tests {
             composer::reduce(&mut s.composer, ComposerMsg::SetBody("move this".into()));
             let commands = s.submit_comment(CommentMode::Pending, "me", Instant::now());
             match commands.as_slice() {
-                [Command::AddToServerReview {
-                    review_id, comment, ..
-                }] => {
+                [
+                    Command::AddToServerReview {
+                        review_id, comment, ..
+                    },
+                ] => {
                     assert_eq!(review_id, "PRR_9");
                     assert_eq!(comment.target, target);
                     assert_eq!(comment.body, "move this");
@@ -2571,9 +2582,11 @@ mod tests {
             "the summary went with the review"
         );
         assert_eq!(s.pending.event, ReviewEvent::Comment);
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, Command::LoadReviews { .. })));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::LoadReviews { .. }))
+        );
         assert!(
             commands
                 .iter()
@@ -2833,9 +2846,10 @@ mod tests {
         let cmds = on_review_submitted(&mut s, review(ReviewState::Commented));
         assert!(s.pending.is_empty());
         assert_eq!(s.reviews.len(), 1);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadThreads { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. }))
+        );
         assert!(
             session::load_draft(dir.path(), "github.com", &repo(), 7)
                 .unwrap()
@@ -2968,10 +2982,11 @@ mod tests {
             done: true,
         });
         s.select_file(1);
-        assert!(s
-            .row_model
-            .rows
-            .contains(&RowRef::HunkHeader { file: 1, hunk: 0 }));
+        assert!(
+            s.row_model
+                .rows
+                .contains(&RowRef::HunkHeader { file: 1, hunk: 0 })
+        );
 
         let cmds = s.expand_gap(1, 0, Expand::All);
         assert!(
@@ -3253,10 +3268,11 @@ mod tests {
         }
         assert!(s.image_for(0).is_none());
         assert!(s.image_for(200).is_some());
-        assert!(s
-            .evicted_images
-            .iter()
-            .any(|uri| uri.ends_with("/0/head.png")));
+        assert!(
+            s.evicted_images
+                .iter()
+                .any(|uri| uri.ends_with("/0/head.png"))
+        );
         assert!(
             !s.load_images(0).is_empty(),
             "an evicted file can be requested again"
@@ -3292,17 +3308,17 @@ mod tests {
             "the stashed text diff comes back"
         );
         assert!(!s.wants_images(0));
-        assert!(s
-            .row_model
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowRef::Line { .. })));
+        assert!(
+            s.row_model
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowRef::Line { .. }))
+        );
     }
 
     /// A patch with one whitespace-only hunk and one real hunk, so the
     /// filtered and original forms differ and either can be told apart.
-    const WS_AND_REAL: &str =
-        "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n@@ -4 +4 @@\n-let y = 1;\n+let y = 2;\n";
+    const WS_AND_REAL: &str = "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n@@ -4 +4 @@\n-let y = 1;\n+let y = 2;\n";
 
     #[test]
     fn hide_whitespace_off_under_a_rendered_svg_restores_the_original_to_text() {
@@ -3470,12 +3486,14 @@ mod tests {
             },
         });
         assert!(!s.merging);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadPrMetadata { .. })));
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadReviews { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadPrMetadata { .. }))
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadReviews { .. }))
+        );
     }
 
     #[test]

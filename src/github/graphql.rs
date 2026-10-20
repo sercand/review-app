@@ -8,9 +8,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::github::client::{GithubClient, READ_BACKOFF};
-use crate::github::error::{classify, GhError, ResponseMeta};
-use crate::model::pr::{CiState, PrSummary, ReviewDecision};
+use crate::github::error::{GhError, ResponseMeta, classify};
 use crate::model::RepoRef;
+use crate::model::pr::{CiState, PrSummary, ReviewDecision};
 
 /// The GraphQL document that lists one page of PRs for one search query.
 ///

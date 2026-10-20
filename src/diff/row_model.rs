@@ -457,10 +457,12 @@ mod tests {
                 (Some(4), Some(4))
             ]
         );
-        assert!(build_one(&files, Some(0), DiffMode::Unified)
-            .rows
-            .iter()
-            .all(|r| !matches!(r, RowRef::Pair { .. })));
+        assert!(
+            build_one(&files, Some(0), DiffMode::Unified)
+                .rows
+                .iter()
+                .all(|r| !matches!(r, RowRef::Pair { .. }))
+        );
     }
 
     #[test]

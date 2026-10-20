@@ -164,13 +164,12 @@ pub fn render(
                     }
                 });
 
-            if enter
-                && let Some(entry) = matches.get(state.selected) {
-                    run = Some(match entry {
-                        PaletteEntry::Action(action) => PaletteSelection::Action(action.id),
-                        PaletteEntry::File { index, .. } => PaletteSelection::File(*index),
-                    });
-                }
+            if enter && let Some(entry) = matches.get(state.selected) {
+                run = Some(match entry {
+                    PaletteEntry::Action(action) => PaletteSelection::Action(action.id),
+                    PaletteEntry::File { index, .. } => PaletteSelection::File(*index),
+                });
+            }
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 keep_open = false;
             }

@@ -6,12 +6,12 @@
 
 use std::time::{Duration, SystemTime};
 
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::{Client, RequestBuilder, Response};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
-use crate::github::error::{classify, GhError, ResponseMeta};
+use crate::github::error::{GhError, ResponseMeta, classify};
 
 /// The `X-GitHub-Api-Version` every request pins.
 const API_VERSION: &str = "2022-11-28";
