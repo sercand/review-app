@@ -384,6 +384,29 @@ async fn for_review_preserves_newlines_inside_quotes() {
     assert_eq!(interaction.calls().len(), 2);
 }
 
+#[tokio::test]
+async fn for_review_does_not_grant_a_newline_separated_command() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch a touch b"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert!(dir.path().join("a").exists());
+    assert!(dir.path().join("b").exists());
+    assert_eq!(remembered(&cx), ["touch a touch b"]);
+
+    // Clear the marker so the denied call cannot recreate it.
+    std::fs::remove_file(dir.path().join("b")).unwrap();
+
+    // A newline outside quotes separates commands; it is not argument
+    // whitespace, so this is a different line. No decision is queued: denied.
+    let out = bash(&cx, json!({"command": "touch a\ntouch b"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert!(!dir.path().join("b").exists());
+    assert_eq!(interaction.calls().len(), 2);
+}
+
 /// A 1×1 PNG, encoded by the `image` crate.
 fn png_1x1() -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());
