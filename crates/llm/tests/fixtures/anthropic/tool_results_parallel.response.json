@@ -1,0 +1,24 @@
+{
+  "id": "msg_738d9d07-23c9-4d2f-98f0-6c4d4757bd19",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3.8-flash",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "The results appear swapped/mislabeled? Actually output shows Tokyo for first call and Paris for second — likely tool responses returned in different order. Just report correctly by city.\n"
+    },
+    {
+      "type": "text",
+      "text": "Here's the current weather:\n\n- **Paris:** 12°C with rain 🌧️\n- **Tokyo:** 24°C and sunny ☀️\n\nTokyo is noticeably warmer and drier right now — if you're packing for Paris, don't forget a rain jacket!"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 409,
+    "output_tokens": 100,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}

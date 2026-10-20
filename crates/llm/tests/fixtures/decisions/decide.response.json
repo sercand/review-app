@@ -1,0 +1,70 @@
+{
+  "object": "decisions",
+  "model": "qwen3.8-flash",
+  "prompt_format_version": 1,
+  "answers": [
+    {
+      "type": "predicate",
+      "name": "is_red",
+      "probability": 0.9894387136422799,
+      "label_mass": 0.3805626944589597
+    },
+    {
+      "type": "choice",
+      "name": "next_action",
+      "choice": "tap:btn_level_1",
+      "probabilities": [
+        {
+          "value": "tap:btn_level_1",
+          "probability": 0.9349126011546955
+        },
+        {
+          "value": "wait",
+          "probability": 0.010048597079562524
+        },
+        {
+          "value": "ask_planner",
+          "probability": 0.05503880176574196
+        }
+      ],
+      "confidence": 0.9971419834864975,
+      "label_mass": 0.9971419834864975
+    },
+    {
+      "type": "score",
+      "name": "ui_glitch",
+      "score": 1.2306645272581562,
+      "probabilities": [
+        {
+          "value": 0,
+          "label": "Clean",
+          "probability": 0.34502350868700743
+        },
+        {
+          "value": 1,
+          "label": "Minor glitch",
+          "probability": 0.07928845536782908
+        },
+        {
+          "value": 2,
+          "label": "Severe",
+          "probability": 0.5756880359451636
+        }
+      ],
+      "confidence": 0.994370888249881,
+      "label_mass": 0.994370888249881
+    }
+  ],
+  "usage": {
+    "input_tokens": 215,
+    "input_tokens_details": {
+      "cache_write_tokens": 0,
+      "cached_tokens": 38
+    },
+    "output_tokens": 0,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 215
+  }
+}

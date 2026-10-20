@@ -1,0 +1,81 @@
+event: response.created
+data: {"response":{"id":"resp_9fef0eda-ec4c-4f59-b8db-20c5aca21358","object":"response","created_at":1792139592,"status":"in_progress","model":"qwen3.8-flash","output":[],"error":null,"incomplete_details":null,"instructions":"You are a terse assistant.","max_output_tokens":256,"previous_response_id":null,"parallel_tool_calls":false,"metadata":{},"usage":null},"type":"response.created","sequence_number":0}
+
+event: response.in_progress
+data: {"response":{"id":"resp_9fef0eda-ec4c-4f59-b8db-20c5aca21358","object":"response","created_at":1792139592,"status":"in_progress","model":"qwen3.8-flash","output":[],"error":null,"incomplete_details":null,"instructions":"You are a terse assistant.","max_output_tokens":256,"previous_response_id":null,"parallel_tool_calls":false,"metadata":{},"usage":null},"type":"response.in_progress","sequence_number":1}
+
+event: response.output_item.added
+data: {"output_index":0,"item":{"type":"reasoning","id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","summary":[],"content":[]},"type":"response.output_item.added","sequence_number":2}
+
+event: response.reasoning_summary_part.added
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""},"type":"response.reasoning_summary_part.added","sequence_number":3}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":"User","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":4}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" wants","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":5}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" one","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":6}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" word","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":7}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" greeting","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":8}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":".","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":9}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" Need","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":10}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" to","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":11}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" comply","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":12}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":".","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":13}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":" Simple","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":14}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":".","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":15}
+
+event: response.reasoning_summary_text.delta
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"delta":"\n","summary_index":0,"type":"response.reasoning_summary_text.delta","sequence_number":16}
+
+event: response.reasoning_summary_text.done
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"summary_index":0,"text":"User wants one word greeting. Need to comply. Simple.\n","type":"response.reasoning_summary_text.done","sequence_number":17}
+
+event: response.reasoning_summary_part.done
+data: {"item_id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":"User wants one word greeting. Need to comply. Simple.\n"},"type":"response.reasoning_summary_part.done","sequence_number":18}
+
+event: response.output_item.done
+data: {"output_index":0,"item":{"type":"reasoning","id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","summary":[{"type":"summary_text","text":"User wants one word greeting. Need to comply. Simple.\n"}],"content":[]},"type":"response.output_item.done","sequence_number":19}
+
+event: response.output_item.added
+data: {"output_index":1,"item":{"type":"message","id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","status":"in_progress","role":"assistant","content":[]},"type":"response.output_item.added","sequence_number":20}
+
+event: response.content_part.added
+data: {"item_id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","output_index":1,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]},"type":"response.content_part.added","sequence_number":21}
+
+event: response.output_text.delta
+data: {"item_id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","output_index":1,"delta":"Hi","content_index":0,"type":"response.output_text.delta","sequence_number":22}
+
+event: response.output_text.done
+data: {"item_id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","output_index":1,"content_index":0,"text":"Hi","type":"response.output_text.done","sequence_number":23}
+
+event: response.content_part.done
+data: {"item_id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","output_index":1,"content_index":0,"part":{"type":"output_text","text":"Hi","annotations":[]},"type":"response.content_part.done","sequence_number":24}
+
+event: response.output_item.done
+data: {"output_index":1,"item":{"type":"message","id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi","annotations":[]}]},"type":"response.output_item.done","sequence_number":25}
+
+event: response.completed
+data: {"response":{"id":"resp_9fef0eda-ec4c-4f59-b8db-20c5aca21358","object":"response","created_at":1792139592,"status":"completed","model":"qwen3.8-flash","output":[{"type":"reasoning","id":"rs_9fef0eda-ec4c-4f59-b8db-20c5aca21358_0","summary":[{"type":"summary_text","text":"User wants one word greeting. Need to comply. Simple.\n"}],"content":[]},{"type":"message","id":"msg_9fef0eda-ec4c-4f59-b8db-20c5aca21358_1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi","annotations":[]}]}],"error":null,"incomplete_details":null,"instructions":"You are a terse assistant.","max_output_tokens":256,"previous_response_id":null,"parallel_tool_calls":false,"metadata":{},"usage":{"input_tokens":65,"input_tokens_details":{"cached_tokens":65,"audio_tokens":0},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":14},"total_tokens":82}},"type":"response.completed","sequence_number":26}
+

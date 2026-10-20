@@ -1,0 +1,38 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "What is the weather in Paris and in Tokyo? Call get_weather once for each city, in parallel, in this turn.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "max_output_tokens": 1024,
+  "model": "qwen3.8-flash",
+  "parallel_tool_calls": true,
+  "store": false,
+  "tool_choice": "required",
+  "tools": [
+    {
+      "description": "Get the current weather for one city.",
+      "name": "get_weather",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

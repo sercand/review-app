@@ -1,0 +1,52 @@
+{
+  "id": "resp_0a323edf-2cc5-42ae-9dd5-88fdf7e2d151",
+  "object": "response",
+  "created_at": 1792139591,
+  "status": "completed",
+  "model": "qwen3.8-flash",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_0a323edf-2cc5-42ae-9dd5-88fdf7e2d151_0",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "We need to respond to user: \"Say hi in one word.\" Need final one word. Likely \"Hi\". Ensure one word.\n"
+        }
+      ],
+      "content": []
+    },
+    {
+      "type": "message",
+      "id": "msg_0a323edf-2cc5-42ae-9dd5-88fdf7e2d151_1",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Hi",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": "You are a terse assistant.",
+  "max_output_tokens": 256,
+  "previous_response_id": null,
+  "parallel_tool_calls": false,
+  "metadata": {},
+  "usage": {
+    "input_tokens": 65,
+    "input_tokens_details": {
+      "cached_tokens": 64,
+      "audio_tokens": 0
+    },
+    "output_tokens": 32,
+    "output_tokens_details": {
+      "reasoning_tokens": 29
+    },
+    "total_tokens": 97
+  }
+}

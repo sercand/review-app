@@ -1,0 +1,28 @@
+{
+  "id": "msg_1a663f88-0cbd-480a-afbc-7a3196bb733a",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3.8-flash",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "The user wants me to tap the Play button with id `btn_play`.\n"
+    },
+    {
+      "type": "tool_use",
+      "id": "call_00000000000001f7_0",
+      "name": "tap",
+      "input": {
+        "id": "btn_play"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 376,
+    "output_tokens": 43,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}

@@ -1,0 +1,89 @@
+{
+  "model": "qwen3.8-flash",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "You are testing a children's coloring app shown in landscape.\nGOAL: finish the first-launch onboarding as a guest, then open the 'PAW Patrol' franchise, its 'PAW Patrol: Dino Movie' category, and the first coloring sheet of that category so the painting canvas is visible.\nExpected flow: tap 'Get started' (never 'Sign in'). Parent gate asking for a year of birth: tap the keypad digits 1, 9, 9, 9, one digit per tap. Tap 'Let's go'. Pick an age tile, then 'Continue'. Pick one or two themes, then 'Continue' (there are two theme pages that look alike). Notifications screen: tap 'Maybe later'. Wait while coloring pages are personalized. Title screen: tap the round Play button. Wait for loading. On a gallery wall, tap the home icon at the top-left. In the catalog, tap 'Franchise: PAW Patrol' (not a banner). In the category bar at the top, tap 'Category: PAW Patrol: Dino Movie'. Then tap the first coloring sheet of that category: the left-most one in the sheet list. A '(locked)' sheet opens a subscription paywall instead of the canvas.\nPrevious steps (oldest first):\n- steps 1-5: waited\n- step 6, screen with ['Get started', 'Already subscribed? / Sign in']: chose 'Get started' (p=0.93) → the screen changed\nEach pressable element on the screenshot has a red outline with its letter in a red tag at its top-left corner (just above it for small elements)."
+        },
+        {
+          "type": "input_image",
+          "image_url": "<kedis_step07.jpg>"
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "type": "choice",
+      "name": "action",
+      "instructions": "Which action should be taken next to make progress toward the GOAL?",
+      "choices": [
+        {
+          "value": "wait",
+          "description": "Do nothing yet: the screen is loading, fading, or playing a video or animation."
+        },
+        {
+          "value": "A",
+          "description": "Tap 'CloseButton', top-right"
+        },
+        {
+          "value": "B",
+          "description": "Tap '1', top-centre"
+        },
+        {
+          "value": "C",
+          "description": "Tap '2', top-centre"
+        },
+        {
+          "value": "D",
+          "description": "Tap '3', top-right"
+        },
+        {
+          "value": "E",
+          "description": "Tap '4', middle-centre"
+        },
+        {
+          "value": "F",
+          "description": "Tap '5', middle-centre"
+        },
+        {
+          "value": "G",
+          "description": "Tap '6', middle-right"
+        },
+        {
+          "value": "H",
+          "description": "Tap '7', middle-centre"
+        },
+        {
+          "value": "I",
+          "description": "Tap '8', middle-centre"
+        },
+        {
+          "value": "J",
+          "description": "Tap '9', middle-right"
+        },
+        {
+          "value": "K",
+          "description": "Tap '0', bottom-centre"
+        },
+        {
+          "value": "L",
+          "description": "Tap 'BackspaceButton', bottom-right"
+        }
+      ]
+    },
+    {
+      "type": "predicate",
+      "name": "goal_reached",
+      "instructions": "Is a coloring sheet open on the painting canvas, with brushes or colors to paint with?"
+    },
+    {
+      "type": "predicate",
+      "name": "looks_broken",
+      "instructions": "Ignoring the red outlines and letter tags, does anything on this screen look broken? For example: pink/magenta or missing textures, raw text keys instead of words (like 'Button.Title'), error or exception messages, UI elements overlapping or cut off, stretched or garbled images, or a large empty area where content should be. Loading screens, fades and animations are normal."
+    }
+  ]
+}

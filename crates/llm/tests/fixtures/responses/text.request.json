@@ -1,0 +1,18 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Say hi in one word.",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "You are a terse assistant.",
+  "max_output_tokens": 256,
+  "model": "qwen3.8-flash",
+  "store": false
+}

@@ -1,0 +1,59 @@
+{
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "Take a screenshot and tell me the main color of the screen in one word.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "call_shot",
+          "input": {},
+          "name": "take_screenshot",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": [
+            {
+              "text": "Screenshot:",
+              "type": "text"
+            },
+            {
+              "source": {
+                "data": "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==",
+                "media_type": "image/png",
+                "type": "base64"
+              },
+              "type": "image"
+            }
+          ],
+          "tool_use_id": "call_shot",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-flash",
+  "tools": [
+    {
+      "description": "Take a screenshot of the device screen.",
+      "input_schema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "take_screenshot"
+    }
+  ]
+}

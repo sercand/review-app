@@ -1,0 +1,63 @@
+{
+  "input": [
+    {
+      "content": [
+        {
+          "text": "Goal: start Level 1. The screenshot shows the current screen.",
+          "type": "input_text"
+        },
+        {
+          "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg==",
+          "type": "input_image"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-flash",
+  "questions": [
+    {
+      "instructions": "Is the screen mostly red?",
+      "name": "is_red",
+      "type": "predicate"
+    },
+    {
+      "choices": [
+        {
+          "description": "Tap the 'Level 1' button",
+          "value": "tap:btn_level_1"
+        },
+        {
+          "description": "Wait for the screen to change",
+          "value": "wait"
+        },
+        {
+          "description": "None of these fits",
+          "value": "ask_planner"
+        }
+      ],
+      "instructions": "Which action moves toward the goal?",
+      "name": "next_action",
+      "type": "choice"
+    },
+    {
+      "instructions": "How broken does the UI look?",
+      "levels": [
+        {
+          "description": "No visual problems",
+          "label": "Clean"
+        },
+        {
+          "description": "Cosmetic issue, still usable",
+          "label": "Minor glitch"
+        },
+        {
+          "description": "Broken layout or unreadable UI",
+          "label": "Severe"
+        }
+      ],
+      "name": "ui_glitch",
+      "type": "score"
+    }
+  ]
+}

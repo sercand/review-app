@@ -1,0 +1,52 @@
+{
+  "id": "resp_ed408921-1194-4a29-adbe-8813c95e377b",
+  "object": "response",
+  "created_at": 1792158146,
+  "status": "completed",
+  "model": "qwen3.8-flash",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_ed408921-1194-4a29-adbe-8813c95e377b_0",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "The user wants the main color in one word. The screenshot is a solid red screen. Answer: Red.\n"
+        }
+      ],
+      "content": []
+    },
+    {
+      "type": "message",
+      "id": "msg_ed408921-1194-4a29-adbe-8813c95e377b_1",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Red",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 1024,
+  "previous_response_id": null,
+  "parallel_tool_calls": false,
+  "metadata": {},
+  "usage": {
+    "input_tokens": 347,
+    "input_tokens_details": {
+      "cached_tokens": 347,
+      "audio_tokens": 0
+    },
+    "output_tokens": 27,
+    "output_tokens_details": {
+      "reasoning_tokens": 24
+    },
+    "total_tokens": 374
+  }
+}

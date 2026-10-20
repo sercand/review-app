@@ -1,0 +1,225 @@
+event: message_start
+data: {"message":{"id":"msg_2d7e0baa-414a-4edf-8a5c-f43249b8a1cf","type":"message","role":"assistant","model":"qwen3.8-flash","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":332,"output_tokens":0}},"type":"message_start"}
+
+event: content_block_start
+data: {"index":0,"content_block":{"type":"thinking","thinking":"","signature":""},"type":"content_block_start"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"We"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" need"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" to"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" respond"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" to"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" user"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":":"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" \""},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"What"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" is"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" the"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" weather"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" Paris"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" and"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" Tokyo"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"?"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" Call"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" get"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"_weather"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" once"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" for"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" each"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" city"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":","},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" parallel"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":","},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" this"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" turn"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":".\""},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"\n\n"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"Need"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" call"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" get"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"_weather"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" twice"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" parallel"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" in"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" same"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" block"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"."},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" Then"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" final"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" answer"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" after"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" tool"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" results"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"."},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" Ensure"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" no"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" extra"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" text"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"?"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" We"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" can"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" just"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" tool"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":" call"},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"."},"type":"content_block_delta"}
+
+event: content_block_delta
+data: {"index":0,"delta":{"type":"thinking_delta","thinking":"\n"},"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":0,"type":"content_block_stop"}
+
+event: content_block_start
+data: {"index":1,"content_block":{"type":"tool_use","id":"call_00000000000001f9_0","name":"get_weather","input":{}},"type":"content_block_start"}
+
+event: content_block_delta
+data: {"index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"},"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":1,"type":"content_block_stop"}
+
+event: content_block_start
+data: {"index":2,"content_block":{"type":"tool_use","id":"call_00000000000001f9_1","name":"get_weather","input":{}},"type":"content_block_start"}
+
+event: content_block_delta
+data: {"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Tokyo\"}"},"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":2,"type":"content_block_stop"}
+
+event: message_delta
+data: {"delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":12,"output_tokens":118,"cache_read_input_tokens":320,"cache_creation_input_tokens":0},"type":"message_delta"}
+
+event: message_stop
+data: {"type":"message_stop"}
+
