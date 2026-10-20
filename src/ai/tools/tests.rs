@@ -255,6 +255,34 @@ async fn no_interaction_denies_without_a_reason() {
     assert!(!dir.path().join("denied").exists());
 }
 
+#[tokio::test]
+async fn for_review_never_grants_a_bare_wrapper() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    // `echo true` feeds the pipe, so `sh` reads `true` and exits.
+    let out = bash(&cx, json!({"command": "echo true | sh"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    let allowed = cx.allowed_snapshot();
+    assert!(
+        allowed.iter().any(|entry| entry == "echo true"),
+        "{allowed:?}"
+    );
+    assert!(!allowed.iter().any(|entry| entry == "sh"), "{allowed:?}");
+
+    // A bare `sh` entry would let this run silently. No decision is queued, so
+    // the scripted user denies it: nothing runs and the call is recorded.
+    let out = bash(&cx, json!({"command": "sh -c true"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    let calls = interaction.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(
+        matches!(&calls[1], InteractionCall::Approve { command, .. } if command == "sh -c true"),
+        "{calls:?}"
+    );
+}
+
 /// A 1×1 PNG, encoded by the `image` crate.
 fn png_1x1() -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());

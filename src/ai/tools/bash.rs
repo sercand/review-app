@@ -97,8 +97,9 @@ impl Tool for Bash {
 ///
 /// Returns `None` when the command may run (silently, approved once, or
 /// approved for the rest of the review) and `Some(error)` when it must not.
-/// An approval "for this review" records every normalized segment of the line,
-/// so the next identical line — and each of its parts on its own — is silent.
+/// An approval "for this review" records [`review_sandbox::approval_entries`] of
+/// the line, so the next identical line — and each of its parts on its own — is
+/// silent, except bare words and wrappers, which always ask again.
 async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     let reason = match review_sandbox::classify(command, &cx.allowed_snapshot()) {
         Verdict::Run => return None,
@@ -111,7 +112,7 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     {
         ApprovalDecision::Once => None,
         ApprovalDecision::ForReview => {
-            cx.allow_segments(review_sandbox::normalized_segments(command));
+            cx.allow_segments(review_sandbox::approval_entries(command));
             None
         }
         ApprovalDecision::Deny { reason } => {
