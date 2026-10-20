@@ -305,24 +305,68 @@ pub fn plan_checkout(
 /// Any failure after the stash was created restores the repository before
 /// the error is returned; a `HEAD` mismatch runs a full restore and then
 /// fails with [`CheckoutError::HeadMismatch`].
+///
+/// Two deliberate exceptions to that restore rule, both at a point where no
+/// usable stash exists yet (none was created, or it could not be named):
+///
+/// - A failed `git stash push` leaves the tree **untouched** (a restore
+///   would `reset --hard` the very changes the stash was meant to protect)
+///   and marks the record `Failed`.
+/// - If `rev-parse stash@{0}` fails right after a push that reported
+///   success, the tree is likewise left untouched and the record marked
+///   `Failed`; the returned error names the situation so the user can find
+///   their work in `git stash list`. Restoring here would `reset --hard`
+///   with `stash_sha == None` and orphan the work inside the stash.
+///
+/// Same-PR retry: when the store still holds a `Started`/`Active` record
+/// for the *same* PR (a retry after a failed attempt), that row is marked
+/// `Failed` (superseded) and its stash SHA is carried into the new record
+/// whenever this attempt does not create its own stash, so the repo lock
+/// and the user's stash move to the new row instead of leaking. (A retry
+/// that *does* stash new work supersedes the old record but leaves the old
+/// stash entry in `git stash list` unreferenced; nothing is dropped.)
 pub fn execute_checkout(
     plan: &CheckoutPlan,
     pr: &PrTarget,
     store: &Store,
 ) -> Result<CheckoutRecord, CheckoutError> {
     let repo = plan.repo_path.clone();
+    // A same-PR record still held means this is a retry: supersede it below.
+    let superseded = store
+        .checkout_holding(&plan.repo_path)
+        .map_err(CheckoutError::Store)?
+        .filter(|old| old.pr_number == pr.number);
+    let carried_stash = if plan.dirty {
+        None
+    } else {
+        superseded.as_ref().and_then(|old| old.stash_sha.clone())
+    };
     let mut rec = CheckoutRecord {
         id: 0,
         repo_path: repo.clone(),
         repo: format!("{}/{}", pr.owner, pr.name),
         pr_number: pr.number,
         original: plan.original.clone(),
-        stash_sha: None,
+        // A carried-over stash from a superseded same-PR attempt is part of
+        // the new row from the moment it exists, so the lock and the stash
+        // move together.
+        stash_sha: carried_stash,
         head_sha: pr.head_sha.clone(),
         state: CheckoutState::Started,
     };
     // Record BEFORE anything is stashed so a crash can be undone (§7.3).
     rec.id = store.checkout_begin(&rec).map_err(CheckoutError::Store)?;
+    if let Some(old) = &superseded {
+        // Move the lock over only after the new row exists; if the
+        // supersede write fails, back out the new row and report.
+        if let Err(e) = store
+            .checkout_set_state(old.id, CheckoutState::Failed)
+            .map_err(CheckoutError::Store)
+        {
+            let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+            return Err(e);
+        }
+    }
 
     if plan.dirty {
         let msg = stash_message(pr.number);
@@ -330,15 +374,30 @@ pub fn execute_checkout(
             repo.as_path(),
             &["stash", "push", "--include-untracked", "-m", &msg],
         ) {
-            abort_failed_checkout(&rec, store);
+            // The push failed, so no stash protects the user's work: a
+            // restore here would `reset --hard` + `clean -fd` with
+            // `stash_sha == None` and destroy it. Leave the tree exactly as
+            // it is and mark the record Failed (best-effort) for §7.3.
+            let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
             return Err(e);
         }
         // Track the stash by commit SHA, never `stash@{0}` (§7.1 step 4).
         let sha = match git(repo.as_path(), &["rev-parse", "stash@{0}"]) {
             Ok(sha) => sha.trim().to_string(),
             Err(e) => {
-                abort_failed_checkout(&rec, store);
-                return Err(e);
+                // The push succeeded but we cannot name the stash: do NOT
+                // restore (that would reset --hard with no stash SHA and
+                // orphan the work). Mark Failed and describe the situation.
+                let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+                return Err(CheckoutError::Git {
+                    args: format!("rev-parse stash@{{0}} [{}]", stash_message(pr.number)),
+                    stderr: format!(
+                        "the stash was created but its SHA could not be resolved; \
+                         the working tree was left untouched and the checkout \
+                         record marked failed - recover the changes from \
+                         `git stash list` ({e})"
+                    ),
+                });
             }
         };
         if let Err(e) = store
@@ -938,6 +997,114 @@ mod tests {
 
         // The same PR may be re-planned (retry after a failed attempt).
         assert!(plan_checkout(&clone, &pr, &store).is_ok());
+    }
+
+    #[test]
+    fn stash_push_failure_leaves_the_tree_untouched_and_marks_failed() {
+        let dir = tempdir();
+        let db = dir.path().join("ai.sqlite");
+        let store = Store::open(&db).unwrap();
+        let (_git_dir, clone, pr) = fixture();
+        write_file(&clone.join("a.txt"), "precious\n");
+        write_file(&clone.join("scratch.txt"), "keep me\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        assert!(plan.dirty);
+
+        // Another process is updating the stash ref: `refs/stash.lock`
+        // makes `git stash push` fail ("Cannot save the current status")
+        // while `git reset --hard` + `git clean -fd` still work — the exact
+        // destructive path this test forbids. (An `index.lock` would also
+        // block the reset, hiding the bug instead of exposing it.)
+        let lock = clone.join(".git").join("refs").join("stash.lock");
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::File::create(&lock).unwrap();
+        let err = execute_checkout(&plan, &pr, &store).expect_err("stash push must fail");
+        match &err {
+            CheckoutError::Git { args, .. } => assert!(
+                args.starts_with("stash push"),
+                "the failure must come from the stash push: {err:?}"
+            ),
+            other => panic!("expected a git error from stash push, got {other:?}"),
+        }
+        std::fs::remove_file(&lock).unwrap();
+
+        // The tree is untouched: the work the stash was meant to protect
+        // is still there, uncommitted, and we are still on main.
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "precious\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("scratch.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert_eq!(gitx(&clone, &["symbolic-ref", "--short", "HEAD"]), "main");
+        assert!(
+            gitx(&clone, &["stash", "list"]).is_empty(),
+            "no stash was created"
+        );
+
+        // The single record is Failed and no longer holds the repo.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let states: Vec<String> = conn
+            .prepare("SELECT state FROM ai_checkout")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(states, vec!["failed".to_string()]);
+        assert!(store.checkout_holding(&rec_path(&clone)).unwrap().is_none());
+    }
+
+    #[test]
+    fn same_pr_retry_supersedes_the_old_record_and_carries_the_stash() {
+        let dir = tempdir();
+        let db = dir.path().join("ai.sqlite");
+        let store = Store::open(&db).unwrap();
+        let (_git_dir, clone, pr) = fixture();
+        write_file(&clone.join("a.txt"), "mine\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        let first = execute_checkout(&plan, &pr, &store).unwrap();
+        let stash_sha = first.stash_sha.clone().expect("first attempt stashed");
+
+        // Retry the same PR: the tree is clean now, the work lives in the
+        // first attempt's stash.
+        let plan2 = plan_checkout(&clone, &pr, &store).unwrap();
+        assert!(!plan2.dirty);
+        let second = execute_checkout(&plan2, &pr, &store).unwrap();
+        assert_eq!(second.stash_sha.as_deref(), Some(stash_sha.as_str()));
+        assert_eq!(gitx(&clone, &["rev-parse", "HEAD"]), pr.head_sha);
+
+        // The old row was superseded (Failed); the new row holds the lock.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let old_state: String = conn
+            .query_row(
+                "SELECT state FROM ai_checkout WHERE id = ?1",
+                [first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_state, "failed");
+        let held = store
+            .checkout_holding(&second.repo_path)
+            .unwrap()
+            .expect("new row holds");
+        assert_eq!(held.id, second.id);
+
+        // Restoring the new record brings the user's work back, drops the
+        // carried stash, and leaves nothing unrestored.
+        assert_eq!(
+            restore(&second, false, &store).unwrap(),
+            RestoreOutcome::Restored
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "mine\n"
+        );
+        assert!(gitx(&clone, &["stash", "list"]).is_empty());
+        assert!(store.checkout_holding(&second.repo_path).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
     }
 
     #[test]
