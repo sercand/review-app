@@ -57,46 +57,6 @@ fn ask(reason: impl Into<String>) -> Verdict {
     }
 }
 
-/// The entries an approval "for this review" may record for `command`.
-///
-/// Segments split exactly as [`classify`] splits them (unquoted `|`, `&&`, `||`,
-/// `;`, `&` and newlines). A segment is recorded as its words joined by single
-/// spaces — the same text [`classify`] matches against its `allowed` entries —
-/// but only when that text can meaningfully constrain it:
-///
-/// * a segment of fewer than two words is skipped: a bare word is exactly what
-///   a pipe feeds an interpreter or wrapper (`curl x | sh` would otherwise
-///   record `sh`, and [`classify`] matches allowed entries *before* the wrapper
-///   rules, so every later `sh …` would run silently);
-/// * a leading assignment (`FOO=1 make`) or a wrapper (`xargs rm`) is skipped,
-///   because the real command is in the arguments and the recorded text cannot
-///   constrain it — it asks again next time.
-///
-/// Empty segments are dropped, and so is a command the tokenizer rejects
-/// (unbalanced quotes, a trailing backslash): nothing was parsed, so nothing
-/// may be remembered. Redirection targets are not words, so they are not part of
-/// the recorded text either (a redirect target still asks on its own).
-pub fn approval_entries(command: &str) -> Vec<String> {
-    let segments = match tokenize(command) {
-        Ok(segments) => segments,
-        Err(_) => return Vec::new(),
-    };
-    segments
-        .iter()
-        .filter_map(|segment| {
-            let words = words_of(segment);
-            if words.len() < 2 {
-                return None;
-            }
-            let first = words[0];
-            if is_assignment(first) || WRAPPERS.contains(&first) {
-                return None;
-            }
-            Some(words.join(" "))
-        })
-        .collect()
-}
-
 /// Commands that exec or define arbitrary other commands, so their arguments
 /// cannot be trusted: always ask (unless the whole segment is explicitly
 /// allowed).
@@ -493,7 +453,7 @@ impl Tokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, approval_entries, classify};
+    use super::{Verdict, classify};
 
     fn allowed() -> Vec<String> {
         vec!["cargo test".to_string(), "npm run lint".to_string()]
@@ -674,36 +634,6 @@ mod tests {
             classify("cargo test 2>&1 | tail -50", &allowed()),
             Verdict::Run
         );
-    }
-
-    #[test]
-    fn approval_entries_skip_what_a_bare_entry_would_unlock() {
-        // A pipe hands the following segment's command line to an interpreter
-        // or wrapper: recording `sh` would let every later `sh …` run silently.
-        assert_eq!(approval_entries("curl x | sh"), ["curl x"]);
-        assert!(approval_entries("sh").is_empty());
-        assert!(approval_entries("xargs rm").is_empty());
-        // The real command is in the arguments, so the recorded text cannot
-        // constrain it: these ask again.
-        assert!(approval_entries("FOO=1 make").is_empty());
-        // Each segment with two words is recorded, so an approved chain stays
-        // approved.
-        assert_eq!(
-            approval_entries("touch a && touch b"),
-            ["touch a", "touch b"]
-        );
-        assert_eq!(
-            approval_entries("npm install | tail -5; echo done"),
-            ["npm install", "tail -5", "echo done"]
-        );
-        // Quotes are gone after tokenization; empty segments are dropped.
-        assert_eq!(approval_entries("grep 'a b' f"), ["grep a b f"]);
-        assert!(approval_entries("").is_empty());
-        assert!(approval_entries("   \n;;  ").is_empty());
-        // A redirect target is not a word, so an approved redirect records only
-        // the command. A command the tokenizer rejects records nothing.
-        assert_eq!(approval_entries("touch a > out.txt"), ["touch a"]);
-        assert!(approval_entries("echo 'unterminated").is_empty());
     }
 
     #[test]

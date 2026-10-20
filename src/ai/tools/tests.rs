@@ -72,6 +72,7 @@ fn ctx_with(
         agent: agent(),
         interaction,
         allowed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        for_review: Arc::new(std::sync::Mutex::new(Vec::new())),
     }
 }
 
@@ -80,6 +81,14 @@ fn ctx_allowing(sandbox: Arc<dyn SandboxOps>, repo_root: PathBuf, allowed: &[&st
     let cx = ctx(sandbox, repo_root);
     cx.allow_segments(allowed.iter().map(|s| (*s).to_string()));
     cx
+}
+
+/// The exact lines remembered as approved "for this review".
+fn remembered(cx: &ToolCx) -> Vec<String> {
+    cx.for_review
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// A context over `host`, with the sandbox's root as the repo root.
@@ -207,7 +216,7 @@ async fn for_review_is_remembered() {
 }
 
 #[tokio::test]
-async fn for_review_remembers_each_segment_of_a_chain() {
+async fn for_review_remembers_the_exact_line() {
     let (dir, host) = host();
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
     let cx = interaction_ctx(&host, interaction.clone());
@@ -216,15 +225,21 @@ async fn for_review_remembers_each_segment_of_a_chain() {
     assert!(!out.is_error, "{t}", t = text(&out));
     assert!(dir.path().join("a").exists());
     assert!(dir.path().join("b").exists());
-    assert_eq!(
-        cx.allowed_snapshot(),
-        ["touch a".to_string(), "touch b".to_string()]
-    );
+    assert_eq!(remembered(&cx), ["touch a && touch b"]);
+    // The line itself is remembered, not its segments.
+    assert!(cx.allowed_snapshot().is_empty());
 
-    // Both parts were remembered, so the identical line runs silently.
+    // The identical line runs silently.
     let out = bash(&cx, json!({"command": "touch a && touch b"})).await;
     assert!(!out.is_error, "{t}", t = text(&out));
     assert_eq!(interaction.calls().len(), 1);
+
+    // A longer line is a different line: no decision is queued, so it asks and
+    // is denied.
+    let out = bash(&cx, json!({"command": "touch a && touch b && touch c"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert!(!dir.path().join("c").exists());
+    assert_eq!(interaction.calls().len(), 2);
 }
 
 #[tokio::test]
@@ -256,6 +271,61 @@ async fn no_interaction_denies_without_a_reason() {
 }
 
 #[tokio::test]
+async fn for_review_does_not_grant_appended_arguments() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch a"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert!(dir.path().join("a").exists());
+    assert_eq!(remembered(&cx), ["touch a"]);
+
+    // No decision is queued: the scripted user denies. `touch a b` is a
+    // different line from the approved `touch a`, so it asks again.
+    let out = bash(&cx, json!({"command": "touch a b"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert!(!dir.path().join("b").exists());
+    assert_eq!(interaction.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn for_review_is_whitespace_insensitive() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch  a"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert_eq!(remembered(&cx), ["touch a"]);
+
+    // Runs of whitespace are collapsed, so the same line with one space runs
+    // without asking. Everything else is compared verbatim.
+    let out = bash(&cx, json!({"command": "touch a"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert!(dir.path().join("a").exists());
+    assert_eq!(interaction.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn for_review_never_grants_a_path_qualified_wrapper() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    // `echo x` feeds the pipe; `env` runs `sh`, which tries to run `x`.
+    let out = bash(&cx, json!({"command": "echo x | /usr/bin/env sh"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert_eq!(remembered(&cx), ["echo x | /usr/bin/env sh"]);
+
+    // No decision is queued: the scripted user denies. A path-qualified
+    // wrapper is not a prefix grant either.
+    let out = bash(&cx, json!({"command": "/usr/bin/env sh -c true"})).await;
+    assert!(out.is_error, "{:?}", out.parts);
+    assert_eq!(interaction.calls().len(), 2);
+}
+
+#[tokio::test]
 async fn for_review_never_grants_a_bare_wrapper() {
     let (_dir, host) = host();
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
@@ -264,12 +334,9 @@ async fn for_review_never_grants_a_bare_wrapper() {
     // `echo true` feeds the pipe, so `sh` reads `true` and exits.
     let out = bash(&cx, json!({"command": "echo true | sh"})).await;
     assert!(!out.is_error, "{:?}", out.parts);
-    let allowed = cx.allowed_snapshot();
-    assert!(
-        allowed.iter().any(|entry| entry == "echo true"),
-        "{allowed:?}"
-    );
-    assert!(!allowed.iter().any(|entry| entry == "sh"), "{allowed:?}");
+    // The whole line is remembered — never `sh` on its own.
+    assert_eq!(remembered(&cx), ["echo true | sh"]);
+    assert!(cx.allowed_snapshot().is_empty());
 
     // A bare `sh` entry would let this run silently. No decision is queued, so
     // the scripted user denies it: nothing runs and the call is recorded.

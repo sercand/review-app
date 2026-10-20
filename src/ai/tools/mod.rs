@@ -125,15 +125,20 @@ pub struct ToolCx {
     pub agent: AgentRef,
     /// The user, for questions and command approvals.
     pub interaction: Arc<dyn crate::ai::interaction::Interaction>,
-    /// Commands `bash` may run without asking: the repo's configured commands,
-    /// seeded at run start, plus what the user approved "for this review".
-    ///
-    /// Shared by every agent of the run, so an approval in one reviewer is
-    /// silent for the next. Guarded by a std mutex because it is only touched
-    /// synchronously, never across an `.await`; the [`ToolCx::allowed_snapshot`]
-    /// and [`ToolCx::allow_segments`] helpers recover from a poisoned lock so a
-    /// panicking holder cannot turn a tool call into a panic.
+    /// Commands `bash` may run without asking: the repo's configured commands
+    /// and nothing else. Entries match by whole-word prefix, so configure
+    /// `cargo test` and not `cargo`.
     pub allowed: Arc<Mutex<Vec<String>>>,
+    /// Exact, whitespace-normalized command lines the user approved "for this
+    /// review".
+    ///
+    /// `bash` checks this list **before** [`review_sandbox::classify`], so an
+    /// approved line runs without asking again for the rest of the run. It is
+    /// deliberately never prefix-matched: approving `touch a` does not grant
+    /// `touch a b`, `/usr/bin/env sh proxy`, or an extended `find … -exec`. A
+    /// line is stored with runs of whitespace collapsed and everything else
+    /// (quotes included) verbatim, so it must match exactly.
+    pub for_review: Arc<Mutex<Vec<String>>>,
 }
 
 impl ToolCx {
@@ -152,6 +157,22 @@ impl ToolCx {
             }
         }
     }
+
+    /// Whether the user already approved exactly `line` for this review.
+    pub fn for_review_contains(&self, line: &str) -> bool {
+        for_review_lock(&self.for_review)
+            .iter()
+            .any(|entry| entry == line)
+    }
+
+    /// Remembers `line` as approved for this review, once. An empty line is
+    /// never remembered: there is no command to approve.
+    pub fn remember_for_review(&self, line: String) {
+        let mut lines = for_review_lock(&self.for_review);
+        if !line.is_empty() && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
 }
 
 /// Locks the allowed-commands list, recovering from a poisoned mutex: the list
@@ -159,6 +180,12 @@ impl ToolCx {
 /// command in the run.
 fn allowed_lock(allowed: &Mutex<Vec<String>>) -> std::sync::MutexGuard<'_, Vec<String>> {
     allowed.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Locks the for-review line list, recovering from poisoning for the same
+/// reason as [`allowed_lock`].
+fn for_review_lock(lines: &Mutex<Vec<String>>) -> std::sync::MutexGuard<'_, Vec<String>> {
+    lines.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A tool an agent can call.

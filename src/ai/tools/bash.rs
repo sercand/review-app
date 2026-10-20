@@ -95,12 +95,20 @@ impl Tool for Bash {
 
 /// Asks the user about `command` when the classifier requires it.
 ///
-/// Returns `None` when the command may run (silently, approved once, or
-/// approved for the rest of the review) and `Some(error)` when it must not.
-/// An approval "for this review" records [`review_sandbox::approval_entries`] of
-/// the line, so the next identical line — and each of its parts on its own — is
-/// silent, except bare words and wrappers, which always ask again.
+/// Returns `None` when the command may run (silently, approved once, or the
+/// exact line was approved earlier in this review) and `Some(error)` when it
+/// must not.
+///
+/// "For this review" memory is the exact line, whitespace-normalized and
+/// otherwise verbatim: approving `touch a` never grants `touch a b`, and
+/// approving a line with a wrapper in it never grants that wrapper. It is
+/// checked before [`review_sandbox::classify`], so the approved line runs even
+/// if the classifier would ask again.
 async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
+    let line = normalized_line(command);
+    if cx.for_review_contains(&line) {
+        return None;
+    }
     let reason = match review_sandbox::classify(command, &cx.allowed_snapshot()) {
         Verdict::Run => return None,
         Verdict::Ask { reason } => reason,
@@ -112,7 +120,7 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     {
         ApprovalDecision::Once => None,
         ApprovalDecision::ForReview => {
-            cx.allow_segments(review_sandbox::approval_entries(command));
+            cx.remember_for_review(line);
             None
         }
         ApprovalDecision::Deny { reason } => {
@@ -124,4 +132,10 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
             Some(ToolOutput::error(text))
         }
     }
+}
+
+/// The line "for this review" remembers: runs of whitespace collapsed, every
+/// other character — quotes, escapes, globs — kept verbatim.
+fn normalized_line(command: &str) -> String {
+    command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
