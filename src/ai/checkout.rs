@@ -320,11 +320,14 @@ pub fn plan_checkout(
 ///
 /// Same-PR retry: when the store still holds a `Started`/`Active` record
 /// for the *same* PR (a retry after a failed attempt), that row is marked
-/// `Failed` (superseded) and its stash SHA is carried into the new record
-/// whenever this attempt does not create its own stash, so the repo lock
-/// and the user's stash move to the new row instead of leaking. (A retry
-/// that *does* stash new work supersedes the old record but leaves the old
-/// stash entry in `git stash list` unreferenced; nothing is dropped.)
+/// `Failed` (superseded) and both its stash SHA and its `original` ref are
+/// carried into the new record, so the repo lock, the user's stash and the
+/// real pre-checkout state move to the new row instead of leaking. The
+/// `original` is only taken over when this plan's `original` is
+/// `Detached(pr.head_sha)`, i.e. the retry starts from our own previous
+/// checkout; otherwise the plan's value describes a genuine user state.
+/// (A retry that *does* stash new work supersedes the old record but leaves
+/// the old stash entry in `git stash list` unreferenced; nothing is dropped.)
 pub fn execute_checkout(
     plan: &CheckoutPlan,
     pr: &PrTarget,
@@ -341,12 +344,20 @@ pub fn execute_checkout(
     } else {
         superseded.as_ref().and_then(|old| old.stash_sha.clone())
     };
+    // A retry runs on top of our own previous checkout, so the plan says
+    // `Detached(pr.head_sha)` — not a user state worth returning to. Keep the
+    // superseded row's original (e.g. `Branch("main")`) so restore still
+    // returns the user to where they really were (§7.3).
+    let original = match (&superseded, &plan.original) {
+        (Some(old), OriginalRef::Detached(sha)) if *sha == pr.head_sha => old.original.clone(),
+        _ => plan.original.clone(),
+    };
     let mut rec = CheckoutRecord {
         id: 0,
         repo_path: repo.clone(),
         repo: format!("{}/{}", pr.owner, pr.name),
         pr_number: pr.number,
-        original: plan.original.clone(),
+        original,
         // A carried-over stash from a superseded same-PR attempt is part of
         // the new row from the moment it exists, so the lock and the stash
         // move together.
@@ -1097,6 +1108,47 @@ mod tests {
         assert_eq!(
             restore(&second, false, &store).unwrap(),
             RestoreOutcome::Restored
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "mine\n"
+        );
+        assert!(gitx(&clone, &["stash", "list"]).is_empty());
+        assert!(store.checkout_holding(&second.repo_path).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_pr_retry_carries_the_original_ref_and_restores_the_branch() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        write_file(&clone.join("a.txt"), "mine\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        assert_eq!(plan.original, OriginalRef::Branch("main".to_string()));
+        let first = execute_checkout(&plan, &pr, &store).unwrap();
+
+        // A second start while the first checkout is still Active: the tree
+        // is already detached at the PR head, so the new plan's "original"
+        // is our own checkout, not the user's state.
+        let plan2 = plan_checkout(&clone, &pr, &store).unwrap();
+        assert_eq!(
+            plan2.original,
+            OriginalRef::Detached(pr.head_sha.clone()),
+            "the retry starts on top of the previous checkout"
+        );
+        let second = execute_checkout(&plan2, &pr, &store).unwrap();
+        // …so the record must still know where the user really came from.
+        assert_eq!(second.original, OriginalRef::Branch("main".to_string()));
+        assert_eq!(second.stash_sha, first.stash_sha);
+
+        assert_eq!(
+            restore(&second, false, &store).unwrap(),
+            RestoreOutcome::Restored
+        );
+        assert_eq!(
+            gitx(&clone, &["symbolic-ref", "--short", "HEAD"]),
+            "main",
+            "restore must return to the user's branch, not the PR head"
         );
         assert_eq!(
             std::fs::read_to_string(clone.join("a.txt")).unwrap(),
