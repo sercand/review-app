@@ -7,3 +7,6 @@
 pub mod checkout;
 pub mod llm;
 pub mod store;
+pub mod tools;
+
+pub use tools::{AgentRef, AgentRole};

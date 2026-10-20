@@ -37,6 +37,7 @@ tempfile = "3.27.0"
 wiremock = "0.6.5"
 
 [target.'cfg(unix)'.dependencies]
+async-trait = "0.1.92"
 review-llm = { path = "crates/llm" }
 review-sandbox = { path = "crates/sandbox" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -1,0 +1,231 @@
+//! The review agent's read-only repo tools: `bash`, `read_file`, `glob` and
+//! `grep`, with mono's names, schemas and messages, run against any
+//! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
+//! temp-dir host in tests).
+//!
+//! Every text result is cut to [`MAX_TOOL_OUTPUT`] bytes by [`truncate_middle`].
+//! Bad input and failed sandbox ops are tool errors (`is_error`) that carry the
+//! message, so the model can correct itself; a non-zero exit from `bash` is not an
+//! error.
+//!
+//! The set is deliberately read-only (spec §6.3): there is no edit, write, merge or
+//! GitHub-write tool. [`all`] lists every tool this crate registers, and the
+//! `registry_has_no_write_or_merge_tools` test guards it; an agent gets an explicit
+//! subset through [`Registry::new`].
+
+mod bash;
+mod files;
+mod search;
+mod truncate;
+
+#[cfg(test)]
+mod tests;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
+pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};
+
+/// Which kind of agent a tool call belongs to.
+///
+/// [`AgentRole::App`] never runs a model: it tags notices the app itself produces
+/// (e.g. a force-push fallback message shown in the run's transcript).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    /// Maps the PR and writes the review brief.
+    Scout,
+    /// Reviews one group of files against a checklist.
+    Reviewer,
+    /// Tries to break the reviewers' findings before they reach the user.
+    Challenger,
+    /// Answers a reviewer's side question without reviewing.
+    Lookup,
+    /// Checks findings against the code and the PR's CI.
+    Verifier,
+    /// Checks earlier review comments on the same lines.
+    PriorCheck,
+    /// Turns the surviving findings into the review draft.
+    Assembler,
+    /// Answers the user's questions about the run.
+    Chat,
+    /// An app-generated notice, not a model agent.
+    App,
+}
+
+/// A stable handle to one agent instance of a run.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentRef {
+    /// The agent's number within the run, unique across roles.
+    pub id: u32,
+    /// What kind of agent it is.
+    pub role: AgentRole,
+    /// The short human label shown in the UI (e.g. `reviewer 2`).
+    pub label: String,
+}
+
+/// What a tool hands back to the model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutput {
+    /// The result content: text, or an image for `read_file` on an image.
+    pub parts: Vec<review_llm::ToolResultPart>,
+    /// The call failed; the text says why.
+    pub is_error: bool,
+}
+
+impl ToolOutput {
+    /// A successful text result, cut to [`MAX_TOOL_OUTPUT`].
+    pub fn text(text: impl AsRef<str>) -> ToolOutput {
+        ToolOutput {
+            parts: vec![review_llm::ToolResultPart::Text {
+                text: truncate_middle(text.as_ref(), MAX_TOOL_OUTPUT),
+            }],
+            is_error: false,
+        }
+    }
+
+    /// A successful text result the caller has already cut to size.
+    fn raw_text(text: String) -> ToolOutput {
+        ToolOutput {
+            parts: vec![review_llm::ToolResultPart::Text { text }],
+            is_error: false,
+        }
+    }
+
+    /// A tool error carrying `message`, cut to [`MAX_TOOL_OUTPUT`].
+    pub fn error(message: impl AsRef<str>) -> ToolOutput {
+        ToolOutput {
+            is_error: true,
+            ..ToolOutput::text(message)
+        }
+    }
+}
+
+/// Everything a tool may touch: the sandbox, the checkout root and who is asking.
+///
+/// Later pipeline pieces add their shared state here by name (`snapshot`, `run`,
+/// `interaction`, `context`, `spawner`, …), so a tool takes one context argument
+/// and its signature never changes.
+pub struct ToolCx {
+    /// The sandbox every file and command op runs through.
+    pub sandbox: Arc<dyn review_sandbox::SandboxOps>,
+    /// The checkout the PR head is on; paths in tool input are relative to it.
+    pub repo_root: PathBuf,
+    /// The agent that made the call.
+    pub agent: AgentRef,
+}
+
+/// A tool an agent can call.
+#[async_trait::async_trait]
+pub trait Tool: Send + Sync {
+    /// The tool's name, description and JSON input schema.
+    fn definition(&self) -> review_llm::Tool;
+    /// Runs the tool. Failures come back as [`ToolOutput::error`], never as a panic.
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolOutput;
+}
+
+/// The tools of one agent, looked up by name.
+///
+/// An agent's registry is an explicit subset of [`all`]: a scout gets file tools, a
+/// verifier gets CI tools, and nobody gets a write tool.
+#[derive(Clone, Default)]
+pub struct Registry {
+    tools: Vec<Arc<dyn Tool>>,
+}
+
+impl Registry {
+    /// A registry over exactly `tools`.
+    pub fn new(tools: Vec<Arc<dyn Tool>>) -> Registry {
+        Registry { tools }
+    }
+
+    /// Every tool's definition, in registry order, for the LLM request.
+    pub fn definitions(&self) -> Vec<review_llm::Tool> {
+        self.tools.iter().map(|t| t.definition()).collect()
+    }
+
+    /// The tool called `name`, if the registry has it.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .iter()
+            .find(|t| t.definition().name == name)
+            .cloned()
+    }
+}
+
+/// Every tool this crate registers, in presentation order.
+///
+/// It exists so the safety test can sweep the whole set as it grows; agents get
+/// explicit subsets built with [`Registry::new`].
+pub fn all() -> Vec<Arc<dyn Tool>> {
+    vec![
+        Arc::new(bash::Bash),
+        Arc::new(files::ReadFile),
+        Arc::new(search::Glob),
+        Arc::new(search::Grep),
+    ]
+}
+
+/// Names a tool may not have: they would write to GitHub or to the checkout.
+///
+/// A name is forbidden when it equals one of these or starts with one plus `_`
+/// (so `merge`, `merge_pr` and `resolve_thread` are all out).
+#[cfg(test)]
+const FORBIDDEN_TOOL_NAMES: [&str; 8] = [
+    "merge",
+    "approve",
+    "post_review",
+    "submit_review",
+    "resolve",
+    "edit_file",
+    "write_file",
+    "create_comment",
+];
+
+/// The local draft tool (Task 14): its name starts with a forbidden one, but it
+/// posts nothing — it fills a draft the app shows the user for approval.
+#[cfg(test)]
+const LOCAL_DRAFT_TOOL: &str = "submit_review_draft";
+
+/// Whether `name` is a write or merge tool (see [`FORBIDDEN_TOOL_NAMES`]).
+#[cfg(test)]
+fn is_forbidden_tool_name(name: &str) -> bool {
+    if name == LOCAL_DRAFT_TOOL {
+        return false;
+    }
+    FORBIDDEN_TOOL_NAMES.iter().any(|bad| {
+        name.strip_prefix(bad)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('_'))
+    })
+}
+
+/// Parses a tool's input, or the tool error to return.
+fn parse<T: DeserializeOwned>(input: Value) -> Result<T, ToolOutput> {
+    // A model may send `null` for a tool without required fields.
+    let input = if input.is_null() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        input
+    };
+    serde_json::from_value(input).map_err(|e| ToolOutput::error(format!("invalid input: {e}")))
+}
+
+/// A tool definition from a static schema. The schemas are fixed and checked by tests.
+fn definition(name: &str, description: &str, schema: Value) -> review_llm::Tool {
+    review_llm::Tool::new(name, description, schema)
+        .unwrap_or_else(|e| unreachable!("tool {name}: invalid built-in schema: {e}"))
+}
+
+/// The directory a search runs under: the given one, or the checkout root.
+fn search_root(directory: &str) -> &str {
+    if directory.trim().is_empty() {
+        "."
+    } else {
+        directory
+    }
+}

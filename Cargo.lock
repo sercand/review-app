@@ -2028,6 +2028,7 @@ name = "gh-review-desktop"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "directories",
  "eframe",
  "egui_extras",
