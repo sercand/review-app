@@ -275,13 +275,25 @@ pub fn render(
                 .desired_width(f32::INFINITY),
         );
         form.title_edited |= title.changed();
-        let message = ui.add(
-            egui::TextEdit::multiline(&mut form.message)
-                .hint_text("Add an optional extended description…")
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-        form.message_edited |= message.changed();
+        // A multiline TextEdit grows to its full text, and a popup measures
+        // its content intrinsically — a long squash message (the PR body)
+        // would stretch the popover past the bottom of the window. The box
+        // scrolls instead, like GitHub's.
+        let mut message_changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt("merge-message")
+            .max_height(160.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let message = ui.add(
+                    egui::TextEdit::multiline(&mut form.message)
+                        .hint_text("Add an optional extended description…")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
+                );
+                message_changed = message.changed();
+            });
+        form.message_edited |= message_changed;
     }
 
     ui.separator();
@@ -496,5 +508,77 @@ mod tests {
         blocked.get_by_label("Merge").click();
         blocked.run();
         assert!(blocked.state().1.is_empty(), "a blocked gate must not fire");
+    }
+
+    #[test]
+    fn a_long_message_keeps_the_merge_button_on_screen() {
+        use egui_kittest::kittest::Queryable;
+        // A squash prefill is the PR body, which can run to hundreds of
+        // lines; the message box must scroll, not stretch the popover and
+        // push the Merge button off screen. Driven through the real detail
+        // screen, the same path the app paints.
+        let long_body = "line\n".repeat(200);
+        let (mut session, _cmds) = crate::state::pr_detail::PrSession::open(
+            crate::runtime::SessionId(1),
+            "github.com".into(),
+            crate::test_support::repo(),
+            7,
+        );
+        let mut m = meta("sha_head");
+        m.body = long_body;
+        session.on_event(&crate::runtime::Event::PrMetadataLoaded {
+            session: crate::runtime::SessionId(1),
+            meta: m,
+        });
+        let mut state = crate::ui::screens::pr_detail::PrDetailState {
+            merge_open: true,
+            ..Default::default()
+        };
+        state.merge_form = MergeForm::with_method(MergeMethod::Squash);
+        let mut cache = crate::diff::highlight::HighlightCache::new(
+            16,
+            Box::new(crate::diff::highlight::SyntectHighlighter::new(true)),
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1400.0, 900.0])
+            .with_context_setup(|ctx| {
+                ctx.set_fonts(crate::ui::fonts::font_definitions());
+                crate::ui::theme::install(ctx, 13.0);
+            })
+            .build_ui_state(
+                move |ui, _state: &mut ()| {
+                    let mut diff_actions = Vec::new();
+                    crate::ui::screens::pr_detail::render(
+                        ui,
+                        &mut session,
+                        &mut state,
+                        &mut cache,
+                        &mut diff_actions,
+                        crate::ui::screens::pr_detail::ScreenInputs {
+                            login: "viewer",
+                            write_blocked: None,
+                            theme: crate::ui::theme::Theme::Dark,
+                            system_dark: true,
+                        },
+                    );
+                },
+                (),
+            );
+        harness.run_steps(6);
+        let rects: Vec<_> = harness
+            .get_all_by_label("Merge")
+            .map(|node| node.rect())
+            .collect();
+        // One "Merge" is the top bar's button; the popover's is the lowest.
+        let popover_button = rects
+            .into_iter()
+            .filter(|r| r.top() > 60.0)
+            .max_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the popover's Merge button");
+        assert!(
+            popover_button.bottom() <= 900.0,
+            "the popover's Merge button must stay on screen, was at y={}",
+            popover_button.bottom()
+        );
     }
 }
