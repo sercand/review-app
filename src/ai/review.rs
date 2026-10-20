@@ -299,6 +299,12 @@ impl RunState {
         self.session_id
     }
 
+    /// The store this run persists through, for writers that are not
+    /// findings or coverage (the agent loop's transcript, spec §9.2).
+    pub fn store(&self) -> &std::sync::Arc<Store> {
+        &self.store
+    }
+
     /// Locks the cache, recovering from poisoning: it mirrors rows that are
     /// already committed, so a panicking thread lost nothing.
     fn cache(&self) -> MutexGuard<'_, RunCache> {

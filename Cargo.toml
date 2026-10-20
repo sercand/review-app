@@ -50,6 +50,7 @@ review-llm = { path = "crates/llm" }
 review-sandbox = { path = "crates/sandbox" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
+tokio-util = "0.7"
 url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
