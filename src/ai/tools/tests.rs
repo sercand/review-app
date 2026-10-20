@@ -75,6 +75,8 @@ fn ctx_with(
         for_review: Arc::new(std::sync::Mutex::new(Vec::new())),
         snapshot: None,
         context: None,
+        run: crate::test_support::ai_run_state(),
+        assigned: Arc::new(Vec::new()),
     }
 }
 
@@ -1105,7 +1107,10 @@ fn tool_definitions_have_valid_schemas() {
             "gh_pr_patch",
             "gh_threads",
             "gh_checks",
-            "load_skill"
+            "load_skill",
+            "record_finding",
+            "record_check",
+            "done"
         ]
     );
     for t in &tools {
@@ -1134,6 +1139,12 @@ fn tool_definitions_have_valid_schemas() {
     assert!(req("gh_threads").is_empty());
     assert!(req("gh_checks").is_empty());
     assert_eq!(req("load_skill"), ["name"]);
+    assert_eq!(
+        req("record_finding"),
+        ["path", "line", "severity", "title", "body", "evidence"]
+    );
+    assert_eq!(req("record_check"), ["file", "item", "result", "note"]);
+    assert!(req("done").is_empty());
     let props = |name: &str| -> Vec<String> {
         let mut v: Vec<String> = tool(name).definition().input_schema["properties"]
             .as_object()
@@ -1159,6 +1170,22 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(props("gh_threads"), ["path"]);
     assert!(props("gh_checks").is_empty());
     assert_eq!(props("load_skill"), ["name"]);
+    assert_eq!(
+        props("record_finding"),
+        [
+            "body",
+            "checklist_item",
+            "evidence",
+            "line",
+            "path",
+            "severity",
+            "side",
+            "start_line",
+            "title"
+        ]
+    );
+    assert_eq!(props("record_check"), ["file", "item", "note", "result"]);
+    assert_eq!(props("done"), ["summary"]);
 }
 
 /// The registry hands out every definition in order, and looks a tool up by name.
@@ -1183,6 +1210,9 @@ fn registry_definitions_and_lookup() {
     assert!(registry.get("gh_threads").is_some());
     assert!(registry.get("gh_checks").is_some());
     assert!(registry.get("load_skill").is_some());
+    assert!(registry.get("record_finding").is_some());
+    assert!(registry.get("record_check").is_some());
+    assert!(registry.get("done").is_some());
     assert!(registry.get("edit_file").is_none());
     assert!(registry.get("").is_none());
 }

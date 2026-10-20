@@ -1,7 +1,8 @@
 //! The review agent's read-only repo tools: `bash`, `read_file`, `glob`,
 //! `grep`, `list_dir`, `asset_stats`, `git_show`/`git_log`/`git_diff`, the
-//! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`
-//! and the context-backed `load_skill`, with mono's names and schemas where
+//! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`,
+//! the context-backed `load_skill`, and the review-output `record_finding`,
+//! `record_check` and `done`, with mono's names and schemas where
 //! they exist, run against any
 //! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
 //! temp-dir host in tests). The git tools run `git` directly in the checkout,
@@ -14,7 +15,8 @@
 //! error.
 //!
 //! The set is deliberately read-only (spec §6.3): there is no edit, write, merge or
-//! GitHub-write tool. [`all`] lists every tool this crate registers, and the
+//! GitHub-write tool — the review-output tools write only to the run's own
+//! [`crate::ai::review::RunState`]. [`all`] lists every tool this crate registers, and the
 //! `registry_has_no_write_or_merge_tools` test guards it; an agent gets an explicit
 //! subset through [`Registry::new`].
 
@@ -23,6 +25,7 @@ mod files;
 mod gh;
 mod git;
 mod inspect;
+mod record;
 mod search;
 mod skills;
 mod truncate;
@@ -160,6 +163,14 @@ pub struct ToolCx {
     /// before the checkout was scanned. `load_skill` then returns an error
     /// rather than guessing, and nothing else reads this field.
     pub context: Option<Arc<crate::ai::context::RepoContext>>,
+    /// The run's shared findings/coverage/Q&A state, written by the
+    /// `record_*` tools and read by the pipeline (spec §5.4).
+    pub run: Arc<crate::ai::review::RunState>,
+    /// The `(file, checklist item)` pairs assigned to this agent.
+    ///
+    /// `record_check` refuses items outside this list; an empty list means
+    /// anything may be recorded (the scout, chat, and tool tests).
+    pub assigned: Arc<Vec<(String, String)>>,
 }
 
 impl ToolCx {
@@ -268,6 +279,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(gh::GhThreads),
         Arc::new(gh::GhChecks),
         Arc::new(skills::LoadSkill),
+        Arc::new(record::RecordFinding),
+        Arc::new(record::RecordCheck),
+        Arc::new(record::Done),
     ]
 }
 

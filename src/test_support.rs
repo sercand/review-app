@@ -35,6 +35,31 @@ pub fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("failed to create a temporary directory")
 }
 
+/// A [`crate::ai::review::RunState`] over a fresh in-memory store with one
+/// session and one full run, for `ToolCx` test contexts. The event receiver
+/// is dropped at once, so the state's sends fail and are ignored.
+#[cfg(unix)]
+pub fn ai_run_state() -> std::sync::Arc<crate::ai::review::RunState> {
+    use crate::ai::review::RunState;
+    use crate::ai::store::{PrKey, RunKind, Store};
+    use std::sync::Arc;
+
+    let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
+    let session = store
+        .session_id(&PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+        })
+        .expect("session row");
+    let run = store
+        .run_begin(session, RunKind::Full, None, "sha_head")
+        .expect("run row");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    Arc::new(RunState::new(store, session, run, tx))
+}
+
 /// A repository reference in the `o/r` every unit test uses.
 pub fn repo() -> crate::model::RepoRef {
     crate::model::RepoRef::new("o", "r")

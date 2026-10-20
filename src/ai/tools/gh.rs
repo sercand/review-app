@@ -412,6 +412,8 @@ mod tests {
             for_review: Arc::new(Mutex::new(Vec::new())),
             snapshot,
             context: None,
+            run: crate::test_support::ai_run_state(),
+            assigned: Arc::new(Vec::new()),
         };
         (dir, cx)
     }
