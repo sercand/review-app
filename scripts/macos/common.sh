@@ -20,6 +20,8 @@ DIST_DIR="${DIST_DIR:-$ROOT/target/dist}"
 ARCHIVE_PATH="$DIST_DIR/$BIN_NAME-$VERSION.xcarchive"
 # Distributables, without extension: notarize.sh writes .dmg and .zip.
 DIST_BASE="$DIST_DIR/${APP_NAME// /-}-$VERSION"
+# Dev bundle written by dev-app.sh (not part of the release pipeline).
+DEV_APP_DIR="${DEV_APP_DIR:-$ROOT/target/bundle}"
 ICON_SVG="$ROOT/assets/app-icon/AppIcon.svg"
 ICNS_PATH="$ROOT/assets/app-icon/AppIcon.icns"
 

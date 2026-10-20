@@ -52,6 +52,17 @@ pub struct PrMetadata {
     pub milestone: Option<String>,
     /// The PR's web URL.
     pub html_url: String,
+    /// Whether GitHub has decided the PR can be merged; `None` while it is
+    /// still computing mergeability.
+    pub mergeable: Option<bool>,
+    /// The legacy mergeability verdict, e.g. `clean`, `blocked`, `dirty`;
+    /// empty when unknown.
+    pub mergeable_state: String,
+    /// The current mergeability verdict (`merge_state_status`), which
+    /// supersedes `mergeable_state` when non-empty; empty when unknown.
+    pub merge_state_status: String,
+    /// Whether the PR was merged (`merged_at` is set).
+    pub merged: bool,
 }
 
 /// `GET /repos/{o}/{r}/pulls/{n}` as GitHub sends it.
@@ -90,6 +101,14 @@ struct WireMetadata {
     milestone: Option<WireMilestone>,
     #[serde(default)]
     html_url: String,
+    #[serde(default)]
+    mergeable: Option<bool>,
+    #[serde(default)]
+    mergeable_state: String,
+    #[serde(default)]
+    merge_state_status: String,
+    #[serde(default)]
+    merged_at: Option<String>,
 }
 
 /// One branch (`base` or `head`).
@@ -169,6 +188,10 @@ impl From<WireMetadata> for PrMetadata {
                 .collect(),
             milestone: meta.milestone.map(|milestone| milestone.title),
             html_url: meta.html_url,
+            mergeable: meta.mergeable,
+            mergeable_state: meta.mergeable_state,
+            merge_state_status: meta.merge_state_status,
+            merged: meta.merged_at.is_some(),
         }
     }
 }
@@ -203,5 +226,31 @@ mod tests {
         assert_eq!(m.body, ""); // null body
         assert!(m.draft);
         assert_eq!(m.changed_files, 3);
+    }
+
+    #[test]
+    fn parses_merge_state() {
+        let m = parse_metadata(fixture!("pr_metadata.json")).unwrap();
+        assert_eq!(m.mergeable, Some(true));
+        assert_eq!(m.mergeable_state, "clean");
+        assert_eq!(m.merge_state_status, "clean");
+    }
+
+    #[test]
+    fn merge_state_defaults_when_absent_or_null() {
+        // GitHub computes mergeability asynchronously: `mergeable` is null
+        // while it runs, and older hosts may omit the fields entirely.
+        let m = parse_metadata(r#"{"number": 7, "mergeable": null, "mergeable_state": "unknown"}"#)
+            .unwrap();
+        assert_eq!(m.mergeable, None);
+        assert_eq!(m.mergeable_state, "unknown");
+        assert_eq!(m.merge_state_status, "");
+        assert!(!m.merged);
+    }
+
+    #[test]
+    fn merged_when_merged_at_is_set() {
+        let m = parse_metadata(r#"{"number": 7, "merged_at": "2026-01-01T00:00:00Z"}"#).unwrap();
+        assert!(m.merged);
     }
 }

@@ -16,5 +16,8 @@
   "requested_teams": [{ "slug": "core", "name": "Core" }],
   "labels": [{ "name": "bug", "color": "d73a4a" }],
   "milestone": null,
-  "html_url": "https://github.com/o/r/pull/7"
+  "html_url": "https://github.com/o/r/pull/7",
+  "mergeable": true,
+  "mergeable_state": "clean",
+  "merge_state_status": "clean"
 }

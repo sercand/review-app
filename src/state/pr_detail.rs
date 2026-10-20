@@ -153,6 +153,11 @@ pub struct PrSession {
     /// The PR's conversation (issue) comments, once loaded, oldest first
     /// (Task 51).
     pub conversation: Vec<ConversationComment>,
+    /// The repository's merge-method allow flags, once loaded.
+    pub repo_settings: Option<crate::github::merge::RepoSettings>,
+    /// Whether a merge request is currently in flight; it blocks a second
+    /// one (the mutation is never retried).
+    pub merging: bool,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
     /// The live pending-review draft (Phase F submits it), pinned to one
@@ -338,6 +343,8 @@ impl PrSession {
             svg_diffs: HashMap::new(),
             next_optimistic_id: 1,
             optimistic: None,
+            repo_settings: None,
+            merging: false,
             collapsed_dirs,
             last_opened_file,
             composer_draft,
@@ -393,9 +400,12 @@ impl PrSession {
             // the command above brings back (Task 51).
             Command::LoadConversation {
                 session: id,
-                repo,
+                repo: repo.clone(),
                 number,
             },
+            // And the merge-method allow flags: the Merge popover greys out
+            // what the repository does not offer.
+            Command::LoadRepoSettings { session: id, repo },
         ];
         (session, commands)
     }
@@ -608,6 +618,32 @@ impl PrSession {
             }
             Event::ReviewSubmitFailed { session, error } if *session == self.id => {
                 on_submit_error(self, error.clone());
+                Vec::new()
+            }
+            Event::RepoSettingsLoaded { session, settings } if *session == self.id => {
+                self.repo_settings = Some(settings.clone());
+                Vec::new()
+            }
+            Event::PrMerged { session, .. } if *session == self.id => {
+                self.merging = false;
+                // Reload the metadata (the PR is closed and merged now) and
+                // the reviews (the merge records them), like a submit did.
+                vec![
+                    Command::LoadPrMetadata {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        number: self.number,
+                    },
+                    Command::LoadReviews {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        number: self.number,
+                    },
+                ]
+            }
+            Event::MergeFailed { session, error } if *session == self.id => {
+                self.merging = false;
+                self.error = Some(error.clone());
                 Vec::new()
             }
             Event::HeadBlobLoaded {
@@ -1699,6 +1735,43 @@ pub fn on_submit_error(session: &mut PrSession, error: GhError) {
     session.error = Some(error);
 }
 
+/// The merge command for the popover's choices, when [`merge_gate`] allows
+/// them; `None` otherwise (the popover disables Merge in exactly that case).
+///
+/// The payload is built here, at click time, pinned to the head SHA the
+/// diff on screen belongs to.
+pub fn start_merge(
+    session: &PrSession,
+    method: crate::github::merge::MergeMethod,
+    commit_title: String,
+    commit_message: String,
+) -> Option<Command> {
+    if crate::ui::widgets::merge_panel::merge_gate(
+        session.metadata.as_ref(),
+        session.repo_settings.as_ref(),
+        session.merging,
+        method,
+    ) != crate::ui::widgets::merge_panel::MergeGate::Allowed
+    {
+        return None;
+    }
+    let sha = session
+        .diff_head_sha
+        .clone()
+        .or_else(|| session.metadata.as_ref().map(|m| m.head_sha.clone()))?;
+    Some(Command::MergePr {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+        payload: crate::github::merge::merge_payload(&crate::github::merge::MergeRequest {
+            sha,
+            method,
+            commit_title,
+            commit_message,
+        }),
+    })
+}
+
 /// The persisted composer draft for the live composer; `None` when there is
 /// nothing to keep — no target, or a blank body (the empty→`None` rule).
 fn composer_draft_of(state: &ComposerState) -> Option<ComposerDraft> {
@@ -1827,7 +1900,8 @@ mod tests {
                 Command::LoadThreads { .. },
                 Command::LoadReviews { .. },
                 Command::LoadCommits { .. },
-                Command::LoadConversation { .. }
+                Command::LoadConversation { .. },
+                Command::LoadRepoSettings { .. }
             ]
         ));
         let cmds = s.on_event(&Event::PrMetadataLoaded {
@@ -3327,6 +3401,120 @@ mod tests {
             s.files[1].diff.as_ref().unwrap().hunks.len(),
             2,
             "turning the option off restores the fresh diff's whitespace hunk too"
+        );
+    }
+
+    fn all_repo_settings() -> crate::github::merge::RepoSettings {
+        crate::github::merge::RepoSettings {
+            allow_merge_commit: true,
+            allow_squash_merge: true,
+            allow_rebase_merge: true,
+        }
+    }
+
+    #[test]
+    fn start_merge_builds_the_payload_at_click_time() {
+        use crate::github::merge::MergeMethod;
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.on_event(&Event::RepoSettingsLoaded {
+            session: SessionId(1),
+            settings: all_repo_settings(),
+        });
+        assert!(s.repo_settings.is_some());
+        let cmd = start_merge(&s, MergeMethod::Squash, "t".into(), "m".into());
+        match cmd {
+            Some(Command::MergePr {
+                session,
+                number,
+                payload,
+                ..
+            }) => {
+                assert_eq!(session, SessionId(1));
+                assert_eq!(number, 7);
+                assert_eq!(payload["sha"], "sha1");
+                assert_eq!(payload["merge_method"], "squash");
+                assert_eq!(payload["commit_title"], "t");
+                assert_eq!(payload["commit_message"], "m");
+            }
+            other => panic!("expected a MergePr command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_merge_is_refused_while_a_merge_is_in_flight() {
+        use crate::github::merge::MergeMethod;
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.merging = true;
+        assert!(start_merge(&s, MergeMethod::Merge, "t".into(), String::new()).is_none());
+    }
+
+    #[test]
+    fn start_merge_is_refused_for_a_disallowed_method() {
+        use crate::github::merge::MergeMethod;
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.on_event(&Event::RepoSettingsLoaded {
+            session: SessionId(1),
+            settings: crate::github::merge::RepoSettings {
+                allow_squash_merge: false,
+                ..all_repo_settings()
+            },
+        });
+        assert!(start_merge(&s, MergeMethod::Squash, "t".into(), String::new()).is_none());
+    }
+
+    #[test]
+    fn merged_clears_in_flight_and_reloads_metadata_and_reviews() {
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.merging = true;
+        let cmds = s.on_event(&Event::PrMerged {
+            session: SessionId(1),
+            result: crate::github::merge::MergeResult {
+                sha: "merge_sha".into(),
+                merged: true,
+                message: "Pull Successfully merged".into(),
+            },
+        });
+        assert!(!s.merging);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadPrMetadata { .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, Command::LoadReviews { .. })));
+    }
+
+    #[test]
+    fn merge_failure_records_the_error_and_clears_in_flight() {
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.merging = true;
+        let cmds = s.on_event(&Event::MergeFailed {
+            session: SessionId(1),
+            error: GhError::Forbidden("not approved".into()),
+        });
+        assert!(cmds.is_empty());
+        assert!(!s.merging);
+        assert!(matches!(s.error, Some(GhError::Forbidden(_))));
+    }
+
+    #[test]
+    fn stale_merge_events_do_not_touch_the_session() {
+        let mut s = session_with(&[("a.rs", PATCH)]);
+        s.merging = true;
+        s.on_event(&Event::MergeFailed {
+            session: SessionId(99),
+            error: GhError::NotFound,
+        });
+        s.on_event(&Event::RepoSettingsLoaded {
+            session: SessionId(99),
+            settings: all_repo_settings(),
+        });
+        assert!(
+            s.merging,
+            "the stale failure must not clear the in-flight flag"
+        );
+        assert!(
+            s.repo_settings.is_none(),
+            "the stale settings must not land"
         );
     }
 }

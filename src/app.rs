@@ -39,6 +39,7 @@ use crate::ui::theme;
 use crate::ui::widgets::command_palette::{self, PaletteState};
 use crate::ui::widgets::diff_view::{DiffAction, DiffMode, DiffViewState};
 use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFooterAction};
+use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::review_panel::ReviewAction;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
@@ -168,7 +169,8 @@ fn event_error(event: &Event) -> Option<&GhError> {
         Event::Failed { error, .. }
         | Event::PrSearchFailed { error, .. }
         | Event::CommentFailed { error, .. }
-        | Event::ReviewSubmitFailed { error, .. } => Some(error),
+        | Event::ReviewSubmitFailed { error, .. }
+        | Event::MergeFailed { error, .. } => Some(error),
         _ => None,
     }
 }
@@ -381,6 +383,20 @@ impl ReviewApp {
                 if unauthorized {
                     // Spec §6: a 401 anywhere ends the session; the draft
                     // survives on disk (Review Focus #5).
+                    self.on_unauthorized(now);
+                }
+            }
+            // The session stores the allow flags through
+            // `apply_session_event`; the Merge popover reads them from there.
+            Event::RepoSettingsLoaded { .. } => {}
+            // The session clears its in-flight flag and reloads metadata and
+            // reviews through `apply_session_event`; the toast confirms.
+            Event::PrMerged { .. } => self.toasts.push("Pull request merged.".to_owned(), now),
+            Event::MergeFailed { error, .. } => {
+                let unauthorized = matches!(error, GhError::Unauthorized);
+                self.toasts.push(error.to_string(), now);
+                if unauthorized {
+                    // Spec §6: a 401 anywhere ends the session.
                     self.on_unauthorized(now);
                 }
             }
@@ -819,6 +835,7 @@ impl ReviewApp {
             right_pane: self.settings.layout.right_pane,
             right_open: self.settings.layout.right_open,
             details_tab: self.settings.layout.details_tab,
+            merge_form: merge_panel::MergeForm::with_method(self.settings.merge_method),
             ..PrDetailState::default()
         };
         for command in commands {
@@ -928,6 +945,35 @@ impl ReviewApp {
                 PrDetailAction::Review(action) => {
                     for command in self.apply_review_action(action, &login, now) {
                         self.worker.send(command);
+                    }
+                }
+                PrDetailAction::Merge(merge_panel::MergeAction::Merge) => {
+                    // Spec §13: the popover disables Merge while a rate limit
+                    // is in force; this is the same gate behind the button.
+                    let write_blocked = self
+                        .write_blocked_until
+                        .is_some_and(|until| until > SystemTime::now());
+                    if write_blocked {
+                        continue;
+                    }
+                    let method = self.pr_detail.merge_form.method;
+                    let title = self.pr_detail.merge_form.title.clone();
+                    let message = self.pr_detail.merge_form.message.clone();
+                    // The method the reviewer picked becomes the next PR's
+                    // starting point.
+                    if self.settings.merge_method != method {
+                        self.settings.merge_method = method;
+                        self.save_settings(now);
+                    }
+                    if let Some(session) = &mut self.session {
+                        if let Some(command) =
+                            crate::state::pr_detail::start_merge(session, method, title, message)
+                        {
+                            // The popover's in-flight half: the button rests
+                            // until GitHub answers.
+                            session.merging = true;
+                            self.worker.send(command);
+                        }
                     }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),

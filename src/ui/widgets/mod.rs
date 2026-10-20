@@ -10,6 +10,7 @@ pub mod file_tree;
 pub mod filter_bar;
 pub mod image_diff;
 pub mod markdown;
+pub mod merge_panel;
 pub mod metadata_panel;
 pub mod pr_row;
 pub mod review_panel;

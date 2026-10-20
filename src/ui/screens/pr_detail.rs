@@ -23,6 +23,7 @@ use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_header::{self, FileHeaderAction, FooterAction as FileFooterAction};
 use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
 use crate::ui::widgets::filter_bar;
+use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::metadata_panel;
 use crate::ui::widgets::review_panel::{self, ReviewAction};
 use crate::ui::widgets::thread_view::CommentDrafts;
@@ -48,6 +49,8 @@ pub enum PrDetailAction {
     },
     /// A control the review panel reported (Task 44).
     Review(ReviewAction),
+    /// A control the merge popover reported.
+    Merge(merge_panel::MergeAction),
     /// Open the settings window (Task 53).
     OpenSettings,
     /// Open the pull request on GitHub.
@@ -91,6 +94,10 @@ pub struct PrDetailState {
     pub filter_bar: filter_bar::FilterBarState,
     /// Whether the top bar's review popover is open (Task 12).
     pub review_open: bool,
+    /// Whether the top bar's merge popover is open.
+    pub merge_open: bool,
+    /// The merge popover's live form (method, title, message).
+    pub merge_form: merge_panel::MergeForm,
     /// Which details tab the right pane shows (Task 13).
     pub details_tab: metadata_panel::DetailsTab,
 }
@@ -108,6 +115,8 @@ impl Default for PrDetailState {
             find_open: false,
             filter_bar: filter_bar::FilterBarState::default(),
             review_open: false,
+            merge_open: false,
+            merge_form: merge_panel::MergeForm::default(),
             details_tab: metadata_panel::DetailsTab::default(),
         }
     }
@@ -160,11 +169,21 @@ pub fn render(
     };
     let review_vm = review_panel::review_panel_vm(&panel_inputs);
 
+    // The merge gate is read by the top bar's Merge button and its popover;
+    // computed once per frame before either borrows the session.
+    let merge_gate = merge_panel::merge_gate(
+        session.metadata.as_ref(),
+        session.repo_settings.as_ref(),
+        session.merging,
+        state.merge_form.method,
+    );
+
     // The top bar: back, state pill, repo/title, CI, tools, and the Review
     // button whose popover replaced the bottom review panel (Task 12).
     let bar_vm = top_bar::top_bar_vm(session);
     let mut bar_actions = Vec::new();
     let mut review_actions = Vec::new();
+    let mut merge_actions = Vec::new();
     crate::ui::widgets::title_bar::show(ui, "pr-detail-top", |ui| {
         top_bar::render(
             ui,
@@ -175,9 +194,21 @@ pub fn render(
                 details_open: state.right_open,
             },
             &mut state.review_open,
+            &mut state.merge_open,
             &mut bar_actions,
             |ui| {
                 review_panel::render(ui, &review_vm, &mut session.pending, &mut review_actions);
+            },
+            |ui| {
+                let merge_inputs = merge_panel::MergeInputs {
+                    owner: &session.repo.owner,
+                    meta: session.metadata.as_ref(),
+                    repo: session.repo_settings.as_ref(),
+                    commits: &session.commits,
+                    gate: merge_gate,
+                    write_blocked: inputs.write_blocked,
+                };
+                merge_panel::render(ui, &merge_inputs, &mut state.merge_form, &mut merge_actions);
             },
         );
     });
@@ -196,6 +227,10 @@ pub fn render(
         state.review_open = false;
     }
     actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
+    if merge_actions.contains(&merge_panel::MergeAction::Merge) {
+        state.merge_open = false;
+    }
+    actions.extend(merge_actions.into_iter().map(PrDetailAction::Merge));
 
     let left = egui::Panel::left("pr-detail-left")
         .resizable(true)

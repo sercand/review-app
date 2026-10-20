@@ -27,6 +27,17 @@ Outputs land in `target/dist/`.
 `scripts/macos/make-icon.sh` to rebuild `AppIcon.icns`. You need
 `rsvg-convert` (`brew install librsvg`) or `resvg`.
 
+For development, `cargo run` wraps the binary in a minimal bundle under
+`target/bundle/` (via `scripts/macos/dev-app.sh`) so the Dock shows the real
+app icon; run `scripts/macos/dev-app.sh` directly and `open` the printed path
+to launch the bundle without cargo. If the Dock keeps showing the generic
+placeholder after an update, the icon cache is stale:
+
+```sh
+/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "/Applications/GH Review.app"
+killall Dock
+```
+
 ## Settings
 
 The defaults live in `common.sh`, and you can override any of them from the

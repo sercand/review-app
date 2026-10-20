@@ -9,6 +9,10 @@
 #
 # The identity is $GH_REVIEW_SIGN_IDENTITY, or the first "Apple Development"
 # identity in the keychain. Without one, the binary runs as built.
+#
+# The binary is then copied into a minimal .app bundle (scripts/macos/dev-app.sh)
+# and exec'd from there, so the Dock shows the real app icon and name instead
+# of the generic executable placeholder.
 set -eu
 
 bin="$1"
@@ -22,6 +26,9 @@ if [ "$(basename "$bin")" = "gh-review-desktop" ]; then
     elif ! codesign --force --sign "$identity" --identifier gh-review-desktop "$bin" 2>/dev/null; then
         echo "note: could not sign $bin with $identity; the keychain may ask again" >&2
     fi
+
+    app="$("$(dirname "$0")/macos/dev-app.sh" "$bin" | tail -n 1)"
+    exec "$app/Contents/MacOS/gh-review-desktop" "$@"
 fi
 
 exec "$bin" "$@"

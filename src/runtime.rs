@@ -26,6 +26,7 @@ use crate::github::conversation::ConversationComment;
 use crate::github::error::GhError;
 use crate::github::files::{LoadedFile, PrFile};
 use crate::github::graphql::SearchPage;
+use crate::github::merge::{MergeResult, RepoSettings};
 use crate::github::metadata::PrMetadata;
 use crate::github::reviews::{viewer_pending_review, Review, ServerPendingComment};
 use crate::model::diff::FileDiff;
@@ -293,6 +294,26 @@ pub enum Command {
         /// at click time.
         payload: serde_json::Value,
     },
+    /// Fetch a repository's merge-method allow flags.
+    LoadRepoSettings {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository to ask.
+        repo: RepoRef,
+    },
+    /// Merge a PR with a body built by
+    /// [`crate::github::merge::merge_payload`].
+    MergePr {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The repository the PR lives in.
+        repo: RepoRef,
+        /// The PR number within the repository.
+        number: u64,
+        /// The REST body, built once by the session so the contract is fixed
+        /// at click time.
+        payload: serde_json::Value,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -454,6 +475,28 @@ pub enum Event {
     /// Submitting a review failed; the draft is kept intact (spec §11).
     ReviewSubmitFailed {
         /// The session that tried to submit.
+        session: SessionId,
+        /// The classified failure.
+        error: GhError,
+    },
+    /// A repository's merge-method allow flags arrived.
+    RepoSettingsLoaded {
+        /// The session that asked.
+        session: SessionId,
+        /// The allow flags.
+        settings: RepoSettings,
+    },
+    /// The PR was merged; the session reloads metadata and reviews so the
+    /// header shows the merged state.
+    PrMerged {
+        /// The session that merged the PR.
+        session: SessionId,
+        /// What GitHub reported.
+        result: MergeResult,
+    },
+    /// Merging failed; GitHub's message is preserved for the toast.
+    MergeFailed {
+        /// The session that tried to merge.
         session: SessionId,
         /// The classified failure.
         error: GhError,
@@ -1131,6 +1174,43 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             match client.submit_review(&repo, number, &payload).await {
                 Ok(review) => events.send(Event::ReviewSubmitted { session, review }),
                 Err(error) => events.send(Event::ReviewSubmitFailed { session, error }),
+            }
+        }
+        Command::LoadRepoSettings { session, repo } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            match client.repo_settings(&repo).await {
+                Ok(settings) => events.send(Event::RepoSettingsLoaded { session, settings }),
+                Err(error) => events.send(Event::Failed {
+                    session: Some(session),
+                    error,
+                }),
+            }
+        }
+        Command::MergePr {
+            session,
+            repo,
+            number,
+            payload,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::MergeFailed {
+                    session,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+
+            // A mutation: sent once, never retried.
+            match client.merge_pr(&repo, number, &payload).await {
+                Ok(result) => events.send(Event::PrMerged { session, result }),
+                Err(error) => events.send(Event::MergeFailed { session, error }),
             }
         }
         Command::ExpandContext {

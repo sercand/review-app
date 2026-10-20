@@ -73,6 +73,9 @@ pub struct Settings {
     /// Whether the PR list groups rows under repository headers
     /// (redesign Task 15).
     pub group_by_repo: bool,
+    /// The merge method the merge popover starts with, clamped to what the
+    /// repository allows.
+    pub merge_method: crate::github::merge::MergeMethod,
 }
 
 /// The diff layout choices, remembered across PRs and restarts.
@@ -117,6 +120,7 @@ impl Default for Settings {
             code_font_size: 13.0,
             recent_constraints: Vec::new(),
             group_by_repo: false,
+            merge_method: crate::github::merge::MergeMethod::default(),
         }
     }
 }
@@ -197,6 +201,28 @@ mod tests {
         assert_eq!(
             Settings::load_or_default(dir.path()).layout.details_tab,
             crate::ui::widgets::metadata_panel::DetailsTab::Checks
+        );
+    }
+
+    #[test]
+    fn merge_method_defaults_to_merge_and_round_trips() {
+        use crate::github::merge::MergeMethod;
+        assert_eq!(Settings::default().merge_method, MergeMethod::Merge);
+        let dir = tempdir();
+        let s = Settings {
+            merge_method: MergeMethod::Squash,
+            ..Settings::default()
+        };
+        s.save(dir.path()).unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).merge_method,
+            MergeMethod::Squash
+        );
+        // A file written before the feature loads with the default.
+        std::fs::write(dir.path().join("settings.toml"), "host = \"github.com\"\n").unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).merge_method,
+            MergeMethod::Merge
         );
     }
 

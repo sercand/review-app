@@ -177,6 +177,10 @@ pub fn meta_by(author: &str, head_sha: &str) -> crate::github::metadata::PrMetad
         labels: Vec::new(),
         milestone: None,
         html_url: "https://github.com/o/r/pull/7".to_owned(),
+        mergeable: Some(true),
+        mergeable_state: "clean".to_owned(),
+        merge_state_status: "clean".to_owned(),
+        merged: false,
     }
 }
 

@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod error;
 pub mod files;
 pub mod graphql;
+pub mod merge;
 pub mod metadata;
 pub mod reviews;
 pub mod search;

@@ -30,6 +30,8 @@ pub struct TopBarVm {
     pub combined: Option<CombinedStatus>,
     /// Pending comments, for the Review button's count pill.
     pub pending: usize,
+    /// Whether the PR has been merged; the Merge button rests.
+    pub merged: bool,
 }
 
 /// Pull the bar's view-model out of a session.
@@ -49,6 +51,7 @@ pub fn top_bar_vm(session: &PrSession) -> TopBarVm {
         // The local draft plus the comments in a pending review on GitHub.
         pending: session.pending.comments.len()
             + session.threads.iter().filter(|t| t.is_pending()).count(),
+        merged: session.metadata.as_ref().is_some_and(|m| m.merged),
     }
 }
 
@@ -98,22 +101,32 @@ pub fn next_theme(current: theme::Theme, system_dark: bool) -> theme::Theme {
     }
 }
 
-/// Draw the bar. `review_open` drives (and is written back by) the review
-/// popover, whose content the caller supplies as `review_popover`.
+/// Draw the bar. `review_open` and `merge_open` drive (and are written back
+/// by) the review and merge popovers, whose content the caller supplies as
+/// `review_popover` and `merge_popover`.
+#[allow(clippy::too_many_arguments)] // one flag and one closure per popover
 pub fn render(
     ui: &mut egui::Ui,
     vm: &TopBarVm,
     settings: &TopBarSettings,
     review_open: &mut bool,
+    merge_open: &mut bool,
     actions: &mut Vec<TopBarAction>,
     review_popover: impl FnOnce(&mut egui::Ui),
+    merge_popover: impl FnOnce(&mut egui::Ui),
 ) {
     let p = theme::palette_of(ui);
     ui.horizontal(|ui| {
         if icons::icon_button(ui, icons::ARROW_LEFT, "Back to list  Esc").clicked() {
             actions.push(TopBarAction::Back);
         }
-        let (icon, label, tone) = if vm.draft {
+        let (icon, label, tone) = if vm.merged {
+            (
+                icons::GIT_COMMIT_HORIZONTAL,
+                "Merged",
+                crate::ui::components::Tone::Ok,
+            )
+        } else if vm.draft {
             (
                 icons::GIT_PULL_REQUEST_DRAFT,
                 "Draft",
@@ -195,6 +208,23 @@ pub fn render(
                 .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| review_popover(ui));
 
+            let merge = Btn::new(BtnKind::Default, if vm.merged { "Merged" } else { "Merge" })
+                .icon(icons::CHECK)
+                .enabled(!vm.merged)
+                .show(ui);
+            if merge.clicked() {
+                *merge_open = !*merge_open;
+            }
+            let merge = if vm.merged {
+                merge.on_hover_text("this pull request was already merged")
+            } else {
+                merge
+            };
+            Popup::from_response(&merge)
+                .open_bool(merge_open)
+                .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| merge_popover(ui));
+
             ui.separator();
             let mut details_open = settings.details_open;
             if icons::icon_toggle(ui, icons::PANEL_RIGHT, "Details  O", &mut details_open).clicked()
@@ -239,6 +269,7 @@ mod tests {
             runs: Vec::new(),
             combined: None,
             pending: 0,
+            merged: false,
         };
         egui_kittest::Harness::builder()
             .with_size([1200.0, 400.0])
@@ -252,7 +283,17 @@ mod tests {
                     };
                     state.1 = false;
                     let (open, drawn) = (&mut state.0, &mut state.1);
-                    render(ui, &vm, &settings, open, &mut Vec::new(), |_| *drawn = true);
+                    let mut merge_open = false;
+                    render(
+                        ui,
+                        &vm,
+                        &settings,
+                        open,
+                        &mut merge_open,
+                        &mut Vec::new(),
+                        |_| *drawn = true,
+                        |_| {},
+                    );
                 },
                 (false, false),
             )
