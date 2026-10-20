@@ -306,8 +306,10 @@ pub fn plan_checkout(
 
 /// Whether `plan`'s snapshot still describes the repository: the dirty flag
 /// (untracked files included) and the original ref must be unchanged since
-/// [`plan_checkout`] built it. Any mismatch is [`CheckoutError::PlanStale`];
-/// a failed probe (e.g. `HEAD` went missing) counts as one too.
+/// [`plan_checkout`] built it. A dirty-flag mismatch is
+/// [`CheckoutError::PlanStale`], and so is a failed original-ref probe (e.g.
+/// `HEAD` went missing); a failed `git status` propagates as
+/// [`CheckoutError::Git`] instead.
 fn check_plan_current(plan: &CheckoutPlan) -> Result<(), CheckoutError> {
     let dirty = !git(&plan.repo_path, &["status", "--porcelain"])?
         .trim()

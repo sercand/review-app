@@ -488,7 +488,7 @@ git commit -am "feat(ai): build LLM clients from settings; Test connection comma
   - `pub struct PrKey { pub host: String, pub owner: String, pub repo: String, pub number: u64 }` (owner/repo stored lowercased)
   - `Store::session_id(&self, key: &PrKey) -> anyhow::Result<i64>`: get-or-create the `ai_sessions` row
   - `pub enum OriginalRef { Branch(String), Detached(String) }`
-  - `pub enum CheckoutState { Started, Active, Restored, Failed }` (stored as text `started|active|restored|failed`)
+  - `pub enum CheckoutState { Started, Active, Restored, Failed }` (stored as text `started|active|restored|failed`; `Superseded` added during review for replaced same-PR rows — terminal, never a lock holder or recovery target)
   - `pub struct CheckoutRecord { pub id: i64, pub repo_path: PathBuf, pub repo: String, pub pr_number: u64, pub original: OriginalRef, pub stash_sha: Option<String>, pub head_sha: String, pub state: CheckoutState }`
   - `Store::checkout_begin(&self, rec: &CheckoutRecord) -> anyhow::Result<i64>` (ignores `rec.id`), `checkout_set_stash(id, sha)`, `checkout_set_state(id, CheckoutState)`, `checkout_holding(&self, repo_path: &Path) -> anyhow::Result<Option<CheckoutRecord>>` (state `Started`/`Active`: the repo lock), `checkouts_unrestored() -> anyhow::Result<Vec<CheckoutRecord>>`
 

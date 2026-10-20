@@ -826,7 +826,7 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
         .iter()
         .any(|p| p.settings.name == current && !p.key_input.is_empty());
     ui.horizontal(|ui| {
-        let ready = test_connection_ready(provider.is_some(), &model, key_stored, key_typed);
+        let ready = test_connection_ready(provider.is_some(), &model, key_stored);
         let clicked = Btn::new(BtnKind::Default, "Test connection")
             .icon(icons::CHECK_CHECK)
             .enabled(ready)
@@ -838,13 +838,10 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
                 model: ai.default_model.clone(),
             });
         }
-        // A typed key is enough to probe, but it is only stored on Save.
-        if ready && key_typed && !key_stored {
-            ui.label(
-                RichText::new("uses the key above without saving")
-                    .size(12.0)
-                    .color(p.muted),
-            );
+        // The worker reads the keychain only: a typed key must be saved (and
+        // so stored) before it can be tested.
+        if key_typed && !key_stored {
+            ui.label(RichText::new("save to test").size(12.0).color(p.muted));
         }
         match ai.test_results.get(&current) {
             Some(Ok(model)) => {
@@ -862,16 +859,11 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
 }
 
 /// Whether "Test connection" may run: the provider exists, a model id is
-/// entered, and there is a key to try — stored in the keychain or typed in
-/// this session (a typed key probes without being saved).
+/// entered, and the keychain already holds a key for it. The probe reads the
+/// keychain only, so a merely typed (unsaved) key cannot be tested.
 #[cfg(unix)]
-fn test_connection_ready(
-    provider_exists: bool,
-    model: &str,
-    key_stored: bool,
-    key_typed: bool,
-) -> bool {
-    provider_exists && !model.trim().is_empty() && (key_stored || key_typed)
+fn test_connection_ready(provider_exists: bool, model: &str, key_stored: bool) -> bool {
+    provider_exists && !model.trim().is_empty() && key_stored
 }
 
 /// The per-repository settings: the checkout path (with a folder picker) and
@@ -1375,19 +1367,15 @@ mod tests {
     #[test]
     fn test_connection_needs_a_provider_model_and_key() {
         assert!(
-            test_connection_ready(true, "model", true, false),
-            "stored key"
+            test_connection_ready(true, "model", true),
+            "a stored key is testable"
         );
         assert!(
-            test_connection_ready(true, "model", false, true),
-            "a typed key may probe without saving"
+            !test_connection_ready(true, "model", false),
+            "a typed but unsaved key cannot be tested: the probe reads the keychain"
         );
-        assert!(
-            !test_connection_ready(true, "model", false, false),
-            "no key at all"
-        );
-        assert!(!test_connection_ready(false, "model", true, true));
-        assert!(!test_connection_ready(true, "  ", true, false));
+        assert!(!test_connection_ready(false, "model", true));
+        assert!(!test_connection_ready(true, "  ", true));
     }
 
     #[test]
