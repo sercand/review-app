@@ -43,6 +43,46 @@ pub enum PrListAction {
     },
     /// Open the settings window.
     Settings,
+    /// Open the command palette.
+    Palette,
+    /// Switch between the dark and light themes.
+    ToggleTheme,
+}
+
+/// The list's title bar (mockup `prs.html` `.titlebar`): the screen's name,
+/// then Commands, refresh, theme and settings on the right.
+pub fn render_title_bar(
+    ui: &mut egui::Ui,
+    msgs: &mut Vec<PrListMsg>,
+    actions: &mut Vec<PrListAction>,
+) {
+    crate::ui::widgets::title_bar::show(ui, "pr-list-title", |ui| {
+        ui.label(RichText::new("Pull requests").font(crate::ui::fonts::semibold(13.0)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if icons::icon_button(ui, icons::SETTINGS, "Settings").clicked() {
+                actions.push(PrListAction::Settings);
+            }
+            let glyph = if ui.visuals().dark_mode {
+                icons::SUN
+            } else {
+                icons::MOON
+            };
+            if icons::icon_button(ui, glyph, "Toggle theme").clicked() {
+                actions.push(PrListAction::ToggleTheme);
+            }
+            if icons::icon_button(ui, icons::REFRESH_CW, "Refresh").clicked() {
+                msgs.push(PrListMsg::Refresh);
+            }
+            let commands =
+                crate::ui::components::Btn::new(crate::ui::components::BtnKind::Ghost, "Commands")
+                    .icon(icons::COMMAND)
+                    .kbd("⌘K")
+                    .show(ui);
+            if commands.clicked() {
+                actions.push(PrListAction::Palette);
+            }
+        });
+    });
 }
 
 /// The dropdown label for a sort.
@@ -107,13 +147,14 @@ pub fn render(
     let filter_id = ui.make_persistent_id("pr_filter");
     handle_shortcuts(ui, state, form, actions, filter_id);
 
-    render_toolbar(ui, state, form, msgs, actions, filter_id);
+    render_toolbar(ui, state, form, msgs, filter_id);
     if let Some(error) = &state.error {
         ui.colored_label(pal.bad, error.to_string());
     }
 
     let rows = visible_items(state);
     let pending_key = auto_key(state);
+    pr_row::render_header(ui);
     let mut opened: Option<(RepoRef, u64)> = None;
 
     egui::ScrollArea::vertical()
@@ -122,8 +163,10 @@ pub fn render(
             if rows.is_empty() && !state.loading {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        RichText::new("no pull requests to show — adjust the scopes or filter")
-                            .color(pal.muted),
+                        RichText::new(
+                            "No open pull requests match. Turn on another scope or pick a different repository.",
+                        )
+                        .color(pal.muted),
                     );
                 });
             }
@@ -239,21 +282,32 @@ fn render_toolbar(
     state: &mut PrListState,
     form: &mut PrListForm,
     msgs: &mut Vec<PrListMsg>,
-    actions: &mut Vec<PrListAction>,
     filter_id: egui::Id,
 ) {
     let pal = theme::palette_of(ui);
     egui::Frame::new()
-        .fill(pal.surface)
-        .inner_margin(egui::Margin::symmetric(10, 6))
+        .fill(pal.bg)
+        .inner_margin(egui::Margin::symmetric(16, 10))
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 8.0);
+            ui.horizontal(|ui| {
                 let mut toggled = state.scopes.clone();
-                for scope in Scope::ALL {
+                for scope in SCOPE_ORDER {
                     let on = toggled.contains(&scope);
-                    if scope_chip(ui, scope, on, state.scope_count(scope.name())).clicked() {
+                    let count = state.scope_count(scope.name()) as u32;
+                    let chip = crate::ui::components::toggle_chip(
+                        ui,
+                        on,
+                        Some(pr_row::scope_icon(scope.name())),
+                        scope.label(),
+                        Some(count),
+                    )
+                    .on_hover_text(format!(
+                        "{} pull requests where you're {}",
+                        if on { "Hide" } else { "Show" },
+                        scope.label().to_lowercase()
+                    ));
+                    if chip.clicked() {
                         if on {
                             toggled.retain(|selected| *selected != scope);
                         } else {
@@ -264,68 +318,36 @@ fn render_toolbar(
                 if toggled != state.scopes {
                     msgs.push(PrListMsg::SetScopes(toggled));
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::icon_button(ui, icons::SETTINGS, "Settings").clicked() {
-                        actions.push(PrListAction::Settings);
-                    }
-                    if icons::icon_button(ui, icons::REFRESH_CW, "Refresh list").clicked() {
-                        msgs.push(PrListMsg::Refresh);
-                    }
-                });
             });
 
             ui.horizontal(|ui| {
                 repo_combobox(ui, state, form, msgs);
-                let field_w = (ui.available_width() - 130.0).max(140.0);
-                let field = ui.add_sized(
-                    [field_w, 24.0],
-                    egui::TextEdit::singleline(&mut state.search)
-                        .hint_text("Filter titles, repos, authors  /")
-                        .desired_width(field_w - 16.0)
-                        .margin(egui::vec2(8.0, 4.0))
-                        .id(filter_id),
-                );
-                if field.changed() {
-                    let text = state.search.clone();
-                    msgs.push(PrListMsg::SetSearch(text));
-                }
-                sort_menu(ui, state, form, msgs);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    sort_menu(ui, state, form, msgs);
+                    let field = crate::ui::components::Field::new(&mut state.search)
+                        .icon(icons::SEARCH)
+                        .hint("Filter title, repo or author")
+                        .trailing_kbd("/")
+                        .width(ui.available_width().min(320.0))
+                        .id(filter_id)
+                        .show(ui);
+                    if field.changed() {
+                        let text = state.search.clone();
+                        msgs.push(PrListMsg::SetSearch(text));
+                    }
+                });
             });
         });
 }
 
-/// One scope chip: `{icon} {label} {count}`, filled while selected.
-fn scope_chip(ui: &mut egui::Ui, scope: Scope, on: bool, count: usize) -> egui::Response {
-    let pal = theme::palette_of(ui);
-    let mut job = egui::text::LayoutJob::default();
-    let base = egui::TextFormat::simple(
-        egui::FontId::proportional(12.0),
-        if on { pal.accent } else { pal.text },
-    );
-    job.append(
-        &format!("{} {}  ", pr_row::scope_icon(scope.name()), scope.label()),
-        0.0,
-        base,
-    );
-    job.append(
-        &count.to_string(),
-        0.0,
-        egui::TextFormat::simple(
-            egui::FontId::proportional(11.0),
-            if on { pal.accent } else { pal.faint },
-        ),
-    );
-    ui.add(
-        egui::Button::new(job)
-            .fill(if on { pal.accent_soft } else { pal.raised })
-            .stroke(egui::Stroke::new(
-                1.0,
-                if on { pal.accent } else { pal.line },
-            ))
-            .corner_radius(11.0)
-            .min_size(egui::vec2(0.0, 24.0)),
-    )
-}
+/// The scope chips' order (mockup `prs.html`): the review queue first.
+const SCOPE_ORDER: [Scope; 5] = [
+    Scope::ReviewRequested,
+    Scope::Assigned,
+    Scope::Authored,
+    Scope::Involves,
+    Scope::Mentions,
+];
 
 /// The repository combobox: current selection as its label; the popup offers
 /// a search field, the recent constraints, and the repositories already
@@ -345,17 +367,12 @@ fn repo_combobox(
             ScopeConstraint::Repo(repo) => repo.to_string(),
             ScopeConstraint::Org(org) => format!("org: {org}"),
         });
-    let button = ui.add_sized(
-        [190.0, 24.0],
-        egui::Button::new(
-            RichText::new(format!("{label} {}", icons::CHEVRON_DOWN))
-                .size(12.0)
-                .color(pal.text),
-        )
-        .fill(pal.raised)
-        .stroke(egui::Stroke::new(1.0, pal.line))
-        .corner_radius(6.0)
-        .min_size(egui::vec2(190.0, 24.0)),
+    let button = combo_button(
+        ui,
+        icons::BOOK_MARKED,
+        &label,
+        label == "All repositories",
+        220.0,
     );
     if button.clicked() {
         form.repo_open = !form.repo_open;
@@ -436,6 +453,64 @@ fn repo_combobox(
     }
 }
 
+/// A field-styled combobox button (mockup `.combo`): a leading icon, the
+/// current value (`faint` while it is the placeholder) and an up/down
+/// chevron, `width` wide.
+fn combo_button(
+    ui: &mut egui::Ui,
+    icon: char,
+    value: &str,
+    placeholder: bool,
+    width: f32,
+) -> egui::Response {
+    let pal = theme::palette_of(ui);
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, crate::ui::components::CONTROL_H),
+        egui::Sense::click(),
+    );
+    let stroke = if response.hovered() {
+        pal.muted
+    } else {
+        pal.line
+    };
+    ui.painter().rect(
+        rect,
+        6.0,
+        pal.bg,
+        egui::Stroke::new(1.0, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let cy = rect.center().y;
+    ui.painter().text(
+        egui::pos2(rect.left() + 8.0, cy),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        egui::FontId::proportional(15.0),
+        pal.muted,
+    );
+    ui.painter().text(
+        egui::pos2(rect.right() - 8.0, cy),
+        egui::Align2::RIGHT_CENTER,
+        icons::CHEVRONS_UP_DOWN,
+        egui::FontId::proportional(14.0),
+        pal.muted,
+    );
+    let color = if placeholder { pal.faint } else { pal.text };
+    let galley = crate::ui::components::elided_galley(
+        ui,
+        value,
+        egui::FontId::proportional(13.0),
+        color,
+        rect.width() - 60.0,
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left() + 30.0, cy - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response
+}
+
 /// The sort menu: the three sorts plus the "Group by repository" toggle.
 fn sort_menu(
     ui: &mut egui::Ui,
@@ -443,23 +518,12 @@ fn sort_menu(
     form: &mut PrListForm,
     msgs: &mut Vec<PrListMsg>,
 ) {
-    let pal = theme::palette_of(ui);
-    let button = ui.add_sized(
-        [110.0, 24.0],
-        egui::Button::new(
-            RichText::new(format!(
-                "{} {}",
-                sort_label(state.sort),
-                icons::CHEVRON_DOWN
-            ))
-            .size(12.0)
-            .color(pal.text),
-        )
-        .fill(pal.raised)
-        .stroke(egui::Stroke::new(1.0, pal.line))
-        .corner_radius(6.0)
-        .min_size(egui::vec2(110.0, 24.0)),
-    );
+    let button = crate::ui::components::Btn::new(
+        crate::ui::components::BtnKind::Default,
+        sort_label(state.sort),
+    )
+    .icon(icons::ARROW_DOWN_WIDE_NARROW)
+    .show(ui);
     if button.clicked() {
         form.sort_open = !form.sort_open;
     }

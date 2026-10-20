@@ -18,7 +18,7 @@
           "author": { "login": "mona" },
           "repository": { "nameWithOwner": "octo/repo" },
           "commits": {
-            "last": { "nodes": [{ "commit": { "statusCheckRollup": { "state": "ERROR" } } }] }
+            "nodes": [{ "commit": { "statusCheckRollup": { "state": "ERROR" } } }]
           }
         },
         {},

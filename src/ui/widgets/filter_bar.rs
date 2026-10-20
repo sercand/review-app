@@ -60,18 +60,17 @@ pub fn render(
     options: &[ExtOption],
     state: &mut FilterBarState,
 ) {
-    let p = theme::palette_of(ui);
     let search_id = ui.scope_id().with("filter-ext-search");
     let state_id = ui.scope_id().with("filter-bar-popover");
     let was_open = ui.data(|d| d.get_temp::<bool>(state_id)).unwrap_or(false);
 
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new(RichText::new(icons::SEARCH).color(p.faint)).selectable(false));
         let field_w = ui.available_width() - 34.0;
-        ui.add_sized(
-            [field_w.max(60.0), 24.0],
-            TextEdit::singleline(&mut filters.path_query).hint_text("Filter by path or file type"),
-        );
+        crate::ui::components::Field::new(&mut filters.path_query)
+            .icon(icons::SEARCH)
+            .hint("Filter paths, * matches any")
+            .width(field_w.max(60.0))
+            .show(ui);
         let button = icons::icon_toggle(
             ui,
             icons::LIST_FILTER,
@@ -98,21 +97,16 @@ pub fn render(
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             for chip in chips {
-                let frame = egui::Frame::new()
-                    .fill(p.accent_soft)
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(8, 2));
-                let removed = frame
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            ui.label(chip.label.clone());
-                            icons::icon_button(ui, icons::X, "remove filter")
-                        })
-                        .inner
-                        .clicked()
-                    })
-                    .inner;
+                let removed = crate::ui::components::Btn::new(
+                    crate::ui::components::BtnKind::Default,
+                    &chip.label,
+                )
+                .selected(true)
+                .height(22.0)
+                .trailing_icon(icons::X)
+                .show(ui)
+                .on_hover_text("Remove filter")
+                .clicked();
                 if removed {
                     match &chip.kind {
                         ChipKind::Ext(extension) => {

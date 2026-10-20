@@ -1,0 +1,4 @@
+# Re-sign the app binary before `cargo run` so the keychain's "Always Allow"
+# survives rebuilds (see scripts/macos-run.sh).
+[target.'cfg(target_os = "macos")']
+runner = "scripts/macos-run.sh"

@@ -166,12 +166,12 @@ fn parse_epoch_seconds(stamp: &str) -> Option<i64> {
     };
     // Days from the Unix epoch, Howard Hinnant's civil-algorithm form.
     let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
     let yoe = y - era * 400;
     let mp = (m + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468 + h * 3600 + min * 60 + s)
+    Some((era * 146_097 + doe - 719_468) * 86_400 + h * 3600 + min * 60 + s)
 }
 
 /// A ghost text button: transparent until hovered, then `accent_soft`
@@ -235,27 +235,46 @@ pub fn render_thread(
 ) {
     let ThreadPlacement { login, indent } = place;
     let palette = palette_of(ui);
+    // A comment in the viewer's pending review on GitHub wears the pending
+    // style, like a local draft comment does.
+    let stroke = if thread.is_pending() {
+        palette.pending
+    } else {
+        palette.line
+    };
+    thread_frame(ui, indent, stroke, |ui| {
+        if collapsed {
+            render_collapsed(ui, thread, vm, drafts);
+            return;
+        }
+        render_expanded(ui, thread, vm, drafts, actions, login);
+    });
+}
+
+/// The thread card (mockup `.thread`): indented `indent` from the row's left
+/// edge, a 10 pt radius, a `bg` fill and a 1 pt `stroke` border, sized to
+/// its content.
+fn thread_frame(
+    ui: &mut egui::Ui,
+    indent: f32,
+    stroke: egui::Color32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let palette = palette_of(ui);
     egui::Frame::new()
-        .inner_margin(egui::Margin {
+        .outer_margin(egui::Margin {
             left: indent as i8,
             right: 14,
             top: 10,
             bottom: 10,
         })
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .corner_radius(10.0)
         .fill(palette.bg)
-        .stroke(egui::Stroke::new(1.0, palette.line))
+        .stroke(egui::Stroke::new(1.0, stroke))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt(("thread", thread.id.as_str()))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if collapsed {
-                        render_collapsed(ui, thread, vm, drafts);
-                        return;
-                    }
-                    render_expanded(ui, thread, vm, drafts, actions, login);
-                });
+            ui.set_width(ui.available_width());
+            add(ui);
         });
 }
 
@@ -310,8 +329,10 @@ fn render_expanded(
     // Reply and resolve address the thread by its GraphQL node id, and an
     // optimistic thread's id is local until a refresh confirms it, so both
     // controls stay hidden until then (the prefix matches `optimistic_thread`
-    // in `state::pr_detail`).
-    let confirmed = !thread.id.starts_with("optimistic-");
+    // in `state::pr_detail`). A pending thread on GitHub can be neither
+    // resolved nor replied to until its review is submitted.
+    let pending = thread.is_pending();
+    let confirmed = !thread.id.starts_with("optimistic-") && !pending;
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
@@ -328,6 +349,15 @@ fn render_expanded(
         );
         if thread.is_outdated {
             ui.label(egui::RichText::new("outdated").color(palette.faint));
+        }
+        if pending {
+            crate::ui::components::pill(
+                ui,
+                Some(MESSAGE_SQUARE_DASHED),
+                "Pending on GitHub",
+                crate::ui::components::Tone::Pending,
+            )
+            .on_hover_text("Part of your pending review. Submit the review to publish it.");
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ghost_button(ui, "Collapse").clicked() {
@@ -409,12 +439,12 @@ fn render_expanded(
             .replies
             .get_mut(&key)
             .expect("the draft slot was just opened");
-        let response = ui.add(
-            egui::TextEdit::singleline(draft)
-                .hint_text("Reply")
-                .desired_width((ui.available_width() - 92.0).max(120.0)),
-        );
-        let send = ghost_button(ui, "Reply");
+        let response = crate::ui::components::Field::new(draft)
+            .hint("Reply")
+            .width((ui.available_width() - 80.0).max(120.0))
+            .show(ui);
+        let send = crate::ui::components::Btn::new(crate::ui::components::BtnKind::Ghost, "Reply")
+            .show(ui);
         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if (send.clicked() || enter) && !draft.trim().is_empty() {
             submitted = true;
@@ -441,50 +471,40 @@ pub fn render_pending(
     actions: &mut Vec<PendingAction>,
 ) {
     let palette = palette_of(ui);
-    egui::Frame::new()
-        .inner_margin(egui::Margin {
-            left: indent as i8,
-            right: 14,
-            top: 10,
-            bottom: 10,
-        })
-        .corner_radius(10.0)
-        .fill(palette.bg)
-        .stroke(egui::Stroke::new(1.0, palette.pending))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                avatar(ui, login, 28.0);
-                ui.vertical(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.strong(login);
-                        pill(
-                            ui,
-                            MESSAGE_SQUARE_DASHED,
-                            "Pending",
-                            palette.pending,
-                            palette.pending_soft,
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let delete = crate::ui::icons::icon_button(ui, TRASH_2, "Delete");
-                            let edit = crate::ui::icons::icon_button(ui, PENCIL, "Edit");
-                            if edit.clicked() {
-                                actions.push(PendingAction::Edit {
-                                    local_id: pending.local_id,
-                                });
-                            }
-                            if delete.clicked() {
-                                actions.push(PendingAction::Delete {
-                                    local_id: pending.local_id,
-                                });
-                            }
-                        });
+    thread_frame(ui, indent, palette.pending, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            avatar(ui, login, 28.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.strong(login);
+                    pill(
+                        ui,
+                        MESSAGE_SQUARE_DASHED,
+                        "Pending",
+                        palette.pending,
+                        palette.pending_soft,
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete = crate::ui::icons::icon_button(ui, TRASH_2, "Delete");
+                        let edit = crate::ui::icons::icon_button(ui, PENCIL, "Edit");
+                        if edit.clicked() {
+                            actions.push(PendingAction::Edit {
+                                local_id: pending.local_id,
+                            });
+                        }
+                        if delete.clicked() {
+                            actions.push(PendingAction::Delete {
+                                local_id: pending.local_id,
+                            });
+                        }
                     });
-                    markdown::render(ui, &markdown::to_doc(&pending.body));
                 });
+                markdown::render(ui, &markdown::to_doc(&pending.body));
             });
         });
+    });
 }
 
 /// What the reviewer asked of a pending comment.
@@ -504,6 +524,19 @@ pub enum PendingAction {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn epoch_seconds_follow_the_calendar() {
+        assert_eq!(super::parse_epoch_seconds("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            super::parse_epoch_seconds("2026-10-17T10:00:00Z"),
+            Some(1_792_231_200)
+        );
+        assert_eq!(
+            super::parse_epoch_seconds("2000-02-29T12:30:05Z"),
+            Some(951_827_405)
+        );
+    }
+
     use super::*;
     use crate::model::diff::Side;
     use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
@@ -527,6 +560,7 @@ mod tests {
         let t = ReviewThread {
             comments: vec![
                 ThreadComment {
+                    pending: false,
                     database_id: 1,
                     author: "a".into(),
                     avatar_url: None,
@@ -534,6 +568,7 @@ mod tests {
                     created_at: "1".into(),
                 },
                 ThreadComment {
+                    pending: false,
                     database_id: 2,
                     author: "b".into(),
                     avatar_url: None,
@@ -573,6 +608,7 @@ mod tests {
     fn render_paints_expanded_and_collapsed_without_actions() {
         let t = ReviewThread {
             comments: vec![ThreadComment {
+                pending: false,
                 database_id: 1,
                 author: "octocat".into(),
                 avatar_url: Some("https://avatars/1".into()),
@@ -625,6 +661,7 @@ mod tests {
         let t = ReviewThread {
             id: "optimistic-1".into(),
             comments: vec![ThreadComment {
+                pending: false,
                 database_id: 1,
                 author: "me".into(),
                 avatar_url: None,

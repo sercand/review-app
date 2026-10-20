@@ -220,9 +220,10 @@ fn parse_node(node: &Value) -> Option<PrSummary> {
         comments: count(node, "totalCommentsCount"),
         scopes: Vec::new(),
         ci: node
+            // `commits(last: 1)` answers under `commits.nodes`; the
+            // argument is not part of the response shape.
             .get("commits")
-            .and_then(|commits| commits.get("last"))
-            .and_then(|last| last.get("nodes"))
+            .and_then(|commits| commits.get("nodes"))
             .and_then(Value::as_array)
             .and_then(|nodes| nodes.first())
             .and_then(|node| node.get("commit"))

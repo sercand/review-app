@@ -84,6 +84,10 @@ pub const USER_CHECK: char = '\u{e19f}';
 pub const USERS: char = '\u{e1a3}';
 pub const WRAP_TEXT: char = '\u{e247}';
 pub const X: char = '\u{e1b1}';
+/// The Shift key (⇧) in key hints.
+pub const ARROW_BIG_UP: char = '\u{e1e3}';
+/// The Return key (↵) in key hints.
+pub const CORNER_DOWN_LEFT: char = '\u{e0a5}';
 
 /// Every icon constant, used by the glyph coverage test.
 pub const ALL: &[char] = &[
@@ -163,7 +167,23 @@ pub const ALL: &[char] = &[
     USERS,
     WRAP_TEXT,
     X,
+    ARROW_BIG_UP,
+    CORNER_DOWN_LEFT,
 ];
+
+/// A key hint such as `"⌘↵"` or `"⇧V"` with the modifier symbols swapped
+/// for their Lucide glyphs: neither Plex, JetBrains Mono nor egui's
+/// fallback fonts carry ⌘, ⇧ or ↵, so drawn as text they become tofu.
+pub fn key_hint(keys: &str) -> String {
+    keys.chars()
+        .map(|c| match c {
+            '⌘' => COMMAND,
+            '⇧' => ARROW_BIG_UP,
+            '↵' => CORNER_DOWN_LEFT,
+            other => other,
+        })
+        .collect()
+}
 
 /// The size of an icon glyph, per the mockups.
 const GLYPH_PT: f32 = 16.0;
@@ -260,6 +280,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_hints_use_lucide_modifiers() {
+        assert_eq!(key_hint("⌘↵"), format!("{COMMAND}{CORNER_DOWN_LEFT}"));
+        assert_eq!(
+            key_hint("Viewed, next  ⇧V"),
+            format!("Viewed, next  {ARROW_BIG_UP}V")
+        );
+        assert_eq!(key_hint("Split  S"), "Split  S");
+    }
+
+    #[test]
     fn icon_codepoints_are_unique_private_use() {
         let mut seen = std::collections::HashSet::new();
         for &c in ALL {
@@ -269,6 +299,6 @@ mod tests {
             );
             assert!(seen.insert(c), "{c:?} listed twice");
         }
-        assert_eq!(ALL.len(), 76); // every constant above
+        assert_eq!(ALL.len(), 78); // every constant above
     }
 }

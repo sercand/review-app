@@ -64,6 +64,9 @@ pub struct ComposerInputs<'a> {
     /// Whether the draft review already has comments: it names the mode
     /// buttons (spec §7.1).
     pub has_open_review: bool,
+    /// Whether the viewer has a pending review on GitHub, which file-level
+    /// comments can join.
+    pub github_review: bool,
     /// Whether the anchor is a context row, where the side toggle is
     /// meaningful (spec §7.3).
     pub show_side: bool,
@@ -89,6 +92,7 @@ pub fn render_composer(
 ) {
     let ComposerInputs {
         has_open_review,
+        github_review,
         show_side,
         warning,
         width,
@@ -238,15 +242,14 @@ pub fn render_composer(
                     let enabled = can_submit(state) && write_blocked.is_none();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(enabled, |ui| {
-                            let buttons = mode_buttons(target, has_open_review);
-                            let is_line = matches!(target, CommentTarget::Line(_));
+                            let buttons = mode_buttons(target, has_open_review, github_review);
                             // Right-to-left: the primary button first so it
                             // lands rightmost.
                             for (label, mode) in buttons.iter().rev() {
-                                let primary = !is_line
+                                let primary = buttons.len() == 1
                                     || *mode == crate::state::composer::CommentMode::Pending;
                                 let text = if primary {
-                                    format!("{label}  ⌘↵")
+                                    crate::ui::icons::key_hint(&format!("{label}  ⌘↵"))
                                 } else {
                                     (*label).to_owned()
                                 };
@@ -354,6 +357,7 @@ mod tests {
                 &mut state,
                 ComposerInputs {
                     has_open_review: false,
+                    github_review: false,
                     show_side: true,
                     warning: None,
                     width: 600.0,
@@ -367,6 +371,7 @@ mod tests {
                 &mut state,
                 ComposerInputs {
                     has_open_review: true,
+                    github_review: false,
                     show_side: false,
                     warning: Some(
                         "This line is outside the PR's diff; GitHub may reject the comment.",

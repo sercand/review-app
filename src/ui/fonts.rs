@@ -48,6 +48,17 @@ pub fn font_definitions() -> FontDefinitions {
         FontFamily::Name("mono-bold".into()),
         vec!["jetbrains-bold".into(), "lucide".into()],
     );
+    // egui's bundled fonts go last in every family: they carry the symbols
+    // Plex and JetBrains Mono lack (⇧, ⌘, ↵ in key hints), so a hint never
+    // draws as a missing-glyph box.
+    let fallbacks = FontDefinitions::default().families[&FontFamily::Proportional].clone();
+    for family in fonts.families.values_mut() {
+        for name in &fallbacks {
+            if !family.contains(name) {
+                family.push(name.clone());
+            }
+        }
+    }
     fonts
 }
 
@@ -82,6 +93,16 @@ mod tests {
             }
             assert!(f.has_glyph(&semibold(13.0), 'ï'));
             assert!(f.has_glyph(&egui::FontId::monospace(12.5), '−')); // U+2212 used in −N counts
+            for c in ['…', '✓', '–'] {
+                for font in [
+                    egui::FontId::proportional(13.0),
+                    egui::FontId::monospace(12.5),
+                    semibold(13.0),
+                    mono_bold(12.5),
+                ] {
+                    assert!(f.has_glyph(&font, c), "{c:?} missing in {font:?}");
+                }
+            }
         });
     }
 }

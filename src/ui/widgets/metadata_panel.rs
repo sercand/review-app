@@ -284,45 +284,53 @@ fn render_conversation(ui: &mut egui::Ui, inputs: &PanelInputs<'_>) {
         ui.weak("No conversation yet.");
         return;
     }
-    for item in items {
-        let row = ui
-            .horizontal(|ui| {
-                ui.vertical(|ui| {
-                    let author = match &item {
-                        TimelineItem::Review(vm) => vm.author.clone(),
-                        TimelineItem::Comment(comment) => comment.author.clone(),
+    let count = items.len();
+    for (index, item) in items.into_iter().enumerate() {
+        let author = match &item {
+            TimelineItem::Review(vm) => vm.author.clone(),
+            TimelineItem::Comment(comment) => comment.author.clone(),
+        };
+        // The avatar column on the left, the entry beside it: the body
+        // never runs under the avatar or the connecting line.
+        let row = ui.horizontal_top(|ui| {
+            let avatar_rect = ui.scope(|ui| avatar(ui, &author, 24.0)).response.rect;
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&author).strong());
+                    let when = match &item {
+                        TimelineItem::Review(vm) => vm.submitted_at.clone(),
+                        TimelineItem::Comment(comment) => comment.created_at.clone(),
                     };
-                    ui.horizontal(|ui| {
-                        avatar(ui, &author, 24.0);
-                        ui.label(RichText::new(&author).strong());
-                        let when = match &item {
-                            TimelineItem::Review(vm) => vm.submitted_at.clone(),
-                            TimelineItem::Comment(comment) => comment.created_at.clone(),
-                        };
-                        ui.colored_label(p.faint, relative_time(&when));
-                        if let TimelineItem::Review(vm) = &item {
-                            reviewer_pill(ui, &vm.state);
-                        }
-                    });
-                    match &item {
-                        TimelineItem::Review(vm) => markdown::render(ui, &vm.body_doc),
-                        TimelineItem::Comment(comment) => {
-                            markdown::render(ui, &markdown::to_doc(&comment.body));
-                        }
+                    ui.colored_label(p.faint, relative_time(&when));
+                    if let TimelineItem::Review(vm) = &item {
+                        reviewer_pill(ui, &vm.state);
                     }
                 });
-            })
-            .response;
-        // The connecting line down the avatar column.
-        let x = row.rect.left() + 12.0;
-        ui.painter().line_segment(
-            [
-                egui::pos2(x, row.rect.top()),
-                egui::pos2(x, row.rect.bottom() + ui.spacing().item_spacing.y),
-            ],
-            (1.0, p.line),
-        );
-        ui.add_space(6.0);
+                match &item {
+                    TimelineItem::Review(vm) => markdown::render(ui, &vm.body_doc),
+                    TimelineItem::Comment(comment) => {
+                        markdown::render(ui, &markdown::to_doc(&comment.body));
+                    }
+                }
+            });
+            avatar_rect
+        });
+        let gap = 12.0;
+        // The connecting line runs from under this avatar to the next one,
+        // down the avatar column only (mockup `.tl::before`).
+        if index + 1 < count {
+            let avatar_rect = row.inner;
+            ui.painter().vline(
+                avatar_rect.center().x,
+                egui::Rangef::new(
+                    avatar_rect.bottom() + 4.0,
+                    row.response.rect.bottom() + gap - 4.0,
+                ),
+                (1.0, p.line),
+            );
+        }
+        ui.add_space(gap);
     }
     ui.colored_label(
         p.faint,

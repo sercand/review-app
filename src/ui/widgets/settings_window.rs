@@ -7,6 +7,8 @@
 
 use eframe::egui::{self, Frame, Margin, RichText};
 
+use crate::ui::components::{elided_label, segmented, toggle_chip, Btn, BtnKind, Field, Seg};
+
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
 use crate::persist::settings::Settings;
@@ -155,6 +157,7 @@ pub fn render(
         )
         .show(ctx, |ui| {
             ui.set_width(600.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
 
             ui.horizontal(|ui| {
                 ui.label(
@@ -162,155 +165,135 @@ pub fn render(
                         .font(fonts::semibold(14.0)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icons::icon_button(ui, icons::X, "Close").clicked() {
+                    if icons::icon_button(ui, icons::X, "Close  Esc").clicked() {
                         close = true;
                     }
                 });
             });
-            ui.separator();
+            rule(ui);
 
-            egui::Grid::new("settings-grid")
-                .num_columns(2)
-                .spacing([16.0, 10.0])
-                .show(ui, |ui| {
-                    label(ui, "Account");
-                    ui.horizontal(|ui| {
-                        if let Some(account) = &account {
-                            avatar(ui, account.login, 24.0);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(account.login).strong());
-                                ui.colored_label(
-                                    p.muted,
-                                    format!(
-                                        "{}, scopes {}",
-                                        account.host,
-                                        if account.scopes.is_empty() {
-                                            "none".to_owned()
-                                        } else {
-                                            account.scopes.join(" and ")
-                                        }
-                                    ),
-                                );
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(icons::icon_text(
-                                                    icons::LOG_OUT,
-                                                    "Sign out",
-                                                ))
-                                                .color(p.bad),
-                                            )
-                                            .frame(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        sign_out = true;
-                                        close = true;
-                                    }
-                                },
-                            );
-                        } else {
-                            ui.weak("Not signed in");
+            setting_row(ui, "Account", |ui| {
+                let Some(account) = &account else {
+                    ui.label(RichText::new("Not signed in").color(p.muted));
+                    return;
+                };
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let out = Btn::new(BtnKind::Danger, "Sign out")
+                            .icon(icons::LOG_OUT)
+                            .show(ui);
+                        if out.clicked() {
+                            sign_out = true;
+                            close = true;
                         }
-                    });
-                    ui.end_row();
-
-                    label(ui, "Theme");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut state.vm.theme, Theme::Dark, "Dark");
-                        ui.selectable_value(&mut state.vm.theme, Theme::Light, "Light");
-                        ui.selectable_value(&mut state.vm.theme, Theme::System, "System");
-                    });
-                    ui.end_row();
-
-                    label(ui, "Default scopes");
-                    ui.horizontal_wrapped(|ui| {
-                        for scope in ALL_SCOPES {
-                            let selected = state.vm.default_scopes.contains(&scope);
-                            let chip = egui::Button::selectable(
-                                selected,
-                                RichText::new(icons::icon_text(
-                                    scope_icon(&scope),
-                                    &scope_label(&scope),
-                                ))
-                                .color(if selected {
-                                    p.accent
-                                } else {
-                                    p.muted
-                                }),
-                            )
-                            .fill(if selected {
-                                p.accent_soft
-                            } else {
-                                p.raised
-                            });
-                            if ui.add(chip).clicked() {
-                                if selected {
-                                    state.vm.default_scopes.retain(|s| s != &scope);
-                                } else {
-                                    state.vm.default_scopes.push(scope);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            avatar(ui, account.login, 28.0);
+                            ui.add_space(4.0);
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new(account.login).font(fonts::semibold(13.0)));
+                                let summary = account_summary(account.host, account.scopes);
+                                let width = ui.available_width();
+                                let line = elided_label(
+                                    ui,
+                                    &summary,
+                                    egui::FontId::proportional(12.0),
+                                    p.muted,
+                                    width,
+                                );
+                                if !account.scopes.is_empty() {
+                                    line.on_hover_text(account.scopes.join(", "));
                                 }
+                            });
+                        });
+                    });
+                });
+            });
+
+            setting_row(ui, "Theme", |ui| {
+                if let Some(theme) = segmented(
+                    ui,
+                    state.vm.theme,
+                    &[
+                        Seg::icon_text(Theme::Dark, icons::MOON, "Dark"),
+                        Seg::icon_text(Theme::Light, icons::SUN, "Light"),
+                        Seg::text(Theme::System, "System"),
+                    ],
+                ) {
+                    state.vm.theme = theme;
+                }
+            });
+
+            setting_row(ui, "Default scopes", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for scope in ALL_SCOPES {
+                        let selected = state.vm.default_scopes.contains(&scope);
+                        let chip = toggle_chip(
+                            ui,
+                            selected,
+                            Some(scope_icon(&scope)),
+                            &scope_label(&scope),
+                            None,
+                        );
+                        if chip.clicked() {
+                            if selected {
+                                state.vm.default_scopes.retain(|s| s != &scope);
+                            } else {
+                                state.vm.default_scopes.push(scope);
                             }
                         }
-                    });
-                    ui.end_row();
-
-                    label(ui, "Diff layout");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut state.vm.diff_mode, DiffMode::Split, "Split");
-                        ui.selectable_value(&mut state.vm.diff_mode, DiffMode::Unified, "Unified");
-                    });
-                    ui.end_row();
-
-                    label(ui, "Code font size");
-                    ui.horizontal(|ui| {
-                        for size in [12.0, 13.0, 14.0] {
-                            ui.selectable_value(
-                                &mut state.vm.code_font_size,
-                                size,
-                                format!("{size:.0}"),
-                            );
-                        }
-                    });
-                    ui.end_row();
-
-                    label(ui, "Host");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.vm.host)
-                            .desired_width(ui.available_width()),
-                    );
-                    ui.end_row();
-
-                    label(ui, "OAuth client ID");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.vm.client_id)
-                            .desired_width(ui.available_width())
-                            .hint_text("default"),
-                    );
-                    ui.end_row();
+                    }
                 });
+            });
 
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new("Save")
-                                .color(p.accent_ink)
-                                .font(fonts::semibold(12.5)),
-                        )
-                        .fill(p.accent),
-                    )
-                    .clicked()
-                {
+            setting_row(ui, "Diff layout", |ui| {
+                if let Some(mode) = segmented(
+                    ui,
+                    state.vm.diff_mode,
+                    &[
+                        Seg::icon_text(DiffMode::Split, icons::COLUMNS_2, "Split"),
+                        Seg::icon_text(DiffMode::Unified, icons::ROWS_2, "Unified"),
+                    ],
+                ) {
+                    state.vm.diff_mode = mode;
+                }
+            });
+
+            setting_row(ui, "Code font size", |ui| {
+                if let Some(size) = segmented(
+                    ui,
+                    state.vm.code_font_size as u32,
+                    &[
+                        Seg::text(12, "12"),
+                        Seg::text(13, "13"),
+                        Seg::text(14, "14"),
+                    ],
+                ) {
+                    state.vm.code_font_size = size as f32;
+                }
+            });
+
+            setting_row(ui, "Host", |ui| {
+                Field::new(&mut state.vm.host)
+                    .icon(icons::GLOBE)
+                    .hint("github.com")
+                    .show(ui);
+            });
+
+            setting_row(ui, "OAuth client ID", |ui| {
+                Field::new(&mut state.vm.client_id)
+                    .icon(icons::KEY_ROUND)
+                    .hint("Built-in")
+                    .show(ui);
+            });
+
+            rule(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Btn::new(BtnKind::Primary, "Save").show(ui).clicked() {
                     actions.push(SettingsAction::Apply(state.vm.clone()));
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
                     close = true;
                 }
             });
@@ -323,13 +306,43 @@ pub fn render(
     }
 }
 
-/// The 130 pt label column of the settings grid.
-fn label(ui: &mut egui::Ui, text: &str) {
+/// One settings row (mockup `.settings-grid`): a 130 pt `muted` label
+/// beside the control, which keeps its natural width.
+fn setting_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     let p = theme::palette_of(ui);
-    ui.add_sized(
-        [130.0, 0.0],
-        egui::Label::new(RichText::new(text).color(p.muted)).selectable(false),
-    );
+    ui.horizontal_top(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(130.0, 30.0), egui::Sense::hover());
+        ui.painter().text(
+            egui::pos2(rect.left(), rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            p.muted,
+        );
+        ui.vertical(|ui| add(ui));
+    });
+    ui.add_space(8.0);
+}
+
+/// A full-width 1 pt `line` rule with breathing room.
+fn rule(ui: &mut egui::Ui) {
+    let p = theme::palette_of(ui);
+    ui.add_space(4.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, (1.0, p.line));
+    ui.add_space(8.0);
+}
+
+/// The account's second line: the host and its scopes, named when there are
+/// at most three ("github.com, scopes repo and read:org"), counted otherwise.
+pub fn account_summary(host: &str, scopes: &[String]) -> String {
+    match scopes.len() {
+        0 => format!("{host}, no scopes"),
+        1..=3 => format!("{host}, scopes {}", scopes.join(" and ")),
+        n => format!("{host}, {n} scopes"),
+    }
 }
 
 /// The chip icon for a scope (mockup 05).
@@ -357,6 +370,17 @@ fn scope_label(scope: &Scope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_summary_names_few_scopes_and_counts_many() {
+        let few = vec!["repo".to_owned(), "read:org".to_owned()];
+        assert_eq!(
+            account_summary("github.com", &few),
+            "github.com, scopes repo and read:org"
+        );
+        let many: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
+        assert_eq!(account_summary("github.com", &many), "github.com, 8 scopes");
+    }
     use crate::test_support::tempdir;
 
     #[test]

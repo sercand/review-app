@@ -583,13 +583,25 @@ impl PrSession {
                 Vec::new()
             }
             Event::ServerPendingResolved { session } if *session == self.id => {
-                // The submit or discard changed GitHub's state; reload the
-                // reviews so the panel and the banner show the result.
-                vec![Command::LoadReviews {
-                    session: self.id,
-                    repo: self.repo.clone(),
-                    number: self.number,
-                }]
+                // The review was submitted or discarded on GitHub: drop it
+                // now (the banner and popover follow), clear the summary and
+                // verdict it was sent with, and reload the reviews and the
+                // threads, whose comments are no longer pending.
+                self.server_pending = None;
+                self.set_pending_body(String::new());
+                self.set_pending_event(ReviewEvent::Comment);
+                vec![
+                    Command::LoadReviews {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        number: self.number,
+                    },
+                    Command::LoadThreads {
+                        session: self.id,
+                        repo: self.repo.clone(),
+                        number: self.number,
+                    },
+                ]
             }
             Event::ReviewSubmitted { session, review } if *session == self.id => {
                 on_review_submitted(self, review.clone())
@@ -1230,7 +1242,7 @@ impl PrSession {
             &mut self.composer,
             ComposerMsg::OpenFor {
                 target,
-                has_open_review: !self.pending.is_empty(),
+                has_open_review: !self.pending.is_empty() || self.server_pending.is_some(),
             },
         );
         self.rebuild_rows();
@@ -1254,12 +1266,36 @@ impl PrSession {
         let Some(target) = self.composer.target.clone() else {
             return Vec::new();
         };
-        // A file-level comment is never pending, whatever button was hit.
-        let mode = match target {
-            CommentTarget::File { .. } => CommentMode::Immediate,
-            CommentTarget::Line(_) => mode,
+        // With a pending review on GitHub, "Add to review" goes straight
+        // into it — line or file — the way the web UI adds to one.
+        let github_review = self
+            .server_pending
+            .as_ref()
+            .map(|(review, _)| review.node_id.clone())
+            .filter(|id| !id.is_empty());
+        // Without one, a file-level comment cannot be held in the local
+        // draft (the REST review endpoint has no file-level comments), so it
+        // posts immediately whatever button was hit.
+        let mode = match (&target, &github_review) {
+            (CommentTarget::File { .. }, None) => CommentMode::Immediate,
+            _ => mode,
         };
         let body = self.composer.body.clone();
+
+        if let (CommentMode::Pending, Some(review_id)) = (mode, github_review) {
+            return self.post_optimistic(
+                target,
+                body,
+                author,
+                |comment, optimistic_id, session| Command::AddToServerReview {
+                    session,
+                    review_id,
+                    comment,
+                    optimistic_id,
+                },
+                true,
+            );
+        }
 
         if mode == CommentMode::Pending {
             // A file-level target was forced to Immediate above, so a pending
@@ -1289,6 +1325,33 @@ impl PrSession {
             return Vec::new();
         }
 
+        let (repo, number) = (self.repo.clone(), self.number);
+        self.post_optimistic(
+            target,
+            body,
+            author,
+            |comment, optimistic_id, session| Command::PostComment {
+                session,
+                repo,
+                number,
+                comment,
+                optimistic_id,
+            },
+            false,
+        )
+    }
+
+    /// Insert an optimistic bubble for `target` and build the command that
+    /// posts it: the result events replace or roll the bubble back (spec
+    /// §7.1). `pending` styles the bubble as part of the GitHub review.
+    fn post_optimistic(
+        &mut self,
+        target: CommentTarget,
+        body: String,
+        author: &str,
+        command: impl FnOnce(NewComment, u64, SessionId) -> Command,
+        pending: bool,
+    ) -> Vec<Command> {
         let Some(commit_id) = self.diff_head_sha.clone() else {
             self.composer.error = Some("the diff is still loading".to_owned());
             return Vec::new();
@@ -1296,12 +1359,16 @@ impl PrSession {
 
         let optimistic_id = self.allocate_id();
         let thread_index = self.threads.len();
-        self.threads.push(optimistic_thread(
+        let mut thread = optimistic_thread(
             &target,
             optimistic_id,
             &body,
             if author.is_empty() { "me" } else { author },
-        ));
+        );
+        for comment in &mut thread.comments {
+            comment.pending = pending;
+        }
+        self.threads.push(thread);
         self.optimistic = Some(OptimisticPost {
             optimistic_id,
             thread_index,
@@ -1312,17 +1379,15 @@ impl PrSession {
         composer::reduce(&mut self.composer, ComposerMsg::Submitted);
         self.rebuild_rows();
 
-        vec![Command::PostComment {
-            session: self.id,
-            repo: self.repo.clone(),
-            number: self.number,
-            comment: NewComment {
+        vec![command(
+            NewComment {
                 commit_id,
                 body,
                 target,
             },
             optimistic_id,
-        }]
+            self.id,
+        )]
     }
 
     /// Append a suggestion block for the composer's anchored rows (spec §7.4).
@@ -1577,6 +1642,11 @@ pub fn add_pending(
 /// The payload is built here, at click time, so the contract GitHub sees is
 /// the one the reviewer confirmed.
 pub fn start_submit(session: &PrSession) -> Option<Command> {
+    // GitHub allows one pending review per reviewer: while one is open
+    // there, the local draft cannot be posted as a second (spec §7.6).
+    if session.server_pending.is_some() {
+        return None;
+    }
     let head_sha = session.diff_head_sha.clone()?;
     let inputs = PanelInputs {
         pending: &session.pending,
@@ -1588,6 +1658,7 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
         server_pending: session.server_pending.is_some(),
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: None,
+        threads: &session.threads,
     };
     if !review_panel_vm(&inputs).submit_enabled {
         return None;
@@ -1710,6 +1781,7 @@ fn optimistic_thread(target: &CommentTarget, id: u64, body: &str, author: &str) 
         side,
         subject_type,
         comments: vec![ThreadComment {
+            pending: false,
             database_id: id,
             author: author.to_owned(),
             avatar_url: None,
@@ -2297,6 +2369,7 @@ mod tests {
 
     fn comment(database_id: u64, body: &str) -> ThreadComment {
         ThreadComment {
+            pending: false,
             database_id,
             author: "me".into(),
             avatar_url: None,
@@ -2372,6 +2445,83 @@ mod tests {
         });
         assert_eq!(s.threads[0].comments[0].database_id, 99);
         assert_eq!(s.threads[0].comments[0].created_at, "2026-10-01T00:00:00Z");
+    }
+
+    /// A session whose viewer has a pending review on GitHub (node `PRR_9`).
+    fn session_with_github_review() -> (PrSession, tempfile::TempDir) {
+        let (mut s, dir) = loaded_session();
+        let review = crate::github::reviews::Review {
+            node_id: "PRR_9".into(),
+            ..crate::test_support::review(crate::github::reviews::ReviewState::Pending)
+        };
+        s.server_pending = Some((review, Vec::new()));
+        (s, dir)
+    }
+
+    #[test]
+    fn add_to_review_goes_into_the_pending_review_on_github() {
+        for target in [
+            CommentTarget::Line(line_anchor("a.rs", 1)),
+            CommentTarget::File {
+                path: "a.rs".into(),
+            },
+        ] {
+            let (mut s, _dir) = session_with_github_review();
+            s.open_comment(target.clone());
+            composer::reduce(&mut s.composer, ComposerMsg::SetBody("move this".into()));
+            let commands = s.submit_comment(CommentMode::Pending, "me", Instant::now());
+            match commands.as_slice() {
+                [Command::AddToServerReview {
+                    review_id, comment, ..
+                }] => {
+                    assert_eq!(review_id, "PRR_9");
+                    assert_eq!(comment.target, target);
+                    assert_eq!(comment.body, "move this");
+                }
+                other => panic!("expected AddToServerReview, got {other:?}"),
+            }
+            assert!(s.pending.is_empty(), "the local draft is left alone");
+            assert!(
+                s.threads.last().is_some_and(ReviewThread::is_pending),
+                "the optimistic bubble shows as pending"
+            );
+        }
+    }
+
+    #[test]
+    fn finishing_the_github_review_clears_it_and_reloads() {
+        let (mut s, _dir) = session_with_github_review();
+        s.set_pending_body("looks good".into());
+        s.set_pending_event(ReviewEvent::Approve);
+        let commands = s.on_event(&Event::ServerPendingResolved {
+            session: SessionId(1),
+        });
+        assert!(s.server_pending.is_none(), "the banner goes at once");
+        assert!(
+            s.pending.body.is_empty(),
+            "the summary went with the review"
+        );
+        assert_eq!(s.pending.event, ReviewEvent::Comment);
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, Command::LoadReviews { .. })));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. })),
+            "its comments are no longer pending"
+        );
+    }
+
+    #[test]
+    fn without_a_github_review_a_file_comment_is_still_immediate() {
+        let (mut s, _dir) = loaded_session();
+        s.open_comment(CommentTarget::File {
+            path: "a.rs".into(),
+        });
+        composer::reduce(&mut s.composer, ComposerMsg::SetBody("x".into()));
+        let commands = s.submit_comment(CommentMode::Pending, "me", Instant::now());
+        assert!(matches!(commands.as_slice(), [Command::PostComment { .. }]));
     }
 
     #[test]

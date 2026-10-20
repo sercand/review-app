@@ -50,6 +50,9 @@ impl ReviewState {
 pub struct Review {
     /// The REST review id.
     pub id: u64,
+    /// The GraphQL node id, which `addPullRequestReviewThread` takes to add
+    /// a comment to a pending review.
+    pub node_id: String,
     /// The reviewer's login.
     pub author: String,
     /// The state the review is in.
@@ -95,6 +98,8 @@ pub fn parse_reviews(body: &str) -> Result<Vec<Review>, GhError> {
 #[derive(Deserialize)]
 struct RawReview {
     id: u64,
+    #[serde(default)]
+    node_id: String,
     user: Option<RawUser>,
     state: String,
     body: Option<String>,
@@ -120,6 +125,7 @@ struct RawPendingComment {
 fn to_review(raw: RawReview) -> Option<Review> {
     Some(Review {
         id: raw.id,
+        node_id: raw.node_id,
         author: raw
             .user
             .and_then(|user| user.login)

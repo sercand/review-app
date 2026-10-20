@@ -50,6 +50,8 @@ pub enum PrDetailAction {
     Review(ReviewAction),
     /// Open the settings window (Task 53).
     OpenSettings,
+    /// Open the pull request on GitHub.
+    OpenInBrowser,
     /// Open the command palette from the top bar (Task 12).
     Palette,
     /// Cycle the theme from the top bar (Task 12).
@@ -154,6 +156,7 @@ pub fn render(
         server_pending: session.server_pending.is_some(),
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: write_blocked.map(str::to_owned),
+        threads: &session.threads,
     };
     let review_vm = review_panel::review_panel_vm(&panel_inputs);
 
@@ -162,7 +165,7 @@ pub fn render(
     let bar_vm = top_bar::top_bar_vm(session);
     let mut bar_actions = Vec::new();
     let mut review_actions = Vec::new();
-    egui::Panel::top("pr-detail-top").show(ui, |ui| {
+    crate::ui::widgets::title_bar::show(ui, "pr-detail-top", |ui| {
         top_bar::render(
             ui,
             &bar_vm,
@@ -186,7 +189,11 @@ pub fn render(
             top_bar::TopBarAction::ToggleTheme => actions.push(PrDetailAction::ToggleTheme),
             top_bar::TopBarAction::Settings => actions.push(PrDetailAction::OpenSettings),
             top_bar::TopBarAction::ToggleDetails => state.right_open = !state.right_open,
+            top_bar::TopBarAction::OpenInBrowser => actions.push(PrDetailAction::OpenInBrowser),
         }
+    }
+    if review_actions.iter().any(review_panel::closes_popover) {
+        state.review_open = false;
     }
     actions.extend(review_actions.into_iter().map(PrDetailAction::Review));
 
@@ -257,9 +264,9 @@ pub fn render(
                 ui.colored_label(p.pending, banner.clone());
             });
         }
-        let mut banner_actions = Vec::new();
-        review_panel::render_server_pending_banner(ui, &review_vm, &mut banner_actions);
-        actions.extend(banner_actions.into_iter().map(PrDetailAction::Review));
+        if review_panel::render_server_pending_banner(ui, &review_vm) {
+            state.review_open = true;
+        }
         if session.files_truncated {
             review_panel::banner_frame(ui, |ui| {
                 let p = crate::ui::theme::palette_of(ui);

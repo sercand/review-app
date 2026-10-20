@@ -1,0 +1,36 @@
+# macOS release
+
+```sh
+scripts/macos/archive.sh    # universal, signed .app inside an .xcarchive
+scripts/macos/notarize.sh   # notarize, staple, and build the .dmg / .zip
+```
+
+Outputs land in `target/dist/`.
+
+## One-time setup
+
+- A **Developer ID Application** certificate in the login keychain. The scripts
+  pick the first one they find. To choose one, set
+  `SIGN_IDENTITY="Developer ID Application: … (TEAMID)"`.
+- Both Rust targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+- Notarization credentials, saved as a keychain profile (create the
+  app-specific password at appleid.apple.com):
+
+  ```sh
+  xcrun notarytool store-credentials gh-review-notary \
+      --apple-id <apple-id> --team-id <TEAMID> --password <app-specific-password>
+  ```
+
+## Icon
+
+`assets/app-icon/AppIcon.svg` is the source. After editing it, run
+`scripts/macos/make-icon.sh` to rebuild `AppIcon.icns`. You need
+`rsvg-convert` (`brew install librsvg`) or `resvg`.
+
+## Settings
+
+The defaults live in `common.sh`, and you can override any of them from the
+environment: `APP_NAME` (default "GH Review"), `BUNDLE_ID`
+(`com.sercand.gh-review-desktop`), `MIN_MACOS` (12.0), `BUILD_NUMBER` (git
+commit count), `NOTARY_PROFILE`, `TARGETS`, and `DIST_DIR`. The version comes
+from `Cargo.toml`.

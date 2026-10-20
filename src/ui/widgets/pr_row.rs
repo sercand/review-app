@@ -6,6 +6,8 @@
 
 use eframe::egui;
 
+use crate::ui::components::{tone_colors, Tone};
+
 use crate::model::pr::{CiState, PrSummary, ReviewDecision};
 use crate::ui::{icons, theme};
 
@@ -253,9 +255,9 @@ pub fn diff_fractions(additions: u32, deletions: u32) -> (f32, f32) {
 pub fn scope_icon(name: &str) -> char {
     match name {
         "assigned" => icons::USER_CHECK,
-        "authored" => icons::GIT_COMMIT_HORIZONTAL,
+        "authored" => icons::PENCIL_LINE,
         "review-requested" => icons::EYE,
-        "involves" => icons::LAYERS,
+        "involves" => icons::USERS,
         _ => icons::AT_SIGN,
     }
 }
@@ -263,11 +265,77 @@ pub fn scope_icon(name: &str) -> char {
 /// The height of one PR list row (Task 15).
 pub const ROW_H: f32 = 52.0;
 
+/// The row grid's fixed columns after the title, left to right (mockup
+/// `prs.html`): why, CI, review, changes, comments, updated.
+const COLS: [f32; 6] = [54.0, 26.0, 150.0, 120.0, 44.0, 64.0];
+
+/// The gap between grid columns.
+const COL_GAP: f32 = 14.0;
+
+/// The row's side padding.
+const PAD_X: f32 = 16.0;
+
+/// The x ranges of the state icon, the title and the six fixed columns in
+/// a row spanning `rect`.
+fn columns(rect: egui::Rect) -> (egui::Rangef, egui::Rangef, [egui::Rangef; 6]) {
+    let mut right = rect.right() - PAD_X;
+    let mut fixed = [egui::Rangef::new(0.0, 0.0); 6];
+    for i in (0..COLS.len()).rev() {
+        fixed[i] = egui::Rangef::new(right - COLS[i], right);
+        right -= COLS[i] + COL_GAP;
+    }
+    let state = egui::Rangef::new(rect.left() + PAD_X, rect.left() + PAD_X + 20.0);
+    let title = egui::Rangef::new(state.max + COL_GAP, right.max(state.max + COL_GAP + 60.0));
+    (state, title, fixed)
+}
+
+/// The column header above the rows: "Pull request", "Why", "CI",
+/// "Review", "Changes", "Updated" in `faint` 11.5 pt.
+pub fn render_header(ui: &mut egui::Ui) {
+    let pal = theme::palette_of(ui);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, pal.bg);
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom() - 0.5, (1.0, pal.line));
+    let (_, title, fixed) = columns(rect);
+    let font = egui::FontId::proportional(11.5);
+    let cy = rect.center().y;
+    let left = |x: f32, text: &str| {
+        ui.painter().text(
+            egui::pos2(x, cy),
+            egui::Align2::LEFT_CENTER,
+            text,
+            font.clone(),
+            pal.faint,
+        );
+    };
+    left(title.min, "Pull request");
+    left(fixed[0].min, "Why");
+    left(fixed[1].min, "CI");
+    left(fixed[2].min, "Review");
+    ui.painter().text(
+        egui::pos2(fixed[3].max, cy),
+        egui::Align2::RIGHT_CENTER,
+        "Changes",
+        font.clone(),
+        pal.faint,
+    );
+    ui.painter().text(
+        egui::pos2(fixed[5].max, cy),
+        egui::Align2::RIGHT_CENTER,
+        "Updated",
+        font,
+        pal.faint,
+    );
+}
+
 /// Paint one 52 pt PR row across the full available width and return its
-/// click response. The cells, left to right: state icon, title with a
-/// repo/author meta line, the scopes that matched, the CI dot, the review
-/// pill, the `+a −d` figures with a 40×6 bar, the comment count, and the
-/// relative time. Hover fills `surface`, selection fills `accent_soft`.
+/// click response. The cells sit on the fixed grid of [`render_header`]:
+/// state icon, title over a repo/author meta line, the scopes that matched,
+/// the CI icon, the review pill, `+a −d` with a 40×6 bar, the comment
+/// count, and the relative time. Hover fills `surface`, selection fills
+/// `accent_soft`.
 pub fn render_row(ui: &mut egui::Ui, pr: &PrSummary, now: &str, selected: bool) -> egui::Response {
     let pal = theme::palette_of(ui);
     let (rect, response) = ui.allocate_exact_size(
@@ -277,153 +345,228 @@ pub fn render_row(ui: &mut egui::Ui, pr: &PrSummary, now: &str, selected: bool) 
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    let bg = rect.shrink2(egui::vec2(4.0, 1.0));
-    let painter = ui.painter_at(bg);
+    let painter = ui.painter_at(rect);
     if selected {
-        painter.rect_filled(bg, 6.0, pal.accent_soft);
+        painter.rect_filled(rect, 0.0, pal.accent_soft);
     } else if response.hovered() {
-        painter.rect_filled(bg, 6.0, pal.surface);
+        painter.rect_filled(rect, 0.0, pal.surface);
+    }
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, (1.0, pal.line_soft));
+    let (state, title, fixed) = columns(rect);
+    let cy = rect.center().y;
+
+    // State icon.
+    let (icon, color) = if pr.draft {
+        (icons::GIT_PULL_REQUEST_DRAFT, pal.faint)
+    } else {
+        (icons::GIT_PULL_REQUEST, pal.ok)
+    };
+    painter.text(
+        egui::pos2(state.center(), cy),
+        egui::Align2::CENTER_CENTER,
+        icon,
+        egui::FontId::proportional(16.0),
+        color,
+    );
+
+    // Title over the meta line: repo, #number, "by", avatar, author, Draft.
+    let title_galley = crate::ui::components::elided_galley(
+        ui,
+        &pr.title,
+        crate::ui::fonts::semibold(13.0),
+        pal.text,
+        title.span(),
+    );
+    let title_elided = title_galley.elided;
+    painter.galley(
+        egui::pos2(title.min, rect.top() + 9.0),
+        title_galley,
+        pal.text,
+    );
+    let meta_y = rect.top() + 33.0;
+    let small = egui::FontId::proportional(12.0);
+    let mut x = title.min;
+    let put = |x: &mut f32, text: String, color: egui::Color32, gap: f32| {
+        let g = painter.layout_no_wrap(text, small.clone(), color);
+        let w = g.size().x;
+        painter.galley(egui::pos2(*x, meta_y - g.size().y / 2.0), g, color);
+        *x += w + gap;
+    };
+    put(&mut x, pr.repo.to_string(), pal.muted, 6.0);
+    put(&mut x, format!("#{}", pr.number), pal.faint, 6.0);
+    put(&mut x, "by".to_owned(), pal.faint, 5.0);
+    let avatar = egui::Rect::from_center_size(egui::pos2(x + 8.0, meta_y), egui::vec2(16.0, 16.0));
+    painter.circle_filled(
+        avatar.center(),
+        8.0,
+        crate::ui::widgets::thread_view::avatar_color(&pr.author),
+    );
+    painter.text(
+        avatar.center(),
+        egui::Align2::CENTER_CENTER,
+        crate::ui::widgets::thread_view::avatar_initials(&pr.author),
+        egui::FontId::proportional(7.5),
+        theme::AVATAR_INK,
+    );
+    x += 21.0;
+    put(&mut x, pr.author.clone(), pal.muted, 6.0);
+    if pr.draft {
+        let g = painter.layout_no_wrap(
+            "Draft".to_owned(),
+            egui::FontId::proportional(10.5),
+            pal.muted,
+        );
+        let r = egui::Rect::from_min_size(
+            egui::pos2(x, meta_y - 8.0),
+            egui::vec2(g.size().x + 12.0, 16.0),
+        );
+        painter.rect_filled(r, 8.0, pal.raised);
+        painter.galley(r.center() - g.size() / 2.0, g, pal.muted);
     }
 
-    // The right-hand cells first, so the title can take what is left.
-    let rrect = egui::Rect::from_min_max(rect.min, rect.max - egui::vec2(12.0, 0.0));
-    let right = ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(rrect)
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            ui.label(
-                egui::RichText::new(relative_time(&pr.updated_at, now))
-                    .size(11.5)
-                    .color(pal.faint),
-            )
-            .on_hover_text(pr.updated_at.clone());
-            if pr.comments > 0 {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} {}",
-                        icons::MESSAGE_SQUARE,
-                        compact_count(pr.comments)
-                    ))
-                    .size(11.5)
-                    .color(pal.muted),
-                );
-            }
-            diff_cell(ui, pr, pal);
-            review_pill(ui, pr.review, pal);
-            if let Some(ci) = pr.ci {
-                let (icon, color) = match ci {
-                    CiState::Success => (icons::CIRCLE_CHECK, pal.ok),
-                    CiState::Failure => (icons::CIRCLE_X, pal.bad),
-                    CiState::Pending => (icons::CIRCLE_DOT_DASHED, pal.warn),
-                };
-                ui.label(egui::RichText::new(icon).size(16.0).color(color));
-            }
-            for scope in pr.scopes.iter().rev() {
-                ui.label(
-                    egui::RichText::new(scope_icon(scope))
-                        .size(14.0)
-                        .color(pal.faint),
-                )
-                .on_hover_text(scope.clone());
-            }
-            ui.min_rect()
-        },
-    );
-
-    let lrect = egui::Rect::from_min_max(
-        rect.min + egui::vec2(8.0, 0.0),
-        egui::pos2(right.inner.min.x - 12.0, rect.max.y),
-    );
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(lrect)
-            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        |ui| {
-            let (icon, color) = if pr.draft {
-                (icons::GIT_PULL_REQUEST_DRAFT, pal.faint)
-            } else {
-                (icons::CIRCLE_DOT, pal.ok)
-            };
-            ui.label(egui::RichText::new(icon).size(16.0).color(color));
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.add(
-                    egui::Label::new(egui::RichText::new(&pr.title).size(13.5).color(pal.text))
-                        .truncate(),
-                );
-                ui.label(
-                    egui::RichText::new(format!("{} · #{} · {}", pr.repo, pr.number, pr.author))
-                        .size(11.0)
-                        .color(pal.muted),
-                );
-            });
-        },
-    );
-    response
-}
-
-/// The `+a −d` figures with the 40×6 add/del bar.
-fn diff_cell(ui: &mut egui::Ui, pr: &PrSummary, pal: &'static theme::Palette) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(
-            egui::RichText::new(format!("+{}", compact_count(pr.additions)))
-                .size(11.5)
-                .color(pal.ok),
+    // Why: the scopes that matched.
+    let mut wx = fixed[0].min;
+    for scope in &pr.scopes {
+        painter.text(
+            egui::pos2(wx + 7.0, cy),
+            egui::Align2::CENTER_CENTER,
+            scope_icon(scope),
+            egui::FontId::proportional(14.0),
+            pal.faint,
         );
-        ui.label(
-            egui::RichText::new(format!("-{}", compact_count(pr.deletions)))
-                .size(11.5)
-                .color(pal.bad),
-        );
-        let (bar, _) = ui.allocate_exact_size(egui::vec2(40.0, 6.0), egui::Sense::hover());
-        let painter = ui.painter_at(bar);
-        painter.rect_filled(bar, 2.0, pal.line);
-        let (a, d) = diff_fractions(pr.additions, pr.deletions);
-        let w_add = bar.width() * a;
-        if w_add > 0.5 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(bar.min, egui::vec2(w_add, bar.height())),
-                2.0,
-                pal.ok,
-            );
-        }
-        let w_del = bar.width() * d;
-        if w_del > 0.5 {
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(bar.min.x + w_add, bar.min.y),
-                    egui::vec2(w_del, bar.height()),
-                ),
-                2.0,
-                pal.bad,
-            );
-        }
-    });
-}
+        wx += 16.0;
+    }
 
-/// The rounded review-state pill; nothing for a PR with no decision.
-fn review_pill(ui: &mut egui::Ui, review: Option<ReviewDecision>, pal: &'static theme::Palette) {
-    let Some(review) = review else { return };
-    let (icon, text, color) = match review {
-        ReviewDecision::Approved => (icons::CHECK, "Approved", pal.ok),
-        ReviewDecision::ChangesRequested => (icons::X, "Changes requested", pal.bad),
-        ReviewDecision::ReviewRequired => (icons::EYE, "Review required", pal.muted),
+    // CI.
+    if let Some(ci) = pr.ci {
+        let (icon, color) = match ci {
+            CiState::Success => (icons::CIRCLE_CHECK, pal.ok),
+            CiState::Failure => (icons::CIRCLE_X, pal.bad),
+            CiState::Pending => (icons::CIRCLE_DOT_DASHED, pal.warn),
+        };
+        painter.text(
+            egui::pos2(fixed[1].min + 8.0, cy),
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(16.0),
+            color,
+        );
+    } else {
+        painter.text(
+            egui::pos2(fixed[1].min + 8.0, cy),
+            egui::Align2::CENTER_CENTER,
+            icons::MINUS,
+            egui::FontId::proportional(14.0),
+            pal.faint,
+        );
+    }
+
+    // Review.
+    review_pill(ui, &painter, egui::pos2(fixed[2].min, cy), pr.review);
+
+    // Changes: +a −d and the bar, right-aligned.
+    let bar = egui::Rect::from_min_size(
+        egui::pos2(fixed[3].max - 40.0, cy - 3.0),
+        egui::vec2(40.0, 6.0),
+    );
+    painter.rect_filled(bar, 3.0, pal.raised);
+    let (a, d) = diff_fractions(pr.additions, pr.deletions);
+    let w_add = (bar.width() * a).round();
+    if w_add > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(bar.min, egui::vec2(w_add, 6.0)),
+            0.0,
+            pal.ok,
+        );
+    }
+    if d > 0.0 {
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(bar.min.x + w_add, bar.min.y), bar.max),
+            0.0,
+            pal.bad,
+        );
+    }
+    let mono = egui::FontId::monospace(11.5);
+    let del = painter.layout_no_wrap(
+        format!("−{}", compact_count(pr.deletions)),
+        mono.clone(),
+        pal.bad,
+    );
+    let del_x = bar.min.x - 8.0 - del.size().x;
+    painter.galley(egui::pos2(del_x, cy - del.size().y / 2.0), del, pal.bad);
+    let add = painter.layout_no_wrap(format!("+{}", compact_count(pr.additions)), mono, pal.ok);
+    painter.galley(
+        egui::pos2(del_x - 6.0 - add.size().x, cy - add.size().y / 2.0),
+        add,
+        pal.ok,
+    );
+
+    // Comments.
+    let (comment_color, comment_text) = if pr.comments > 0 {
+        (pal.muted, compact_count(pr.comments))
+    } else {
+        (pal.faint.gamma_multiply(0.6), "0".to_owned())
     };
-    egui::Frame::new()
-        .fill(pal.raised)
-        .stroke(egui::Stroke::new(1.0, pal.line))
-        .corner_radius(9.0)
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{icon} {text}"))
-                    .size(11.0)
-                    .color(color),
-            );
-        });
+    painter.text(
+        egui::pos2(fixed[4].max, cy),
+        egui::Align2::RIGHT_CENTER,
+        format!("{} {}", icons::MESSAGE_SQUARE, comment_text),
+        egui::FontId::proportional(12.0),
+        comment_color,
+    );
+
+    // Updated.
+    painter.text(
+        egui::pos2(fixed[5].max, cy),
+        egui::Align2::RIGHT_CENTER,
+        relative_time(&pr.updated_at, now),
+        egui::FontId::proportional(12.0),
+        pal.muted,
+    );
+
+    if title_elided {
+        response.on_hover_text(&pr.title)
+    } else {
+        response
+    }
+}
+
+/// The review-state pill, left-aligned at `left_center`; "No reviews" in
+/// `faint` for a PR with no decision (mockup `.pill`).
+fn review_pill(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    left_center: egui::Pos2,
+    review: Option<ReviewDecision>,
+) {
+    let pal = theme::palette_of(ui);
+    let Some(review) = review else {
+        painter.text(
+            left_center,
+            egui::Align2::LEFT_CENTER,
+            "No reviews",
+            egui::FontId::proportional(12.0),
+            pal.faint,
+        );
+        return;
+    };
+    let (icon, text, tone) = match review {
+        ReviewDecision::Approved => (icons::CHECK, "Approved", Tone::Ok),
+        ReviewDecision::ChangesRequested => (icons::FILE_DIFF, "Changes requested", Tone::Bad),
+        ReviewDecision::ReviewRequired => (icons::EYE, "Review required", Tone::Warn),
+    };
+    let (fg, bg) = tone_colors(pal, tone);
+    let galley = painter.layout_no_wrap(
+        format!("{icon} {text}"),
+        egui::FontId::proportional(11.5),
+        fg,
+    );
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(left_center.x, left_center.y - 10.0),
+        egui::vec2(galley.size().x + 14.0, 20.0),
+    );
+    painter.rect_filled(rect, 10.0, bg);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
 
 #[cfg(test)]

@@ -19,6 +19,9 @@ pub struct ThreadComment {
     pub body: String,
     /// `createdAt`, verbatim as GitHub sent it.
     pub created_at: String,
+    /// Whether the comment belongs to the viewer's pending review on GitHub
+    /// (GraphQL `state: PENDING`): visible only to them until submitted.
+    pub pending: bool,
 }
 
 /// What a review thread is anchored to.
@@ -55,6 +58,13 @@ pub struct ReviewThread {
 }
 
 impl ReviewThread {
+    /// Whether the thread is part of the viewer's pending review on GitHub:
+    /// its root comment is pending, so it can be neither resolved nor
+    /// replied to until the review is submitted.
+    pub fn is_pending(&self) -> bool {
+        self.comments.first().is_some_and(|comment| comment.pending)
+    }
+
     /// The database id of the thread's root comment, for `POST …/replies`.
     pub fn root_comment_id(&self) -> Option<u64> {
         self.comments.first().map(|comment| comment.database_id)

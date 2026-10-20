@@ -185,6 +185,7 @@ pub fn meta_by(author: &str, head_sha: &str) -> crate::github::metadata::PrMetad
 pub fn review(state: crate::github::reviews::ReviewState) -> crate::github::reviews::Review {
     crate::github::reviews::Review {
         id: 1,
+        node_id: "PRR_1".to_owned(),
         author: "me".to_owned(),
         state,
         body: String::new(),

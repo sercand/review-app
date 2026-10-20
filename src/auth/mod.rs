@@ -23,4 +23,4 @@ pub const DEFAULT_SCOPE: &str = "repo read:org";
 /// This placeholder stands in for the real ID of the OAuth App registered with
 /// Device Flow enabled; replace it (or set `client_id` in settings) before
 /// signing in to github.com.
-pub const DEFAULT_CLIENT_ID: &str = "REPLACE_WITH_YOUR_OAUTH_APP_CLIENT_ID";
+pub const DEFAULT_CLIENT_ID: &str = "Ov23liZ2LPGxYYLVS3Sb";

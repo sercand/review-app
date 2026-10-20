@@ -20,7 +20,9 @@ use crate::diff::expand::{gaps, Expand};
 use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
 use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
 use crate::diff::options::{find_matches, next_match, prev_match};
-use crate::diff::row_model::{display_text, pair_indices, RowModel, RowRef, HEADER_H, ROW_H};
+use crate::diff::row_model::{
+    display_text, pair_indices, RowModel, RowRef, HEADER_H, HUNK_H, ROW_H,
+};
 use crate::diff::word::word_diff;
 use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
 use crate::model::comment::{Anchor, CommentTarget};
@@ -38,6 +40,16 @@ pub const GUTTER_W: f32 = 48.0;
 
 /// The width of the sign column (`+`/`−`) in front of a line's text.
 pub const SIGN_W: f32 = 14.0;
+
+/// Where line text starts inside a code cell: the sign glyph sits in the
+/// first [`SIGN_W`] points after a 6 pt margin.
+const CODE_INSET_L: f32 = 6.0 + SIGN_W;
+
+/// The space kept free after line text in a code cell.
+const CODE_INSET_R: f32 = 12.0;
+
+/// The space kept free after a line number in a gutter.
+const GUTTER_PAD: f32 = 10.0;
 
 pub use crate::model::diff::DiffMode;
 
@@ -181,11 +193,11 @@ pub fn char_width(ui: &egui::Ui) -> f32 {
 /// height at the same one, so a wrapped row is never a line short.
 pub fn content_width(ui: &egui::Ui, mode: DiffMode) -> f32 {
     let table = ui.available_width() - ui.spacing().scroll.allocated_width();
-    let spacing = ui.spacing().item_spacing.x;
-    match mode {
-        DiffMode::Unified => (table - 2.0 * GUTTER_W - 2.0 * spacing).max(1.0),
-        DiffMode::Split => ((table - 2.0 * GUTTER_W - 3.0 * spacing) / 2.0).max(1.0),
-    }
+    let column = match mode {
+        DiffMode::Unified => table - 2.0 * GUTTER_W,
+        DiffMode::Split => (table - 2.0 * GUTTER_W) / 2.0,
+    };
+    (column - CODE_INSET_L - CODE_INSET_R).max(1.0)
 }
 
 /// Pair each run of removed lines with the run of added lines that follows it.
@@ -260,7 +272,6 @@ pub fn render(
         font_id: egui::TextStyle::Monospace.resolve(ui.style()),
         plain: ui.visuals().text_color(),
         strong: ui.visuals().strong_text_color(),
-        weak: ui.visuals().weak_text_color(),
     };
 
     // Spec §7.5: the 3000-file banner now lives in the detail screen's
@@ -290,6 +301,14 @@ pub fn render(
     // itself, since those rows overflow their gutter column unclipped.
     let full_width = band.width();
 
+    // A table row grows to fit its tallest cell, so cells paint into their
+    // exact rect rather than laying widgets out; the gaps between columns and
+    // rows go too, so a line's background runs edge to edge. Full-width rows
+    // (threads, composer) get the normal spacing back.
+    let item_spacing = ui.spacing().item_spacing;
+    let interact_h = ui.spacing().interact_size.y;
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+    ui.spacing_mut().interact_size.y = 0.0;
     let mut table = TableBuilder::new(ui)
         .id_salt("diff-view")
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
@@ -306,12 +325,12 @@ pub fn render(
         DiffMode::Unified => table
             .column(Column::exact(GUTTER_W).clip(false))
             .column(Column::exact(GUTTER_W).clip(false))
-            .column(Column::remainder().at_least(160.0)),
+            .column(Column::remainder().at_least(160.0).clip(true)),
         DiffMode::Split => table
             .column(Column::exact(GUTTER_W).clip(false))
-            .column(Column::remainder().at_least(100.0))
+            .column(Column::remainder().at_least(100.0).clip(true))
             .column(Column::exact(GUTTER_W).clip(false))
-            .column(Column::remainder().at_least(100.0)),
+            .column(Column::remainder().at_least(100.0).clip(true)),
     };
 
     let mut ctx = RowCtx {
@@ -324,6 +343,8 @@ pub fn render(
         style: &style,
         write_blocked,
         login,
+        item_spacing,
+        interact_h,
     };
     // The heights are taken out first: the row closure reaches back into the
     // session mutably to draw composer and thread rows.
@@ -392,7 +413,6 @@ pub(crate) struct RowStyle {
     font_id: egui::FontId,
     plain: egui::Color32,
     strong: egui::Color32,
-    weak: egui::Color32,
 }
 
 /// The per-frame context a row is drawn with.
@@ -413,6 +433,10 @@ struct RowCtx<'a> {
     /// The rate-limit tooltip for the composer's Submit buttons (spec §13):
     /// `Some` while writes are disabled.
     write_blocked: Option<&'a str>,
+    /// The pane's normal item spacing, restored inside full-width rows.
+    item_spacing: egui::Vec2,
+    /// The pane's normal control height, restored inside full-width rows.
+    interact_h: f32,
     /// The signed-in user, for the reply row's and pending rows' avatars.
     login: &'a str,
 }
@@ -434,28 +458,52 @@ pub enum GapButton {
     Down(u32),
     /// Reveal the whole gap.
     All(u32),
+    /// Reveal the rest of the file after the last hunk, before the head
+    /// blob (and so the gap's size) is known.
+    Rest,
 }
 
-/// The expansion buttons for a gap of `hidden` lines (mockup: twenty at a
-/// time, plus "All" once that is more than one click's worth). A tail gap
-/// reveals downward from the hunk above it.
-pub fn gap_buttons(hidden: u32, tail: bool) -> Vec<GapButton> {
+/// Where a gap of hidden lines sits relative to the hunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GapAt {
+    /// Above the first hunk: only a hunk below it.
+    First,
+    /// Between two hunks: a hunk on each side.
+    Between,
+    /// After the last hunk: only a hunk above it.
+    Tail,
+}
+
+/// How many lines one click reveals.
+const EXPAND_STEP: u32 = 20;
+
+/// The expansion buttons for a gap of `hidden` lines (`None` when the size
+/// is not known yet, which only happens after the last hunk).
+///
+/// Twenty lines at a time from whichever side touches a hunk — upward from
+/// the hunk below, downward from the hunk above — plus "All" once that is
+/// more than one click's worth. A short gap between hunks opens in one go.
+pub fn gap_buttons(hidden: Option<u32>, at: GapAt) -> Vec<GapButton> {
+    let Some(hidden) = hidden else {
+        return match at {
+            GapAt::Tail => vec![GapButton::Down(EXPAND_STEP), GapButton::Rest],
+            _ => Vec::new(),
+        };
+    };
     if hidden == 0 {
         return Vec::new();
     }
-    if tail {
-        let mut out = vec![GapButton::Down(hidden.min(20))];
-        if hidden > 20 {
-            out.push(GapButton::All(hidden));
-        }
-        out
-    } else {
-        let mut out = vec![GapButton::Up(hidden.min(20))];
-        if hidden > 20 {
-            out.push(GapButton::All(hidden));
-        }
-        out
+    let step = hidden.min(EXPAND_STEP);
+    let mut out = match at {
+        GapAt::First => vec![GapButton::Up(step)],
+        GapAt::Tail => vec![GapButton::Down(step)],
+        GapAt::Between if hidden <= EXPAND_STEP => vec![GapButton::All(hidden)],
+        GapAt::Between => vec![GapButton::Down(step), GapButton::Up(step)],
+    };
+    if hidden > EXPAND_STEP {
+        out.push(GapButton::All(hidden));
     }
+    out
 }
 
 /// The comment target for one side of the table row at `index`, or `None`
@@ -573,21 +621,29 @@ fn render_row(
         }
         RowRef::HunkHeader { file, hunk } => {
             let (file, hunk) = (*file, *hunk);
+            let index = row.index();
+            let (buttons, header) = hunk_bar_contents(ctx.session, file, hunk);
+            // A tail bar with nothing left to reveal (the file ends at the
+            // last hunk) folds away.
+            let height = if buttons.is_empty() && header.is_none() {
+                0.0
+            } else {
+                HUNK_H
+            };
+            if ctx.session.row_model.heights().get(index) != Some(&height) {
+                ctx.session.row_model.set_height(index, height);
+            }
             row.col(|ui| {
+                if height == 0.0 {
+                    return;
+                }
                 let palette = palette_of(ui);
                 let cell = ui.max_rect();
-                // The bar spans every column: draw it from the first cell
-                // across the table's full width, in a scope whose max rect
-                // (and so clip rect) is the whole bar.
-                let bar =
-                    egui::Rect::from_min_size(cell.min, egui::vec2(ctx.full_width, cell.height()));
+                // The bar spans every column: drawn from the first cell
+                // across the table's full width.
+                let bar = egui::Rect::from_min_size(cell.min, egui::vec2(ctx.full_width, HUNK_H));
                 ui.painter().rect_filled(bar, 0.0, palette.hunk_bg);
-                ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .max_rect(bar)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| render_hunk_bar(ui, ctx.session, file, hunk, actions),
-                );
+                render_hunk_bar(ui, bar, file, hunk, &buttons, header.as_deref(), actions);
             });
             for _ in 1..column_count(mode) {
                 row.col(|_ui| {});
@@ -724,13 +780,8 @@ fn render_row(
         }
         RowRef::Thread { thread } => {
             let index = *thread;
-            let indent = if matches!(mode, DiffMode::Unified) {
-                64.0
-            } else {
-                14.0
-            };
-            let login = ctx.login;
-            row.col(|ui| {
+            let indent = comment_indent(mode);
+            full_width_row(row, ctx, |ui, ctx| {
                 let Some(thread) = ctx.session.threads.get(index as usize) else {
                     return;
                 };
@@ -747,21 +798,18 @@ fn render_row(
                     collapsed,
                     drafts,
                     &mut thread_actions,
-                    thread_view::ThreadPlacement { login, indent },
+                    thread_view::ThreadPlacement {
+                        login: ctx.login,
+                        indent,
+                    },
                 );
                 actions.extend(thread_actions.into_iter().map(DiffAction::Thread));
             });
-            blank_rest(row, mode);
         }
         RowRef::Pending { local_id } => {
             let id = *local_id;
-            let indent = if matches!(mode, DiffMode::Unified) {
-                64.0
-            } else {
-                14.0
-            };
-            let login = ctx.login;
-            row.col(|ui| {
+            let indent = comment_indent(mode);
+            full_width_row(row, ctx, |ui, ctx| {
                 let Some(pending) = ctx
                     .session
                     .pending
@@ -773,7 +821,7 @@ fn render_row(
                     return;
                 };
                 let mut pending_actions = Vec::new();
-                thread_view::render_pending(ui, &pending, login, indent, &mut pending_actions);
+                thread_view::render_pending(ui, &pending, ctx.login, indent, &mut pending_actions);
                 for action in pending_actions {
                     match action {
                         thread_view::PendingAction::Edit { local_id } => {
@@ -785,20 +833,21 @@ fn render_row(
                     }
                 }
             });
-            blank_rest(row, mode);
         }
         RowRef::Composer => {
-            let has_open_review = !ctx.session.pending.is_empty();
+            let github_review = ctx.session.server_pending.is_some();
+            let has_open_review = !ctx.session.pending.is_empty() || github_review;
             let show_side = anchor_is_context(ctx.session, ctx.session.composer.target.as_ref());
             let warning = composer_warning(ctx.session, ctx.session.composer.target.as_ref());
             let width = ctx.full_width;
-            row.col(|ui| {
+            full_width_row(row, ctx, |ui, ctx| {
                 let mut composer_actions = Vec::new();
                 comment_composer::render_composer(
                     ui,
                     &mut ctx.session.composer,
                     comment_composer::ComposerInputs {
                         has_open_review,
+                        github_review,
                         show_side,
                         warning,
                         width,
@@ -808,8 +857,60 @@ fn render_row(
                 );
                 actions.extend(composer_actions.into_iter().map(DiffAction::Composer));
             });
-            blank_rest(row, mode);
         }
+    }
+}
+
+/// How far a comment row sits in from the table's left edge: past both
+/// gutters in unified mode, a small margin in split mode (mockup `.thread`).
+fn comment_indent(mode: DiffMode) -> f32 {
+    match mode {
+        DiffMode::Unified => 64.0,
+        DiffMode::Split => 14.0,
+    }
+}
+
+/// Draw a row that spans the whole table — a thread, a pending comment, the
+/// composer — and fit the row to what it drew.
+///
+/// The content lays out in a child as wide as the table, with the pane's
+/// normal spacing restored, on the row's `surface` band. These rows have no
+/// intrinsic height, so the height they used is written back to the row
+/// model and the table picks it up next frame.
+fn full_width_row(
+    row: &mut egui_extras::TableRow<'_, '_>,
+    ctx: &mut RowCtx<'_>,
+    add: impl FnOnce(&mut egui::Ui, &mut RowCtx<'_>),
+) {
+    let index = row.index();
+    let mode = ctx.mode;
+    let mut used = 0.0;
+    row.col(|ui| {
+        let cell = ui.max_rect();
+        let band = egui::Rect::from_min_size(cell.min, egui::vec2(ctx.full_width, cell.height()));
+        let palette = palette_of(ui);
+        ui.painter().rect_filled(band, 0.0, palette.surface);
+        ui.painter()
+            .hline(band.x_range(), band.top(), (1.0, palette.line_soft));
+        ui.painter()
+            .hline(band.x_range(), band.bottom(), (1.0, palette.line_soft));
+        let area = egui::Rect::from_min_size(cell.min, egui::vec2(ctx.full_width, 100_000.0));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(area)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        child
+            .set_clip_rect(band.intersect(ui.clip_rect().expand2(egui::vec2(ctx.full_width, 0.0))));
+        child.spacing_mut().item_spacing = ctx.item_spacing;
+        child.spacing_mut().interact_size.y = ctx.interact_h;
+        add(&mut child, ctx);
+        used = child.min_rect().height();
+    });
+    blank_rest(row, mode);
+    let current = ctx.session.row_model.heights().get(index).copied();
+    if used > 0.0 && current.is_some_and(|h| (h - used).abs() > 0.5) {
+        ctx.session.row_model.set_height(index, used.ceil());
     }
 }
 
@@ -1090,6 +1191,9 @@ impl CellComment {
 
 /// One gutter cell: the line number over the kind's background. A number is
 /// clickable: it opens the composer on that line (spec §7.3).
+///
+/// Cells paint into their exact rect — no widget layout — so a line row is
+/// always the height the row model says.
 fn number_cell(
     ui: &mut egui::Ui,
     number: Option<u32>,
@@ -1100,51 +1204,58 @@ fn number_cell(
 ) -> Option<CommentTarget> {
     let palette = palette_of(ui);
     let target = comment.and_then(|c| c.target(ctx.session));
+    let rect = ui.max_rect();
+    let sense = if target.is_some() {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.allocate_rect(rect, sense);
     let bg = match kind {
         CellKind::Context => None,
         CellKind::Removed => Some(palette.del_gutter),
         CellKind::Added => Some(palette.add_gutter),
         CellKind::Missing => Some(palette.filler),
     };
-    let rect = ui.max_rect();
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
-    if ctx
-        .session
-        .composer
-        .target
-        .as_ref()
-        .is_some_and(|open| target.as_ref() == Some(open))
-    {
+    if is_composer_line(ctx, target.as_ref()) {
         ui.painter().rect_filled(rect, 0.0, palette.accent_soft);
     }
     if divider == Some(true) {
         ui.painter()
-            .line_segment([rect.left_top(), rect.left_bottom()], (1.0, palette.line));
+            .vline(rect.left(), rect.y_range(), (1.0, palette.line));
     }
-    let text = number.map(|number| number.to_string()).unwrap_or_default();
-    let color = match kind {
-        CellKind::Missing => palette.faint,
-        _ => style_weak(ctx),
-    };
-    let label = egui::Label::new(
-        egui::RichText::new(text)
-            .font(ctx.style.font_id.clone())
-            .color(color),
-    )
-    .selectable(false);
-    let response = match (&comment, &target) {
-        (Some(_), Some(_)) => ui.add(label.sense(egui::Sense::click())),
-        _ => ui.add(label),
-    };
-    if target.is_some() {
-        response.clone().on_hover_text("Comment on line");
+    if let Some(number) = number {
+        let color = if response.hovered() && target.is_some() {
+            palette.text
+        } else if kind == CellKind::Context {
+            palette.faint
+        } else {
+            palette.muted
+        };
+        ui.painter().text(
+            egui::pos2(rect.right() - GUTTER_PAD, rect.top() + ROW_H / 2.0),
+            egui::Align2::RIGHT_CENTER,
+            number.to_string(),
+            ctx.style.font_id.clone(),
+            color,
+        );
     }
-    if response.clicked() {
+    if target.is_some() && response.clicked() {
         return target;
     }
+    if target.is_some() {
+        response.on_hover_text("Comment on line");
+    }
     None
+}
+
+/// Whether `target` is the line the open composer is anchored to, which the
+/// mockup tints with `accent_soft`.
+fn is_composer_line(ctx: &RowCtx<'_>, target: Option<&CommentTarget>) -> bool {
+    target.is_some() && ctx.session.composer.target.as_ref() == target
 }
 
 /// One code cell: background fill, sign glyph, and the highlighted text with
@@ -1161,79 +1272,82 @@ fn code_cell(
 ) -> Option<CommentTarget> {
     let palette = palette_of(ui);
     let target = comment.and_then(|c| c.target(ctx.session));
+    let rect = ui.max_rect();
+    ui.allocate_rect(rect, egui::Sense::hover());
     let bg = match kind {
         CellKind::Context => None,
         CellKind::Removed => Some(palette.del_bg),
         CellKind::Added => Some(palette.add_bg),
         CellKind::Missing => Some(palette.filler),
     };
-    let rect = ui.max_rect();
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
-    if ctx
-        .session
-        .composer
-        .target
-        .as_ref()
-        .is_some_and(|open| target.as_ref() == Some(open))
-    {
+    if is_composer_line(ctx, target.as_ref()) {
         ui.painter().rect_filled(rect, 0.0, palette.accent_soft);
     }
     let text = text?;
 
-    // The hover plus button: only while the pointer is over the cell, so
-    // idle rows allocate nothing.
-    let hovered = ui
-        .input(|i| i.pointer.hover_pos())
-        .is_some_and(|p| rect.contains(p));
-    if hovered {
-        if let Some(target) = target.clone() {
-            let plus = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 10.0, rect.center().y),
-                egui::vec2(18.0, 18.0),
-            );
-            let galley = ui.painter().layout_no_wrap(
-                PLUS.to_string(),
-                egui::FontId::proportional(12.0),
-                palette.accent,
-            );
-            let response = ui.put(
-                plus,
-                egui::Label::new(galley)
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-            );
-            if response.clicked() {
-                return Some(target);
-            }
-            response.on_hover_text("Comment on line");
-        }
-    }
-
     let (sign, sign_color) = match kind {
         CellKind::Removed => ("−", palette.bad),
         CellKind::Added => ("+", palette.ok),
-        _ => (" ", style_weak(ctx)),
+        _ => ("", palette.faint),
     };
+    let mid = rect.top() + ROW_H / 2.0;
+    ui.painter().text(
+        egui::pos2(rect.left() + 6.0, mid),
+        egui::Align2::LEFT_CENTER,
+        sign,
+        ctx.style.font_id.clone(),
+        sign_color,
+    );
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        ui.add_sized(
-            [SIGN_W, 0.0],
-            egui::Label::new(
-                egui::RichText::new(sign)
-                    .font(ctx.style.font_id.clone())
-                    .color(sign_color),
-            )
-            .selectable(false),
-        );
-        let mark_bg = match kind {
-            CellKind::Added => palette.add_word,
-            _ => palette.del_word,
-        };
-        add_line_marked(ui, text, spans, mark, mark_bg, ctx);
-    });
+    let mark_bg = match kind {
+        CellKind::Added => palette.add_word,
+        _ => palette.del_word,
+    };
+    let mut job = layout_job(text, spans, mark, mark_bg, ctx.style);
+    if ctx.wrap {
+        job.wrap.max_width = ctx.content;
+        job.wrap.break_anywhere = true;
+    }
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    // Centre the first line on the row, so a one-line row reads the same as
+    // the gutter's number beside it.
+    let first_line_h = galley.rows.first().map_or(ROW_H, |r| r.height());
+    let top = mid - first_line_h / 2.0;
+    ui.painter().galley(
+        egui::pos2(rect.left() + CODE_INSET_L, top),
+        galley,
+        palette.text,
+    );
+
+    // The hover plus button: only while the pointer is over the cell. The
+    // cell's rect, not `response.hovered()`, decides: the button takes the
+    // hover from the cell, which would hide it again before it is clicked.
+    if ui.rect_contains_pointer(rect) {
+        if let Some(target) = target {
+            let plus = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 11.0, mid),
+                egui::vec2(18.0, 18.0),
+            );
+            let id = ui.make_persistent_id(("diff-plus", rect.min.x as i32, rect.min.y as i32));
+            let button = ui.interact(plus, id, egui::Sense::click());
+            ui.painter().rect_filled(plus, 4.0, palette.accent);
+            ui.painter().text(
+                plus.center(),
+                egui::Align2::CENTER_CENTER,
+                PLUS.to_string(),
+                egui::FontId::proportional(12.0),
+                palette.accent_ink,
+            );
+            let clicked = button.clicked();
+            button.on_hover_text("Comment on line");
+            if clicked {
+                return Some(target);
+            }
+        }
+    }
     None
 }
 
@@ -1241,76 +1355,136 @@ fn code_cell(
 /// then the `@@` line in faint mono (mockup `.hunk`).
 fn render_hunk_bar(
     ui: &mut egui::Ui,
-    session: &PrSession,
+    bar: egui::Rect,
     file: u32,
     hunk: u32,
+    buttons: &[GapButton],
+    header: Option<&str>,
     actions: &mut Vec<DiffAction>,
 ) {
     let palette = palette_of(ui);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let diff = session
-            .files
-            .get(file as usize)
-            .and_then(|l| l.diff.as_ref());
-        let Some(diff) = diff else { return };
-        // The gap directly above this hunk, if GitHub omitted context there.
-        let hidden = gaps(diff, u32::MAX)
-            .into_iter()
-            .find(|gap| gap.before_hunk == hunk)
-            .map(|gap| gap.new_end - gap.new_start + 1)
-            .unwrap_or(0);
-        for button in gap_buttons(hidden, false) {
-            let (icon, label, how) = match button {
-                GapButton::Up(n) => (CHEVRONS_UP, n.to_string(), Expand::Up(n)),
-                GapButton::Down(n) => (CHEVRONS_DOWN, n.to_string(), Expand::Down(n)),
-                GapButton::All(n) => (UNFOLD_VERTICAL, format!("All {n} lines"), Expand::All),
-            };
-            let response = ui.add(
-                egui::Button::new(
-                    egui::RichText::new(format!("{icon} {label}"))
-                        .small()
-                        .color(palette.accent),
-                )
-                .fill(egui::Color32::TRANSPARENT)
-                .corner_radius(4.0)
-                .min_size(egui::vec2(0.0, 22.0)),
-            );
-            if response.hovered() {
-                ui.painter()
-                    .rect_filled(response.rect, 4.0, palette.accent_soft);
-            }
-            if response.clicked() {
-                actions.push(DiffAction::ExpandGap {
-                    file,
-                    before_hunk: hunk,
-                    how,
-                });
-            }
+    let cy = bar.center().y;
+    let mut x = bar.left() + 8.0;
+    for &button in buttons {
+        let (icon, label, how, tip) = match button {
+            GapButton::Up(n) => (
+                CHEVRONS_UP,
+                n.to_string(),
+                Expand::Up(n),
+                format!("Show {n} more lines above"),
+            ),
+            GapButton::Down(n) => (
+                CHEVRONS_DOWN,
+                n.to_string(),
+                Expand::Down(n),
+                format!("Show {n} more lines below"),
+            ),
+            GapButton::All(n) => (
+                UNFOLD_VERTICAL,
+                format!("All {n} lines"),
+                Expand::All,
+                format!("Show all {n} hidden lines"),
+            ),
+            GapButton::Rest => (
+                UNFOLD_VERTICAL,
+                "Rest of file".to_owned(),
+                Expand::All,
+                "Show the rest of the file".to_owned(),
+            ),
+        };
+        let galley = ui.painter().layout_no_wrap(
+            format!("{icon} {label}"),
+            egui::FontId::proportional(11.5),
+            palette.accent,
+        );
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(x, cy - 11.0),
+            egui::vec2(galley.size().x + 12.0, 22.0),
+        );
+        x = rect.right() + 4.0;
+        // The kind goes in the id: "↓ 20" and "↑ 20" share a label.
+        let id = ui.make_persistent_id(("gap", file, hunk, format!("{button:?}")));
+        let response = ui.interact(rect, id, egui::Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, palette.accent_soft);
         }
-        if let Some(hunk_data) = diff.hunks.get(hunk as usize) {
-            let (old_len, new_len) = hunk_lengths(hunk_data);
-            let mut text = format!(
-                "@@ -{},{} +{},{} @@",
-                hunk_data.old_start, old_len, hunk_data.new_start, new_len
-            );
-            if !hunk_data.section.is_empty() {
-                text.push(' ');
-                text.push_str(&hunk_data.section);
-            }
-            ui.add_space(8.0);
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(text)
-                        .monospace()
-                        .small()
-                        .color(palette.faint),
-                )
-                .selectable(false)
-                .truncate(),
-            );
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, palette.accent);
+        if response.on_hover_text(tip).clicked() {
+            actions.push(DiffAction::ExpandGap {
+                file,
+                before_hunk: hunk,
+                how,
+            });
         }
+    }
+    if let Some(header) = header {
+        let galley = crate::ui::components::elided_galley(
+            ui,
+            header,
+            egui::FontId::monospace(11.5),
+            palette.faint,
+            bar.right() - x - 16.0,
+        );
+        ui.painter().galley(
+            egui::pos2(x + 8.0, cy - galley.size().y / 2.0),
+            galley,
+            palette.faint,
+        );
+    }
+}
+
+/// The buttons and the `@@` header text for the bar before `hunk` — or,
+/// when `hunk` is one past the last hunk, the tail bar after it.
+fn hunk_bar_contents(
+    session: &PrSession,
+    file: u32,
+    hunk: u32,
+) -> (Vec<GapButton>, Option<String>) {
+    let Some(diff) = session
+        .files
+        .get(file as usize)
+        .and_then(|l| l.diff.as_ref())
+    else {
+        return (Vec::new(), None);
+    };
+    let tail = hunk as usize >= diff.hunks.len();
+    // The head blob bounds the tail; until it is fetched the tail's size
+    // is unknown, and only the tail depends on it.
+    let line_count = session
+        .head_blobs
+        .get(&file)
+        .map(|blob| blob.lines().count() as u32);
+    let hidden = if tail && line_count.is_none() {
+        None
+    } else {
+        Some(
+            gaps(diff, line_count.unwrap_or(u32::MAX))
+                .into_iter()
+                .find(|gap| gap.before_hunk == hunk)
+                .map_or(0, |gap| gap.new_end + 1 - gap.new_start),
+        )
+    };
+    let at = if tail {
+        GapAt::Tail
+    } else if hunk == 0 {
+        GapAt::First
+    } else {
+        GapAt::Between
+    };
+    let header = diff.hunks.get(hunk as usize).map(|hunk_data| {
+        let (old_len, new_len) = hunk_lengths(hunk_data);
+        let mut text = format!(
+            "@@ -{},{} +{},{} @@",
+            hunk_data.old_start, old_len, hunk_data.new_start, new_len
+        );
+        if !hunk_data.section.is_empty() {
+            text.push(' ');
+            text.push_str(&hunk_data.section);
+        }
+        text
     });
+    (gap_buttons(hidden, at), header)
 }
 
 /// A hunk's row counts per side, as the `@@ -a,b +c,d @@` header shows them.
@@ -1326,36 +1500,6 @@ fn hunk_lengths(hunk: &crate::model::diff::Hunk) -> (u32, u32) {
         }
     }
     (old, new)
-}
-
-/// The weak text colour, for gutters and context signs.
-fn style_weak(ctx: &RowCtx<'_>) -> egui::Color32 {
-    ctx.style.weak
-}
-
-/// Add one line of highlighted text to a cell.
-///
-/// The line wraps at [`RowCtx::content`] — the same width the row's height was
-/// measured at — so a wrapped line is never drawn taller than the row holding it.
-fn add_line_marked(
-    ui: &mut egui::Ui,
-    text: &str,
-    spans: &[HighlightSpan],
-    mark: Option<std::ops::Range<usize>>,
-    mark_bg: egui::Color32,
-    ctx: &RowCtx<'_>,
-) {
-    let mut job = layout_job(text, spans, mark, mark_bg, ctx.style);
-    if ctx.wrap {
-        job.wrap.max_width = ctx.content;
-        job.wrap.break_anywhere = true;
-    }
-
-    // Laying the job out ourselves (rather than handing the job to a `Label`)
-    // keeps the wrap settings above: a `Label` would replace them with the
-    // enclosing layout's.
-    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-    ui.add(egui::Label::new(galley).selectable(false));
 }
 
 /// Build the [`egui::text::LayoutJob`] for one line: plain text split by the
@@ -1584,18 +1728,33 @@ mod tests {
     use crate::test_support::{line_anchor, loaded, rows_from};
 
     #[test]
-    fn gap_buttons_offer_twenty_then_all() {
-        assert_eq!(gap_buttons(0, false), vec![]);
-        assert_eq!(gap_buttons(3, false), vec![GapButton::Up(3)]);
+    fn gap_buttons_reveal_from_whichever_side_the_gap_touches() {
+        use GapAt::*;
+        // Above the first hunk: only upward, there is no hunk above.
+        assert_eq!(gap_buttons(Some(0), First), vec![]);
+        assert_eq!(gap_buttons(Some(6), First), vec![GapButton::Up(6)]);
         assert_eq!(
-            gap_buttons(60, false),
+            gap_buttons(Some(60), First),
             vec![GapButton::Up(20), GapButton::All(60)]
         );
+        // Between hunks: below the hunk above, above the hunk below, or all.
+        assert_eq!(gap_buttons(Some(8), Between), vec![GapButton::All(8)]);
         assert_eq!(
-            gap_buttons(60, true),
+            gap_buttons(Some(60), Between),
+            vec![GapButton::Down(20), GapButton::Up(20), GapButton::All(60)]
+        );
+        // After the last hunk: downward; the size is unknown until the head
+        // blob arrives.
+        assert_eq!(gap_buttons(Some(5), Tail), vec![GapButton::Down(5)]);
+        assert_eq!(
+            gap_buttons(Some(60), Tail),
             vec![GapButton::Down(20), GapButton::All(60)]
         );
-        assert_eq!(gap_buttons(5, true), vec![GapButton::Down(5)]);
+        assert_eq!(
+            gap_buttons(None, Tail),
+            vec![GapButton::Down(20), GapButton::Rest]
+        );
+        assert_eq!(gap_buttons(Some(0), Tail), vec![]);
     }
 
     #[test]
@@ -1653,7 +1812,6 @@ mod tests {
             font_id: egui::TextStyle::Monospace.resolve(&style),
             plain: style.visuals.text_color(),
             strong: style.visuals.strong_text_color(),
-            weak: style.visuals.weak_text_color(),
         }
     }
 
@@ -1746,6 +1904,7 @@ mod tests {
             side: Some(Side::Right),
             subject_type: SubjectType::Line,
             comments: vec![crate::model::thread::ThreadComment {
+                pending: false,
                 database_id: 1,
                 author: "octocat".into(),
                 avatar_url: None,

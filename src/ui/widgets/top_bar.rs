@@ -4,6 +4,8 @@
 
 use eframe::egui::{self, Layout, Popup, PopupCloseBehavior, RichText};
 
+use crate::ui::components::{Btn, BtnKind};
+
 use crate::github::checks::{ci_state, CheckRun, CombinedStatus};
 use crate::model::pr::CiState;
 use crate::state::pr_detail::PrSession;
@@ -44,7 +46,9 @@ pub fn top_bar_vm(session: &PrSession) -> TopBarVm {
         ci,
         runs: session.check_runs.clone(),
         combined: session.combined_status.clone(),
-        pending: session.pending.comments.len(),
+        // The local draft plus the comments in a pending review on GitHub.
+        pending: session.pending.comments.len()
+            + session.threads.iter().filter(|t| t.is_pending()).count(),
     }
 }
 
@@ -63,6 +67,8 @@ pub enum TopBarAction {
     Settings,
     /// Show or hide the details pane (`O`).
     ToggleDetails,
+    /// Open the pull request on GitHub.
+    OpenInBrowser,
 }
 
 /// The bar's window-level state: which theme glyph to show, and whether the
@@ -107,28 +113,42 @@ pub fn render(
         if icons::icon_button(ui, icons::ARROW_LEFT, "Back to list  Esc").clicked() {
             actions.push(TopBarAction::Back);
         }
-        let (icon, label, color) = if vm.draft {
-            (icons::GIT_PULL_REQUEST_DRAFT, "Draft", p.muted)
+        let (icon, label, tone) = if vm.draft {
+            (
+                icons::GIT_PULL_REQUEST_DRAFT,
+                "Draft",
+                crate::ui::components::Tone::Neutral,
+            )
         } else {
-            (icons::GIT_PULL_REQUEST, "Open", p.ok)
+            (
+                icons::GIT_PULL_REQUEST,
+                "Open",
+                crate::ui::components::Tone::Ok,
+            )
         };
-        ui.label(
-            RichText::new(icons::icon_text(icon, label))
-                .color(color)
-                .font(fonts::semibold(11.5)),
-        );
+        crate::ui::components::pill(ui, Some(icon), label, tone);
         if let Some(ci) = vm.ci {
             let (icon, color) = match ci {
                 CiState::Success => (icons::CIRCLE_CHECK, p.ok),
                 CiState::Failure => (icons::CIRCLE_X, p.bad),
                 CiState::Pending => (icons::CIRCLE_DOT_DASHED, p.warn),
             };
-            let button = ui.add(
-                egui::Button::new(RichText::new(icon).color(color))
-                    .fill(egui::Color32::TRANSPARENT),
+            let (rect, button) =
+                ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::click());
+            if button.hovered() {
+                ui.painter().rect_filled(rect, 6.0, p.hover);
+            }
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icon,
+                egui::FontId::proportional(16.0),
+                color,
             );
-            Popup::from_response(&button)
-                .close_behavior(PopupCloseBehavior::CloseOnClick)
+            // A toggle popup: a click opens it, the next click (or a click
+            // anywhere else) closes it. `from_response` alone stays open.
+            Popup::from_toggle_button_response(&button)
+                .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| {
                     ui.set_width(320.0);
                     checks::render(ui, &vm.runs, vm.combined.as_ref());
@@ -148,14 +168,14 @@ pub fn render(
         };
 
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            let review = ui.add(
-                egui::Button::new(
-                    RichText::new(icons::icon_text(icons::SEND, "Review"))
-                        .color(p.accent_ink)
-                        .font(fonts::semibold(12.5)),
-                )
-                .fill(p.accent),
-            );
+            let review = Btn::new(BtnKind::Primary, "Review")
+                .icon(icons::SEND)
+                .show(ui);
+            // The popover is bound to `review_open`; the button is what
+            // flips it (the popover only closes itself on outside clicks).
+            if review.clicked() {
+                *review_open = !*review_open;
+            }
             if vm.pending > 0 {
                 let rect = egui::Rect::from_center_size(
                     review.rect.right_top() + egui::vec2(-4.0, 2.0),
@@ -184,6 +204,9 @@ pub fn render(
             if icons::icon_button(ui, icons::SETTINGS, "Settings").clicked() {
                 actions.push(TopBarAction::Settings);
             }
+            if icons::icon_button(ui, icons::GITHUB, "Open pull request on GitHub").clicked() {
+                actions.push(TopBarAction::OpenInBrowser);
+            }
             let dark = settings.theme.resolve(settings.system_dark) == egui::Theme::Dark;
             let glyph = if dark { icons::SUN } else { icons::MOON };
             if icons::icon_button(ui, glyph, "Theme").clicked() {
@@ -192,7 +215,8 @@ pub fn render(
             if icons::icon_button(ui, icons::REFRESH_CW, "Refresh").clicked() {
                 actions.push(TopBarAction::Refresh);
             }
-            if icons::icon_button(ui, icons::COMMAND, "Commands  ⌘K").clicked() {
+            if icons::icon_button(ui, icons::COMMAND, &icons::key_hint("Commands  ⌘K")).clicked()
+            {
                 actions.push(TopBarAction::Palette);
             }
         });
@@ -202,6 +226,49 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Render the bar once per frame with `open` as the popover state;
+    /// the state's flag records whether the popover content was drawn.
+    fn bar_harness() -> egui_kittest::Harness<'static, (bool, bool)> {
+        let vm = TopBarVm {
+            draft: false,
+            repo: "o/r".into(),
+            number: 7,
+            title: Some("t".into()),
+            ci: None,
+            runs: Vec::new(),
+            combined: None,
+            pending: 0,
+        };
+        egui_kittest::Harness::builder()
+            .with_size([1200.0, 400.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, state: &mut (bool, bool)| {
+                    let settings = TopBarSettings {
+                        theme: theme::Theme::Dark,
+                        system_dark: true,
+                        details_open: false,
+                    };
+                    state.1 = false;
+                    let (open, drawn) = (&mut state.0, &mut state.1);
+                    render(ui, &vm, &settings, open, &mut Vec::new(), |_| *drawn = true);
+                },
+                (false, false),
+            )
+    }
+
+    #[test]
+    fn the_review_button_opens_and_closes_its_popover() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = bar_harness();
+        harness.get_by_label("Review").click();
+        harness.run();
+        assert_eq!(*harness.state(), (true, true), "a click opens the popover");
+        harness.get_by_label("Review").click();
+        harness.run();
+        assert!(!harness.state().0, "a second click closes it");
+    }
 
     #[test]
     fn theme_toggle_flips_the_resolved_theme() {

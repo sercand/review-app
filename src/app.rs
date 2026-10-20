@@ -42,6 +42,7 @@ use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFoot
 use crate::ui::widgets::review_panel::ReviewAction;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
+use crate::ui::widgets::title_bar;
 use crate::ui::widgets::toast::Toasts;
 
 /// The three screens. Settings is a modal window, not a fourth screen.
@@ -212,6 +213,8 @@ pub struct ReviewApp {
     exec: Arc<ExecCtx>,
     worker: Worker,
     events: EventReceiver,
+    /// The macOS menu bar; `None` elsewhere.
+    menu: Option<crate::ui::menu::NativeMenu>,
 }
 
 impl ReviewApp {
@@ -222,25 +225,12 @@ impl ReviewApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         // Plex + JetBrains Mono + the Lucide icon font, before the first frame.
         cc.egui_ctx.set_fonts(crate::ui::fonts::font_definitions());
-        // Register both themed visuals and styles once so `apply_theme`'s
-        // `ctx.set_theme` switches between the mockup's dark and light looks.
-        cc.egui_ctx
-            .set_visuals_of(egui::Theme::Dark, theme::visuals(&theme::DARK, true));
-        cc.egui_ctx
-            .set_visuals_of(egui::Theme::Light, theme::visuals(&theme::LIGHT, false));
-
         let config_dir = config_root();
         let settings = Settings::load_or_default(&config_dir);
-        // The styles carry the user's code font size, so they register once
-        // the settings are in hand (Task 14).
-        cc.egui_ctx.set_style_of(
-            egui::Theme::Dark,
-            theme::style(egui::Style::default(), settings.code_font_size),
-        );
-        cc.egui_ctx.set_style_of(
-            egui::Theme::Light,
-            theme::style(egui::Style::default(), settings.code_font_size),
-        );
+        // Both themes' full styles — visuals inside — so `apply_theme`'s
+        // `ctx.set_theme` switches between the mockup's dark and light looks.
+        // They carry the user's code font size, hence after the settings load.
+        theme::install(&cc.egui_ctx, settings.code_font_size);
         let store: Arc<dyn TokenStore> = Arc::new(KeyringStore);
 
         let restored = match restore_token(store.as_ref(), &settings) {
@@ -303,6 +293,7 @@ impl ReviewApp {
             exec,
             worker,
             events: receiver,
+            menu: crate::ui::menu::NativeMenu::install(&cc.egui_ctx),
         }
     }
 
@@ -604,14 +595,7 @@ impl ReviewApp {
                     self.save_settings(now);
                     // The code font size lives in the styles; re-register
                     // both so the next frame picks it up (Task 14).
-                    ctx.set_style_of(
-                        egui::Theme::Dark,
-                        theme::style(egui::Style::default(), self.settings.code_font_size),
-                    );
-                    ctx.set_style_of(
-                        egui::Theme::Light,
-                        theme::style(egui::Style::default(), self.settings.code_font_size),
-                    );
+                    theme::install(ctx, self.settings.code_font_size);
                     if host_changed {
                         self.exec.clear_client();
                         self.flush_session();
@@ -630,6 +614,15 @@ impl ReviewApp {
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }
         }
+    }
+
+    /// Flip between dark and light from a title bar's theme button, and
+    /// remember the choice.
+    fn toggle_theme(&mut self, ctx: &egui::Context, now: Instant) {
+        let system_dark = ctx.system_theme() == Some(egui::Theme::Dark);
+        self.settings.theme =
+            crate::ui::widgets::top_bar::next_theme(self.settings.theme, system_dark);
+        self.save_settings(now);
     }
 
     /// Apply the theme preference against the OS's current light/dark flag.
@@ -767,6 +760,7 @@ impl ReviewApp {
         let mut msgs = Vec::new();
         let mut actions = Vec::new();
         let wall = crate::ui::widgets::pr_row::now_iso();
+        pr_list::render_title_bar(ui, &mut msgs, &mut actions);
         egui::CentralPanel::default().show(ui, |ui| {
             pr_list::render(
                 ui,
@@ -790,6 +784,8 @@ impl ReviewApp {
                 }
                 PrListAction::Open { repo, number } => self.open_pr(repo, number),
                 PrListAction::Settings => self.open_settings(),
+                PrListAction::Palette => self.palette.open_now(),
+                PrListAction::ToggleTheme => self.toggle_theme(ui.ctx(), now),
             }
         }
     }
@@ -840,6 +836,20 @@ impl ReviewApp {
             }
             _ => None,
         };
+        let mut toggle_theme = false;
+        title_bar::show(ui, "login-title", |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let glyph = if ui.visuals().dark_mode {
+                    crate::ui::icons::SUN
+                } else {
+                    crate::ui::icons::MOON
+                };
+                toggle_theme = crate::ui::icons::icon_button(ui, glyph, "Toggle theme").clicked();
+            });
+        });
+        if toggle_theme {
+            self.toggle_theme(ui.ctx(), now);
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             let vm = login::login_vm(&self.auth_state, &self.settings);
             login::render(ui, &vm, &mut self.login_form, &mut actions, remaining);
@@ -921,13 +931,18 @@ impl ReviewApp {
                     }
                 }
                 PrDetailAction::OpenSettings => self.open_settings(),
-                PrDetailAction::Palette => self.palette.open_now(),
-                PrDetailAction::ToggleTheme => {
-                    let system_dark = ui.ctx().system_theme() == Some(egui::Theme::Dark);
-                    self.settings.theme =
-                        crate::ui::widgets::top_bar::next_theme(self.settings.theme, system_dark);
-                    self.save_settings(now);
+                PrDetailAction::OpenInBrowser => {
+                    if let Some(metadata) = self
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.metadata.as_ref())
+                    {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(metadata.html_url.clone()));
+                    }
                 }
+                PrDetailAction::Palette => self.palette.open_now(),
+                PrDetailAction::ToggleTheme => self.toggle_theme(ui.ctx(), now),
                 PrDetailAction::FileHeader(action) => {
                     self.apply_file_header_action(action, ui.ctx(), now);
                 }
@@ -982,6 +997,24 @@ impl ReviewApp {
                 session.delete_pending(local_id, now);
                 Vec::new()
             }
+            ReviewAction::LocateThread(thread_id) => {
+                let anchor = session
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == thread_id)
+                    .map(|thread| (thread.path.clone(), thread.side, thread.line));
+                if let Some((path, side, line)) = anchor {
+                    if let Some(index) = session.files.iter().position(|l| l.file.path == path) {
+                        session.select_file(index);
+                        let row = side.zip(line).and_then(|(side, line)| {
+                            session.row_model.row_of_line(&session.files, side, line)
+                        });
+                        // A file-level thread sits at the top of the file.
+                        self.pr_detail.diff.scroll_to_row = Some(row.unwrap_or(0));
+                    }
+                }
+                Vec::new()
+            }
             ReviewAction::LocatePending(local_id) => {
                 // Task 12: jump the diff to the comment's anchor.
                 let anchor = session
@@ -1009,6 +1042,15 @@ impl ReviewApp {
                 Vec::new()
             }
             ReviewAction::Discard => {
+                // With a review pending on GitHub, the popover's Discard
+                // throws that one away (after its confirmation row).
+                if session.server_pending.is_some() {
+                    return self.apply_review_action(
+                        ReviewAction::DiscardServerPending,
+                        login,
+                        now,
+                    );
+                }
                 session.discard_pending_review(now);
                 Vec::new()
             }
@@ -1030,6 +1072,17 @@ impl ReviewApp {
                         now,
                     );
                     return Vec::new();
+                }
+                // With a review pending on GitHub, Submit finishes that one
+                // with the verdict and summary picked in the popover.
+                if session.server_pending.is_some() {
+                    let event = session.pending.event;
+                    let body = session.pending.body.clone();
+                    return self.apply_review_action(
+                        ReviewAction::SubmitServerPending(event, body),
+                        login,
+                        now,
+                    );
                 }
                 start_submit(session).into_iter().collect()
             }
@@ -1350,6 +1403,40 @@ impl ReviewApp {
         }
     }
 
+    /// Run a menu bar item: the app-level ones here, the rest through the
+    /// same [`ReviewApp::dispatch`] the shortcuts and the palette use.
+    fn dispatch_menu(&mut self, id: &str, ctx: &egui::Context, now: Instant) {
+        let Some(action) = crate::ui::menu::action_for(id) else {
+            return;
+        };
+        match action {
+            "refresh" => match self.screen {
+                ScreenKind::PrList => self.apply_pr_list(PrListMsg::Refresh, now),
+                ScreenKind::PrDetail => {
+                    if let Some(session) = &mut self.session {
+                        for command in session.refresh() {
+                            self.worker.send(command);
+                        }
+                    }
+                }
+                ScreenKind::Login => {}
+            },
+            "open_github" => {
+                if let Some(metadata) = self.session.as_ref().and_then(|s| s.metadata.as_ref()) {
+                    ctx.open_url(egui::OpenUrl::new_tab(metadata.html_url.clone()));
+                }
+            }
+            "back" => {
+                if self.screen == ScreenKind::PrDetail {
+                    self.close_detail();
+                }
+            }
+            "toggle_theme" => self.toggle_theme(ctx, now),
+            "sign_out" => self.perform_sign_out(now),
+            action => self.dispatch(action, now),
+        }
+    }
+
     /// `Esc`: dismiss the topmost surface, then back out of the detail screen.
     ///
     /// The composer cancel belongs to the detail screen: on the list the
@@ -1424,7 +1511,10 @@ impl ReviewApp {
                     .session
                     .as_ref()
                     .and_then(|session| session.metadata.as_ref())
-                    .map(|metadata| format!("{}/files", metadata.html_url))
+                    .zip(path)
+                    .map(|(metadata, path)| {
+                        crate::ui::widgets::file_header::file_url(&metadata.html_url, &path)
+                    })
                 {
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 }
@@ -1602,8 +1692,16 @@ impl ReviewApp {
 }
 
 impl eframe::App for ReviewApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let now = Instant::now();
+        // The traffic lights belong in the middle of the app's title bar;
+        // full screen hides the title bar, and them, altogether.
+        #[cfg(target_os = "macos")]
+        if title_bar::UNDER_TITLE_BAR && !ui.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+            crate::ui::traffic_lights::center(frame, f64::from(title_bar::TITLE_BAR_H));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = frame;
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
@@ -1617,6 +1715,18 @@ impl eframe::App for ReviewApp {
 
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
+
+        // Menu bar clicks run like shortcuts, before the screens draw.
+        let clicked = match &mut self.menu {
+            Some(menu) => {
+                menu.set_pr_open(self.screen == ScreenKind::PrDetail);
+                menu.drain()
+            }
+            None => Vec::new(),
+        };
+        for id in clicked {
+            self.dispatch_menu(&id, &ctx, now);
+        }
 
         // Global shortcuts run before the screens draw, so a file selected
         // by `j`/`k` is rebuilt and drawn on this very frame.
@@ -1700,7 +1810,13 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            // The app's own title bar shares the window's (mockup
+            // `.titlebar`): content runs under a transparent title bar and
+            // only the traffic lights stay (see `widgets::title_bar`).
+            .with_fullsize_content_view(title_bar::UNDER_TITLE_BAR)
+            .with_titlebar_shown(!title_bar::UNDER_TITLE_BAR)
+            .with_title_shown(!title_bar::UNDER_TITLE_BAR),
         ..Default::default()
     };
 

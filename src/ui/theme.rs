@@ -212,6 +212,8 @@ pub fn visuals(p: &Palette, dark: bool) -> egui::Visuals {
     v.warn_fg_color = p.pending;
     v.error_fg_color = p.bad;
     v.override_text_color = None;
+    // Nested markdown lists indent; the mockup draws no guide line there.
+    v.indent_has_left_vline = false;
     v.widgets.noninteractive.fg_stroke.color = p.text;
     v.window_corner_radius = egui::CornerRadius::same(10);
     v.window_shadow = egui::Shadow {
@@ -241,6 +243,24 @@ pub fn style(mut base: egui::Style, code_font_size: f32) -> egui::Style {
     base.text_styles
         .insert(egui::TextStyle::Heading, egui::FontId::proportional(15.0));
     base
+}
+
+/// One theme's complete style: the mockup spacing and type sizes over that
+/// theme's [`visuals`].
+pub fn themed_style(dark: bool, code_font_size: f32) -> egui::Style {
+    let mut s = style(egui::Style::default(), code_font_size);
+    s.visuals = visuals(palette(dark), dark);
+    s
+}
+
+/// Register the dark and light styles on `ctx`.
+///
+/// `set_style_of` replaces the whole style, visuals included, so the themed
+/// visuals must travel inside it; a separate `set_visuals_of` beforehand
+/// would be overwritten by `egui::Style::default()`'s grey visuals.
+pub fn install(ctx: &egui::Context, code_font_size: f32) {
+    ctx.set_style_of(egui::Theme::Dark, themed_style(true, code_font_size));
+    ctx.set_style_of(egui::Theme::Light, themed_style(false, code_font_size));
 }
 
 #[cfg(test)]
@@ -331,6 +351,20 @@ mod tests {
         assert_eq!(v.selection.bg_fill, DARK.accent_soft);
         assert_eq!(v.hyperlink_color, DARK.accent);
         assert!(!visuals(&LIGHT, false).dark_mode);
+    }
+
+    #[test]
+    fn install_keeps_the_themed_visuals() {
+        let ctx = egui::Context::default();
+        install(&ctx, 14.0);
+        let dark = ctx.style_of(egui::Theme::Dark);
+        assert_eq!(dark.visuals.panel_fill, DARK.bg);
+        assert_eq!(dark.visuals.extreme_bg_color, DARK.bg);
+        assert_eq!(dark.text_styles[&egui::TextStyle::Monospace].size, 14.0);
+        assert_eq!(
+            ctx.style_of(egui::Theme::Light).visuals.panel_fill,
+            LIGHT.bg
+        );
     }
 
     #[test]

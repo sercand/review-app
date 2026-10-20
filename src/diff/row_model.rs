@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 
-use crate::github::files::LoadedFile;
+use crate::github::files::{FileStatus, LoadedFile};
 use crate::model::diff::{DiffMode, DiffRow, LineKind};
 
 /// The default height of a file header row.
@@ -251,6 +251,9 @@ pub fn build_one(files: &[LoadedFile], selected: Option<usize>, mode: DiffMode) 
     if let Some(file_idx) = selected.filter(|i| *i < files.len()) {
         let start = model.rows.len();
         push_file(&mut model, file_idx as u32, &files[file_idx], mode);
+        // The file header bar above the table names the file; its row stays
+        // only as the annotate anchor, so it takes no height.
+        model.set_height(start, 0.0);
         model.file_ranges[file_idx] = start..model.rows.len();
     }
 
@@ -299,6 +302,18 @@ fn push_file(model: &mut RowModel, file: u32, loaded: &LoadedFile, mode: DiffMod
                         }
                     }
                 }
+            }
+            // The tail bar: expands the rest of the file after the last
+            // hunk. An added or removed file has no rest to show.
+            let whole_file = matches!(loaded.file.status, FileStatus::Added | FileStatus::Removed);
+            if !diff.hunks.is_empty() && !whole_file {
+                model.push(
+                    RowRef::HunkHeader {
+                        file,
+                        hunk: diff.hunks.len() as u32,
+                    },
+                    HUNK_H,
+                );
             }
         }
     }
@@ -460,7 +475,8 @@ mod tests {
                 RowRef::HunkHeader { file: 0, hunk: 0 }
             ]
         );
-        assert_eq!(m.file_ranges[0], 0..5); // header + hunk bar + 3 lines
+        assert_eq!(m.file_ranges[0], 0..6); // header + hunk bar + 3 lines + tail bar
+        assert_eq!(m.rows[5], RowRef::HunkHeader { file: 0, hunk: 1 });
         assert_eq!(
             m.rows[m.file_ranges[1].start + 1],
             RowRef::Placeholder { file: 1 }

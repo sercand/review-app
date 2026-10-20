@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    Master app icon. scripts/macos/make-icon.sh renders it into AppIcon.icns.
+    Layout follows the macOS icon grid: an 824x824 body centred on a 1024
+    canvas, leaving room for the drop shadow. Colours come from the dark
+    palette in src/ui/theme.rs.
+  -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a303b"/>
+      <stop offset="1" stop-color="#16191f"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="bubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9bbcff"/>
+      <stop offset="1" stop-color="#5f86e8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+    <filter id="lift" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="sheet-clip">
+      <rect x="232" y="232" width="500" height="560" rx="44"/>
+    </clipPath>
+  </defs>
+
+  <!-- Body -->
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)"/>
+  </g>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="183.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+
+  <!-- Diff sheet -->
+  <g filter="url(#lift)">
+    <rect x="232" y="232" width="500" height="560" rx="44" fill="#20242c"/>
+  </g>
+  <g clip-path="url(#sheet-clip)">
+    <!-- header strip -->
+    <rect x="232" y="232" width="500" height="76" fill="#282d37"/>
+    <circle cx="280" cy="270" r="11" fill="#646c7a"/>
+    <rect x="308" y="261" width="170" height="18" rx="9" fill="#646c7a"/>
+
+    <!-- context line -->
+    <rect x="276" y="350" width="44" height="18" rx="9" fill="#33394a"/>
+    <rect x="340" y="350" width="250" height="18" rx="9" fill="#646c7a"/>
+
+    <!-- deleted line -->
+    <rect x="232" y="396" width="500" height="68" fill="#f0605a" fill-opacity="0.18"/>
+    <rect x="232" y="396" width="10" height="68" fill="#f0605a"/>
+    <rect x="276" y="426" width="26" height="8" rx="4" fill="#f0605a"/>
+    <rect x="340" y="421" width="300" height="18" rx="9" fill="#f0605a" fill-opacity="0.75"/>
+
+    <!-- added lines -->
+    <rect x="232" y="464" width="500" height="136" fill="#4ac26b" fill-opacity="0.18"/>
+    <rect x="232" y="464" width="10" height="136" fill="#4ac26b"/>
+    <rect x="276" y="490" width="26" height="8" rx="4" fill="#4ac26b"/>
+    <rect x="285" y="481" width="8" height="26" rx="4" fill="#4ac26b"/>
+    <rect x="340" y="485" width="230" height="18" rx="9" fill="#4ac26b" fill-opacity="0.85"/>
+    <rect x="276" y="558" width="26" height="8" rx="4" fill="#4ac26b"/>
+    <rect x="285" y="549" width="8" height="26" rx="4" fill="#4ac26b"/>
+    <rect x="340" y="553" width="320" height="18" rx="9" fill="#4ac26b" fill-opacity="0.85"/>
+
+    <!-- context lines -->
+    <rect x="276" y="642" width="44" height="18" rx="9" fill="#33394a"/>
+    <rect x="340" y="642" width="200" height="18" rx="9" fill="#646c7a"/>
+    <rect x="276" y="700" width="44" height="18" rx="9" fill="#33394a"/>
+    <rect x="340" y="700" width="140" height="18" rx="9" fill="#646c7a"/>
+  </g>
+  <rect x="233.5" y="233.5" width="497" height="557" rx="42.5" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
+
+  <!-- Review bubble with approval check -->
+  <g filter="url(#lift)">
+    <path d="M 610 548
+             H 798 A 60 60 0 0 1 858 608
+             V 728 A 60 60 0 0 1 798 788
+             H 700 L 640 840 L 648 788
+             H 610 A 60 60 0 0 1 550 728
+             V 608 A 60 60 0 0 1 610 548 Z"
+          fill="url(#bubble)"/>
+  </g>
+  <path d="M 640 670 L 685 714 L 770 626"
+        fill="none" stroke="#0f1830" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

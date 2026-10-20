@@ -39,6 +39,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
               author { login avatarUrl }
               body
               createdAt
+              state
             }
           }
         }
@@ -61,6 +62,7 @@ query($id: ID!, $after: String) {
           author { login avatarUrl }
           body
           createdAt
+          state
         }
       }
     }
@@ -264,10 +266,11 @@ fn parse_comments_connection(connection: &Value) -> (Vec<ThreadComment>, PageInf
 
 /// Parse one comment node; one without a `databaseId` cannot be replied to
 /// or anchored to and is skipped.
-fn parse_comment(node: &Value) -> Option<ThreadComment> {
+pub(crate) fn parse_comment(node: &Value) -> Option<ThreadComment> {
     let database_id = node.get("databaseId")?.as_u64()?;
     let author = node.get("author");
     Some(ThreadComment {
+        pending: node.get("state").and_then(Value::as_str) == Some("PENDING"),
         database_id,
         author: author
             .and_then(|author| author.get("login"))
@@ -310,6 +313,18 @@ mod tests {
     use super::*;
     use crate::fixture;
     use crate::model::diff::Side;
+
+    #[test]
+    fn a_comment_in_the_viewers_pending_review_is_pending() {
+        let node = |state: &str| {
+            serde_json::json!({
+                "databaseId": 7, "author": { "login": "me" }, "body": "b",
+                "createdAt": "2026-10-16T00:00:00Z", "state": state
+            })
+        };
+        assert!(parse_comment(&node("PENDING")).unwrap().pending);
+        assert!(!parse_comment(&node("SUBMITTED")).unwrap().pending);
+    }
 
     #[test]
     fn parses_resolved_outdated_and_file_level_threads() {

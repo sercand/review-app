@@ -112,6 +112,18 @@ pub enum Command {
         /// events so the pending bubble can be replaced or rolled back.
         optimistic_id: u64,
     },
+    /// Add a comment to the viewer's pending review on GitHub, line or file.
+    AddToServerReview {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The pending review's GraphQL node id.
+        review_id: String,
+        /// The comment to add.
+        comment: NewComment,
+        /// The UI's local id for the optimistic bubble, echoed by the result
+        /// events exactly as [`Command::PostComment`] does.
+        optimistic_id: u64,
+    },
     /// Reply to a review thread's root comment (spec §7.4).
     ReplyToThread {
         /// The session that opened the PR.
@@ -810,6 +822,35 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             // A mutation: sent once, never retried; the optimistic bubble in
             // the UI is replaced or rolled back by these two events.
             match client.post_review_comment(&repo, number, &comment).await {
+                Ok(comment) => events.send(Event::CommentPosted {
+                    session,
+                    optimistic_id,
+                    comment,
+                }),
+                Err(error) => events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id,
+                    error,
+                }),
+            }
+        }
+        Command::AddToServerReview {
+            session,
+            review_id,
+            comment,
+            optimistic_id,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::CommentFailed {
+                    session,
+                    optimistic_id,
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+            // A mutation, sent once; the same two events as an immediate
+            // post replace or roll back the optimistic bubble.
+            match client.add_review_thread(&review_id, &comment).await {
                 Ok(comment) => events.send(Event::CommentPosted {
                     session,
                     optimistic_id,

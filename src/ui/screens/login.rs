@@ -271,42 +271,31 @@ pub fn render(
 /// enterprise fields underneath while the latter is active.
 fn host_section(ui: &mut egui::Ui, form: &mut LoginForm, actions: &mut Vec<LoginAction>) {
     let pal = theme::palette_of(ui);
-    ui.label(RichText::new("Host").size(11.0).color(pal.faint));
-    let seg_w = (ui.available_width() - 4.0) / 2.0;
-    let github = segment(
+    ui.label(RichText::new("Host").size(12.0).color(pal.muted));
+    let picked = crate::ui::components::segmented(
         ui,
-        seg_w,
-        icons::GITHUB,
-        "github.com",
-        !form.enterprise,
-        pal,
-    );
-    ui.add_space(0.0);
-    let enterprise = segment(
-        ui,
-        seg_w,
-        icons::BUILDING_2,
-        "Enterprise Server",
         form.enterprise,
-        pal,
+        &[
+            crate::ui::components::Seg::icon_text(false, icons::GITHUB, "github.com"),
+            crate::ui::components::Seg::icon_text(true, icons::BUILDING_2, "Enterprise Server"),
+        ],
     );
-    if github.clicked() && form.enterprise {
+    if picked == Some(false) && form.enterprise {
         form.enterprise = false;
         form.host_input = "github.com".to_owned();
         actions.push(LoginAction::SetHost("github.com".to_owned()));
     }
-    if enterprise.clicked() && !form.enterprise {
+    if picked == Some(true) && !form.enterprise {
         form.enterprise = true;
     }
 
     if form.enterprise {
         ui.add_space(8.0);
         field_label(ui, "Host name");
-        let host = ui.add(
-            egui::TextEdit::singleline(&mut form.host_input)
-                .hint_text("ghe.acme.io")
-                .desired_width(ui.available_width()),
-        );
+        let host = crate::ui::components::Field::new(&mut form.host_input)
+            .icon(icons::GLOBE)
+            .hint("github.acme.corp")
+            .show(ui);
         let entered = host.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if (host.lost_focus() || entered) && !form.host_input.trim().is_empty() {
             let host = form.host_input.trim().to_owned();
@@ -315,11 +304,10 @@ fn host_section(ui: &mut egui::Ui, form: &mut LoginForm, actions: &mut Vec<Login
             }
         }
         field_label(ui, "OAuth client ID");
-        let client = ui.add(
-            egui::TextEdit::singleline(&mut form.client_id_input)
-                .hint_text("Iv1.xxxxxxxxxxxxxxxx")
-                .desired_width(ui.available_width()),
-        );
+        let client = crate::ui::components::Field::new(&mut form.client_id_input)
+            .icon(icons::KEY_ROUND)
+            .hint("Iv1.…")
+            .show(ui);
         if client.lost_focus() && !form.client_id_input.trim().is_empty() {
             actions.push(LoginAction::SetClientId(
                 form.client_id_input.trim().to_owned(),
@@ -335,28 +323,6 @@ fn host_section(ui: &mut egui::Ui, form: &mut LoginForm, actions: &mut Vec<Login
             .color(pal.pending),
         );
     }
-}
-
-/// One half of the host segment control.
-fn segment(
-    ui: &mut egui::Ui,
-    width: f32,
-    icon: char,
-    label: &str,
-    on: bool,
-    pal: &'static theme::Palette,
-) -> egui::Response {
-    ui.add_sized(
-        [width, 28.0],
-        egui::Button::new(
-            RichText::new(format!("{icon} {label}"))
-                .size(12.0)
-                .color(if on { pal.accent } else { pal.muted }),
-        )
-        .fill(if on { pal.accent_soft } else { pal.raised })
-        .stroke(Stroke::new(1.0, if on { pal.accent } else { pal.line }))
-        .corner_radius(6.0),
-    )
 }
 
 /// The two underline tabs.
@@ -504,12 +470,11 @@ fn code_boxes(ui: &mut egui::Ui, user_code: &str) {
 /// The personal-access-token tab.
 fn pat_tab(ui: &mut egui::Ui, vm: &LoginVm, form: &mut LoginForm, actions: &mut Vec<LoginAction>) {
     let pal = theme::palette_of(ui);
-    let field = ui.add_sized(
-        [ui.available_width(), 28.0],
-        egui::TextEdit::singleline(&mut form.pat_input)
-            .password(true)
-            .hint_text("ghp_… or github_pat_…"),
-    );
+    let field = crate::ui::components::Field::new(&mut form.pat_input)
+        .icon(icons::KEY_ROUND)
+        .hint("ghp_… or github_pat_…")
+        .password(true)
+        .show(ui);
     let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     if entered && !form.pat_input.trim().is_empty() {
         actions.push(LoginAction::SubmitPat(form.pat_input.trim().to_owned()));

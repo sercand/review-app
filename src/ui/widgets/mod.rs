@@ -15,5 +15,6 @@ pub mod pr_row;
 pub mod review_panel;
 pub mod settings_window;
 pub mod thread_view;
+pub mod title_bar;
 pub mod toast;
 pub mod top_bar;

@@ -14,12 +14,15 @@ use eframe::egui::{self, RichText, Sense};
 
 use crate::github::reviews::{Review, ReviewState};
 use crate::model::review::{PendingReview, ReviewEvent};
+use crate::model::thread::ReviewThread;
 use crate::ui::widgets::markdown::{self, MarkdownDoc};
 use crate::ui::{file_icons, icons, theme};
 
-/// The blocked-reason shown while the viewer has a pending review on the
-/// server (Review Focus #6): it must be submitted or discarded there first.
-const SERVER_PENDING_REASON: &str = "Submit or discard your pending review from GitHub first";
+/// The note shown while the viewer has a pending review on GitHub *and*
+/// comments in the local draft (Review Focus #6): the popover finishes the
+/// GitHub review, and the local comments can only go out after it.
+const LOCAL_DRAFT_WAITS: &str =
+    "Your local draft comments go out after this GitHub review is finished";
 
 /// Everything [`review_panel_vm`] reads; kept flat so the rules are testable
 /// without a session.
@@ -36,6 +39,24 @@ pub struct PanelInputs<'a> {
     /// Why a rate limit blocks writes right now, when one does (spec §13):
     /// the label doubles as the Submit tooltip.
     pub write_blocked: Option<String>,
+    /// The PR's review threads; the pending ones are the GitHub review's
+    /// comments.
+    pub threads: &'a [ReviewThread],
+}
+
+/// One comment of the viewer's pending review on GitHub, for the popover.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GithubItemVm {
+    /// The thread the click jumps to.
+    pub thread_id: String,
+    /// The full path, for the file icon.
+    pub path: String,
+    /// The file's name only.
+    pub name: String,
+    /// `"R12"`, `"L3"`, or `"File"` for a file-level comment.
+    pub line: String,
+    /// The body's first line, cut to 60 characters with an ellipsis.
+    pub excerpt: String,
 }
 
 /// What the panel may offer this frame.
@@ -55,6 +76,11 @@ pub struct ReviewPanelVm {
     /// The rate-limit tooltip on the disabled Submit, when writes are
     /// blocked (spec §13).
     pub write_blocked: Option<String>,
+    /// Whether Submit and Discard act on the viewer's pending review on
+    /// GitHub rather than the local draft.
+    pub github: bool,
+    /// The GitHub review's comments.
+    pub github_items: Vec<GithubItemVm>,
 }
 
 /// Decide what the panel may offer (spec §7.2, Review Focus #6 and #7).
@@ -65,13 +91,22 @@ pub struct ReviewPanelVm {
 /// rate limit blocks every write until its reset (spec §13).
 pub fn review_panel_vm(i: &PanelInputs) -> ReviewPanelVm {
     let has_body = !i.pending.body.trim().is_empty();
+    let github = i.server_pending;
+    let github_items = github_items(i.threads);
+    // With a review pending on GitHub, Submit finishes that one: its
+    // comments are what a COMMENT needs, not the local draft's.
+    let has_comments = if github {
+        !github_items.is_empty()
+    } else {
+        !i.pending.comments.is_empty()
+    };
     let event_ok = match i.pending.event {
         ReviewEvent::Approve => true,
         ReviewEvent::RequestChanges => has_body,
-        ReviewEvent::Comment => has_body || !i.pending.comments.is_empty(),
+        ReviewEvent::Comment => has_body || has_comments,
     };
-    let blocked_reason = if i.server_pending {
-        Some(SERVER_PENDING_REASON)
+    let blocked_reason = if github && !i.pending.comments.is_empty() {
+        Some(LOCAL_DRAFT_WAITS)
     } else {
         None
     };
@@ -83,11 +118,61 @@ pub fn review_panel_vm(i: &PanelInputs) -> ReviewPanelVm {
         pending_count: i.pending.comments.len(),
         can_approve: !i.viewer_is_author,
         can_request_changes: !i.viewer_is_author,
-        submit_enabled: blocked_reason.is_none() && event_ok && i.write_blocked.is_none(),
+        submit_enabled: event_ok && i.write_blocked.is_none(),
         blocked_reason,
         banner,
         write_blocked: i.write_blocked.clone(),
+        github,
+        github_items,
     }
+}
+
+/// The pending comments of the viewer's GitHub review, one per thread.
+fn github_items(threads: &[ReviewThread]) -> Vec<GithubItemVm> {
+    threads
+        .iter()
+        .filter(|thread| thread.is_pending())
+        .map(|thread| GithubItemVm {
+            thread_id: thread.id.clone(),
+            path: thread.path.clone(),
+            name: thread
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            line: match (thread.side, thread.line) {
+                (Some(crate::model::diff::Side::Left), Some(line)) => format!("L{line}"),
+                (_, Some(line)) => format!("R{line}"),
+                _ => "File".to_owned(),
+            },
+            excerpt: excerpt(thread.comments.first().map_or("", |c| c.body.as_str())),
+        })
+        .collect()
+}
+
+/// A body's first line, cut to 60 characters with an ellipsis.
+fn excerpt(body: &str) -> String {
+    let first = body.lines().next().unwrap_or_default();
+    if first.chars().count() > 60 {
+        format!("{}…", first.chars().take(60).collect::<String>())
+    } else {
+        first.to_owned()
+    }
+}
+
+/// Whether a popover action is the end of the reviewer's business with it:
+/// the review was sent or thrown away, or they jumped to a comment.
+pub fn closes_popover(action: &ReviewAction) -> bool {
+    matches!(
+        action,
+        ReviewAction::Submit
+            | ReviewAction::Discard
+            | ReviewAction::SubmitServerPending(..)
+            | ReviewAction::DiscardServerPending
+            | ReviewAction::LocatePending(_)
+            | ReviewAction::LocateThread(_)
+    )
 }
 
 /// One submitted review, ready to draw.
@@ -138,6 +223,9 @@ pub enum ReviewAction {
     SubmitServerPending(ReviewEvent, String),
     /// Discard the server-side pending review.
     DiscardServerPending,
+    /// Jump to a comment of the viewer's pending review on GitHub, by
+    /// thread id.
+    LocateThread(String),
 }
 
 /// One pending comment as the popover lists it (Task 12).
@@ -199,70 +287,35 @@ fn discard_confirm_id() -> egui::Id {
 /// The server-side pending review banner (Task 12): the REST list does not
 /// expose the verdict the reviewer picked in the web UI, so the banner asks
 /// for it explicitly (defaulting to Comment) before Submit it or Discard it.
-pub fn render_server_pending_banner(
-    ui: &mut egui::Ui,
-    vm: &ReviewPanelVm,
-    actions: &mut Vec<ReviewAction>,
-) {
-    let Some(reason) = vm.blocked_reason else {
-        return;
-    };
+pub fn render_server_pending_banner(ui: &mut egui::Ui, vm: &ReviewPanelVm) -> bool {
+    if !vm.github {
+        return false;
+    }
     let p = theme::palette_of(ui);
+    let mut open = false;
     banner_frame(ui, |ui| {
-        ui.colored_label(p.pending, reason);
-        let mut choice = server_pending_choice(ui);
         ui.horizontal(|ui| {
-            ui.label("Submit as:");
-            for (label, event, allowed, hover) in [
-                ("Comment", ReviewEvent::Comment, true, ""),
-                (
-                    "Approve",
-                    ReviewEvent::Approve,
-                    vm.can_approve,
-                    "you are the pull request's author",
+            ui.colored_label(
+                p.pending,
+                format!(
+                    "{} You have a review pending on GitHub with {} comment{}. New comments join it.",
+                    icons::MESSAGE_SQUARE_DASHED,
+                    vm.github_items.len(),
+                    if vm.github_items.len() == 1 { "" } else { "s" }
                 ),
-                (
-                    "Request changes",
-                    ReviewEvent::RequestChanges,
-                    vm.can_request_changes,
-                    "you are the pull request's author",
-                ),
-            ] {
-                let response = ui.add_enabled(
-                    allowed,
-                    egui::Button::selectable(choice.event == event, label),
-                );
-                if response.clicked() {
-                    choice.event = event;
-                    set_server_pending_choice(ui, choice.clone());
-                }
-                if !allowed {
-                    response.on_hover_text(hover);
-                }
-            }
-        });
-        let choice_body = ui.add(
-            egui::TextEdit::multiline(&mut choice.body)
-                .hint_text("Review summary (optional)")
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
-        if choice_body.changed() {
-            set_server_pending_choice(ui, choice.clone());
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Submit it").clicked() {
-                actions.push(server_pending_submit(
-                    choice.event,
-                    choice.body.clone(),
-                    !vm.can_approve,
-                ));
-            }
-            if ui.button("Discard it").clicked() {
-                actions.push(ReviewAction::DiscardServerPending);
-            }
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                open = crate::ui::components::Btn::new(
+                    crate::ui::components::BtnKind::Default,
+                    "Finish review",
+                )
+                .icon(icons::SEND)
+                .show(ui)
+                .clicked();
+            });
         });
     });
+    open
 }
 
 /// The full-width banner strip style (redesign Task 12): `pending_soft`
@@ -295,6 +348,16 @@ pub fn render(
     let p = theme::palette_of(ui);
     ui.set_width(380.0);
     ui.strong("Finish your review");
+    if vm.github {
+        ui.colored_label(
+            p.muted,
+            format!(
+                "Started on GitHub, {} comment{}",
+                vm.github_items.len(),
+                if vm.github_items.len() == 1 { "" } else { "s" }
+            ),
+        );
+    }
 
     let body_response = ui.add(
         egui::TextEdit::multiline(&mut pending.body)
@@ -376,6 +439,34 @@ pub fn render(
         }
     }
 
+    if !vm.github_items.is_empty() {
+        ui.label(format!("{} comments on GitHub", vm.github_items.len()));
+        for item in &vm.github_items {
+            let frame = egui::Frame::new()
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(6, 2));
+            let row = frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    file_icons::file_icon(ui, &item.path);
+                    ui.label(item.name.clone());
+                    ui.colored_label(p.faint, item.line.clone());
+                    ui.colored_label(p.muted, item.excerpt.clone());
+                });
+            });
+            let response = ui.interact(
+                row.response.rect,
+                ui.make_persistent_id(("github-item", item.thread_id.as_str())),
+                Sense::click(),
+            );
+            if response.clicked() {
+                actions.push(ReviewAction::LocateThread(item.thread_id.clone()));
+            }
+        }
+    }
+    if let Some(reason) = vm.blocked_reason {
+        ui.colored_label(p.pending, reason);
+    }
+
     if vm.pending_count > 0 {
         ui.label(format!("{} pending comments", vm.pending_count));
         for item in pending_items(pending) {
@@ -404,7 +495,11 @@ pub fn render(
     ui.separator();
     if confirm_discard(ui) {
         ui.horizontal(|ui| {
-            ui.label("Discard the whole review?");
+            ui.label(if vm.github {
+                "Discard your pending review on GitHub?"
+            } else {
+                "Discard the whole review?"
+            });
             if ui.button("Yes, discard").clicked() {
                 actions.push(ReviewAction::Discard);
                 set_confirm_discard(ui, false);
@@ -432,7 +527,7 @@ pub fn render(
                     "a comment needs a body or a comment, request changes needs a body",
                 ),
             };
-            ui.label(RichText::new("⌘↵").color(p.faint));
+            ui.label(RichText::new(crate::ui::icons::key_hint("⌘↵")).color(p.faint));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let discard =
                     ui.add(egui::Button::new(RichText::new("Discard").color(p.bad)).frame(false));
@@ -470,46 +565,6 @@ fn set_confirm_discard(ui: &egui::Ui, on: bool) {
     ui.ctx().data_mut(|data| data.insert_temp(id, on));
 }
 
-/// The memory key holding the server-pending banner's verdict picker.
-fn server_pending_choice_id() -> egui::Id {
-    egui::Id::unique("review-panel-server-pending-choice")
-}
-
-/// The server-pending banner's picker state: the verdict and body its Submit
-/// button reports. The REST list does not expose the verdict the reviewer
-/// picked in the web UI, so the banner starts at `Comment` and lets the
-/// reviewer restate their choice explicitly.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct ServerPendingChoice {
-    event: ReviewEvent,
-    body: String,
-}
-
-/// The picker state between frames.
-fn server_pending_choice(ui: &egui::Ui) -> ServerPendingChoice {
-    ui.ctx()
-        .data(|data| data.get_temp::<ServerPendingChoice>(server_pending_choice_id()))
-        .unwrap_or_default()
-}
-
-/// Store the picker state between frames.
-fn set_server_pending_choice(ui: &egui::Ui, choice: ServerPendingChoice) {
-    ui.ctx()
-        .data_mut(|data| data.insert_temp(server_pending_choice_id(), choice));
-}
-
-/// The action the banner's Submit button reports for the chosen verdict and
-/// body. The PR author may not approve or request changes, so a stale pick
-/// (the state lives in memory across pull requests) falls back to `Comment`.
-fn server_pending_submit(event: ReviewEvent, body: String, viewer_is_author: bool) -> ReviewAction {
-    let event = match event {
-        ReviewEvent::Comment => ReviewEvent::Comment,
-        _ if viewer_is_author => ReviewEvent::Comment,
-        event => event,
-    };
-    ReviewAction::SubmitServerPending(event, body)
-}
-
 /// Whether the `Ctrl`/`⌘`+Enter submit shortcut may fire: only while keyboard
 /// focus is on a widget the panel owns (`focused` is one of `owned`), so no
 /// text field elsewhere on the screen can trigger an accidental submit.
@@ -529,7 +584,76 @@ mod tests {
             server_pending: false,
             head_moved_since_pin: false,
             write_blocked: None,
+            threads: &[],
         }
+    }
+
+    /// A pending file comment in the viewer's GitHub review.
+    fn github_pending_thread() -> ReviewThread {
+        ReviewThread {
+            id: "PRRT_1".into(),
+            is_resolved: false,
+            is_outdated: false,
+            path: "Assets/README.md".into(),
+            line: None,
+            start_line: None,
+            side: None,
+            subject_type: crate::model::thread::SubjectType::File,
+            comments: vec![crate::model::thread::ThreadComment {
+                database_id: 1,
+                author: "me".into(),
+                avatar_url: None,
+                body: "move this to under plugins".into(),
+                created_at: String::new(),
+                pending: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_review_pending_on_github_is_finished_from_the_popover() {
+        let p = PendingReview::default();
+        let threads = [github_pending_thread()];
+        let vm = review_panel_vm(&PanelInputs {
+            server_pending: true,
+            threads: &threads,
+            ..inputs(&p)
+        });
+        assert!(vm.github, "the popover acts on the GitHub review");
+        assert!(vm.blocked_reason.is_none());
+        assert!(
+            vm.submit_enabled,
+            "COMMENT with a GitHub comment needs no summary"
+        );
+        assert_eq!(vm.github_items.len(), 1);
+        assert_eq!(vm.github_items[0].thread_id, "PRRT_1");
+        assert_eq!(vm.github_items[0].line, "File");
+
+        let mut changes = PendingReview::default();
+        changes.set_event(ReviewEvent::RequestChanges);
+        let vm = review_panel_vm(&PanelInputs {
+            server_pending: true,
+            threads: &threads,
+            ..inputs(&changes)
+        });
+        assert!(!vm.submit_enabled, "REQUEST_CHANGES still needs a summary");
+    }
+
+    #[test]
+    fn finishing_or_jumping_closes_the_popover() {
+        assert!(closes_popover(&ReviewAction::Submit));
+        assert!(closes_popover(&ReviewAction::Discard));
+        assert!(closes_popover(&ReviewAction::SubmitServerPending(
+            ReviewEvent::Comment,
+            String::new()
+        )));
+        assert!(closes_popover(&ReviewAction::DiscardServerPending));
+        assert!(closes_popover(&ReviewAction::LocatePending(1)));
+        assert!(closes_popover(&ReviewAction::LocateThread("PRRT_1".into())));
+        assert!(!closes_popover(&ReviewAction::SetBody("x".into())));
+        assert!(!closes_popover(&ReviewAction::SetEvent(
+            ReviewEvent::Approve
+        )));
     }
 
     #[test]
@@ -560,14 +684,16 @@ mod tests {
     }
 
     #[test]
-    fn server_pending_review_blocks_local_submit() {
+    fn local_draft_comments_wait_while_a_github_review_is_open() {
         let mut p = PendingReview::default();
         p.add(line_anchor("a.rs", 1), "x".into(), "sha1").unwrap();
         let vm = review_panel_vm(&PanelInputs {
             server_pending: true,
             ..inputs(&p)
         });
-        assert!(!vm.submit_enabled && vm.blocked_reason.is_some());
+        // The GitHub review is what Submit finishes; the local draft cannot
+        // ride along, and the popover says so.
+        assert!(vm.github && vm.blocked_reason.is_some());
     }
 
     #[test]
@@ -613,6 +739,7 @@ mod tests {
     fn reviews_vm_excludes_pending() {
         let review = |state| Review {
             id: 1,
+            node_id: String::new(),
             author: "me".into(),
             state,
             body: String::new(),
@@ -642,11 +769,13 @@ mod tests {
             ..inputs(&p)
         });
         let mut actions = Vec::new();
+        let mut opened = false;
         egui::__run_test_ui(|ui| {
-            render_server_pending_banner(ui, &vm, &mut actions);
+            opened |= render_server_pending_banner(ui, &vm);
             render(ui, &vm, &mut p, &mut actions);
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
+        assert!(!opened, "an untouched banner opens nothing");
     }
 
     #[test]
@@ -665,44 +794,6 @@ mod tests {
         assert_eq!(items[0].line, "R99");
         assert_eq!(items[0].excerpt.chars().count(), 61);
         assert!(items[0].excerpt.ends_with('…'));
-    }
-
-    #[test]
-    fn server_pending_submit_carries_the_chosen_verdict() {
-        assert_eq!(
-            server_pending_submit(ReviewEvent::Comment, String::new(), false),
-            ReviewAction::SubmitServerPending(ReviewEvent::Comment, String::new())
-        );
-        assert_eq!(
-            server_pending_submit(ReviewEvent::Approve, "lgtm".into(), false),
-            ReviewAction::SubmitServerPending(ReviewEvent::Approve, "lgtm".into())
-        );
-        assert_eq!(
-            server_pending_submit(ReviewEvent::RequestChanges, "fix this".into(), false),
-            ReviewAction::SubmitServerPending(ReviewEvent::RequestChanges, "fix this".into())
-        );
-        assert_eq!(
-            ServerPendingChoice::default(),
-            ServerPendingChoice {
-                event: ReviewEvent::Comment,
-                body: String::new(),
-            },
-            "the picker defaults to Comment"
-        );
-    }
-
-    #[test]
-    fn server_pending_submit_falls_back_to_comment_for_the_author() {
-        // A stale Approve pick (kept in memory across pull requests) must
-        // never submit on a PR the viewer authored.
-        assert_eq!(
-            server_pending_submit(ReviewEvent::Approve, String::new(), true),
-            ReviewAction::SubmitServerPending(ReviewEvent::Comment, String::new())
-        );
-        assert_eq!(
-            server_pending_submit(ReviewEvent::RequestChanges, "x".into(), true),
-            ReviewAction::SubmitServerPending(ReviewEvent::Comment, "x".into())
-        );
     }
 
     #[test]

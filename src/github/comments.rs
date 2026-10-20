@@ -52,6 +52,52 @@ pub fn comment_payload(c: &NewComment) -> Value {
     payload
 }
 
+/// The mutation that adds a comment to the viewer's pending review on
+/// GitHub, as a new thread. Unlike the REST review endpoint it takes
+/// file-level comments too, which is how the web UI keeps those pending.
+pub const ADD_REVIEW_THREAD_MUTATION: &str = r#"
+mutation($reviewId: ID!, $path: String!, $body: String!, $line: Int, $side: DiffSide,
+         $startLine: Int, $startSide: DiffSide,
+         $subjectType: PullRequestReviewThreadSubjectType) {
+  addPullRequestReviewThread(input: {
+    pullRequestReviewId: $reviewId, path: $path, body: $body, line: $line, side: $side,
+    startLine: $startLine, startSide: $startSide, subjectType: $subjectType
+  }) {
+    thread {
+      comments(first: 1) {
+        nodes { databaseId author { login avatarUrl } body createdAt state }
+      }
+    }
+  }
+}
+"#;
+
+/// The variables for [`ADD_REVIEW_THREAD_MUTATION`]: the same anchor the
+/// REST payload carries (spec §7.3), in GraphQL's names. A file target sends
+/// `subjectType: FILE` and no coordinates.
+pub fn review_thread_vars(review_id: &str, c: &NewComment) -> Value {
+    let mut vars = json!({ "reviewId": review_id, "body": c.body });
+    match &c.target {
+        CommentTarget::Line(anchor) => {
+            vars["path"] = json!(anchor.path);
+            vars["line"] = json!(anchor.line);
+            vars["side"] = json!(anchor.side);
+            vars["subjectType"] = json!("LINE");
+            if let Some(start_line) = anchor.start_line {
+                vars["startLine"] = json!(start_line);
+            }
+            if let Some(start_side) = anchor.start_side {
+                vars["startSide"] = json!(start_side);
+            }
+        }
+        CommentTarget::File { path } => {
+            vars["path"] = json!(path);
+            vars["subjectType"] = json!("FILE");
+        }
+    }
+    vars
+}
+
 /// Parse a REST comment body (as returned by the create and reply endpoints)
 /// into a [`ThreadComment`]; the REST `id` becomes `database_id`.
 pub fn comment_from_rest(v: &Value) -> Result<ThreadComment, GhError> {
@@ -61,6 +107,7 @@ pub fn comment_from_rest(v: &Value) -> Result<ThreadComment, GhError> {
         .ok_or_else(|| GhError::Decode("comment: missing id".to_owned()))?;
     let user = v.get("user");
     Ok(ThreadComment {
+        pending: false,
         database_id,
         author: user
             .and_then(|user| user.get("login"))
@@ -105,6 +152,25 @@ impl GithubClient {
             .await?;
         let body = response.json::<Value>().await.map_err(decode)?;
         comment_from_rest(&body)
+    }
+
+    /// Add a comment to the viewer's pending review on GitHub (node id
+    /// `review_id`), returning it as GitHub created it — still pending.
+    ///
+    /// A mutation: sent once through the non-retrying GraphQL transport.
+    pub async fn add_review_thread(
+        &self,
+        review_id: &str,
+        c: &NewComment,
+    ) -> Result<ThreadComment, GhError> {
+        let data: Value = self
+            .graphql_mutation(ADD_REVIEW_THREAD_MUTATION, review_thread_vars(review_id, c))
+            .await?;
+        data.pointer("/addPullRequestReviewThread/thread/comments/nodes/0")
+            .and_then(crate::github::threads::parse_comment)
+            .ok_or_else(|| {
+                GhError::Decode("addPullRequestReviewThread: missing the new comment".to_owned())
+            })
     }
 
     /// Reply to a review thread's root comment, returning the reply as
@@ -153,6 +219,46 @@ mod tests {
             start_line: Some(start),
             start_side: Some(Side::Right),
         }
+    }
+
+    #[test]
+    fn review_thread_vars_anchor_the_way_the_web_ui_does() {
+        let line = NewComment {
+            commit_id: "sha".into(),
+            body: "b".into(),
+            target: CommentTarget::Line(Anchor {
+                path: "a.rs".into(),
+                side: Side::Right,
+                line: 3,
+                start_line: None,
+                start_side: None,
+            }),
+        };
+        assert_eq!(
+            review_thread_vars("PRR_1", &line),
+            json!({ "reviewId": "PRR_1", "path": "a.rs", "body": "b",
+                    "line": 3, "side": "RIGHT", "subjectType": "LINE" })
+        );
+        let range = NewComment {
+            target: CommentTarget::Line(range_anchor("a.rs", 2, 5)),
+            ..line.clone()
+        };
+        let vars = review_thread_vars("PRR_1", &range);
+        assert_eq!(
+            (vars["startLine"].clone(), vars["startSide"].clone()),
+            (json!(2), json!("RIGHT"))
+        );
+        assert_eq!(vars["line"], json!(5));
+        let file = NewComment {
+            target: CommentTarget::File {
+                path: "README.md".into(),
+            },
+            ..line
+        };
+        assert_eq!(
+            review_thread_vars("PRR_1", &file),
+            json!({ "reviewId": "PRR_1", "path": "README.md", "body": "b", "subjectType": "FILE" })
+        );
     }
 
     #[test]

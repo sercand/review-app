@@ -210,12 +210,20 @@ pub fn can_submit(state: &ComposerState) -> bool {
 }
 
 /// The mode buttons to show, in order, the way GitHub labels them.
+///
+/// `github_review` is whether the viewer has a pending review on GitHub: a
+/// file-level comment can join that one (GraphQL takes file threads), but
+/// never the local draft, whose REST submission has no file-level comments.
 pub fn mode_buttons(
     target: &CommentTarget,
     has_open_review: bool,
+    github_review: bool,
 ) -> Vec<(&'static str, CommentMode)> {
     match target {
-        // A file-level comment is never part of a review.
+        CommentTarget::File { .. } if github_review => vec![
+            ("Add to review", CommentMode::Pending),
+            ("Add single comment", CommentMode::Immediate),
+        ],
         CommentTarget::File { .. } => vec![("Add single comment", CommentMode::Immediate)],
         CommentTarget::Line(_) => {
             if has_open_review {
@@ -300,16 +308,21 @@ mod tests {
         assert_eq!(default_mode(false), CommentMode::Immediate);
         assert_eq!(default_mode(true), CommentMode::Pending);
         assert_eq!(
-            mode_buttons(&line, false)[1],
+            mode_buttons(&line, false, false)[1],
             ("Start a review", CommentMode::Pending)
         );
         assert_eq!(
-            mode_buttons(&line, true)[0],
+            mode_buttons(&line, true, false)[0],
             ("Add to review", CommentMode::Pending)
         );
         assert_eq!(
-            mode_buttons(&file, true),
+            mode_buttons(&file, true, false),
             vec![("Add single comment", CommentMode::Immediate)]
+        );
+        assert_eq!(
+            mode_buttons(&file, true, true)[0],
+            ("Add to review", CommentMode::Pending),
+            "a pending review on GitHub takes file comments"
         );
 
         let mut s = ComposerState::default();

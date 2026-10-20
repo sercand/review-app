@@ -13,11 +13,12 @@ use eframe::egui;
 use crate::diff::image::ImageMode;
 use crate::github::files::{FileStatus, PrFile};
 use crate::model::diff::DiffMode;
+use crate::ui::components::{pill, segmented, Btn, BtnKind, Seg, Tone};
 use crate::ui::file_icons::file_icon;
 use crate::ui::fonts::mono_bold;
 use crate::ui::icons::{
-    self, icon_button, icon_text, icon_toggle, COLUMNS_2, EXTERNAL_LINK, MESSAGE_SQUARE_PLUS,
-    PILCROW, ROWS_2, SEARCH, SQUARE, SQUARE_CHECK, WRAP_TEXT,
+    self, icon_button, icon_toggle, COLUMNS_2, EXTERNAL_LINK, LAYERS, MESSAGE_SQUARE_PLUS, PILCROW,
+    ROWS_2, SEARCH, SQUARE, SQUARE_CHECK, SQUARE_SPLIT_HORIZONTAL, WRAP_TEXT,
 };
 use crate::ui::theme::palette_of;
 
@@ -171,86 +172,151 @@ pub fn render_header(
         (1.0, p.line),
     );
 
-    ui.horizontal(|ui| {
-        file_icon(ui, &vm.name);
-        let available = ui.available_width();
-        let dir_budget = (available / 2.0).max(8.0) as usize;
-        let dir = elide_left(&vm.dir, dir_budget);
-        if !dir.is_empty() {
-            ui.label(
-                egui::RichText::new(dir)
-                    .color(p.muted)
-                    .font(mono_bold(13.0)),
-            );
-        }
-        ui.label(egui::RichText::new(&vm.name).font(mono_bold(13.5)));
-        if icon_button(ui, icons::COPY, "Copy file path").clicked() {
-            actions.push(FileHeaderAction::CopyPath);
-        }
-
-        status_pill(ui, vm);
-        if matches!(vm.kind, HeaderKind::Text | HeaderKind::TooLarge) {
-            ui.label(
-                egui::RichText::new(format!("+{}", vm.additions))
-                    .color(p.ok)
-                    .font(egui::FontId::monospace(12.0)),
-            );
-            ui.label(
-                egui::RichText::new(format!("−{}", vm.deletions))
-                    .color(p.bad)
-                    .font(egui::FontId::monospace(12.0)),
-            );
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            file_actions(ui, vm, actions);
-            ui.separator();
-            kind_controls(ui, vm, settings, actions);
+    // The right-hand controls lay out first, so the path takes only the
+    // width they leave and can never run under them.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_space(4.0);
+        file_actions(ui, vm, actions);
+        separator(ui);
+        kind_controls(ui, vm, settings, actions);
+        ui.add_space(8.0);
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.add_space(6.0);
+            file_icon(ui, &vm.name);
+            path_and_counts(ui, vm, actions);
         });
     });
 }
 
+/// The path (directory muted, file name bold), the copy button, the status
+/// pill and the +/- counts, fitted into the width the controls left.
+fn path_and_counts(ui: &mut egui::Ui, vm: &FileHeaderVm, actions: &mut Vec<FileHeaderAction>) {
+    let p = palette_of(ui);
+    let font = egui::FontId::monospace(12.5);
+    let bold = mono_bold(12.5);
+    // What follows the path: the copy button, the pill and the counts, as
+    // they will actually measure, plus the gaps between them.
+    let measure =
+        |text: String, font: egui::FontId| ui.painter().layout_no_wrap(text, font, p.text).size().x;
+    let pill_w = measure(
+        status_label(vm.status).to_owned(),
+        egui::FontId::proportional(11.5),
+    ) + 14.0;
+    let counts_w = if matches!(vm.kind, HeaderKind::Text | HeaderKind::TooLarge) {
+        measure(
+            format!("+{} −{}", vm.additions, vm.deletions),
+            egui::FontId::monospace(12.0),
+        ) + 10.0
+    } else {
+        0.0
+    };
+    let tail = 28.0 + pill_w + counts_w + 4.0 * ui.spacing().item_spacing.x;
+    let budget = (ui.available_width() - tail).max(60.0);
+    let name_w = ui
+        .painter()
+        .layout_no_wrap(vm.name.clone(), bold.clone(), p.text)
+        .size()
+        .x;
+    let dir = fit_dir(ui, &vm.dir, &font, budget - name_w);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&dir, 0.0, egui::TextFormat::simple(font, p.muted));
+    job.append(&vm.name, 0.0, egui::TextFormat::simple(bold, p.text));
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let response = ui.add(egui::Label::new(galley).selectable(false));
+    if dir != vm.dir {
+        response.on_hover_text(format!("{}{}", vm.dir, vm.name));
+    }
+    if icon_button(ui, icons::COPY, "Copy path").clicked() {
+        actions.push(FileHeaderAction::CopyPath);
+    }
+    status_pill(ui, vm);
+    if matches!(vm.kind, HeaderKind::Text | HeaderKind::TooLarge) {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(format!("+{}", vm.additions))
+                .color(p.ok)
+                .font(egui::FontId::monospace(12.0)),
+        );
+        ui.label(
+            egui::RichText::new(format!("−{}", vm.deletions))
+                .color(p.bad)
+                .font(egui::FontId::monospace(12.0)),
+        );
+    }
+}
+
+/// `dir` shortened from the left with "…" until it fits `max_width`.
+fn fit_dir(ui: &egui::Ui, dir: &str, font: &egui::FontId, max_width: f32) -> String {
+    let width = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    if dir.is_empty() || width(dir) <= max_width {
+        return dir.to_owned();
+    }
+    let chars: Vec<char> = dir.chars().collect();
+    for start in 1..chars.len() {
+        let candidate: String = std::iter::once('…')
+            .chain(chars[start..].iter().copied())
+            .collect();
+        if width(&candidate) <= max_width {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+/// A 1 pt vertical rule between control groups (mockup `.vsep`).
+fn separator(ui: &mut egui::Ui) {
+    let p = palette_of(ui);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 20.0), egui::Sense::hover());
+    ui.painter()
+        .vline(rect.center().x, rect.y_range(), (1.0, p.line));
+}
+
+/// The status pill's word for a file status.
+fn status_label(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "Added",
+        FileStatus::Removed => "Removed",
+        FileStatus::Renamed => "Renamed",
+        FileStatus::Copied => "Copied",
+        _ => "Modified",
+    }
+}
+
 /// The status pill: a coloured word for the file's status.
 fn status_pill(ui: &mut egui::Ui, vm: &FileHeaderVm) {
-    let p = palette_of(ui);
-    let (label, color) = match vm.status {
-        FileStatus::Added => ("Added", p.ok),
-        FileStatus::Removed => ("Removed", p.bad),
-        FileStatus::Renamed => ("Renamed", p.info),
-        FileStatus::Copied => ("Copied", p.info),
-        _ => ("Modified", p.warn),
+    let tone = match vm.status {
+        FileStatus::Added => Tone::Ok,
+        FileStatus::Removed => Tone::Bad,
+        FileStatus::Renamed | FileStatus::Copied => Tone::Info,
+        _ => Tone::Warn,
     };
-    ui.label(
-        egui::RichText::new(label)
-            .color(color)
-            .font(crate::ui::fonts::semibold(11.5)),
-    );
+    pill(ui, None, status_label(vm.status), tone);
     if let Some(previous) = &vm.previous_name {
+        let p = palette_of(ui);
         ui.label(
             egui::RichText::new(format!("from {previous}"))
-                .color(p.muted)
-                .italics(),
+                .color(p.faint)
+                .size(12.0),
         );
     }
 }
 
 /// The comment / browser / viewed buttons, right to left.
 fn file_actions(ui: &mut egui::Ui, vm: &FileHeaderVm, actions: &mut Vec<FileHeaderAction>) {
-    let p = palette_of(ui);
-    let viewed_label = format!(
-        "{} Viewed  V",
-        if vm.viewed { SQUARE_CHECK } else { SQUARE }
-    );
-    let viewed = egui::Button::new(
-        egui::RichText::new(viewed_label)
-            .color(if vm.viewed { p.accent } else { p.muted })
-            .font(crate::ui::fonts::semibold(12.0)),
-    )
-    .fill(if vm.viewed { p.accent_soft } else { p.surface });
-    if ui.add(viewed).clicked() {
+    let viewed = Btn::new(BtnKind::Default, "Viewed")
+        .icon(if vm.viewed { SQUARE_CHECK } else { SQUARE })
+        .kbd("V")
+        .selected(vm.viewed)
+        .show(ui);
+    if viewed.clicked() {
         actions.push(FileHeaderAction::ToggleViewed);
     }
-    if icon_button(ui, EXTERNAL_LINK, "Open on GitHub").clicked() {
+    if icon_button(ui, EXTERNAL_LINK, "Open file on GitHub").clicked() {
         actions.push(FileHeaderAction::OpenInBrowser);
     }
     if icon_button(ui, MESSAGE_SQUARE_PLUS, "Comment on file").clicked() {
@@ -258,7 +324,7 @@ fn file_actions(ui: &mut egui::Ui, vm: &FileHeaderVm, actions: &mut Vec<FileHead
     }
 }
 
-/// The middle controls the file's kind offers.
+/// The middle controls the file's kind offers, right to left.
 fn kind_controls(
     ui: &mut egui::Ui,
     vm: &FileHeaderVm,
@@ -272,51 +338,56 @@ fn kind_controls(
         rendered,
         image_mode,
     } = settings;
+    if matches!(vm.kind, HeaderKind::Image) && (rendered || !is_svg(vm)) {
+        let picked = segmented(
+            ui,
+            image_mode,
+            &[
+                Seg::icon_text(ImageMode::Onion, LAYERS, "Onion skin"),
+                Seg::icon_text(ImageMode::Swipe, SQUARE_SPLIT_HORIZONTAL, "Swipe"),
+                Seg::icon_text(ImageMode::TwoUp, COLUMNS_2, "2-up"),
+            ],
+        );
+        if let Some(wanted) = picked {
+            actions.push(FileHeaderAction::SetImageMode(wanted));
+        }
+    }
     let show_diff_controls = matches!(vm.kind, HeaderKind::Text)
         || (matches!(vm.kind, HeaderKind::Image) && !rendered && is_svg(vm));
-    if show_diff_controls {
-        if ui
-            .selectable_label(mode == DiffMode::Split, icon_text(COLUMNS_2, "Split  S"))
-            .clicked()
-        {
-            actions.push(FileHeaderAction::SetMode(DiffMode::Split));
-        }
-        if ui
-            .selectable_label(mode == DiffMode::Unified, icon_text(ROWS_2, "Unified  U"))
-            .clicked()
-        {
-            actions.push(FileHeaderAction::SetMode(DiffMode::Unified));
-        }
-        let mut wrap_on = wrap;
-        if icon_toggle(ui, WRAP_TEXT, "Toggle word wrap", &mut wrap_on).clicked() {
-            actions.push(FileHeaderAction::ToggleWrap);
-        }
-        if ui
-            .selectable_label(hide_ws, icon_text(PILCROW, "Hide whitespace-only changes"))
-            .clicked()
-        {
-            actions.push(FileHeaderAction::ToggleHideWhitespace);
-        }
-        if icon_button(ui, SEARCH, "Find in file  ⌘F").clicked() {
-            actions.push(FileHeaderAction::OpenFind);
-        }
-        if is_svg(vm) {
-            if ui.selectable_label(!rendered, "Text").clicked() && rendered {
-                actions.push(FileHeaderAction::ToggleRendered);
-            }
-            if ui.selectable_label(rendered, "Rendered").clicked() && !rendered {
+    if is_svg(vm) {
+        if let Some(want_rendered) = segmented(
+            ui,
+            rendered,
+            &[Seg::text(true, "Rendered"), Seg::text(false, "Text")],
+        ) {
+            if want_rendered != rendered {
                 actions.push(FileHeaderAction::ToggleRendered);
             }
         }
     }
-    if matches!(vm.kind, HeaderKind::Image) && (rendered || !is_svg(vm)) {
-        for (label, wanted) in [
-            ("2-up", ImageMode::TwoUp),
-            ("Swipe", ImageMode::Swipe),
-            ("Onion skin", ImageMode::Onion),
-        ] {
-            if ui.selectable_label(image_mode == wanted, label).clicked() {
-                actions.push(FileHeaderAction::SetImageMode(wanted));
+    if show_diff_controls {
+        if icon_button(ui, SEARCH, &icons::key_hint("Find in file  ⌘F")).clicked() {
+            actions.push(FileHeaderAction::OpenFind);
+        }
+        let mut hide = hide_ws;
+        if icon_toggle(ui, PILCROW, "Hide whitespace-only changes", &mut hide).clicked() {
+            actions.push(FileHeaderAction::ToggleHideWhitespace);
+        }
+        let mut wrap_on = wrap;
+        if icon_toggle(ui, WRAP_TEXT, "Wrap long lines", &mut wrap_on).clicked() {
+            actions.push(FileHeaderAction::ToggleWrap);
+        }
+        // Right to left: the segment's options are listed in reverse.
+        if let Some(wanted) = segmented(
+            ui,
+            mode,
+            &[
+                Seg::icon(DiffMode::Unified, ROWS_2, "Unified  U"),
+                Seg::icon(DiffMode::Split, COLUMNS_2, "Split  S"),
+            ],
+        ) {
+            if wanted != mode {
+                actions.push(FileHeaderAction::SetMode(wanted));
             }
         }
     }
@@ -326,6 +397,16 @@ fn kind_controls(
 /// segment alongside its diff controls).
 fn is_svg(vm: &FileHeaderVm) -> bool {
     crate::state::filters::extension(&vm.name) == "svg"
+}
+
+/// The file's place in the PR's "Files changed" page on GitHub: the files
+/// view anchored at `#diff-<sha256 of the path>`, the anchor GitHub gives
+/// every file there.
+pub fn file_url(pr_html_url: &str, path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{pr_html_url}/files#diff-{hex}")
 }
 
 /// What the footer shows for the current file.
@@ -384,47 +465,45 @@ pub fn render_footer(ui: &mut egui::Ui, vm: &FooterVm, actions: &mut Vec<FooterA
     );
 
     ui.horizontal_centered(|ui| {
-        let prev_label = match &vm.prev {
-            Some(name) => format!("‹ {name}  K"),
-            None => "First file".to_owned(),
+        ui.add_space(4.0);
+        let prev = match &vm.prev {
+            Some(name) => Btn::new(BtnKind::Ghost, name)
+                .icon(icons::CHEVRON_LEFT)
+                .kbd("K"),
+            None => Btn::new(BtnKind::Ghost, "First file").enabled(false),
         };
-        let prev = egui::Button::new(
-            egui::RichText::new(prev_label)
-                .color(if vm.prev.is_some() { p.text } else { p.faint })
-                .font(crate::ui::fonts::semibold(12.0)),
-        )
-        .fill(p.surface);
-        if ui.add_enabled(vm.prev.is_some(), prev).clicked() {
+        if prev.show(ui).clicked() && vm.prev.is_some() {
             actions.push(FooterAction::Prev);
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let next_label = match &vm.next {
-                Some(name) => format!("J {name} ›"),
-                None => "Last file".to_owned(),
+            ui.add_space(4.0);
+            let next = match &vm.next {
+                Some(name) => Btn::new(BtnKind::Ghost, name)
+                    .kbd("J")
+                    .trailing_icon(icons::CHEVRON_RIGHT),
+                None => Btn::new(BtnKind::Ghost, "Last file").enabled(false),
             };
-            let next = egui::Button::new(
-                egui::RichText::new(next_label)
-                    .color(if vm.next.is_some() { p.text } else { p.faint })
-                    .font(crate::ui::fonts::semibold(12.0)),
-            )
-            .fill(p.surface);
-            if ui.add_enabled(vm.next.is_some(), next).clicked() {
+            if next.show(ui).clicked() && vm.next.is_some() {
                 actions.push(FooterAction::Next);
             }
-            let viewed_next = egui::Button::new(
-                egui::RichText::new(format!("{} Viewed, next  ⇧V", icons::CHECK))
-                    .color(p.muted)
-                    .font(crate::ui::fonts::semibold(12.0)),
-            )
-            .fill(p.surface);
-            if ui.add(viewed_next).clicked() {
+            let viewed_next = Btn::new(BtnKind::Default, "Viewed, next")
+                .icon(icons::CHECK)
+                .kbd("⇧V")
+                .show(ui);
+            if viewed_next.clicked() {
                 actions.push(FooterAction::ViewedAndNext);
             }
-            ui.label(
-                egui::RichText::new(format!("{} of {}", vm.position, vm.total))
-                    .color(p.muted)
-                    .font(egui::FontId::monospace(12.0)),
+            // The position sits centred in the space between the buttons.
+            ui.with_layout(
+                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} of {}", vm.position, vm.total))
+                            .color(p.faint)
+                            .size(12.5),
+                    );
+                },
             );
         });
     });
@@ -456,6 +535,18 @@ pub fn elide_left(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_url_anchors_the_file_in_the_files_view() {
+        assert_eq!(
+            file_url(
+                "https://github.com/otsimo/kedis-studio/pull/2293",
+                "Assets/com.yigitdemirkol.idmaptools/README.md"
+            ),
+            "https://github.com/otsimo/kedis-studio/pull/2293/files#diff-\
+             155701b4b73949492effad2ee18ed659410e866868ba749a30520cd90609fea5"
+        );
+    }
     use crate::test_support::{file, files_at};
 
     #[test]
