@@ -73,6 +73,7 @@ fn ctx_with(
         interaction,
         allowed: Arc::new(std::sync::Mutex::new(Vec::new())),
         for_review: Arc::new(std::sync::Mutex::new(Vec::new())),
+        snapshot: None,
     }
 }
 
@@ -1097,7 +1098,12 @@ fn tool_definitions_have_valid_schemas() {
             "asset_stats",
             "git_show",
             "git_log",
-            "git_diff"
+            "git_diff",
+            "gh_pr",
+            "gh_pr_files",
+            "gh_pr_patch",
+            "gh_threads",
+            "gh_checks"
         ]
     );
     for t in &tools {
@@ -1120,6 +1126,11 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(req("git_show"), ["rev"]);
     assert!(req("git_log").is_empty());
     assert_eq!(req("git_diff"), ["range"]);
+    assert!(req("gh_pr").is_empty());
+    assert!(req("gh_pr_files").is_empty());
+    assert_eq!(req("gh_pr_patch"), ["path"]);
+    assert!(req("gh_threads").is_empty());
+    assert!(req("gh_checks").is_empty());
     let props = |name: &str| -> Vec<String> {
         let mut v: Vec<String> = tool(name).definition().input_schema["properties"]
             .as_object()
@@ -1139,6 +1150,11 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(props("git_show"), ["path", "rev"]);
     assert_eq!(props("git_log"), ["n", "path"]);
     assert_eq!(props("git_diff"), ["path", "range"]);
+    assert!(props("gh_pr").is_empty());
+    assert!(props("gh_pr_files").is_empty());
+    assert_eq!(props("gh_pr_patch"), ["path"]);
+    assert_eq!(props("gh_threads"), ["path"]);
+    assert!(props("gh_checks").is_empty());
 }
 
 /// The registry hands out every definition in order, and looks a tool up by name.
@@ -1157,6 +1173,11 @@ fn registry_definitions_and_lookup() {
     assert!(registry.get("git_show").is_some());
     assert!(registry.get("git_log").is_some());
     assert!(registry.get("git_diff").is_some());
+    assert!(registry.get("gh_pr").is_some());
+    assert!(registry.get("gh_pr_files").is_some());
+    assert!(registry.get("gh_pr_patch").is_some());
+    assert!(registry.get("gh_threads").is_some());
+    assert!(registry.get("gh_checks").is_some());
     assert!(registry.get("edit_file").is_none());
     assert!(registry.get("").is_none());
 }

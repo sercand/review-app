@@ -7,6 +7,7 @@
 pub mod checkout;
 pub mod interaction;
 pub mod llm;
+pub mod snapshot;
 pub mod store;
 #[cfg(any(test, feature = "ai-testing"))]
 pub mod testing;

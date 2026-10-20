@@ -1,9 +1,11 @@
 //! The review agent's read-only repo tools: `bash`, `read_file`, `glob`,
-//! `grep`, `list_dir`, `asset_stats` and `git_show`/`git_log`/`git_diff`, with
-//! mono's names and schemas where they exist, run against any
+//! `grep`, `list_dir`, `asset_stats`, `git_show`/`git_log`/`git_diff` and the
+//! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`,
+//! with mono's names and schemas where they exist, run against any
 //! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
 //! temp-dir host in tests). The git tools run `git` directly in the checkout,
-//! so they work even when `bash` is blocked.
+//! so they work even when `bash` is blocked; the `gh_*` tools read
+//! [`ToolCx::snapshot`] and never touch the network.
 //!
 //! Every text result is cut to [`MAX_TOOL_OUTPUT`] bytes by [`truncate_middle`].
 //! Bad input and failed sandbox ops are tool errors (`is_error`) that carry the
@@ -17,6 +19,7 @@
 
 mod bash;
 mod files;
+mod gh;
 mod git;
 mod inspect;
 mod search;
@@ -139,6 +142,13 @@ pub struct ToolCx {
     /// line is stored with runs of whitespace collapsed and everything else
     /// (quotes included) verbatim, so it must match exactly.
     pub for_review: Arc<Mutex<Vec<String>>>,
+    /// The PR under review, frozen by
+    /// [`crate::ai::snapshot::gather_snapshot`] before the run starts.
+    ///
+    /// `None` means no PR context is attached — tool tests, and chat before a
+    /// PR has loaded. The `gh_*` tools then return an error rather than
+    /// guessing, and nothing else reads this field.
+    pub snapshot: Option<Arc<crate::ai::snapshot::PrSnapshot>>,
 }
 
 impl ToolCx {
@@ -241,6 +251,11 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(git::GitShow),
         Arc::new(git::GitLog),
         Arc::new(git::GitDiff),
+        Arc::new(gh::GhPr),
+        Arc::new(gh::GhPrFiles),
+        Arc::new(gh::GhPrPatch),
+        Arc::new(gh::GhThreads),
+        Arc::new(gh::GhChecks),
     ]
 }
 

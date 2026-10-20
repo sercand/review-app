@@ -2084,10 +2084,13 @@ mod tests {
         assert_eq!(s.commits, vec![commit]);
 
         let run = CheckRun {
+            id: 1,
             name: "build".into(),
             status: "completed".into(),
             conclusion: Some("success".into()),
             html_url: None,
+            output_summary: None,
+            output_text: None,
         };
         let combined = CombinedStatus {
             state: "success".into(),
