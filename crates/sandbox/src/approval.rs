@@ -57,6 +57,31 @@ fn ask(reason: impl Into<String>) -> Verdict {
     }
 }
 
+/// The command's segments as normalized text, one entry per shell segment.
+///
+/// Segments split exactly as [`classify`] splits them (unquoted `|`, `&&`, `||`,
+/// `;`, `&` and newlines), and each becomes its words joined by single spaces —
+/// the same text [`classify`] matches against its `allowed` entries. Empty
+/// segments are dropped.
+///
+/// It is what a caller records after the user approves a whole command line "for
+/// this review": approving `a && b` records `a` and `b`, so the next identical
+/// line runs without asking. Redirection targets are not words, so they are not
+/// part of the recorded text (a redirect target still asks on its own).
+///
+/// A command the tokenizer rejects (unbalanced quotes, a trailing backslash)
+/// returns an empty vec: nothing was parsed, so nothing may be remembered.
+pub fn normalized_segments(command: &str) -> Vec<String> {
+    match tokenize(command) {
+        Ok(segments) => segments
+            .iter()
+            .map(|segment| words_of(segment).join(" "))
+            .filter(|normalized| !normalized.is_empty())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Commands that exec or define arbitrary other commands, so their arguments
 /// cannot be trusted: always ask (unless the whole segment is explicitly
 /// allowed).
@@ -453,7 +478,7 @@ impl Tokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Verdict, classify};
+    use super::{Verdict, classify, normalized_segments};
 
     fn allowed() -> Vec<String> {
         vec!["cargo test".to_string(), "npm run lint".to_string()]
@@ -634,6 +659,26 @@ mod tests {
             classify("cargo test 2>&1 | tail -50", &allowed()),
             Verdict::Run
         );
+    }
+
+    #[test]
+    fn normalized_segments_join_words_per_segment() {
+        assert_eq!(
+            normalized_segments("ls -la && git   status"),
+            ["ls -la", "git status"]
+        );
+        assert_eq!(
+            normalized_segments("npm install | tail -5; echo done"),
+            ["npm install", "tail -5", "echo done"]
+        );
+        // Quotes are gone after tokenization; empty segments are dropped.
+        assert_eq!(normalized_segments("grep 'a b' f"), ["grep a b f"]);
+        assert!(normalized_segments("").is_empty());
+        assert!(normalized_segments("   \n;;  ").is_empty());
+        // A redirect target is not a word, so an approved redirect records only
+        // the command. A command the tokenizer rejects records nothing.
+        assert_eq!(normalized_segments("touch a > out.txt"), ["touch a"]);
+        assert!(normalized_segments("echo 'unterminated").is_empty());
     }
 
     #[test]

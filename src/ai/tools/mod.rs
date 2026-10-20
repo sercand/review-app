@@ -26,7 +26,7 @@ mod truncate;
 mod tests;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,42 @@ pub struct ToolCx {
     pub repo_root: PathBuf,
     /// The agent that made the call.
     pub agent: AgentRef,
+    /// The user, for questions and command approvals.
+    pub interaction: Arc<dyn crate::ai::interaction::Interaction>,
+    /// Commands `bash` may run without asking: the repo's configured commands,
+    /// seeded at run start, plus what the user approved "for this review".
+    ///
+    /// Shared by every agent of the run, so an approval in one reviewer is
+    /// silent for the next. Guarded by a std mutex because it is only touched
+    /// synchronously, never across an `.await`; the [`ToolCx::allowed_snapshot`]
+    /// and [`ToolCx::allow_segments`] helpers recover from a poisoned lock so a
+    /// panicking holder cannot turn a tool call into a panic.
+    pub allowed: Arc<Mutex<Vec<String>>>,
+}
+
+impl ToolCx {
+    /// A copy of [`ToolCx::allowed`], for [`review_sandbox::classify`].
+    pub fn allowed_snapshot(&self) -> Vec<String> {
+        allowed_lock(&self.allowed).clone()
+    }
+
+    /// Adds `segments` to [`ToolCx::allowed`], skipping empty and duplicate
+    /// entries so the list stays as small as the approvals that built it.
+    pub fn allow_segments(&self, segments: impl IntoIterator<Item = String>) {
+        let mut allowed = allowed_lock(&self.allowed);
+        for segment in segments {
+            if !segment.is_empty() && !allowed.contains(&segment) {
+                allowed.push(segment);
+            }
+        }
+    }
+}
+
+/// Locks the allowed-commands list, recovering from a poisoned mutex: the list
+/// is a cache of approvals, and refusing to read it would break every later
+/// command in the run.
+fn allowed_lock(allowed: &Mutex<Vec<String>>) -> std::sync::MutexGuard<'_, Vec<String>> {
+    allowed.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A tool an agent can call.

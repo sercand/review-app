@@ -18,6 +18,8 @@ use super::{
     AgentRef, AgentRole, IMAGE_MAX_SIDE, MAX_TOOL_OUTPUT, Registry, Tool, ToolCx, ToolOutput, all,
     is_forbidden_tool_name, truncate_middle, validate_rev,
 };
+use crate::ai::interaction::{ApprovalDecision, Interaction, NoInteraction};
+use crate::ai::testing::{InteractionCall, ScriptedInteraction};
 
 fn tool(name: &str) -> Arc<dyn Tool> {
     all()
@@ -42,17 +44,42 @@ fn image(out: &ToolOutput) -> &review_llm::Image {
     }
 }
 
-/// A context over `sandbox`, rooted at `repo_root`, for one reviewer.
+/// A reviewer's handle, for every test context.
+fn agent() -> AgentRef {
+    AgentRef {
+        id: 1,
+        role: AgentRole::Reviewer,
+        label: "reviewer".to_string(),
+    }
+}
+
+/// A context over `sandbox`, rooted at `repo_root`, for one reviewer, with no
+/// interaction attached: `bash` asks nobody and is therefore denied anything
+/// the classifier would ask about.
 fn ctx(sandbox: Arc<dyn SandboxOps>, repo_root: PathBuf) -> ToolCx {
+    ctx_with(sandbox, repo_root, Arc::new(NoInteraction))
+}
+
+/// A context with `interaction` wired in, and no configured commands.
+fn ctx_with(
+    sandbox: Arc<dyn SandboxOps>,
+    repo_root: PathBuf,
+    interaction: Arc<dyn Interaction>,
+) -> ToolCx {
     ToolCx {
         sandbox,
         repo_root,
-        agent: AgentRef {
-            id: 1,
-            role: AgentRole::Reviewer,
-            label: "reviewer".to_string(),
-        },
+        agent: agent(),
+        interaction,
+        allowed: Arc::new(std::sync::Mutex::new(Vec::new())),
     }
+}
+
+/// `ctx` with `allowed` seeded, as a repo's configured commands would be.
+fn ctx_allowing(sandbox: Arc<dyn SandboxOps>, repo_root: PathBuf, allowed: &[&str]) -> ToolCx {
+    let cx = ctx(sandbox, repo_root);
+    cx.allow_segments(allowed.iter().map(|s| (*s).to_string()));
+    cx
 }
 
 /// A context over `host`, with the sandbox's root as the repo root.
@@ -64,6 +91,10 @@ async fn call(host: &LocalHost, name: &str, input: Value) -> ToolOutput {
     tool(name).call(input, &host_ctx(host)).await
 }
 
+async fn bash(cx: &ToolCx, input: Value) -> ToolOutput {
+    tool("bash").call(input, cx).await
+}
+
 fn host() -> (tempfile::TempDir, LocalHost) {
     let dir = crate::test_support::tempdir();
     let host = LocalHost::new(dir.path()).unwrap();
@@ -73,41 +104,155 @@ fn host() -> (tempfile::TempDir, LocalHost) {
 #[tokio::test]
 async fn bash_tool_reports_exit_code() {
     let (_dir, host) = host();
+    // The repo configures these commands, so `bash` runs them without asking.
+    let cx = ctx_allowing(
+        Arc::new(host.clone()),
+        host.root().path().to_path_buf(),
+        &["echo", "export", "exit"],
+    );
 
-    let out = call(&host, "bash", json!({"command": "echo hi"})).await;
+    let out = bash(&cx, json!({"command": "echo hi"})).await;
     assert!(!out.is_error);
     assert_eq!(text(&out).trim_end(), "hi");
 
     // A non-zero exit is information, not a tool error.
-    let out = call(&host, "bash", json!({"command": "echo oops; exit 3"})).await;
+    let out = bash(&cx, json!({"command": "echo oops; exit 3"})).await;
     assert!(!out.is_error);
     let t = text(&out);
     assert!(t.contains("oops"), "{t}");
     assert!(t.ends_with("\n(exit code 3)"), "{t}");
 
-    let out = call(&host, "bash", json!({})).await;
+    let out = bash(&cx, json!({})).await;
     assert!(out.is_error);
     assert_eq!(text(&out), "command is required unless restart is true");
 
-    let out = call(&host, "bash", json!({"command": "", "restart": true})).await;
+    let out = bash(&cx, json!({"command": "", "restart": true})).await;
     assert!(!out.is_error, "{:?}", out.parts);
     assert!(!text(&out).is_empty());
 
     // Shell state persists across calls until a restart.
-    call(&host, "bash", json!({"command": "export QA_X=1"})).await;
-    let out = call(&host, "bash", json!({"command": "echo \"x=$QA_X\""})).await;
+    bash(&cx, json!({"command": "export QA_X=1"})).await;
+    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\""})).await;
     assert_eq!(text(&out).trim_end(), "x=1");
-    let out = call(
-        &host,
-        "bash",
-        json!({"command": "echo \"x=$QA_X\"", "restart": true}),
-    )
-    .await;
+    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\"", "restart": true})).await;
     assert_eq!(text(&out).trim_end(), "x=");
 
     // Bad input is a tool error, not a panic.
-    let out = call(&host, "bash", json!({"command": 5})).await;
+    let out = bash(&cx, json!({"command": 5})).await;
     assert!(out.is_error);
+}
+
+/// A context over `host` with a scripted interaction, for approval tests.
+fn interaction_ctx(host: &LocalHost, interaction: Arc<ScriptedInteraction>) -> ToolCx {
+    ctx_with(
+        Arc::new(host.clone()),
+        host.root().path().to_path_buf(),
+        interaction,
+    )
+}
+
+#[tokio::test]
+async fn allowed_command_runs_without_asking() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "ls"})).await;
+    assert!(!out.is_error, "{:?}", out.parts);
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn unknown_command_asks_and_runs_once() {
+    let (dir, host) = host();
+    let interaction = Arc::new(
+        ScriptedInteraction::new()
+            .approve(ApprovalDecision::Once)
+            .approve(ApprovalDecision::Once),
+    );
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch x"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("x").exists());
+
+    // `Once` is for one call: the next identical command asks again.
+    let out = bash(&cx, json!({"command": "touch x"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    let calls = interaction.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for call in calls {
+        match call {
+            InteractionCall::Approve { command, .. } => assert_eq!(command, "touch x"),
+            other => panic!("unexpected call: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn for_review_is_remembered() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch remembered"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("remembered").exists());
+
+    // The same command again runs without a second approval.
+    let out = bash(&cx, json!({"command": "touch remembered"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    let calls = interaction.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+}
+
+#[tokio::test]
+async fn for_review_remembers_each_segment_of_a_chain() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch a && touch b"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("a").exists());
+    assert!(dir.path().join("b").exists());
+    assert_eq!(
+        cx.allowed_snapshot(),
+        ["touch a".to_string(), "touch b".to_string()]
+    );
+
+    // Both parts were remembered, so the identical line runs silently.
+    let out = bash(&cx, json!({"command": "touch a && touch b"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert_eq!(interaction.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn denied_command_returns_the_reason() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny {
+        reason: Some("no writes here".to_string()),
+    }));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch nope"})).await;
+    assert!(out.is_error);
+    let t = text(&out);
+    assert!(t.contains("the user declined this command"), "{t}");
+    assert!(t.contains("no writes here"), "{t}");
+    assert!(!dir.path().join("nope").exists());
+    assert_eq!(interaction.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn no_interaction_denies_without_a_reason() {
+    let (dir, host) = host();
+    let cx = host_ctx(&host);
+
+    let out = bash(&cx, json!({"command": "touch denied"})).await;
+    assert!(out.is_error);
+    assert_eq!(text(&out), "the user declined this command");
+    assert!(!dir.path().join("denied").exists());
 }
 
 /// A 1×1 PNG, encoded by the `image` crate.
@@ -415,7 +560,7 @@ async fn bash_tool_formats_timeout() {
     let out = tool("bash")
         .call(
             json!({"command": "sleep 999"}),
-            &ctx(Arc::new(ops), PathBuf::from(".")),
+            &ctx_allowing(Arc::new(ops), PathBuf::from("."), &["sleep"]),
         )
         .await;
     assert!(!out.is_error);

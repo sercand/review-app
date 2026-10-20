@@ -5,8 +5,12 @@
 //! gated the same way.
 
 pub mod checkout;
+pub mod interaction;
 pub mod llm;
 pub mod store;
+#[cfg(any(test, feature = "ai-testing"))]
+pub mod testing;
 pub mod tools;
 
+pub use interaction::{ApprovalDecision, Interaction, NoInteraction, Question};
 pub use tools::{AgentRef, AgentRole};

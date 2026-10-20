@@ -9,6 +9,11 @@ edition = "2024"
 rust-version = "1.99"
 license = "MIT"
 
+[features]
+# Test doubles for the AI pipeline (`ai::testing`), for integration tests that
+# drive the worker. Unit tests compile them unconditionally.
+ai-testing = []
+
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"

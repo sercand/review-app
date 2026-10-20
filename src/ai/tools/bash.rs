@@ -1,11 +1,16 @@
-//! `bash`: one command in the sandbox's persistent shell.
+//! `bash`: one command in the sandbox's persistent shell, gated by the
+//! classifier (spec §8.1): commands proven read-only or explicitly allowed run
+//! silently, everything else waits for the user's approval, and a denied
+//! command never reaches the shell.
 
 use std::time::Duration;
 
+use review_sandbox::Verdict;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolCx, ToolOutput, definition, parse};
+use crate::ai::interaction::ApprovalDecision;
 
 /// The `bash` tool.
 pub(super) struct Bash;
@@ -56,6 +61,13 @@ impl Tool for Bash {
         if input.command.trim().is_empty() && !input.restart {
             return ToolOutput::error("command is required unless restart is true");
         }
+        // A restart with no command has nothing to classify: it only resets
+        // the shell, which writes nothing.
+        if !input.command.trim().is_empty()
+            && let Some(out) = approve(&input.command, cx).await
+        {
+            return out;
+        }
         // A zero timeout is the sandbox's default (120 s).
         let res = match cx
             .sandbox
@@ -78,5 +90,37 @@ impl Tool for Bash {
             text.push_str("(no output)");
         }
         ToolOutput::text(text)
+    }
+}
+
+/// Asks the user about `command` when the classifier requires it.
+///
+/// Returns `None` when the command may run (silently, approved once, or
+/// approved for the rest of the review) and `Some(error)` when it must not.
+/// An approval "for this review" records every normalized segment of the line,
+/// so the next identical line — and each of its parts on its own — is silent.
+async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
+    let reason = match review_sandbox::classify(command, &cx.allowed_snapshot()) {
+        Verdict::Run => return None,
+        Verdict::Ask { reason } => reason,
+    };
+    match cx
+        .interaction
+        .approve_command(&cx.agent, command, &reason)
+        .await
+    {
+        ApprovalDecision::Once => None,
+        ApprovalDecision::ForReview => {
+            cx.allow_segments(review_sandbox::normalized_segments(command));
+            None
+        }
+        ApprovalDecision::Deny { reason } => {
+            let mut text = "the user declined this command".to_string();
+            if let Some(reason) = reason.filter(|reason| !reason.trim().is_empty()) {
+                text.push_str(": ");
+                text.push_str(&reason);
+            }
+            Some(ToolOutput::error(text))
+        }
     }
 }
