@@ -9,6 +9,7 @@ pub mod checklist;
 pub mod checkout;
 pub mod context;
 pub mod events;
+pub mod hub;
 pub mod incremental;
 pub mod interaction;
 pub mod llm;
@@ -22,6 +23,7 @@ pub mod store;
 #[cfg(any(test, feature = "ai-testing"))]
 pub mod testing;
 pub mod tools;
+pub mod ui_interaction;
 
 pub use interaction::{ApprovalDecision, Interaction, NoInteraction, Question};
 pub use tools::{AgentRef, AgentRole};

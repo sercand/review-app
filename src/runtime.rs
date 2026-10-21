@@ -46,6 +46,10 @@ use crate::model::thread::{ReviewThread, ThreadComment};
 pub struct SessionId(pub u64);
 
 /// A unit of work handed from the UI to the worker.
+///
+/// `AiStart` carries the loaded snapshot inputs; later tasks match them as
+/// concrete values, so the enum keeps them unboxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Command {
     /// Round-trip probe used by the bridge tests.
@@ -327,6 +331,137 @@ pub enum Command {
         /// The model to probe with.
         model: crate::persist::settings::ModelSettings,
     },
+    /// Attach to a PR's AI review: rebinds any live run to `session` and
+    /// answers with [`Event::AiSnapshot`] (spec §10.2). Unix-only with
+    /// [`crate::ai`].
+    #[cfg(unix)]
+    AiAttach {
+        /// The session that opened the PR.
+        session: SessionId,
+        /// The PR the session is looking at.
+        key: crate::ai::store::PrKey,
+    },
+    /// Validate and plan the AI checkout for `pr`, answering with
+    /// [`Event::AiCheckoutPlanned`] for the user to confirm (spec §4 step 2).
+    #[cfg(unix)]
+    AiPlanCheckout {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the session is looking at.
+        key: crate::ai::store::PrKey,
+        /// The PR to check out.
+        pr: crate::ai::checkout::PrTarget,
+    },
+    /// Start an AI review run: checkout, prepare, sandbox, snapshot,
+    /// pipeline (spec §10.3).
+    #[cfg(unix)]
+    AiStart {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the session is looking at.
+        key: crate::ai::store::PrKey,
+        /// The PR to review.
+        pr: crate::ai::checkout::PrTarget,
+        /// What the session already loaded for the snapshot.
+        snapshot_inputs: crate::ai::hub::SnapshotInputs,
+        /// Full diff or incremental re-review.
+        mode: crate::ai::pipeline::RunMode,
+    },
+    /// Answer a parked `ask_user` question (spec §10.4).
+    #[cfg(unix)]
+    AiAnswer {
+        /// The session that answered.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+        /// The [`Event::AiQuestion`] id.
+        question_id: u64,
+        /// The answer text.
+        answer: String,
+    },
+    /// Decide a parked command approval (spec §8.1).
+    #[cfg(unix)]
+    AiApprove {
+        /// The session that decided.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+        /// The [`Event::AiApprovalRequest`] id.
+        approval_id: u64,
+        /// The decision.
+        decision: crate::ai::interaction::ApprovalDecision,
+    },
+    /// Decide a parked prepare approval (spec §8.5).
+    #[cfg(unix)]
+    AiApprovePrepare {
+        /// The session that decided.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+        /// The [`Event::AiApprovalRequest`] id.
+        approval_id: u64,
+        /// Whether the prepare commands may run.
+        ok: bool,
+    },
+    /// Queue a user note for every agent of the live run (spec §10.5).
+    #[cfg(unix)]
+    AiUserMessage {
+        /// The session that sent it.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+        /// The note text.
+        text: String,
+    },
+    /// Hold every running agent before its next model call.
+    #[cfg(unix)]
+    AiPause {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+    },
+    /// Release an [`Self::AiPause`].
+    #[cfg(unix)]
+    AiResume {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+    },
+    /// Stop the run; the checkout stays held so a re-run is cheap.
+    #[cfg(unix)]
+    AiCancel {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+    },
+    /// End the run and restore the checkout (spec §7.3, §10.6).
+    /// `discard = None` asks first when the tree is dirty.
+    #[cfg(unix)]
+    AiFinish {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the run belongs to.
+        key: crate::ai::store::PrKey,
+        /// Whether to discard review changes; `None` asks first.
+        discard: Option<bool>,
+    },
+    /// Move an AI finding to a new user state (spec §11).
+    #[cfg(unix)]
+    AiFindingState {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the finding belongs to.
+        key: crate::ai::store::PrKey,
+        /// The finding's row id.
+        id: i64,
+        /// The state to move it to.
+        state: crate::ai::review::FindingState,
+        /// The pending-comment link to record with it.
+        pending_local_id: Option<u64>,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -561,6 +696,105 @@ pub enum Event {
         /// The model that served the probe, or why the probe failed.
         result: Result<String, String>,
     },
+    /// A PR's full AI state, replayed on attach and after a run starts
+    /// (spec §10.3).
+    #[cfg(unix)]
+    AiSnapshot {
+        /// The session that asked.
+        session: SessionId,
+        /// The state to rebuild the AI tab from.
+        snapshot: crate::ai::hub::AiSnapshotData,
+    },
+    /// A checkout plan is ready for the user to confirm (spec §4 step 2).
+    #[cfg(unix)]
+    AiCheckoutPlanned {
+        /// The session that asked.
+        session: SessionId,
+        /// The plan to show.
+        plan: crate::ai::checkout::CheckoutPlan,
+    },
+    /// A checkout, prepare, or run-start step failed; `message` is safe to
+    /// show.
+    #[cfg(unix)]
+    AiCheckoutFailed {
+        /// The session that asked.
+        session: SessionId,
+        /// Why it failed.
+        message: String,
+    },
+    /// The prepare stage's command outputs (spec §8.5).
+    #[cfg(unix)]
+    AiPrepareOutput {
+        /// The session that started the run.
+        session: SessionId,
+        /// One entry per prepare command, in order.
+        outputs: Vec<crate::ai::checkout::PrepareOutput>,
+    },
+    /// A pipeline event forwarded verbatim (spec §10.3).
+    #[cfg(unix)]
+    AiPipeline {
+        /// The run's current session, rebound by [`Command::AiAttach`].
+        session: SessionId,
+        /// The pipeline event.
+        event: crate::ai::events::PipelineEvent,
+    },
+    /// An agent asked the user something; answer with [`Command::AiAnswer`]
+    /// (spec §10.4).
+    #[cfg(unix)]
+    AiQuestion {
+        /// The run's current session.
+        session: SessionId,
+        /// The id the answer carries.
+        id: u64,
+        /// The asking agent.
+        agent: crate::ai::tools::AgentRef,
+        /// The question text.
+        text: String,
+        /// Quick-reply choices; empty means free text.
+        options: Vec<String>,
+    },
+    /// A command or the prepare stage needs approval; decide with
+    /// [`Command::AiApprove`] / [`Command::AiApprovePrepare`] (spec §10.7).
+    #[cfg(unix)]
+    AiApprovalRequest {
+        /// The run's current session.
+        session: SessionId,
+        /// The id the decision carries.
+        id: u64,
+        /// The asking agent.
+        agent: crate::ai::tools::AgentRef,
+        /// What is being asked.
+        kind: crate::ai::ui_interaction::ApprovalKind,
+    },
+    /// A chat-stream event (spec §10.5, Task 7).
+    #[cfg(unix)]
+    AiChat {
+        /// The run's current session.
+        session: SessionId,
+        /// The chat event.
+        event: crate::ai::hub::ChatEvent,
+    },
+    /// A finish found changes the review made; the user must decide to keep
+    /// or discard them (spec §7.3).
+    #[cfg(unix)]
+    AiRestoreNeedsDecision {
+        /// The session that asked to finish.
+        session: SessionId,
+        /// `git status --porcelain` lines for the changes.
+        changes: Vec<String>,
+    },
+    /// The checkout was restored; the run is closed (spec §7.3).
+    #[cfg(unix)]
+    AiRestored {
+        /// The session that asked to finish.
+        session: SessionId,
+        /// How the restore went.
+        outcome: crate::ai::checkout::RestoreOutcome,
+    },
+    /// Checkouts a previous session never restored, sent once at startup
+    /// (spec §7.3). Not PR-scoped: the UI matches them to sessions by path.
+    #[cfg(unix)]
+    AiUnrestored(Vec<crate::ai::store::CheckoutRecord>),
 }
 
 /// Sends [`Event`]s from worker tasks to the UI thread.
@@ -693,21 +927,44 @@ fn panic_message(error: JoinError) -> String {
     }
 }
 
-/// Shared state every executor arm needs: the HTTP client (once signed in) and
-/// the token store.
+/// Shared state every executor arm needs: the HTTP client (once signed in),
+/// the token store, and the AI hub.
 pub struct ExecCtx {
     /// The installed GitHub client, or `None` before sign-in.
     pub client: RwLock<Option<GithubClient>>,
     /// The OS keychain, shared with the UI thread.
     pub store: Arc<dyn TokenStore>,
+    /// The AI review hub (spec §10.2). Unix-only with [`crate::ai`].
+    #[cfg(unix)]
+    pub ai: crate::ai::hub::AiHub,
 }
 
 impl ExecCtx {
-    /// A context with no client installed yet.
+    /// A context with no client installed yet and a throwaway in-memory AI
+    /// store — right for tests; the app uses [`Self::with_ai`] so runs
+    /// persist.
     pub fn new(store: Arc<dyn TokenStore>) -> ExecCtx {
         ExecCtx {
             client: RwLock::new(None),
+            store: store.clone(),
+            #[cfg(unix)]
+            ai: crate::ai::hub::AiHub::new(
+                Arc::new(
+                    crate::ai::store::Store::open_in_memory()
+                        .expect("an in-memory AI store always opens"),
+                ),
+                store,
+            ),
+        }
+    }
+
+    /// A context whose AI hub is `ai` (the app opens the real database).
+    #[cfg(unix)]
+    pub fn with_ai(store: Arc<dyn TokenStore>, ai: crate::ai::hub::AiHub) -> ExecCtx {
+        ExecCtx {
+            client: RwLock::new(None),
             store,
+            ai,
         }
     }
 
@@ -744,6 +1001,9 @@ impl ExecCtx {
 /// Every arm reports progress and failure through `events`; nothing here
 /// touches the UI, the settings file, or drafts.
 pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
+    // The startup checkout-recovery event, at most once (spec §7.3).
+    #[cfg(unix)]
+    ctx.ai.drain_startup(&events);
     match cmd {
         Command::Ping(n) => events.send(Event::Pong(n)),
         Command::Shutdown => {}
@@ -1268,6 +1528,82 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 });
             }
         }
+        #[cfg(unix)]
+        Command::AiAttach { session, key } => {
+            ctx.ai.attach(session, key, &events);
+        }
+        #[cfg(unix)]
+        Command::AiPlanCheckout { session, key, pr } => {
+            ctx.ai.plan_checkout(session, key, pr, &events).await;
+        }
+        #[cfg(unix)]
+        Command::AiStart {
+            session,
+            key,
+            pr,
+            snapshot_inputs,
+            mode,
+        } => {
+            let Some(client) = ctx.client() else {
+                events.send(Event::Failed {
+                    session: Some(session),
+                    error: GhError::Unauthorized,
+                });
+                return;
+            };
+            ctx.ai
+                .start(client, session, key, pr, snapshot_inputs, mode, &events)
+                .await;
+        }
+        #[cfg(unix)]
+        Command::AiAnswer {
+            session: _,
+            key,
+            question_id,
+            answer,
+        } => ctx.ai.answer(&key, question_id, answer),
+        #[cfg(unix)]
+        Command::AiApprove {
+            session: _,
+            key,
+            approval_id,
+            decision,
+        } => ctx.ai.approve(&key, approval_id, decision),
+        #[cfg(unix)]
+        Command::AiApprovePrepare {
+            session: _,
+            key,
+            approval_id,
+            ok,
+        } => ctx.ai.approve_prepare(&key, approval_id, ok),
+        #[cfg(unix)]
+        Command::AiUserMessage { session, key, text } => {
+            ctx.ai.user_message(session, &key, text, &events);
+        }
+        #[cfg(unix)]
+        Command::AiPause { session: _, key } => ctx.ai.pause(&key, &events),
+        #[cfg(unix)]
+        Command::AiResume { session: _, key } => ctx.ai.resume(&key, &events),
+        #[cfg(unix)]
+        Command::AiCancel { session: _, key } => ctx.ai.cancel(&key, &events),
+        #[cfg(unix)]
+        Command::AiFinish {
+            session,
+            key,
+            discard,
+        } => {
+            ctx.ai.finish(session, &key, discard, &events).await;
+        }
+        #[cfg(unix)]
+        Command::AiFindingState {
+            session,
+            key: _,
+            id,
+            state,
+            pending_local_id,
+        } => ctx
+            .ai
+            .finding_state(session, id, state, pending_local_id, &events),
         Command::ExpandContext {
             session,
             repo,

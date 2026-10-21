@@ -243,6 +243,15 @@ impl ReviewApp {
             }
         };
 
+        // The AI hub opens the persisted AI database beside the settings;
+        // its settings snapshot is replaced whenever the user saves (Task 1).
+        #[cfg(unix)]
+        let exec = {
+            let ai = crate::ai::hub::AiHub::open(&config_dir, store.clone());
+            ai.set_settings(settings.ai.clone());
+            Arc::new(ExecCtx::with_ai(store.clone(), ai))
+        };
+        #[cfg(not(unix))]
         let exec = Arc::new(ExecCtx::new(store.clone()));
         if let Some(token) = &restored {
             exec.install_client(GithubClient::new(&settings.host, token));
@@ -439,6 +448,21 @@ impl ReviewApp {
                     .test_results
                     .insert(provider, result);
             }
+            // The AI tab (Tasks 2+) renders these; for now a failed start
+            // still deserves the toast (Task 1).
+            #[cfg(unix)]
+            Event::AiCheckoutFailed { message, .. } => self.toasts.push(message, now),
+            #[cfg(unix)]
+            Event::AiSnapshot { .. }
+            | Event::AiCheckoutPlanned { .. }
+            | Event::AiPrepareOutput { .. }
+            | Event::AiPipeline { .. }
+            | Event::AiQuestion { .. }
+            | Event::AiApprovalRequest { .. }
+            | Event::AiChat { .. }
+            | Event::AiRestoreNeedsDecision { .. }
+            | Event::AiRestored { .. }
+            | Event::AiUnrestored(_) => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -607,6 +631,9 @@ impl ReviewApp {
             self.toasts
                 .push(format!("could not save settings: {error}"), now);
         }
+        // The worker's AI hub reads its settings from its own copy (Task 1).
+        #[cfg(unix)]
+        self.exec.ai.set_settings(self.settings.ai.clone());
     }
 
     /// Open the settings window on a fresh copy of the current settings.

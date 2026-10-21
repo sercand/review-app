@@ -11,6 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use anyhow::Context;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::ai::review::{
@@ -109,7 +110,7 @@ pub fn ai_db_path(config_root: &Path) -> PathBuf {
 /// Identifies the PR an AI session belongs to. `host`, `owner`, and `repo`
 /// are stored (and therefore matched) lowercased, so the unique index on
 /// `ai_sessions (host, owner, repo, number)` is case-insensitive.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PrKey {
     /// GitHub host, e.g. `github.com`. Stored lowercased.
     pub host: String,
@@ -252,6 +253,25 @@ pub struct CheckoutRecord {
     pub head_sha: String,
     /// Current lifecycle state.
     pub state: CheckoutState,
+}
+
+/// One `ai_runs` row, as the UI needs it to show run status on attach
+/// (spec §10.3). `kind` and `status` keep their stored spelling
+/// ([`RunKind`] / [`crate::ai::events::RunStatus`] parse them back).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Database row id.
+    pub id: i64,
+    /// `"full"` or `"incremental"`.
+    pub kind: String,
+    /// For incremental runs: the head the previous run reviewed.
+    pub base_sha: Option<String>,
+    /// The head this run reviewed.
+    pub head_sha: String,
+    /// Lifecycle status (`completed|cancelled|failed|budget_exhausted|running`).
+    pub status: String,
+    /// Why the run stopped early, when it did.
+    pub stop_reason: Option<String>,
 }
 
 /// The `ai_checkout` columns behind a [`CheckoutRecord`]'s fields, in struct
@@ -840,6 +860,102 @@ impl Store {
         }
         Ok(out)
     }
+
+    /// The whole transcript of `run_id` in insertion order, as
+    /// (agent_id, role, content_json) triples (spec §10.3: the UI rebuilds
+    /// the timeline on attach).
+    pub fn run_timeline(&self, run_id: i64) -> anyhow::Result<Vec<(String, String, String)>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT agent_id, role, content_json FROM ai_messages
+                 WHERE run_id = ?1 ORDER BY id",
+            )
+            .context("preparing run_timeline query")?;
+        let rows = stmt
+            .query_map(rusqlite::params![run_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("querying run_timeline")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("reading run_timeline row")?);
+        }
+        Ok(out)
+    }
+
+    /// The newest run row for `session_id`, when the session has one.
+    pub fn latest_run(&self, session_id: i64) -> anyhow::Result<Option<RunRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, base_sha, head_sha, status, stop_reason
+                 FROM ai_runs WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+            )
+            .context("preparing latest_run query")?;
+        let mut rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(RunRecord {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    base_sha: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    status: row.get(4)?,
+                    stop_reason: row.get(5)?,
+                })
+            })
+            .context("querying latest_run")?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.context("reading latest_run row")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The head SHA the last completed review ran against, when any run has
+    /// recorded one (drives the incremental re-review offer, spec §5.8).
+    pub fn session_last_reviewed(&self, session_id: i64) -> anyhow::Result<Option<String>> {
+        self.conn()
+            .query_row(
+                "SELECT last_reviewed_sha FROM ai_sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .context("reading last_reviewed_sha")
+            .map(|found| found.flatten())
+    }
+
+    /// Move finding `id` to `state` from the UI, keeping the stored
+    /// `pending_local_id` unless the caller supplies one (spec §11: the
+    /// pending-comment link survives keeps and drops).
+    pub fn finding_set_user_state(
+        &self,
+        id: i64,
+        state: FindingState,
+        pending_local_id: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE ai_findings
+                    SET state = ?2, pending_local_id = COALESCE(?3, pending_local_id)
+                  WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    state.as_str(),
+                    pending_local_id.map(|id| id.to_string())
+                ],
+            )
+            .context("updating ai_findings user state")?;
+        if n == 0 {
+            anyhow::bail!("no finding with id {id}");
+        }
+        Ok(())
+    }
 }
 
 /// The `ai_findings.evidence_json` shape: the evidence list plus the agent
@@ -881,6 +997,93 @@ mod tests {
             head_sha: "abc123".to_string(),
             state: CheckoutState::Started,
         }
+    }
+
+    #[test]
+    fn run_timeline_latest_run_and_user_state_round_trip() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let key = PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+        };
+        let session = store.session_id(&key).expect("session row");
+
+        assert_eq!(store.latest_run(session).expect("no run yet"), None);
+        assert_eq!(
+            store.session_last_reviewed(session).expect("no sha yet"),
+            None
+        );
+
+        let run = store
+            .run_begin(session, RunKind::Full, None, "head1")
+            .expect("run row");
+        store
+            .message_append(run, "scout", "assistant", r#"{"text":"hi"}"#)
+            .expect("message");
+        store
+            .session_set_last_reviewed(session, "head1")
+            .expect("last reviewed");
+
+        let latest = store.latest_run(session).expect("latest run");
+        assert_eq!(latest.expect("a run").head_sha, "head1");
+        let timeline = store.run_timeline(run).expect("timeline");
+        assert_eq!(
+            timeline,
+            vec![(
+                "scout".to_string(),
+                "assistant".to_string(),
+                r#"{"text":"hi"}"#.to_string()
+            )]
+        );
+        assert_eq!(
+            store.session_last_reviewed(session).expect("sha"),
+            Some("head1".to_string())
+        );
+
+        let finding_id = store
+            .finding_insert(
+                session,
+                &Finding {
+                    id: 0,
+                    run_id: run,
+                    agent: AgentRef {
+                        id: 1,
+                        role: crate::ai::tools::AgentRole::Reviewer,
+                        label: "reviewer 1".to_string(),
+                    },
+                    anchor: FindingAnchor::Summary {
+                        path: "a.rs".to_string(),
+                    },
+                    severity: Severity::Risk,
+                    title: "t".to_string(),
+                    body: "b".to_string(),
+                    evidence: vec![Evidence {
+                        path: "a.rs".to_string(),
+                        line: None,
+                        note: "n".to_string(),
+                    }],
+                    checklist_item: None,
+                    state: FindingState::Draft,
+                    state_reason: None,
+                    pending_local_id: None,
+                },
+            )
+            .expect("finding row");
+        store
+            .finding_set_user_state(finding_id, FindingState::Kept, Some(9))
+            .expect("keep finding");
+        let kept = &store.finding_list(session).expect("findings")[0];
+        assert_eq!(kept.state, FindingState::Kept);
+        assert_eq!(kept.pending_local_id, Some(9));
+        // A later state change without a local id keeps the stored link.
+        store
+            .finding_set_user_state(finding_id, FindingState::Posted, None)
+            .expect("post finding");
+        let posted = &store.finding_list(session).expect("findings")[0];
+        assert_eq!(posted.state, FindingState::Posted);
+        assert_eq!(posted.pending_local_id, Some(9));
     }
 
     #[test]
