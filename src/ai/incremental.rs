@@ -44,9 +44,13 @@ pub async fn incremental_files(
         });
     }
 
+    // `core.quotePath=false` keeps non-ASCII paths as raw UTF-8 instead of
+    // octal-quoted `"src/\303\251.rs"`, so the names match the PR file list.
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
+        .arg("-c")
+        .arg("core.quotePath=false")
         .args(["diff", "--name-only", &format!("{since}..{head}")])
         .stdin(Stdio::null())
         .output()
@@ -191,6 +195,23 @@ mod tests {
             }
             other => panic!("expected the force-push fallback, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn incremental_scope_keeps_non_ascii_paths_unquoted() {
+        let repo = TempRepo::new();
+        repo.write(&[("src/a.rs", "a1\n")]);
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base"]);
+        let base = rev_parse(repo.path(), "HEAD");
+
+        repo.commit(&[("src/naïve.rs", "n1\n")], "add a unicode path");
+
+        // Without `core.quotePath=false` git would print `"src/na\303\257ve.rs"`.
+        let scope = incremental_files(repo.path(), &base, &rev_parse(repo.path(), "HEAD"))
+            .await
+            .unwrap();
+        assert_eq!(scope, IncrementalScope::Files(vec!["src/naïve.rs".into()]));
     }
 
     #[tokio::test]

@@ -109,14 +109,7 @@ pub async fn run_reviewer(
     }
 
     let text = seed_message(
-        initial_message(
-            brief,
-            group,
-            &snapshot,
-            cx.context.as_deref(),
-            &assigned,
-            &cx.run.qa(),
-        ),
+        initial_message(brief, group, &snapshot, cx.context.as_deref(), &assigned),
         &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
@@ -235,15 +228,15 @@ fn record_skips(run: &RunState, assigned: &[(String, String)]) -> Vec<(String, S
 
 /// The reviewer's single task message (spec §5.4): the intent, the group,
 /// its patches (or hunk ranges), the assigned checklist with instruction
-/// text, the scoped instructions, the skill index, the threads on these
-/// files, and the user Q&A so far.
+/// text, the scoped instructions, the skill index and the threads on these
+/// files. The user Q&A is not part of it: [`seed_message`] appends the one
+/// shared `## Known facts from the user` section.
 fn initial_message(
     brief: &Brief,
     group: &Group,
     snapshot: &PrSnapshot,
     context: Option<&RepoContext>,
     assigned: &[(String, String)],
-    qa: &[(String, String)],
 ) -> String {
     let mut out = String::from("## Intent\n\n");
     out.push_str(brief.intent.trim_end());
@@ -337,13 +330,6 @@ fn initial_message(
         out.push_str("\n## Existing threads\n\n");
         for thread in threads {
             out.push_str(&format!("- {}\n", thread_text(thread)));
-        }
-    }
-
-    if !qa.is_empty() {
-        out.push_str("\n## Questions already answered\n\n");
-        for (question, answer) in qa {
-            out.push_str(&format!("Q: {question}\nA: {answer}\n"));
         }
     }
     out
@@ -878,13 +864,13 @@ mod tests {
         let brief = brief_with(vec![core.clone()]);
         let assigned = assignment(&core, &snapshot, &context.checks);
 
-        let text = initial_message(
-            &brief,
-            &core,
-            &snapshot,
-            Some(&context),
-            &assigned,
-            &[("is empty allowed?".to_string(), "yes".to_string())],
+        // The seed is what the agent sees: the shared helper owns the Q&A
+        // section, rendered exactly once.
+        let qa = [("is empty allowed?".to_string(), "yes".to_string())];
+        let text = seed_message(
+            initial_message(&brief, &core, &snapshot, Some(&context), &assigned),
+            &qa,
+            None,
         );
 
         let order = [
@@ -895,7 +881,7 @@ mod tests {
             "## Instructions",
             "## Skills",
             "## Existing threads",
-            "## Questions already answered",
+            "## Known facts from the user",
         ];
         let mut last = 0;
         for section in order {
@@ -940,6 +926,11 @@ mod tests {
         );
         assert!(!text.contains("web/other.ts"), "{text}");
         assert!(text.contains("Q: is empty allowed?\nA: yes"), "{text}");
+        assert_eq!(
+            text.matches("Q: is empty allowed?").count(),
+            1,
+            "the Q&A renders exactly once:\n{text}"
+        );
     }
 
     #[test]
@@ -950,7 +941,7 @@ mod tests {
         let brief = brief_with(vec![core.clone()]);
         let assigned = assignment(&core, &snapshot, &[]);
 
-        let text = initial_message(&brief, &core, &snapshot, None, &assigned, &[]);
+        let text = initial_message(&brief, &core, &snapshot, None, &assigned);
 
         assert!(text.contains("[patch truncated]"), "patch was not capped");
         assert!(
@@ -962,7 +953,10 @@ mod tests {
             !text.contains("## Existing threads"),
             "no threads, no section:\n{text}"
         );
-        assert!(!text.contains("## Questions"), "{text}");
+        assert!(
+            !text.contains("## Known facts"),
+            "the shared helper adds the Q&A section, not this message:\n{text}"
+        );
     }
 
     #[test]
