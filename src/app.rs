@@ -178,18 +178,6 @@ fn ai_target(session: &PrSession) -> Option<crate::ai::checkout::PrTarget> {
     })
 }
 
-/// The store key for the open PR's AI rows, lowercased like the store's own
-/// session identity.
-#[cfg(unix)]
-fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
-    crate::ai::store::PrKey {
-        host: session.host.to_lowercase(),
-        owner: session.repo.owner.to_lowercase(),
-        repo: session.repo.name.to_lowercase(),
-        number: session.number,
-    }
-}
-
 /// Whether the repo's AI settings already name commands. The scout only
 /// proposes commands while the repo has none (spec §4 step 1), so once one
 /// is configured the tab's suggested-commands card retires.
@@ -2021,7 +2009,7 @@ impl ReviewApp {
                             session.mark_session_dirty(now);
                             let command = Command::AiFindingState {
                                 session: session.id,
-                                key: pr_key(session),
+                                key: crate::state::pr_detail::pr_key(session),
                                 id,
                                 state: FindingState::Kept,
                                 pending_local_id: kept.pending_local_id,
@@ -2040,7 +2028,7 @@ impl ReviewApp {
                     };
                     let command = Command::AiEditFinding {
                         session: session.id,
-                        key: pr_key(session),
+                        key: crate::state::pr_detail::pr_key(session),
                         id,
                         body,
                     };
@@ -2060,7 +2048,7 @@ impl ReviewApp {
                     session.mark_session_dirty(now);
                     let command = Command::AiFindingState {
                         session: session.id,
-                        key: pr_key(session),
+                        key: crate::state::pr_detail::pr_key(session),
                         id,
                         state: FindingState::DroppedByUser,
                         pending_local_id: None,
@@ -2080,7 +2068,7 @@ impl ReviewApp {
                     let text = crate::state::ai_review::why_question(&finding);
                     let command = Command::AiUserMessage {
                         session: session.id,
-                        key: pr_key(session),
+                        key: crate::state::pr_detail::pr_key(session),
                         text: text.clone(),
                     };
                     self.worker.send(command);

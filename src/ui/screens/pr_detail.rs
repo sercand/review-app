@@ -168,6 +168,15 @@ pub fn render(
 
     // The review view-model is read by the top bar's popover and the banner
     // strip; computed once per frame before either borrows the session.
+    // The AI draft's suggestion line rides in as an input (Plan 3 Task 6).
+    #[cfg(unix)]
+    let suggested = session
+        .ai
+        .draft
+        .as_ref()
+        .map(|draft| review_panel::suggestion_line(draft.verdict, &draft.rationale));
+    #[cfg(not(unix))]
+    let suggested: Option<String> = None;
     let panel_inputs = review_panel::PanelInputs {
         pending: &session.pending,
         viewer_is_author: viewer_is_author(session, login),
@@ -175,6 +184,7 @@ pub fn render(
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: write_blocked.map(str::to_owned),
         threads: &session.threads,
+        suggested: suggested.as_deref(),
     };
     let review_vm = review_panel::review_panel_vm(&panel_inputs);
 

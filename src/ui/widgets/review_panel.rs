@@ -42,6 +42,9 @@ pub struct PanelInputs<'a> {
     /// The PR's review threads; the pending ones are the GitHub review's
     /// comments.
     pub threads: &'a [ReviewThread],
+    /// The AI draft's suggestion line, when a draft is present (Plan 3
+    /// Task 6); the app threads it in so the widget reads no app state.
+    pub suggested: Option<&'a str>,
 }
 
 /// One comment of the viewer's pending review on GitHub, for the popover.
@@ -81,6 +84,9 @@ pub struct ReviewPanelVm {
     pub github: bool,
     /// The GitHub review's comments.
     pub github_items: Vec<GithubItemVm>,
+    /// The AI draft's suggestion line, when one is present: the verdict and
+    /// one-line rationale the assembler proposed (Plan 3 Task 6).
+    pub suggested: Option<String>,
 }
 
 /// Decide what the panel may offer (spec §7.2, Review Focus #6 and #7).
@@ -124,7 +130,23 @@ pub fn review_panel_vm(i: &PanelInputs) -> ReviewPanelVm {
         write_blocked: i.write_blocked.clone(),
         github,
         github_items,
+        suggested: i.suggested.map(str::to_owned),
     }
+}
+
+/// The popover's suggestion line for the assembler's draft (Plan 3 Task 6):
+/// the ✦ sparkles, the verdict in the popover's own words, and the one-line
+/// rationale.
+#[cfg(unix)]
+pub fn suggestion_line(verdict: crate::ai::stages::assemble::Verdict, rationale: &str) -> String {
+    use crate::ai::stages::assemble::Verdict;
+
+    let verdict = match verdict {
+        Verdict::Approve => "Approve",
+        Verdict::Comment => "Comment",
+        Verdict::RequestChanges => "Request changes",
+    };
+    format!("{} suggested: {verdict} — {rationale}", icons::SPARKLES)
 }
 
 /// The pending comments of the viewer's GitHub review, one per thread.
@@ -359,6 +381,10 @@ pub fn render(
         );
     }
 
+    if let Some(suggested) = &vm.suggested {
+        ui.label(RichText::new(suggested.clone()).color(p.muted));
+    }
+
     let body_response = ui.add(
         egui::TextEdit::multiline(&mut pending.body)
             .hint_text("Leave a summary (optional for Approve)")
@@ -585,6 +611,7 @@ mod tests {
             head_moved_since_pin: false,
             write_blocked: None,
             threads: &[],
+            suggested: None,
         }
     }
 
@@ -776,6 +803,28 @@ mod tests {
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
         assert!(!opened, "an untouched banner opens nothing");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn suggestion_line_names_the_verdict_and_rationale() {
+        use crate::ai::stages::assemble::Verdict;
+
+        assert_eq!(
+            suggestion_line(Verdict::RequestChanges, "a kept bug blocks the merge"),
+            format!(
+                "{} suggested: Request changes — a kept bug blocks the merge",
+                icons::SPARKLES
+            )
+        );
+        assert_eq!(
+            suggestion_line(Verdict::Approve, "ship it"),
+            format!("{} suggested: Approve — ship it", icons::SPARKLES)
+        );
+        assert_eq!(
+            suggestion_line(Verdict::Comment, "one nit"),
+            format!("{} suggested: Comment — one nit", icons::SPARKLES)
+        );
     }
 
     #[test]

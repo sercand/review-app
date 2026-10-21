@@ -716,6 +716,21 @@ impl PrSession {
                 self.phase = LoadPhase::Failed;
                 Vec::new()
             }
+            // The assembler's draft is what lands the review's summary and
+            // verdict: an untouched summary is pre-filled from it, once
+            // (Plan 3 Task 6). A draft for a PR the user left is dropped by
+            // the session guard, like every AI event (spec §12).
+            #[cfg(unix)]
+            ev @ Event::AiPipeline {
+                session,
+                event: crate::ai::events::PipelineEvent::DraftReady { .. },
+            } if *session == self.id => {
+                self.ai.apply(ev);
+                if prefill_review(&mut self.pending, self.ai.draft.as_ref()) {
+                    self.save_pending_draft();
+                }
+                Vec::new()
+            }
             // The ✦ AI tab's events fold into the reducer (Task 2), which
             // never emits commands of its own. The session guard here is the
             // stale-event rule: a run keeps going when the PR is left, and
@@ -1757,6 +1772,89 @@ pub fn keep_draft(session: &mut PrSession, id: i64) -> Result<KeepResult, String
     }
 }
 
+/// The review event a draft's verdict maps to (spec §5.6, §12): GitHub's
+/// three verdicts, one each.
+#[cfg(unix)]
+pub fn map_verdict(verdict: crate::ai::stages::assemble::Verdict) -> ReviewEvent {
+    use crate::ai::stages::assemble::Verdict;
+
+    match verdict {
+        Verdict::Approve => ReviewEvent::Approve,
+        Verdict::Comment => ReviewEvent::Comment,
+        Verdict::RequestChanges => ReviewEvent::RequestChanges,
+    }
+}
+
+/// Pre-fill the review draft from the assembler's draft (Plan 3 Task 6): the
+/// summary becomes the body and the verdict the event — but only while the
+/// body is still empty, so a summary the reviewer typed is never overwritten
+/// (nor the verdict they picked). Returns whether anything was written.
+#[cfg(unix)]
+pub fn prefill_review(
+    pending: &mut PendingReview,
+    draft: Option<&crate::ai::stages::assemble::ReviewDraft>,
+) -> bool {
+    let Some(draft) = draft else {
+        return false;
+    };
+    if !pending.body.trim().is_empty() {
+        return false;
+    }
+    pending.set_body(draft.summary.clone());
+    pending.set_event(map_verdict(draft.verdict));
+    true
+}
+
+/// Mark the kept findings this submit posted as [`Posted`], returning the
+/// store commands that record it (spec §11, §12).
+///
+/// Runs before the draft is cleared: the submitted comments' local ids are
+/// all there is to go by. Summary items (`pending_local_id: None`) ride the
+/// review body rather than a comment, so they stay kept.
+///
+/// [`Posted`]: crate::ai::review::FindingState::Posted
+#[cfg(unix)]
+fn posted_findings(session: &mut PrSession) -> Vec<Command> {
+    use crate::ai::review::FindingState;
+
+    let submitted: BTreeSet<u64> = session
+        .pending
+        .comments
+        .iter()
+        .map(|comment| comment.local_id)
+        .collect();
+    let key = pr_key(session);
+    let mut commands = Vec::new();
+    for finding in session.ai.findings.values_mut() {
+        let Some(local_id) = finding.pending_local_id else {
+            continue;
+        };
+        if finding.state == FindingState::Kept && submitted.contains(&local_id) {
+            finding.state = FindingState::Posted;
+            commands.push(Command::AiFindingState {
+                session: session.id,
+                key: key.clone(),
+                id: finding.id,
+                state: FindingState::Posted,
+                pending_local_id: Some(local_id),
+            });
+        }
+    }
+    commands
+}
+
+/// The store key for the open PR's AI rows, lowercased like the store's own
+/// session identity.
+#[cfg(unix)]
+pub fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
+    crate::ai::store::PrKey {
+        host: session.host.to_lowercase(),
+        owner: session.repo.owner.to_lowercase(),
+        repo: session.repo.name.to_lowercase(),
+        number: session.number,
+    }
+}
+
 /// Add a pending comment anchored to the diff on screen, persisting the
 /// draft immediately.
 ///
@@ -1808,6 +1906,8 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: None,
         threads: &session.threads,
+        // Submission rules do not read the AI suggestion; the popover does.
+        suggested: None,
     };
     if !review_panel_vm(&inputs).submit_enabled {
         return None;
@@ -1824,22 +1924,27 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
 /// in memory and on disk — the review is appended, and the threads and
 /// reviews are reloaded so the new comments render anchored (spec §7.2).
 pub fn on_review_submitted(session: &mut PrSession, review: Review) -> Vec<Command> {
+    // The findings this submit posts, decided before the draft is cleared:
+    // their pending comments' local ids are the only link (Plan 3 Task 6).
+    #[cfg(unix)]
+    let mut commands = posted_findings(session);
+    #[cfg(not(unix))]
+    let mut commands: Vec<Command> = Vec::new();
     session.pending.clear();
     session.rebuild_rows();
     session.save_pending_draft();
     session.reviews.push(review);
-    vec![
-        Command::LoadThreads {
-            session: session.id,
-            repo: session.repo.clone(),
-            number: session.number,
-        },
-        Command::LoadReviews {
-            session: session.id,
-            repo: session.repo.clone(),
-            number: session.number,
-        },
-    ]
+    commands.push(Command::LoadThreads {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+    });
+    commands.push(Command::LoadReviews {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+    });
+    commands
 }
 
 /// Fold a failed submit in: the draft is never lost (spec §11), only the
@@ -3025,6 +3130,85 @@ mod tests {
         );
     }
 
+    /// Submitting the review posts exactly the kept findings whose pending
+    /// comments went out with it; the ones left out of the draft, and the
+    /// summary items that ride the review body, stay kept (spec §11, §12).
+    #[test]
+    #[cfg(unix)]
+    fn submit_marks_kept_findings_posted() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let first = add_pending(&mut s, line_anchor("a.rs", 1), "**Bug:** one".into()).unwrap();
+        let second = add_pending(&mut s, line_anchor("a.rs", 1), "**Risk:** two".into()).unwrap();
+        for (id, anchor, severity, local_id) in [
+            (
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                Some(first),
+            ),
+            (
+                2,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Risk,
+                Some(second),
+            ),
+            // Kept, but its comment never made it into this draft.
+            (
+                3,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Nit,
+                Some(9),
+            ),
+            // A summary item: it lives in the review body, not a comment.
+            (
+                4,
+                FindingAnchor::Summary {
+                    path: "a.rs".into(),
+                },
+                Severity::Nit,
+                None,
+            ),
+        ] {
+            let mut finding = ai_finding(id, anchor, severity, FindingState::Kept, "title", "body");
+            finding.pending_local_id = local_id;
+            s.ai.findings.insert(id, finding);
+        }
+
+        let commands = on_review_submitted(&mut s, review(ReviewState::Commented));
+
+        for id in [1, 2] {
+            assert_eq!(
+                s.ai.findings[&id].state,
+                FindingState::Posted,
+                "finding #{id} was in the submitted draft"
+            );
+        }
+        for id in [3, 4] {
+            assert_eq!(
+                s.ai.findings[&id].state,
+                FindingState::Kept,
+                "finding #{id} was not posted by this submit"
+            );
+        }
+
+        let mut posted: Vec<i64> = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::AiFindingState {
+                    id,
+                    state: FindingState::Posted,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        posted.sort_unstable();
+        assert_eq!(posted, vec![1, 2], "the store hears about the same two");
+    }
+
     #[test]
     fn moved_head_keeps_the_draft_pinned() {
         let (mut s, _dir) = ready_session("sha1");
@@ -3842,6 +4026,111 @@ mod tests {
         );
         assert!(s.pending.comments.is_empty());
         assert!(s.pending.commit_id.is_none(), "a summary item pins nothing");
+    }
+
+    /// The assembler's draft pre-fills the review summary and verdict — but
+    /// only while the reviewer has not written a summary of their own
+    /// (spec §12, Plan 3 Task 6).
+    #[test]
+    #[cfg(unix)]
+    fn prefill_only_when_body_empty() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
+        let draft = ReviewDraft {
+            summary: "adds the retry loop; one bug in the backoff".into(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".into(),
+            rewrites: Default::default(),
+        };
+
+        let mut pending = PendingReview::default();
+        assert!(
+            !prefill_review(&mut pending, None),
+            "without a draft there is nothing to prefill"
+        );
+        assert!(pending.body.is_empty());
+
+        assert!(
+            prefill_review(&mut pending, Some(&draft)),
+            "an empty body takes the draft's summary"
+        );
+        assert_eq!(pending.body, draft.summary);
+        assert_eq!(pending.event, ReviewEvent::RequestChanges);
+
+        let mut typed = PendingReview::default();
+        typed.set_body("my own summary".into());
+        typed.set_event(ReviewEvent::Comment);
+        assert!(
+            !prefill_review(&mut typed, Some(&draft)),
+            "a body the reviewer typed is never overwritten"
+        );
+        assert_eq!(typed.body, "my own summary");
+        assert_eq!(
+            typed.event,
+            ReviewEvent::Comment,
+            "the verdict they picked stands too"
+        );
+
+        let mut blank = PendingReview::default();
+        blank.set_body("  \n\t".into());
+        assert!(
+            prefill_review(&mut blank, Some(&draft)),
+            "whitespace is an empty body"
+        );
+        assert_eq!(blank.body, draft.summary);
+    }
+
+    /// The verdict mapping the prefill uses, one-to-one with GitHub's events.
+    #[test]
+    #[cfg(unix)]
+    fn map_verdict_table() {
+        use crate::ai::stages::assemble::Verdict;
+
+        assert_eq!(map_verdict(Verdict::Approve), ReviewEvent::Approve);
+        assert_eq!(map_verdict(Verdict::Comment), ReviewEvent::Comment);
+        assert_eq!(
+            map_verdict(Verdict::RequestChanges),
+            ReviewEvent::RequestChanges
+        );
+    }
+
+    /// A `DraftReady` event is what lands the draft: the fold fills the
+    /// pending review in the same step (Plan 3 Task 6).
+    #[test]
+    #[cfg(unix)]
+    fn draft_ready_prefills_the_pending_review() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let draft = ReviewDraft {
+            summary: "adds retries".into(),
+            verdict: Verdict::Approve,
+            rationale: "clean".into(),
+            rewrites: Default::default(),
+        };
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(2),
+            event: PipelineEvent::DraftReady {
+                draft: draft.clone(),
+            },
+        });
+        assert!(
+            s.pending.body.is_empty(),
+            "a draft for a PR the user left never pre-fills this one"
+        );
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::DraftReady { draft },
+        });
+        assert_eq!(s.pending.body, "adds retries");
+        assert_eq!(s.pending.event, ReviewEvent::Approve);
+        assert_eq!(
+            s.ai.draft.as_ref().map(|d| d.summary.as_str()),
+            Some("adds retries")
+        );
     }
 
     /// The tree's ✦ badge counts the open (draft) findings per file; kept and
