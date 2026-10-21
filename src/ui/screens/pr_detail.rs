@@ -136,6 +136,9 @@ pub struct ScreenInputs<'a> {
     pub theme: crate::ui::theme::Theme,
     /// Whether the OS is dark right now, same reason.
     pub system_dark: bool,
+    /// Whether the AI surface is on (`settings.ai.models.default` is set),
+    /// which decides whether the top bar shows its ✦ AI review button.
+    pub ai_configured: bool,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -186,7 +189,7 @@ pub fn render(
 
     // The top bar: back, state pill, repo/title, CI, tools, and the Review
     // button whose popover replaced the bottom review panel (Task 12).
-    let bar_vm = top_bar::top_bar_vm(session);
+    let bar_vm = top_bar::top_bar_vm(session, inputs.ai_configured);
     let mut bar_actions = Vec::new();
     let mut review_actions = Vec::new();
     let mut merge_actions = Vec::new();
@@ -227,6 +230,20 @@ pub fn render(
             top_bar::TopBarAction::Settings => actions.push(PrDetailAction::OpenSettings),
             top_bar::TopBarAction::ToggleDetails => state.right_open = !state.right_open,
             top_bar::TopBarAction::OpenInBrowser => actions.push(PrDetailAction::OpenInBrowser),
+            // The ✦ AI review button rides the tab's own actions (spec §4
+            // step 2), so the top bar and the tab share one path.
+            #[cfg(unix)]
+            top_bar::TopBarAction::AiStart => {
+                actions.push(PrDetailAction::Ai(
+                    crate::ui::widgets::ai_panel::AiPanelAction::Start,
+                ));
+            }
+            #[cfg(unix)]
+            top_bar::TopBarAction::AiContinue => {
+                actions.push(PrDetailAction::Ai(
+                    crate::ui::widgets::ai_panel::AiPanelAction::Continue,
+                ));
+            }
         }
     }
     if review_actions.iter().any(review_panel::closes_popover) {
@@ -666,6 +683,7 @@ mod tests {
                     write_blocked: None,
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
+                    ai_configured: false,
                 },
             );
         });
@@ -720,6 +738,7 @@ mod tests {
                     write_blocked: None,
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
+                    ai_configured: false,
                 },
             );
         });

@@ -60,6 +60,9 @@ pub enum AiPanelAction {
     JumpToFinding(i64),
     /// Toggle the dropped-by-verifier findings (spec §12).
     ShowDropped(bool),
+    /// User clicked "Add to settings" on the suggested-commands card
+    /// (task 4): copy the brief's commands into the repo's AI settings.
+    AddSuggestedCommands,
 }
 
 /// The display name of a pipeline stage.
@@ -202,6 +205,7 @@ pub fn render(ui: &mut egui::Ui, st: &AiReviewState, show_dropped: bool) -> Vec<
     let mut actions = Vec::new();
     render_stage_strip(ui, st);
     render_phase(ui, st, &mut actions);
+    render_suggestions(ui, st, &mut actions);
     ui.separator();
     for (index, entry) in st.timeline.iter().enumerate() {
         render_entry(ui, st, index, entry, &mut actions);
@@ -270,6 +274,7 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
         }
         AiPhase::Finished => {
             ui.weak("The checkout was restored.");
+            can_start = true;
         }
         AiPhase::Failed(message) => {
             ui.colored_label(p.bad, format!("The review stopped: {message}"));
@@ -283,7 +288,7 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
         // The head comparison behind a re-review (`can_continue`) needs the
         // PR head, which the tab cannot see; offering Continue whenever a
         // completed review exists and nothing is in flight is the tab's
-        // half, and the app's `AiStart` is the worker's gate.
+        // half, and `app.rs` gates the click on `can_continue` (Task 4).
         if st.last_reviewed_sha.is_some()
             && matches!(
                 st.phase,
@@ -292,6 +297,43 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
             && ui.button("Continue review").clicked()
         {
             actions.push(AiPanelAction::Continue);
+        }
+    });
+}
+
+/// The suggested-commands card: the scout's proposals for a repo with no
+/// configured commands (spec §4 step 1), shown until the user applies them
+/// to the repo's AI settings (task 4).
+fn render_suggestions(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanelAction>) {
+    let Some(suggestions) = st.suggestions.as_ref() else {
+        return;
+    };
+    if suggestions.commands.is_empty() && suggestions.prepare.is_empty() {
+        return;
+    }
+    let p = theme::palette_of(ui);
+    card(ui, |ui| {
+        ui.label(RichText::new("Suggested commands").font(fonts::semibold(12.5)));
+        ui.label(
+            RichText::new("The scout proposed these for this repo. Add them to the repo's AI settings so agents can run them without asking.")
+                .color(p.muted)
+                .size(11.5),
+        );
+        for command in &suggestions.commands {
+            mono_line(ui, command);
+        }
+        if !suggestions.prepare.is_empty() {
+            ui.label(
+                RichText::new("Prepare (outside the sandbox)")
+                    .color(p.faint)
+                    .size(11.5),
+            );
+            for command in &suggestions.prepare {
+                mono_line(ui, command);
+            }
+        }
+        if ui.button("Add to settings").clicked() {
+            actions.push(AiPanelAction::AddSuggestedCommands);
         }
     });
 }
@@ -626,6 +668,7 @@ fn severity_color(p: &theme::Palette, severity: crate::ai::review::Severity) -> 
 mod tests {
     use super::*;
     use crate::ai::tools::AgentRef;
+    use crate::state::ai_review::BriefSuggestions;
 
     fn reviewer(group: Option<&str>) -> TimelineEntry {
         TimelineEntry::Agent {
@@ -876,6 +919,7 @@ mod tests {
             (AiPhase::Running, true),
             (AiPhase::Paused, false),
             (AiPhase::Done, false),
+            (AiPhase::Finished, false),
             (AiPhase::Failed("boom".to_string()), false),
         ] {
             st.phase = phase.clone();
@@ -888,5 +932,53 @@ mod tests {
                 );
             });
         }
+    }
+
+    fn panel_harness(st: AiReviewState) -> egui_kittest::Harness<'static, Vec<AiPanelAction>> {
+        egui_kittest::Harness::builder()
+            .with_size([420.0, 900.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, actions: &mut Vec<AiPanelAction>| {
+                    // Accumulate: kittest runs a follow-up frame after the
+                    // click, and that frame reports nothing.
+                    actions.extend(render(ui, &st, false));
+                },
+                Vec::new(),
+            )
+    }
+
+    /// The suggested-commands card offers "Add to settings" (task 4), and a
+    /// finished run offers a fresh Start from the tab (ruling 7b).
+    #[test]
+    fn suggestions_and_finished_phase_report_their_actions() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = panel_harness(AiReviewState {
+            suggestions: Some(BriefSuggestions {
+                commands: vec!["cargo test".to_string()],
+                prepare: vec!["cargo fetch".to_string()],
+            }),
+            ..AiReviewState::default()
+        });
+        harness.get_by_label("Add to settings").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::AddSuggestedCommands],
+            "the card's button reports the settings action"
+        );
+
+        let mut harness = panel_harness(AiReviewState {
+            phase: AiPhase::Finished,
+            ..AiReviewState::default()
+        });
+        harness.get_by_label("Start AI review").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::Start],
+            "a restored run can be started again from the tab"
+        );
     }
 }

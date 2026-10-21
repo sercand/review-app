@@ -52,6 +52,7 @@ globset = "0.4"
 ignore = "0.4"
 review-llm = { path = "crates/llm" }
 review-sandbox = { path = "crates/sandbox" }
+rfd = "0.17.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
 tokio-util = "0.7"

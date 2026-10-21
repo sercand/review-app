@@ -559,6 +559,7 @@ mod tests {
                             write_blocked: None,
                             theme: crate::ui::theme::Theme::Dark,
                             system_dark: true,
+                            ai_configured: false,
                         },
                     );
                 },

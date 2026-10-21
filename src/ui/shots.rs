@@ -354,6 +354,7 @@ fn detail(mode: DiffMode, dark: bool, name: &str) {
                 write_blocked: None,
                 theme: theme::Theme::Dark,
                 system_dark: dark,
+                ai_configured: false,
             },
         );
     });
@@ -651,6 +652,7 @@ fn ai_detail(dark: bool, name: &str, ai: crate::state::ai_review::AiReviewState)
                 write_blocked: None,
                 theme: theme::Theme::Dark,
                 system_dark: dark,
+                ai_configured: true,
             },
         );
     });

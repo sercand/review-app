@@ -457,6 +457,21 @@ impl Store {
         }
     }
 
+    /// The checkout record with this id, when one exists. Used by the
+    /// crash-recovery dialog's Restore button (spec §7.3).
+    pub fn checkout_get(&self, id: i64) -> anyhow::Result<Option<CheckoutRecord>> {
+        let raw = self.conn().query_row(
+            &format!("SELECT id, {CHECKOUT_COLUMNS} FROM ai_checkout WHERE id = ?1"),
+            rusqlite::params![id],
+            raw_from_row,
+        );
+        match raw {
+            Ok(raw) => decode_record(id, raw).map(Some),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).context("reading checkout by id"),
+        }
+    }
+
     /// All checkouts still in `Started`, `Active` or `Failed` state, oldest
     /// first — the crash-recovery list (§7.3).
     ///

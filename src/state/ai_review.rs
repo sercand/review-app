@@ -171,6 +171,21 @@ pub struct AiReviewState {
     pub show_dropped: bool,
     /// The head the last completed review ran against (spec §5.8).
     pub last_reviewed_sha: Option<String>,
+    /// The scout's suggested commands awaiting the tab's "Add to settings"
+    /// action (spec §4 step 1), read from the snapshot's stored brief. The
+    /// scout only fills them when the repo has no configured commands.
+    pub suggestions: Option<BriefSuggestions>,
+}
+
+/// The scout's build/test/lint suggestions for a repo with no configured
+/// commands (spec §4 step 1), shown as a Notice until the user applies them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BriefSuggestions {
+    /// Commands the agents may then run in the sandbox without asking
+    /// (spec §8.1).
+    pub commands: Vec<String>,
+    /// Commands run outside the sandbox before the run (spec §8.5).
+    pub prepare: Vec<String>,
 }
 
 impl AiReviewState {
@@ -195,6 +210,24 @@ impl AiReviewState {
             Event::AiCheckoutFailed { message, .. } => {
                 self.plan = None;
                 self.phase = AiPhase::Failed(message.clone());
+            }
+            Event::AiCheckoutHeld { pr_number, .. } => {
+                self.plan = None;
+                self.phase = AiPhase::Failed(format!(
+                    "PR #{pr_number} is already checked out in this repository"
+                ));
+            }
+            Event::AiNotice { text, .. } => {
+                self.timeline
+                    .push(TimelineEntry::Notice { text: text.clone() });
+                // The only producer today is the "leave as is" answer to a
+                // restore decision: the run is closed and the checkout was
+                // left in place, so the tab rests at Done, not Restoring,
+                // and the decision is answered.
+                if self.phase == AiPhase::Restoring {
+                    self.phase = AiPhase::Done;
+                }
+                self.restore_decision = None;
             }
             // There is no "checkout started" event; the prepare output is the
             // first signal that the confirmed plan got past the checkout
@@ -291,6 +324,16 @@ impl AiReviewState {
         self.timeline.push(TimelineEntry::ChatUser { text });
     }
 
+    /// The user cancelled a plan that was awaiting confirmation (Task 4's
+    /// dialog): the tab returns to rest so Start can be pressed again.
+    /// Every other phase is left alone.
+    pub fn cancel_planning(&mut self) {
+        if self.phase == AiPhase::Planning {
+            self.phase = AiPhase::Idle;
+            self.plan = None;
+        }
+    }
+
     /// The stage strip: one entry per stage that has announced itself, in
     /// pipeline execution order, with its latest status and an agent
     /// progress label (`"2/3"` = two of three agents finished, empty when
@@ -375,6 +418,7 @@ impl AiReviewState {
         self.coverage = snap.coverage.clone();
         self.checkout = snap.checkout.clone();
         self.last_reviewed_sha = snap.last_reviewed_sha.clone();
+        self.suggestions = brief_suggestions(snap.brief.as_deref());
         // The snapshot carries neither the draft nor the usage tally, so a
         // rebuild starts those fresh; the next run refills them.
         self.draft = None;
@@ -540,6 +584,20 @@ impl AiReviewState {
         }
         (started, finished)
     }
+}
+
+/// The command suggestions carried by a stored brief JSON (spec §4 step 1).
+/// The scout fills these only when the repo has no configured commands, and
+/// a brief that fails to parse suggests nothing.
+fn brief_suggestions(raw: Option<&str>) -> Option<BriefSuggestions> {
+    let brief: crate::ai::stages::scout::Brief = serde_json::from_str(raw?).ok()?;
+    if brief.suggested_commands.is_empty() && brief.suggested_prepare.is_empty() {
+        return None;
+    }
+    Some(BriefSuggestions {
+        commands: brief.suggested_commands,
+        prepare: brief.suggested_prepare,
+    })
 }
 
 /// The phase a snapshot's run row and checkout describe (spec §10.3).
@@ -1066,6 +1124,126 @@ mod tests {
             "the transcript is rebuilt and the stale notice is gone"
         );
         assert!(st.can_continue("sha_new"), "a completed run can continue");
+    }
+
+    /// A tab awaiting a checkout confirmation.
+    fn planned() -> AiReviewState {
+        AiReviewState {
+            phase: AiPhase::Planning,
+            plan: Some(CheckoutPlan {
+                repo_path: PathBuf::from("/repo"),
+                remote: "origin".to_string(),
+                original: OriginalRef::Branch("main".to_string()),
+                dirty: false,
+                commands: Vec::new(),
+            }),
+            ..AiReviewState::default()
+        }
+    }
+
+    /// Task 4's dialog-driven events: a held checkout fails the tab with a
+    /// message naming the PR, and the "leave as is" notice rests a tab that
+    /// was waiting on the restore.
+    #[test]
+    fn held_fails_the_tab_and_notice_rests_it() {
+        let mut st = planned();
+        st.apply(&Event::AiCheckoutHeld {
+            session: SESSION,
+            pr_number: 9,
+        });
+        assert!(
+            matches!(&st.phase, AiPhase::Failed(message) if message.contains("#9")),
+            "a held checkout names the PR that holds the checkout: {st:?}"
+        );
+        assert!(st.plan.is_none(), "the unstartable plan is dropped");
+
+        st.phase = AiPhase::Restoring;
+        st.restore_decision = Some(vec!["?? stray.txt".to_string()]);
+        st.apply(&Event::AiNotice {
+            session: SESSION,
+            text: "left PR #7's checkout in place".to_string(),
+        });
+        assert_eq!(
+            st.phase,
+            AiPhase::Done,
+            "the leave-as-is notice rests the tab"
+        );
+        assert!(
+            st.restore_decision.is_none(),
+            "the notice answers the restore decision"
+        );
+        assert!(
+            matches!(st.timeline.last(),
+                Some(TimelineEntry::Notice { text }) if text.contains("in place")),
+            "the notice lands on the timeline"
+        );
+    }
+
+    #[test]
+    fn cancel_planning_only_rests_a_planning_tab() {
+        let mut st = planned();
+        st.cancel_planning();
+        assert_eq!(st.phase, AiPhase::Idle, "a cancelled plan returns to rest");
+        assert!(st.plan.is_none());
+
+        st.phase = AiPhase::Running;
+        st.cancel_planning();
+        assert_eq!(st.phase, AiPhase::Running, "a live run is left alone");
+    }
+
+    /// The suggested-commands card's data comes from the snapshot's stored
+    /// brief (spec §4 step 1); an absent, unparseable, or empty brief
+    /// suggests nothing.
+    #[test]
+    fn snapshot_extracts_brief_suggestions() {
+        fn snapshot_with(brief: Option<&str>) -> AiSnapshotData {
+            AiSnapshotData {
+                findings: Vec::new(),
+                coverage: Vec::new(),
+                timeline: Vec::new(),
+                brief: brief.map(str::to_string),
+                run: Some(run("completed", None)),
+                checkout: Some(checkout_record()),
+                bash_disabled: None,
+                last_reviewed_sha: None,
+            }
+        }
+
+        let mut st = AiReviewState::default();
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot: snapshot_with(Some(
+                r#"{"intent":"s","description_matches":true,"groups":[],"suggested_commands":["cargo test"],"suggested_prepare":["cargo fetch"]}"#,
+            )),
+        });
+        assert_eq!(
+            st.suggestions,
+            Some(BriefSuggestions {
+                commands: vec!["cargo test".to_string()],
+                prepare: vec!["cargo fetch".to_string()],
+            }),
+            "the brief's proposals surface as suggestions"
+        );
+
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot: snapshot_with(Some(
+                r#"{"intent":"s","description_matches":true,"groups":[]}"#,
+            )),
+        });
+        assert_eq!(
+            st.suggestions, None,
+            "a brief with no proposals suggests nothing"
+        );
+
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot: snapshot_with(Some("not json")),
+        });
+        assert_eq!(
+            st.suggestions, None,
+            "an unparseable brief suggests nothing"
+        );
     }
 
     #[test]

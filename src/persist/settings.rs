@@ -245,6 +245,14 @@ impl AiSettings {
             .find(|repo| repo.repo.to_lowercase() == key)
     }
 
+    /// Like [`Self::repo`], but only when the entry names a folder. The
+    /// settings window creates empty rows; a row without a path is not a
+    /// configured checkout, so the AI flow asks for one (spec §4 step 2).
+    pub fn repo_with_folder(&self, host: &str, owner: &str, name: &str) -> Option<&RepoAiSettings> {
+        self.repo(host, owner, name)
+            .filter(|repo| !repo.path.as_os_str().is_empty())
+    }
+
     /// The provider with this exact `name`.
     pub fn provider(&self, name: &str) -> Option<&ProviderSettings> {
         self.providers.iter().find(|p| p.name == name)
@@ -583,6 +591,37 @@ extra_deny_read = []
         assert_eq!(s.theme, Theme::Dark);
         assert_eq!(s.ai.providers.len(), 1);
         assert_eq!(s.ai.providers[0].api, LlmApi::Unsupported);
+    }
+
+    /// A repo row the settings window created but never gave a folder is not
+    /// a configured checkout (Task 4's folder dialog opens instead of
+    /// planning against an empty path).
+    #[test]
+    fn repo_with_folder_ignores_an_empty_path() {
+        let mut s = Settings::default();
+        s.ai.repos.push(RepoAiSettings {
+            repo: "github.com/acme/app".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            s.ai.repo("github.com", "acme", "app").is_some(),
+            "the row exists"
+        );
+        assert!(
+            s.ai.repo_with_folder("github.com", "acme", "app").is_none(),
+            "an empty path is not a folder"
+        );
+
+        s.ai.repos[0].path = PathBuf::from("/src/app");
+        let repo =
+            s.ai.repo_with_folder("GitHub.com", "Acme", "App")
+                .expect("a row with a path is configured");
+        assert_eq!(repo.path, PathBuf::from("/src/app"));
+        assert!(
+            s.ai.repo_with_folder("github.com", "acme", "other")
+                .is_none(),
+            "another repo is still unconfigured"
+        );
     }
 
     #[test]

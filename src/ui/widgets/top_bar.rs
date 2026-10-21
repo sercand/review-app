@@ -32,10 +32,17 @@ pub struct TopBarVm {
     pub pending: usize,
     /// Whether the PR has been merged; the Merge button rests.
     pub merged: bool,
+    /// The ✦ AI review button: `(label, enabled)`, or `None` when the AI
+    /// surface is off (no model configured). Unix-only (Plan 3).
+    #[cfg(unix)]
+    pub ai: Option<(&'static str, bool)>,
 }
 
-/// Pull the bar's view-model out of a session.
-pub fn top_bar_vm(session: &PrSession) -> TopBarVm {
+/// Pull the bar's view-model out of a session. `ai_configured` is the app's
+/// answer to "is the AI surface on" (`settings.ai.models.default` is set);
+/// the AI button itself is Unix-only, so the argument is unused elsewhere.
+#[cfg_attr(not(unix), allow(unused_variables))]
+pub fn top_bar_vm(session: &PrSession, ai_configured: bool) -> TopBarVm {
     let ci = session
         .combined_status
         .as_ref()
@@ -52,6 +59,15 @@ pub fn top_bar_vm(session: &PrSession) -> TopBarVm {
         pending: session.pending.comments.len()
             + session.threads.iter().filter(|t| t.is_pending()).count(),
         merged: session.metadata.as_ref().is_some_and(|m| m.merged),
+        #[cfg(unix)]
+        ai: ai_button(
+            &session.ai,
+            session
+                .metadata
+                .as_ref()
+                .map_or("", |meta| meta.head_sha.as_str()),
+            ai_configured,
+        ),
     }
 }
 
@@ -72,6 +88,42 @@ pub enum TopBarAction {
     ToggleDetails,
     /// Open the pull request on GitHub.
     OpenInBrowser,
+    /// Start an AI review (spec §4 step 2). Unix-only with the AI surface.
+    #[cfg(unix)]
+    AiStart,
+    /// Start an incremental re-review (spec §5.8). Unix-only.
+    #[cfg(unix)]
+    AiContinue,
+}
+
+/// The AI button's label when an incremental re-review is available.
+#[cfg(unix)]
+const AI_CONTINUE_LABEL: &str = "Continue review";
+
+/// The top bar's ✦ AI review button (spec §4 step 2): `None` when the AI
+/// surface is off (`!configured` — no model is set), otherwise the label —
+/// [`AI_CONTINUE_LABEL`] when `st.can_continue(head_sha)`, "AI review"
+/// otherwise — and whether it is clickable, which it is not while a run is
+/// `Running` or `Paused`.
+#[cfg(unix)]
+pub fn ai_button(
+    st: &crate::state::ai_review::AiReviewState,
+    head_sha: &str,
+    configured: bool,
+) -> Option<(&'static str, bool)> {
+    if !configured {
+        return None;
+    }
+    let label = if st.can_continue(head_sha) {
+        AI_CONTINUE_LABEL
+    } else {
+        "AI review"
+    };
+    let enabled = !matches!(
+        st.phase,
+        crate::state::ai_review::AiPhase::Running | crate::state::ai_review::AiPhase::Paused
+    );
+    Some((label, enabled))
 }
 
 /// The bar's window-level state: which theme glyph to show, and whether the
@@ -225,6 +277,23 @@ pub fn render(
                 .close_behavior(PopupCloseBehavior::CloseOnClickOutside)
                 .show(|ui| merge_popover(ui));
 
+            // The ✦ AI review button, beside the primary actions (spec §4
+            // step 2); `vm.ai` is `None` when the surface is off.
+            #[cfg(unix)]
+            if let Some((label, enabled)) = vm.ai {
+                let ai = Btn::new(BtnKind::Default, label)
+                    .icon(icons::SPARKLES)
+                    .enabled(enabled)
+                    .show(ui);
+                if ai.clicked() {
+                    if label == AI_CONTINUE_LABEL {
+                        actions.push(TopBarAction::AiContinue);
+                    } else {
+                        actions.push(TopBarAction::AiStart);
+                    }
+                }
+            }
+
             ui.separator();
             let mut details_open = settings.details_open;
             if icons::icon_toggle(ui, icons::PANEL_RIGHT, "Details  O", &mut details_open).clicked()
@@ -270,6 +339,8 @@ mod tests {
             combined: None,
             pending: 0,
             merged: false,
+            #[cfg(unix)]
+            ai: None,
         };
         egui_kittest::Harness::builder()
             .with_size([1200.0, 400.0])
@@ -317,5 +388,70 @@ mod tests {
         assert_eq!(next_theme(theme::Theme::Light, true), theme::Theme::Dark);
         assert_eq!(next_theme(theme::Theme::System, true), theme::Theme::Light);
         assert_eq!(next_theme(theme::Theme::System, false), theme::Theme::Dark);
+    }
+
+    /// The full label/enabled table of the ✦ AI review button (spec §4
+    /// step 2, §5.8): hidden when unconfigured, Continue when the head moved
+    /// since a completed review, resting while a run is in flight.
+    #[cfg(unix)]
+    #[test]
+    fn top_bar_label_and_enabled_table() {
+        use crate::state::ai_review::{AiPhase, AiReviewState};
+
+        // Not configured: no button at all, whatever the state.
+        let mut st = AiReviewState {
+            phase: AiPhase::Done,
+            last_reviewed_sha: Some("sha_old".to_string()),
+            ..AiReviewState::default()
+        };
+        assert_eq!(ai_button(&st, "sha_new", false), None);
+
+        // A completed review and a moved head: Continue review.
+        assert_eq!(
+            ai_button(&st, "sha_new", true),
+            Some(("Continue review", true))
+        );
+        // The head has not moved: a plain review.
+        assert_eq!(ai_button(&st, "sha_old", true), Some(("AI review", true)));
+
+        // Nothing reviewed yet: a plain review, enabled.
+        let idle = AiReviewState::default();
+        assert_eq!(ai_button(&idle, "sha", true), Some(("AI review", true)));
+
+        // In flight: the button rests, and `can_continue` is false while a
+        // run is live, so it never wears the Continue label there.
+        st.phase = AiPhase::Running;
+        assert_eq!(
+            ai_button(&st, "sha_new", true),
+            Some(("AI review", false)),
+            "running rests"
+        );
+        st.phase = AiPhase::Paused;
+        assert_eq!(
+            ai_button(&st, "sha_old", true),
+            Some(("AI review", false)),
+            "paused rests"
+        );
+
+        // The remaining phases keep the button live; only the completed
+        // ones can offer Continue (`can_continue`'s own rule).
+        for phase in [
+            AiPhase::Idle,
+            AiPhase::Planning,
+            AiPhase::CheckingOut,
+            AiPhase::Done,
+            AiPhase::Restoring,
+            AiPhase::Finished,
+            AiPhase::Failed("boom".to_string()),
+        ] {
+            st.phase = phase.clone();
+            let (label, enabled) = ai_button(&st, "sha_new", true).expect("configured");
+            assert!(enabled, "phase {phase:?}");
+            let continues = matches!(
+                phase,
+                AiPhase::Idle | AiPhase::Done | AiPhase::Finished | AiPhase::Failed(_)
+            );
+            assert_eq!(label == AI_CONTINUE_LABEL, continues, "phase {phase:?}");
+        }
     }
 }

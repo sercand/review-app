@@ -24,6 +24,8 @@ use crate::model::comment::CommentTarget;
 use crate::model::review::ReviewEvent;
 use crate::persist::config_root;
 use crate::persist::session::DebouncedWriter;
+#[cfg(unix)]
+use crate::persist::settings::RepoAiSettings;
 use crate::persist::settings::Settings;
 use crate::runtime::{
     Command, Event, EventReceiver, ExecCtx, SessionId, Worker, event_channel, execute, spawn_worker,
@@ -176,6 +178,14 @@ fn ai_target(session: &PrSession) -> Option<crate::ai::checkout::PrTarget> {
     })
 }
 
+/// Whether the repo's AI settings already name commands. The scout only
+/// proposes commands while the repo has none (spec §4 step 1), so once one
+/// is configured the tab's suggested-commands card retires.
+#[cfg(unix)]
+fn repo_has_commands(repo: Option<&RepoAiSettings>) -> bool {
+    repo.is_some_and(|repo| !repo.commands.is_empty() || !repo.prepare.is_empty())
+}
+
 /// The error an event carries, if it carries one. Every such event toasts
 /// it, so this is where the app notices a write-blocking failure.
 fn event_error(event: &Event) -> Option<&GhError> {
@@ -231,6 +241,16 @@ pub struct ReviewApp {
     events: EventReceiver,
     /// The macOS menu bar; `None` elsewhere.
     menu: Option<crate::ui::menu::NativeMenu>,
+    /// The AI dialog open over the screens (Task 4); `None` shows none.
+    #[cfg(unix)]
+    ai_dialog: Option<crate::ui::widgets::ai_dialogs::AiDialog>,
+    /// The folder-validation error the pick dialog shows (Task 4).
+    #[cfg(unix)]
+    ai_dialog_error: Option<String>,
+    /// The in-flight OS folder picker's answer, polled once per frame
+    /// (Task 4); `None` when no picker is open.
+    #[cfg(unix)]
+    folder_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
 }
 
 impl ReviewApp {
@@ -319,6 +339,12 @@ impl ReviewApp {
             worker,
             events: receiver,
             menu: crate::ui::menu::NativeMenu::install(&cc.egui_ctx),
+            #[cfg(unix)]
+            ai_dialog: None,
+            #[cfg(unix)]
+            ai_dialog_error: None,
+            #[cfg(unix)]
+            folder_picker: None,
         }
     }
 
@@ -327,6 +353,10 @@ impl ReviewApp {
         let previous = self.screen;
         self.screen = route(self.screen, &event);
         self.apply_session_event(&event);
+        // The tab's suggested-commands card is a first-run aid: once the
+        // repo names commands of its own, it retires (spec §4 step 1).
+        #[cfg(unix)]
+        self.retire_ai_suggestions();
         // Spec §13: a 404 on the open PR means it is gone or inaccessible;
         // the toast below is the notice and the session closes with it.
         let pr_gone = pr_is_gone(&event, self.session.as_ref().map(|session| session.id));
@@ -465,20 +495,71 @@ impl ReviewApp {
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
-            // `AiUnrestored` opens Task 4's recovery dialog.
+            // The dialogs (Task 4) open only for the PR the user is looking
+            // at — the same stale-event rule for a surface the app owns —
+            // and close when the flow answers them. `AiUnrestored` is
+            // app-wide.
             #[cfg(unix)]
-            Event::AiCheckoutFailed { message, .. } => self.toasts.push(message, now),
+            Event::AiCheckoutFailed { session, message } => {
+                // The failure toasts for any PR (the run may outlive the
+                // screen), and ends that PR's flow's dialog; the app-wide
+                // recovery dialog belongs to no PR and stays.
+                if self.ai_screen_is(session)
+                    && !matches!(
+                        self.ai_dialog,
+                        Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
+                    )
+                {
+                    self.ai_dialog = None;
+                }
+                self.toasts.push(message, now);
+            }
+            #[cfg(unix)]
+            Event::AiCheckoutPlanned { session, plan } if self.ai_screen_is(session) => {
+                self.ai_dialog = Some(crate::ui::widgets::ai_dialogs::AiDialog::ConfirmCheckout(
+                    plan,
+                ));
+                self.ai_dialog_error = None;
+            }
+            #[cfg(unix)]
+            Event::AiCheckoutHeld { session, pr_number } if self.ai_screen_is(session) => {
+                self.ai_dialog = Some(crate::ui::widgets::ai_dialogs::AiDialog::Held { pr_number });
+            }
+            #[cfg(unix)]
+            Event::AiRestoreNeedsDecision { session, changes } if self.ai_screen_is(session) => {
+                self.ai_dialog =
+                    Some(crate::ui::widgets::ai_dialogs::AiDialog::Restore { lines: changes });
+            }
+            #[cfg(unix)]
+            Event::AiRestored { session, .. } if self.ai_screen_is(session) => {
+                // A recovery restore (from the app-wide dialog) has no
+                // session and never lands here.
+                if !matches!(
+                    self.ai_dialog,
+                    Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
+                ) {
+                    self.ai_dialog = None;
+                }
+            }
+            #[cfg(unix)]
+            Event::AiUnrestored(records) => {
+                if !records.is_empty() {
+                    self.ai_dialog =
+                        Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(records));
+                }
+            }
             #[cfg(unix)]
             Event::AiSnapshot { .. }
             | Event::AiCheckoutPlanned { .. }
+            | Event::AiCheckoutHeld { .. }
+            | Event::AiNotice { .. }
             | Event::AiPrepareOutput { .. }
             | Event::AiPipeline { .. }
             | Event::AiQuestion { .. }
             | Event::AiApprovalRequest { .. }
             | Event::AiChat { .. }
             | Event::AiRestoreNeedsDecision { .. }
-            | Event::AiRestored { .. }
-            | Event::AiUnrestored(_) => {}
+            | Event::AiRestored { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -953,6 +1034,16 @@ impl ReviewApp {
         self.next_session += 1;
 
         let (mut session, commands) = PrSession::open(id, self.settings.host.clone(), repo, number);
+        // The AI dialogs belong to the PR being left (Task 4); the
+        // crash-recovery dialog is app-wide and stays open.
+        #[cfg(unix)]
+        if !matches!(
+            self.ai_dialog,
+            Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
+        ) {
+            self.ai_dialog = None;
+            self.ai_dialog_error = None;
+        }
         // The diff layout is a global preference (Task 7): every PR opens
         // the way the reviewer left the last one.
         let prefs = self.settings.diff;
@@ -1046,6 +1137,9 @@ impl ReviewApp {
                 write_blocked,
                 theme: self.settings.theme,
                 system_dark,
+                // The ✦ AI review button appears once a model is configured
+                // (spec §4 step 1); the folder is picked on first use.
+                ai_configured: self.settings.ai.models.default.is_some(),
             },
         );
 
@@ -1300,6 +1394,40 @@ impl ReviewApp {
         }
     }
 
+    /// Whether `session` names the PR currently open: the stale-event rule
+    /// for surfaces the app owns, like the AI dialogs (Task 4).
+    fn session_is(&self, session: SessionId) -> bool {
+        self.session.as_ref().is_some_and(|open| open.id == session)
+    }
+
+    /// Whether the user is looking at `session`'s PR: the session is the open
+    /// one *and* the detail screen is showing. The AI dialogs open on this
+    /// rule, so a plan that lands after Back does not float over the list.
+    #[cfg(unix)]
+    fn ai_screen_is(&self, session: SessionId) -> bool {
+        self.screen == ScreenKind::PrDetail && self.session_is(session)
+    }
+
+    /// Drop the tab's suggested-commands card once the repo's settings name
+    /// commands: the scout's proposals are for repos that have none (spec
+    /// §4 step 1), and a stored brief keeps carrying them.
+    #[cfg(unix)]
+    fn retire_ai_suggestions(&mut self) {
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if session.ai.suggestions.is_none() {
+            return;
+        }
+        let repo = self
+            .settings
+            .ai
+            .repo(&session.host, &session.repo.owner, &session.repo.name);
+        if repo_has_commands(repo) {
+            session.ai.suggestions = None;
+        }
+    }
+
     /// Fold one ✦ AI tab control into the open session and send its worker
     /// command (spec §12).
     ///
@@ -1330,23 +1458,28 @@ impl ReviewApp {
         };
         match action {
             AiPanelAction::Start => {
-                // Until Task 4's folder dialog, an unconfigured repository
-                // just gets pointed at Settings → AI.
+                // No folder for this repo: ask for one now (Task 4). The
+                // pick dialog validates the choice, saves it, and plans the
+                // checkout right away (spec §4 step 2).
                 if self
                     .settings
                     .ai
-                    .repo(&session.host, &session.repo.owner, &session.repo.name)
+                    .repo_with_folder(&session.host, &session.repo.owner, &session.repo.name)
                     .is_none()
                 {
-                    self.toasts.push(
-                        "no AI checkout folder for this repository — pick one in Settings → AI"
-                            .to_owned(),
-                        now,
-                    );
+                    self.ai_dialog =
+                        Some(crate::ui::widgets::ai_dialogs::AiDialog::PickFolder { key });
+                    self.ai_dialog_error = None;
                     return;
                 }
                 let Some(pr) = ai_target(session) else {
-                    return; // no metadata yet: nothing to check out
+                    // The button is live before the metadata arrives; the
+                    // head SHA is what the plan needs.
+                    self.toasts.push(
+                        "the pull request is still loading — try again in a moment".to_owned(),
+                        now,
+                    );
+                    return;
                 };
                 self.worker.send(Command::AiPlanCheckout {
                     session: session.id,
@@ -1358,12 +1491,25 @@ impl ReviewApp {
                 if self
                     .settings
                     .ai
-                    .repo(&session.host, &session.repo.owner, &session.repo.name)
+                    .repo_with_folder(&session.host, &session.repo.owner, &session.repo.name)
                     .is_none()
                 {
                     self.toasts.push(
                         "no AI checkout folder for this repository — pick one in Settings → AI"
                             .to_owned(),
+                        now,
+                    );
+                    return;
+                }
+                // The tab offers Continue whenever a completed review
+                // exists; the head comparison behind it (`can_continue`)
+                // is the app's gate, so a stale click gets a toast instead
+                // of a redundant run.
+                if let Some(head) = session.metadata.as_ref().map(|meta| &meta.head_sha)
+                    && !session.ai.can_continue(head)
+                {
+                    self.toasts.push(
+                        "this head is already reviewed or a review is in flight".to_owned(),
                         now,
                     );
                     return;
@@ -1379,6 +1525,10 @@ impl ReviewApp {
                         metadata: meta.clone(),
                     }),
                 ) else {
+                    self.toasts.push(
+                        "the pull request is still loading — try again in a moment".to_owned(),
+                        now,
+                    );
                     return;
                 };
                 self.worker.send(Command::AiStart {
@@ -1454,6 +1604,236 @@ impl ReviewApp {
             // Task 5 wires diff scrolling.
             AiPanelAction::JumpToFinding(_) => {}
             AiPanelAction::ShowDropped(show) => session.ai.show_dropped = show,
+            AiPanelAction::AddSuggestedCommands => {
+                // Copy the scout's proposals into the repo's settings and
+                // retire the card (Task 4). The run only suggests when the
+                // repo entry exists, so this updates rather than creates.
+                let Some(suggestions) = session.ai.suggestions.clone() else {
+                    return;
+                };
+                let repo_key = format!(
+                    "{}/{}/{}",
+                    session.host, session.repo.owner, session.repo.name
+                )
+                .to_lowercase();
+                match self
+                    .settings
+                    .ai
+                    .repos
+                    .iter_mut()
+                    .find(|repo| repo.repo.to_lowercase() == repo_key)
+                {
+                    Some(repo) => {
+                        repo.commands = suggestions.commands;
+                        repo.prepare = suggestions.prepare;
+                    }
+                    None => self.settings.ai.repos.push(RepoAiSettings {
+                        repo: repo_key,
+                        commands: suggestions.commands,
+                        prepare: suggestions.prepare,
+                        ..Default::default()
+                    }),
+                }
+                session.ai.suggestions = None;
+                self.save_settings(now);
+            }
+        }
+    }
+
+    /// Collect the OS folder picker's answer once per frame (Task 4). The
+    /// picker runs on a plain thread because `rfd` blocks; a cancelled
+    /// picker leaves the pick dialog open for another try.
+    #[cfg(unix)]
+    fn poll_folder_picker(&mut self, now: Instant) {
+        use std::sync::mpsc::TryRecvError;
+
+        let answer = match &self.folder_picker {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(answer) => Some(answer),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(None),
+            },
+            None => return,
+        };
+        let Some(answer) = answer else { return };
+        self.folder_picker = None;
+        if let Some(path) = answer {
+            self.apply_ai_dialog_action(
+                crate::ui::widgets::ai_dialogs::AiDialogAction::FolderChosen(path),
+                now,
+            );
+        }
+    }
+
+    /// Paint the open AI dialog over every screen, like the settings
+    /// window (Task 4).
+    #[cfg(unix)]
+    fn render_ai_dialog(&mut self, ctx: &egui::Context, now: Instant) {
+        use crate::ui::widgets::ai_dialogs::{self, DialogInputs};
+
+        let Some(dialog) = self.ai_dialog.clone() else {
+            return;
+        };
+        let pr = self.session.as_ref().and_then(ai_target);
+        let prepare = self
+            .session
+            .as_ref()
+            .and_then(|session| {
+                self.settings.ai.repo_with_folder(
+                    &session.host,
+                    &session.repo.owner,
+                    &session.repo.name,
+                )
+            })
+            .map(|repo| repo.prepare.clone())
+            .unwrap_or_default();
+        let mut actions = Vec::new();
+        let inputs = DialogInputs {
+            pr: pr.as_ref(),
+            prepare: &prepare,
+            error: self.ai_dialog_error.as_deref(),
+        };
+        ai_dialogs::render(ctx, &dialog, &inputs, &mut actions);
+        for action in actions {
+            self.apply_ai_dialog_action(action, now);
+        }
+    }
+
+    /// Apply one AI dialog answer (Task 4): the pick dialog validates and
+    /// saves the folder then plans the checkout, the confirm dialog starts
+    /// the run, the restore dialog answers the finish, and the recovery
+    /// dialog restores stored checkouts one at a time.
+    #[cfg(unix)]
+    fn apply_ai_dialog_action(
+        &mut self,
+        action: crate::ui::widgets::ai_dialogs::AiDialogAction,
+        now: Instant,
+    ) {
+        use crate::ai::hub::SnapshotInputs;
+        use crate::ai::pipeline::RunMode;
+        use crate::ai::store::PrKey;
+        use crate::ui::widgets::ai_dialogs::{self, AiDialog, AiDialogAction};
+
+        match action {
+            AiDialogAction::PickFolder => {
+                if self.folder_picker.is_some() {
+                    return; // one picker at a time
+                }
+                // `rfd` blocks its calling thread (on macOS it dispatches
+                // the panel to the main thread and waits), so the GUI
+                // thread must not call it; the answer arrives over the
+                // channel `poll_folder_picker` reads.
+                let (sender, receiver) = std::sync::mpsc::channel();
+                self.folder_picker = Some(receiver);
+                std::thread::spawn(move || {
+                    let _ = sender.send(rfd::FileDialog::new().pick_folder());
+                });
+            }
+            AiDialogAction::FolderChosen(path) => {
+                let Some(AiDialog::PickFolder { key }) = self.ai_dialog.clone() else {
+                    return;
+                };
+                if let Some(error) = ai_dialogs::folder_error(&path, &key) {
+                    self.ai_dialog_error = Some(error);
+                    return;
+                }
+                ai_dialogs::save_folder(&mut self.settings.ai, &key, path);
+                self.save_settings(now);
+                self.ai_dialog = None;
+                self.ai_dialog_error = None;
+                // The pick was asked for by this PR's Start: plan the
+                // checkout right away (spec §4 step 2).
+                let open_matches = self.session.as_ref().is_some_and(|open| {
+                    open.number == key.number
+                        && open.host.eq_ignore_ascii_case(&key.host)
+                        && open.repo.owner.eq_ignore_ascii_case(&key.owner)
+                        && open.repo.name.eq_ignore_ascii_case(&key.repo)
+                });
+                if !open_matches {
+                    return;
+                }
+                let session = self.session.as_mut().expect("checked above");
+                let Some(pr) = ai_target(session) else {
+                    return; // no metadata yet: nothing to check out
+                };
+                self.worker.send(Command::AiPlanCheckout {
+                    session: session.id,
+                    key,
+                    pr,
+                });
+            }
+            AiDialogAction::ConfirmCheckout => {
+                self.ai_dialog = None;
+                let Some(session) = &mut self.session else {
+                    return;
+                };
+                let key = PrKey {
+                    host: session.host.to_lowercase(),
+                    owner: session.repo.owner.to_lowercase(),
+                    repo: session.repo.name.to_lowercase(),
+                    number: session.number,
+                };
+                let (Some(pr), Some(snapshot_inputs)) = (
+                    ai_target(session),
+                    session.metadata.as_ref().map(|meta| SnapshotInputs {
+                        files: session.files.clone(),
+                        metadata: meta.clone(),
+                    }),
+                ) else {
+                    return;
+                };
+                self.worker.send(Command::AiStart {
+                    session: session.id,
+                    key,
+                    pr,
+                    snapshot_inputs,
+                    mode: RunMode::Full,
+                });
+            }
+            AiDialogAction::CancelCheckout => {
+                // Cancelling a plan awaiting confirmation rests the tab;
+                // dismissing the held notice or the pick dialog changes
+                // nothing else.
+                let was_confirm = matches!(self.ai_dialog, Some(AiDialog::ConfirmCheckout(_)));
+                self.ai_dialog = None;
+                self.ai_dialog_error = None;
+                if was_confirm && let Some(session) = &mut self.session {
+                    session.ai.cancel_planning();
+                }
+            }
+            AiDialogAction::RestoreDiscard | AiDialogAction::RestoreKeep => {
+                // "Leave as is" is a finish that keeps the checkout: the
+                // hub closes the run, marks the record, and answers with
+                // `AiNotice` (spec §7.3 step 1).
+                let discard = action == AiDialogAction::RestoreDiscard;
+                self.ai_dialog = None;
+                let Some(session) = &mut self.session else {
+                    return;
+                };
+                let key = PrKey {
+                    host: session.host.to_lowercase(),
+                    owner: session.repo.owner.to_lowercase(),
+                    repo: session.repo.name.to_lowercase(),
+                    number: session.number,
+                };
+                self.worker.send(Command::AiFinish {
+                    session: session.id,
+                    key,
+                    discard: Some(discard),
+                });
+            }
+            AiDialogAction::RecoverRestore(id) => {
+                self.worker.send(Command::AiRecoverRestore { id });
+                // Drop the restored row from the dialog; close it when the
+                // last one goes. The worker toasts the outcome.
+                if let Some(AiDialog::Recovery(records)) = &mut self.ai_dialog {
+                    records.retain(|record| record.id != id);
+                    if records.is_empty() {
+                        self.ai_dialog = None;
+                    }
+                }
+            }
+            AiDialogAction::RecoverLater => self.ai_dialog = None,
         }
     }
 
@@ -2047,6 +2427,10 @@ impl eframe::App for ReviewApp {
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
+        // The OS folder picker answers on a background thread (Task 4);
+        // collect it once per frame like the worker's events.
+        #[cfg(unix)]
+        self.poll_folder_picker(now);
 
         // Spec §13: the rate-limit window is over once its reset instant
         // passes; check every frame so the write surfaces wake up on their
@@ -2125,6 +2509,9 @@ impl eframe::App for ReviewApp {
             &mut settings_actions,
         );
         self.apply_settings_actions(settings_actions, &ctx, now);
+        // The AI dialogs float above every screen too (Task 4).
+        #[cfg(unix)]
+        self.render_ai_dialog(&ctx, now);
         command_palette::render_help(&ctx, &mut self.help_open, &entries);
 
         self.toasts.render(ui, now);
@@ -2373,6 +2760,27 @@ mod tests {
             error: GhError::Unauthorized,
         };
         assert!(!pr_is_gone(&unauthorized, open));
+    }
+
+    /// The scout's suggested commands are a first-run aid only: once the repo
+    /// names commands of its own, the tab retires the card (spec §4 step 1).
+    #[cfg(unix)]
+    #[test]
+    fn suggestions_retire_once_the_repo_has_commands() {
+        use crate::persist::settings::RepoAiSettings;
+
+        assert!(!repo_has_commands(None), "no repo row, nothing configured");
+        assert!(!repo_has_commands(Some(&RepoAiSettings::default())));
+        let with_commands = RepoAiSettings {
+            commands: vec!["cargo test".to_string()],
+            ..Default::default()
+        };
+        assert!(repo_has_commands(Some(&with_commands)));
+        let with_prepare = RepoAiSettings {
+            prepare: vec!["cargo fetch".to_string()],
+            ..Default::default()
+        };
+        assert!(repo_has_commands(Some(&with_prepare)));
     }
 
     #[test]

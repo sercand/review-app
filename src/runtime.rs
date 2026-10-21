@@ -462,6 +462,14 @@ pub enum Command {
         /// The pending-comment link to record with it.
         pending_local_id: Option<u64>,
     },
+    /// Restore one unrestored checkout record from the crash-recovery dialog
+    /// (spec §7.3). Not PR-scoped: the record names its own repository, and
+    /// no run is live for it.
+    #[cfg(unix)]
+    AiRecoverRestore {
+        /// The `ai_checkout` row id to restore, discarding stray changes.
+        id: i64,
+    },
 }
 
 /// A result handed from the worker back to the UI.
@@ -721,6 +729,25 @@ pub enum Event {
         session: SessionId,
         /// Why it failed.
         message: String,
+    },
+    /// The plan found another PR still holding the repository's checkout
+    /// (spec §4 step 7); the UI offers to finish that review first.
+    #[cfg(unix)]
+    AiCheckoutHeld {
+        /// The session that asked.
+        session: SessionId,
+        /// The holding PR's number.
+        pr_number: u64,
+    },
+    /// A notice for the AI tab's timeline: the state a left-as-is checkout
+    /// was stopped in (spec §7.3 step 1), folded into a
+    /// [`TimelineEntry::Notice`](crate::state::ai_review::TimelineEntry::Notice).
+    #[cfg(unix)]
+    AiNotice {
+        /// The session the notice belongs to.
+        session: SessionId,
+        /// The text to show.
+        text: String,
     },
     /// The prepare stage's command outputs (spec §8.5).
     #[cfg(unix)]
@@ -1604,6 +1631,10 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         } => ctx
             .ai
             .finding_state(session, id, state, pending_local_id, &events),
+        #[cfg(unix)]
+        Command::AiRecoverRestore { id } => {
+            ctx.ai.recover_restore(id, &events).await;
+        }
         Command::ExpandContext {
             session,
             repo,

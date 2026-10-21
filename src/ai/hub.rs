@@ -27,8 +27,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 use crate::ai::checkout::{
-    CheckoutError, CheckoutPlan, PrTarget, PrepareOutput, execute_checkout, restore,
-    restore_preview, run_prepare,
+    CheckoutError, CheckoutPlan, PrTarget, PrepareOutput, RestoreOutcome, execute_checkout,
+    restore, restore_preview, run_prepare,
 };
 use crate::ai::events::PipelineEvent;
 use crate::ai::interaction::{ApprovalDecision, Interaction};
@@ -409,6 +409,11 @@ impl AiHub {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key, plan.clone());
                 events.send(Event::AiCheckoutPlanned { session, plan });
+            }
+            // The held case gets its own event so the UI can name the
+            // holding PR (spec §4 step 7); every other failure toasts.
+            Ok(Err(CheckoutError::Held { pr_number })) => {
+                events.send(Event::AiCheckoutHeld { session, pr_number });
             }
             Ok(Err(error)) => events.send(Event::AiCheckoutFailed {
                 session,
@@ -880,8 +885,12 @@ impl AiHub {
     ///
     /// `discard = None` asks first: changes made during the review come back
     /// as [`Event::AiRestoreNeedsDecision`] and the run stays so the user
-    /// can decide. `discard = Some(_)` restores for good — `true` throws
-    /// those changes away — and closes the run with [`Event::AiRestored`].
+    /// can decide. `discard = Some(true)` throws those changes away and
+    /// closes the run with [`Event::AiRestored`]. `discard = Some(false)`
+    /// on a dirty tree is that decision's **Keep** answer: the run closes,
+    /// the record is marked `Failed` (still holding the repo, still a
+    /// recovery target), and an [`Event::AiNotice`] describes the state the
+    /// checkout was left in.
     pub async fn finish(
         &self,
         session: SessionId,
@@ -929,12 +938,30 @@ impl AiHub {
         let rec = run.checkout.clone();
         match discard {
             Some(discard) => {
+                // The Keep path needs the record after the blocking call
+                // moved it, so keep a copy for the notice.
+                let rec_for_notice = rec.clone();
                 let outcome =
                     tokio::task::spawn_blocking(move || restore(&rec, discard, &store)).await;
                 match outcome {
                     Ok(Ok(outcome)) => {
                         self.close_run(key, run);
                         events.send(Event::AiRestored { session, outcome });
+                    }
+                    // `discard = Some(false)` on a dirty tree is the user's
+                    // "leave as is" answer (spec §7.3 step 1): stop without
+                    // touching the tree. The record keeps the repo lock and
+                    // stays a recovery target — mark it `Failed`, close the
+                    // run, and tell the tab exactly what state it left.
+                    Ok(Err(CheckoutError::NeedsDecision(changes))) if !discard => {
+                        let _ = self
+                            .store
+                            .checkout_set_state(rec_for_notice.id, CheckoutState::Failed);
+                        self.close_run(key, run);
+                        events.send(Event::AiNotice {
+                            session,
+                            text: left_as_is_text(&rec_for_notice, changes.len()),
+                        });
                     }
                     Ok(Err(CheckoutError::NeedsDecision(changes))) => {
                         events.send(Event::AiRestoreNeedsDecision { session, changes });
@@ -1048,6 +1075,40 @@ impl AiHub {
             ))),
         }
     }
+
+    /// Restore one unrestored checkout record from the crash-recovery dialog
+    /// (spec §7.3): discard whatever the abandoned review left, return to
+    /// the recorded original ref, and re-apply the stash. Not PR-scoped —
+    /// no run is live for a record a previous session left behind — so the
+    /// outcome arrives as a [`Event::Toast`].
+    pub async fn recover_restore(&self, id: i64, events: &EventSender) {
+        let store = self.store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let rec = store
+                .checkout_get(id)?
+                .ok_or_else(|| anyhow::anyhow!("no checkout record #{id}"))?;
+            restore(&rec, true, &store).map(|outcome| (rec, outcome))
+        })
+        .await;
+        match result {
+            Ok(Ok((rec, RestoreOutcome::Restored))) => events.send(Event::Toast(format!(
+                "restored {} to {}",
+                rec.repo_path.display(),
+                original_ref_text(&rec.original)
+            ))),
+            Ok(Ok((rec, RestoreOutcome::StashConflict { stash_sha }))) => {
+                events.send(Event::Toast(format!(
+                    "{} went back to its original ref, but the stash did not apply cleanly; \
+                 your changes are still in stash {stash_sha}",
+                    rec.repo_path.display()
+                )))
+            }
+            Ok(Err(error)) => events.send(Event::Toast(format!(
+                "could not restore the checkout: {error}"
+            ))),
+            Err(_) => events.send(Event::Toast("the restore was cancelled".to_owned())),
+        }
+    }
 }
 
 /// Tear down a run's leftovers: resolve anything parked, drop the chat agent,
@@ -1060,6 +1121,39 @@ fn close_run_handle(run: RunHandle) {
     if let Some(dir) = &run.tmp_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// The display text for a recorded original ref.
+fn original_ref_text(original: &OriginalRef) -> String {
+    match original {
+        OriginalRef::Branch(name) => format!("branch {name}"),
+        OriginalRef::Detached(sha) => format!("detached {}", short(sha)),
+    }
+}
+
+/// The first seven characters of a SHA.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// The Notice text for a checkout the user chose to leave as is (spec §7.3
+/// step 1): where the tree stands, what holds their original work, and how
+/// the checkout gets restored later.
+fn left_as_is_text(rec: &CheckoutRecord, changes: usize) -> String {
+    let stash = match &rec.stash_sha {
+        Some(sha) => format!(
+            "your pre-checkout changes are in stash {} (`git stash apply` takes them back)",
+            short(sha)
+        ),
+        None => "no stash was made".to_string(),
+    };
+    format!(
+        "left the checkout as is: {} is still on PR #{}'s head with {changes} change(s) from \
+         the review; {} is recorded and {stash}. The next start offers to restore it.",
+        rec.repo_path.display(),
+        rec.pr_number,
+        original_ref_text(&rec.original),
+    )
 }
 
 /// The repo's git identity for the agent's written gitconfig (spec §8.2);
@@ -1785,6 +1879,80 @@ mod tests {
         assert!(
             !fx.hub.runs.lock().unwrap().contains_key(&fx.key),
             "the run is closed"
+        );
+    }
+
+    /// The restore dialog's **Keep** answer (spec §7.3 step 1): the finish
+    /// stops without touching the tree, marks the record `Failed` so it stays
+    /// a recovery target, and tells the tab what state it left. The
+    /// crash-recovery dialog then restores it, stash and all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finish_keep_leaves_the_tree_and_recovery_restores_it() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        // The reviewer's own work before the run: stashed by the checkout and
+        // re-applied by the restore.
+        std::fs::write(fx.clone.join("a.txt"), "my local edit\n").expect("dirty");
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+
+        // The run left a change behind (an agent wrote a file).
+        std::fs::write(fx.clone.join("stray.txt"), "agent wrote me\n").expect("stray");
+        let head = gitx(&fx.clone, &["rev-parse", "HEAD"]);
+        assert_eq!(head, fx.pr.head_sha, "the run holds the PR head");
+
+        // Keep: stop, leave everything where it is, say what state it is in.
+        fx.hub
+            .finish(SessionId(1), &fx.key, Some(false), &fx.tx)
+            .await;
+        let notice = wait_for(&fx.events, |e| matches!(e, Event::AiNotice { .. }));
+        match notice {
+            Event::AiNotice { session, text } => {
+                assert_eq!(session, SessionId(1));
+                assert!(text.contains("left the checkout as is"), "{text}");
+                assert!(text.contains("branch main"), "{text}");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            gitx(&fx.clone, &["rev-parse", "HEAD"]),
+            head,
+            "Keep does not move the tree"
+        );
+        assert!(fx.clone.join("stray.txt").exists(), "Keep discards nothing");
+        assert!(
+            !fx.hub.runs.lock().unwrap().contains_key(&fx.key),
+            "the run is closed"
+        );
+
+        // Still a recovery target: `Failed`, holding the repo.
+        let unrestored = fx.store.checkouts_unrestored().expect("the recovery list");
+        assert_eq!(unrestored.len(), 1);
+        assert_eq!(unrestored[0].state, CheckoutState::Failed);
+        assert_eq!(unrestored[0].pr_number, 7);
+
+        // The recovery dialog's Restore: back to the original ref, stash
+        // applied, stray work gone, record no longer unrestored.
+        fx.hub.recover_restore(unrestored[0].id, &fx.tx).await;
+        let toast = wait_for(&fx.events, |e| matches!(e, Event::Toast(_)));
+        assert!(
+            matches!(&toast, Event::Toast(text) if text.contains("restored")),
+            "{toast:?}"
+        );
+        assert_eq!(
+            gitx(&fx.clone, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert!(!fx.clone.join("stray.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(fx.clone.join("a.txt")).expect("a.txt"),
+            "my local edit\n",
+            "the pre-checkout stash came back"
+        );
+        assert!(
+            fx.store.checkouts_unrestored().expect("list").is_empty(),
+            "the record is restored"
         );
     }
 }

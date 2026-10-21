@@ -725,6 +725,8 @@ impl PrSession {
             Event::AiSnapshot { session, .. }
             | Event::AiCheckoutPlanned { session, .. }
             | Event::AiCheckoutFailed { session, .. }
+            | Event::AiCheckoutHeld { session, .. }
+            | Event::AiNotice { session, .. }
             | Event::AiPrepareOutput { session, .. }
             | Event::AiPipeline { session, .. }
             | Event::AiQuestion { session, .. }
