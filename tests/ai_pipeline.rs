@@ -809,31 +809,25 @@ async fn cancel_ends_the_run_cancelled_and_persists_partial_findings() {
 async fn cancel_while_paused_ends_the_run() {
     let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
     scripts.insert("scout".into(), scout_step(brief_one_group()));
-    // The `read_file` parks the reviewer in `spawn_blocking`; it then loops
-    // back into the pause wait, where the cancel has to wake it out.
-    scripts.insert(
-        "reviewer".into(),
-        vec![
-            ScriptStep::ToolCalls(vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]),
-            full_review_step(),
-            ScriptStep::Text("all checked".into()),
-        ],
-    );
     scripts.insert("assembler".into(), vec![draft_step("comment", "unused")]);
 
-    let mut s = start(scripts);
-    drain_until(&mut s.rx, |e| {
-        matches!(
-            e,
-            PipelineEvent::ToolCall { name, agent, .. }
-                if name == "read_file" && agent.role == AgentRole::Reviewer
-        )
-    })
-    .await;
+    let s = start(scripts);
+    // Pause before any task runs (the current-thread runtime starts them at
+    // the test's next await), so the scout parks in the pause wait BEFORE
+    // its first model call: between the seed write and that wait the stage
+    // has no await, so one poll takes it all the way to `pause.changed()`.
     s.control.pause();
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        s.llm.requests_for("scout").is_empty(),
+        "the scout is parked in the pause, not at the model"
+    );
     s.control.cancel();
 
-    // A regression parks the reviewer in the pause forever: fail, don't hang.
+    // Without `cancel()` nudging the pause watch the scout stays parked
+    // forever: fail, don't hang.
     let status = tokio::time::timeout(Duration::from_secs(5), s.handle)
         .await
         .expect("the cancelled run ends instead of parking in the pause")
