@@ -37,7 +37,9 @@ use crate::ai::model::Llm;
 use crate::ai::pipeline::{PipelineControl, PipelineInputs, RunMode, RunStatus, start_pipeline};
 use crate::ai::review::{CoverageEntry, Finding, FindingState};
 use crate::ai::snapshot::gather_snapshot;
-use crate::ai::store::{CheckoutRecord, CheckoutState, PrKey, RunRecord, Store, ai_db_path};
+use crate::ai::store::{
+    CheckoutRecord, CheckoutState, OriginalRef, PrKey, RunRecord, Store, ai_db_path,
+};
 use crate::ai::ui_interaction::UiInteraction;
 use crate::auth::store::{TokenStore, llm_key};
 use crate::github::client::GithubClient;
@@ -139,6 +141,8 @@ pub enum ChatEvent {
 /// One PR's live (or finished-but-unrestored) AI state.
 pub struct RunHandle {
     /// The pipeline handle, taken once the run is cancelled or finishing.
+    /// `None` on the placeholder [`AiHub::start`] installs before its first
+    /// await; the real handle always has one.
     pub control: Option<PipelineControl>,
     /// The run's current session, rebound by [`AiHub::attach`] (spec §10.2).
     pub session: Arc<Mutex<SessionId>>,
@@ -152,11 +156,45 @@ pub struct RunHandle {
     pub bash_disabled: Option<String>,
     /// Whether the pipeline is still running; the forwarder clears it.
     live: Arc<AtomicBool>,
+    /// True while `AiStart` is still working through checkout, prepare, and
+    /// sandbox: the placeholder handle holds the PR's slot so a concurrent
+    /// Start is rejected before it can touch the checkout (spec §10.3).
+    starting: bool,
     /// The orchestrator's handle, awaited by [`AiHub::finish`] so the agents
     /// are gone before the working tree is restored.
     pipeline: Option<JoinHandle<RunStatus>>,
     /// The run's agent-owned temp dir, removed when the run closes.
     tmp_dir: Option<PathBuf>,
+}
+
+impl RunHandle {
+    /// The placeholder [`AiHub::start`] installs before its first await, so
+    /// a concurrent Start for the same PR sees a live entry and stands down.
+    /// `session` is the shared cell the real handle and the forwarder will
+    /// keep using, so an attach that lands mid-start still rebinds.
+    fn starting(session: Arc<Mutex<SessionId>>, events: &EventSender) -> RunHandle {
+        RunHandle {
+            control: None,
+            session: session.clone(),
+            interaction: UiInteraction::new(events.clone(), session, Vec::new()),
+            checkout: CheckoutRecord {
+                id: 0,
+                repo_path: PathBuf::new(),
+                repo: String::new(),
+                pr_number: 0,
+                original: OriginalRef::Detached(String::new()),
+                stash_sha: None,
+                head_sha: String::new(),
+                state: CheckoutState::Started,
+            },
+            chat: None,
+            bash_disabled: None,
+            live: Arc::new(AtomicBool::new(true)),
+            starting: true,
+            pipeline: None,
+            tmp_dir: None,
+        }
+    }
 }
 
 /// The worker's AI surface: live runs, confirmed checkout plans, and the
@@ -276,16 +314,11 @@ impl AiHub {
     /// (spec §10.2). Works with no live run too: the stored findings and
     /// checkout still describe the PR.
     pub fn attach(&self, session: SessionId, key: PrKey, events: &EventSender) {
-        let live = self
-            .runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .map(|run| {
-                *run.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
-                (run.checkout.clone(), run.bash_disabled.clone())
-            });
-        match self.snapshot_data(&key, live.as_ref()) {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(run) = runs.get(&key) {
+            *run.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+        }
+        match self.snapshot_data(&key, runs.get(&key)) {
             Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
             Err(error) => events.send(Event::Toast(format!(
                 "could not load the AI review state: {error}"
@@ -293,10 +326,13 @@ impl AiHub {
         }
     }
 
+    /// The stored state for `key`, overlaid with the live run's checkout and
+    /// bash reason when there is one. A start placeholder (`starting`) has no
+    /// real checkout yet, so it is treated like no live run.
     fn snapshot_data(
         &self,
         key: &PrKey,
-        live: Option<&(CheckoutRecord, Option<String>)>,
+        live: Option<&RunHandle>,
     ) -> anyhow::Result<AiSnapshotData> {
         let session_id = self.store.session_id(key)?;
         let findings = self.store.finding_list(session_id)?;
@@ -320,8 +356,8 @@ impl AiHub {
         };
         let brief = self.store.session_brief(session_id)?;
         let last_reviewed_sha = self.store.session_last_reviewed(session_id)?;
-        let (checkout, bash_disabled) = match live {
-            Some((rec, bash)) => (Some(rec.clone()), bash.clone()),
+        let (checkout, bash_disabled) = match live.filter(|run| !run.starting) {
+            Some(run) => (Some(run.checkout.clone()), run.bash_disabled.clone()),
             None => {
                 // No live run: the checkout the store still holds for this
                 // repo's configured path, if any.
@@ -404,24 +440,10 @@ impl AiHub {
         mode: RunMode,
         events: &EventSender,
     ) {
-        // A live run for this PR owns the checkout; a finished one that was
-        // never finished() is replaced.
-        let replacing = {
-            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-            match runs.get(&key) {
-                Some(run) if run.live.load(Ordering::SeqCst) => {
-                    events.send(Event::Toast(
-                        "an AI review is already running for this PR".to_owned(),
-                    ));
-                    return;
-                }
-                Some(_) => runs.remove(&key),
-                None => None,
-            }
-        };
-        if let Some(old) = replacing {
-            close_run_handle(old);
-        }
+        // The run's session cell exists before anything else: the
+        // placeholder and the real handle share it, so an `AiAttach` that
+        // lands mid-start rebinds the cell the pipeline will use (§10.2).
+        let session_cell = Arc::new(Mutex::new(session));
 
         let Some(repo_settings) = self.repo_settings(&key) else {
             events.send(Event::Toast(format!(
@@ -432,10 +454,40 @@ impl AiHub {
         };
         let settings = self.settings();
 
-        // Undo a checkout this start made when a later step fails.
-        let hub_store = self.store.clone();
-        let abort = move |rec: CheckoutRecord, events: EventSender, message: String| {
-            let store = hub_store.clone();
+        // A live run (or a start in progress) for this PR owns the checkout;
+        // a finished one that was never finished() is replaced. The
+        // placeholder goes in under the same lock as the check, before the
+        // first await: the worker runs commands concurrently, so a
+        // double-clicked Start must not get two pipelines through the
+        // checkout (spec §10.3).
+        let replacing = {
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            match runs.get(&key) {
+                Some(run) if run.live.load(Ordering::SeqCst) => {
+                    events.send(Event::Toast(
+                        "an AI review is already running for this PR".to_owned(),
+                    ));
+                    return;
+                }
+                _ => {
+                    let old = runs.remove(&key);
+                    runs.insert(
+                        key.clone(),
+                        RunHandle::starting(session_cell.clone(), events),
+                    );
+                    old
+                }
+            }
+        };
+        if let Some(old) = replacing {
+            close_run_handle(old);
+        }
+
+        // Undo a checkout this start made when a later step fails; every
+        // failure path also releases the placeholder.
+        let abort = |rec: CheckoutRecord, events: EventSender, message: String| {
+            self.release_starting(&key);
+            let store = self.store.clone();
             async move {
                 events.send(Event::AiCheckoutFailed { session, message });
                 let outcome = tokio::task::spawn_blocking(move || restore(&rec, true, &store))
@@ -472,6 +524,7 @@ impl AiHub {
                 match planned {
                     Ok(plan) => plan,
                     Err(error) => {
+                        self.release_starting(&key);
                         events.send(Event::AiCheckoutFailed {
                             session,
                             message: error.to_string(),
@@ -488,6 +541,7 @@ impl AiHub {
             match tokio::task::spawn_blocking(move || execute_checkout(&plan, &pr, &store)).await {
                 Ok(Ok(rec)) => rec,
                 Ok(Err(error)) => {
+                    self.release_starting(&key);
                     events.send(Event::AiCheckoutFailed {
                         session,
                         message: error.to_string(),
@@ -495,6 +549,7 @@ impl AiHub {
                     return;
                 }
                 Err(_) => {
+                    self.release_starting(&key);
                     events.send(Event::AiCheckoutFailed {
                         session,
                         message: "the checkout was cancelled".to_owned(),
@@ -667,7 +722,6 @@ impl AiHub {
                 return;
             }
         };
-        let session_cell = Arc::new(Mutex::new(session));
         let interaction = UiInteraction::new(
             events.clone(),
             session_cell.clone(),
@@ -702,6 +756,7 @@ impl AiHub {
                 chat: None,
                 bash_disabled: bash_disabled.clone(),
                 live: live.clone(),
+                starting: false,
                 pipeline: Some(pipeline),
                 tmp_dir: Some(tmp_dir),
             },
@@ -720,16 +775,14 @@ impl AiHub {
         });
 
         // The UI needs the checkout record and the bash reason right away.
-        let live_state = {
+        {
             let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-            runs.get(&key)
-                .map(|run| (run.checkout.clone(), run.bash_disabled.clone()))
-        };
-        match self.snapshot_data(&key, live_state.as_ref()) {
-            Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
-            Err(error) => events.send(Event::Toast(format!(
-                "could not load the AI review state: {error}"
-            ))),
+            match self.snapshot_data(&key, runs.get(&key)) {
+                Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
+                Err(error) => events.send(Event::Toast(format!(
+                    "could not load the AI review state: {error}"
+                ))),
+            }
         }
     }
 
@@ -846,6 +899,7 @@ impl AiHub {
                 chat: run.chat.take(),
                 bash_disabled: run.bash_disabled.clone(),
                 live: run.live.clone(),
+                starting: run.starting,
                 pipeline: run.pipeline.take(),
                 tmp_dir: run.tmp_dir.clone(),
             })
@@ -856,6 +910,11 @@ impl AiHub {
             ));
             return;
         };
+        if run.starting {
+            events.send(Event::Toast("the AI review is still starting".to_owned()));
+            self.put_back(key, run);
+            return;
+        }
 
         // The agents must be gone before the tree moves under them.
         if let Some(control) = run.control.take() {
@@ -933,6 +992,15 @@ impl AiHub {
                     }
                 }
             }
+        }
+    }
+
+    /// Drop the start placeholder if it is still the entry for `key`; the
+    /// real handle, once inserted, stays.
+    fn release_starting(&self, key: &PrKey) {
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.get(key).is_some_and(|run| run.starting) {
+            runs.remove(key);
         }
     }
 
@@ -1520,6 +1588,67 @@ mod tests {
             }
         }
         assert!(saw_stage, "stage lifecycle events were forwarded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_starts_only_run_one_pipeline() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        // The worker runs every command as its own task, so a double-clicked
+        // Start lands as two overlapping `start` calls.
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let hub = fx.hub.clone();
+            let client = fx.client.clone();
+            let key = fx.key.clone();
+            let pr = fx.pr.clone();
+            let inputs = snapshot_inputs(&fx.pr.head_sha);
+            let events = fx.tx.clone();
+            tasks.push(tokio::spawn(async move {
+                hub.start(
+                    client,
+                    SessionId(1),
+                    key,
+                    pr,
+                    inputs,
+                    RunMode::Full,
+                    &events,
+                )
+                .await;
+            }));
+        }
+        for task in tasks {
+            task.await.expect("the start task runs to its end");
+        }
+
+        // The loser said so exactly once; the winner's snapshot arrived; and
+        // the single run completed.
+        let mut already_running = 0;
+        let mut saw_snapshot = false;
+        loop {
+            let event = fx
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("an event");
+            match &event {
+                Event::Toast(message) if message.contains("already running") => {
+                    already_running += 1
+                }
+                Event::AiSnapshot { .. } => saw_snapshot = true,
+                Event::WorkerPanicked(message) => panic!("worker panicked: {message}"),
+                _ => {}
+            }
+            if is_run_end(&event) {
+                assert_eq!(run_status(&event), Some(RunStatus::Completed));
+                break;
+            }
+        }
+        assert_eq!(already_running, 1, "the second Start was rejected");
+        assert!(saw_snapshot, "the winner sent its snapshot");
+        let runs = fx.hub.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "exactly one run for the PR");
+        let run = runs.get(&fx.key).expect("the run");
+        assert!(!run.starting, "the placeholder became the real run");
+        assert_eq!(run.checkout.state, CheckoutState::Active);
     }
 
     #[tokio::test(flavor = "multi_thread")]
