@@ -2,16 +2,18 @@
 //! prompt, tool subset, and structured finish tool. [`StageInputs`] is what
 //! every stage gets; [`StageError`] is how every stage fails.
 
+pub mod reviewer;
 pub mod scout;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::mpsc;
 
 use crate::ai::agent::AgentControl;
 use crate::ai::events::PipelineEvent;
 use crate::ai::model::Llm;
-use crate::ai::tools::ToolCx;
+use crate::ai::tools::{AgentRef, ToolCx};
 use crate::persist::settings::{AiSettings, RepoAiSettings};
 
 /// Everything a stage needs: a [`ToolCx`] template (the stage clones it and
@@ -43,4 +45,23 @@ pub enum StageError {
     Failed(String),
     /// The run was cancelled.
     Cancelled,
+}
+
+/// Runs a reviewer's side question through a fresh lookup agent (spec §5.4).
+/// The pipeline implements this (Task 15); the reviewer stage reaches it
+/// through [`ToolCx::spawner`] and the `ask_lookup` tool.
+#[async_trait::async_trait]
+pub trait Spawner: Send + Sync {
+    /// Answer `question` on `from`'s behalf, with a fresh bounded context,
+    /// and return the answer text.
+    async fn lookup(&self, from: &AgentRef, question: &str) -> String;
+}
+
+/// The next agent number for a run ([`AgentRef::id`] is unique across
+/// roles): the scout takes 1, every later stage takes the next number.
+/// Process-wide, so ids are unique across runs too — more than the spec
+/// requires, never less.
+pub(crate) fn next_agent_id() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(2);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }

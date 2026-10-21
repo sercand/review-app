@@ -666,6 +666,8 @@ mod tests {
                 context: None,
                 run: test_support::ai_run_state(),
                 assigned: Arc::new(Vec::new()),
+                spawner: None,
+                prepare: None,
             },
             llm,
             ctl: AgentControl {

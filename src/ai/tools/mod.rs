@@ -1,7 +1,8 @@
 //! The review agent's read-only repo tools: `bash`, `read_file`, `glob`,
 //! `grep`, `list_dir`, `asset_stats`, `git_show`/`git_log`/`git_diff`, the
 //! snapshot-backed `gh_pr`/`gh_pr_files`/`gh_pr_patch`/`gh_threads`/`gh_checks`,
-//! the context-backed `load_skill`, and the review-output `record_finding`,
+//! the context-backed `load_skill`, the interaction tools `ask_lookup`,
+//! `ask_user` and `request_prepare`, and the review-output `record_finding`,
 //! `record_check` and `done`, with mono's names and schemas where
 //! they exist, run against any
 //! [`review_sandbox::SandboxOps`] (a checkout's `LocalHost` in production, a
@@ -26,6 +27,7 @@ mod files;
 mod gh;
 mod git;
 mod inspect;
+mod interact;
 mod record;
 mod search;
 mod skills;
@@ -206,6 +208,20 @@ pub struct ToolCx {
     /// `record_check` refuses items outside this list; an empty list means
     /// anything may be recorded (the scout, chat, and tool tests).
     pub assigned: Arc<Vec<(String, String)>>,
+    /// The pipeline's lookup spawner, for `ask_lookup` (spec §5.4).
+    ///
+    /// `None` means no pipeline is attached — tool tests, and stages that
+    /// do not spawn; `ask_lookup` then returns an error rather than
+    /// guessing.
+    pub spawner: Option<Arc<dyn crate::ai::stages::Spawner>>,
+    /// The repo's prepare commands, run outside the sandbox as the user
+    /// (spec §8.5) once the user approves `request_prepare`.
+    ///
+    /// The closure does the blocking work itself (the tool runs it on the
+    /// blocking pool) and returns the already-formatted combined output.
+    /// `None` when the repo has no prepare commands configured; the tool
+    /// then returns an error rather than running nothing silently.
+    pub prepare: Option<Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>>,
 }
 
 impl ToolCx {
@@ -314,6 +330,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(gh::GhThreads),
         Arc::new(gh::GhChecks),
         Arc::new(skills::LoadSkill),
+        Arc::new(interact::AskLookup),
+        Arc::new(interact::AskUser),
+        Arc::new(interact::RequestPrepare),
         Arc::new(record::RecordFinding),
         Arc::new(record::RecordCheck),
         Arc::new(record::Done),

@@ -77,6 +77,8 @@ fn ctx_with(
         context: None,
         run: crate::test_support::ai_run_state(),
         assigned: Arc::new(Vec::new()),
+        spawner: None,
+        prepare: None,
     }
 }
 
@@ -1108,6 +1110,9 @@ fn tool_definitions_have_valid_schemas() {
             "gh_threads",
             "gh_checks",
             "load_skill",
+            "ask_lookup",
+            "ask_user",
+            "request_prepare",
             "record_finding",
             "record_check",
             "done"
@@ -1139,6 +1144,9 @@ fn tool_definitions_have_valid_schemas() {
     assert!(req("gh_threads").is_empty());
     assert!(req("gh_checks").is_empty());
     assert_eq!(req("load_skill"), ["name"]);
+    assert_eq!(req("ask_lookup"), ["question"]);
+    assert_eq!(req("ask_user"), ["question"]);
+    assert_eq!(req("request_prepare"), ["reason"]);
     assert_eq!(
         req("record_finding"),
         ["path", "line", "severity", "title", "body", "evidence"]
@@ -1170,6 +1178,9 @@ fn tool_definitions_have_valid_schemas() {
     assert_eq!(props("gh_threads"), ["path"]);
     assert!(props("gh_checks").is_empty());
     assert_eq!(props("load_skill"), ["name"]);
+    assert_eq!(props("ask_lookup"), ["question"]);
+    assert_eq!(props("ask_user"), ["options", "question"]);
+    assert_eq!(props("request_prepare"), ["reason"]);
     assert_eq!(
         props("record_finding"),
         [

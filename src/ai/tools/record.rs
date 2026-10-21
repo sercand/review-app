@@ -461,6 +461,8 @@ mod tests {
                     .map(|(f, i)| (f.to_string(), i.to_string()))
                     .collect(),
             ),
+            spawner: None,
+            prepare: None,
         };
         Ctx { _dir: dir, cx, run }
     }
