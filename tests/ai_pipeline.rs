@@ -984,8 +984,10 @@ async fn token_budget_stops_early_but_still_assembles() {
         vec![draft_step("approve", "nothing survived the budget")],
     );
 
-    let mut settings = AiSettings::default();
-    settings.run_token_budget = 1;
+    let settings = AiSettings {
+        run_token_budget: 1,
+        ..AiSettings::default()
+    };
     // The scout's single call already spends 200 tokens.
     let mut s = start_with(scripts, settings, None, Some((100, 100)));
 
