@@ -28,14 +28,16 @@ use crate::ai::events::{PipelineEvent, StageKind, StageStatus};
 use crate::ai::interaction::{ApprovalDecision, Interaction, Question};
 use crate::ai::model::Llm;
 use crate::ai::prompts::system_prompt;
-use crate::ai::review::{Finding, FindingState, RunState};
+use crate::ai::review::{Finding, FindingState, RunState, Severity};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::assemble::run_assembler;
 use crate::ai::stages::challenge::{needs_challenge, run_challenger};
 use crate::ai::stages::reviewer::run_reviewer;
 use crate::ai::stages::scout::{Brief, Group, Risk, SCOUT_LABEL, read_only_tools, run_scout};
 use crate::ai::stages::verify::{MAX_BATCH, dedupe, run_verifier};
-use crate::ai::stages::{Spawner, StageError, StageInputs, next_agent_id, without_bash};
+use crate::ai::stages::{
+    Spawner, StageError, StageInputs, next_agent_id, with_bash_note, without_bash,
+};
 use crate::ai::store::RunKind;
 use crate::ai::tools::{AgentRef, AgentRole, Registry, ToolCx};
 use crate::persist::settings::{AiSettings, ModelSettings, RepoAiSettings};
@@ -113,8 +115,10 @@ pub struct PipelineStatus {
     pub groups: Vec<(String, GroupState)>,
     /// The agents running right now.
     pub running_agents: Vec<AgentRef>,
-    /// Findings recorded so far.
-    pub findings: usize,
+    /// Findings recorded so far, counted by `(severity, state)`. Sorted by
+    /// severity (Bug, Risk, Nit, Question) then state (declaration order);
+    /// pairs with no findings are omitted.
+    pub findings: Vec<(Severity, FindingState, u32)>,
     /// `ask_user` calls waiting on an answer.
     pub open_questions: usize,
 }
@@ -146,20 +150,30 @@ impl PipelineControl {
     }
 
     /// Queue `text` as a user note for every current and future agent.
+    /// The global list is a broadcast list — never drained — so an agent
+    /// starting later still receives every note; agents running right now
+    /// get the note pushed onto their own queue directly, once.
     pub fn note_all(&self, text: &str) {
         {
-            let state = self.ctl.state();
             self.ctl
                 .global_notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push_back(text.to_string());
+            let state = self.ctl.state();
             for slot in state
                 .groups
                 .iter()
                 .filter(|s| s.state == GroupState::Running)
             {
                 slot.notes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(text.to_string());
+            }
+            for running in state.running.iter() {
+                running
+                    .notes
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push_back(text.to_string());
@@ -181,6 +195,13 @@ impl PipelineControl {
                         && slot.agent.as_ref().is_some_and(|a| a.id == agent_id)
                 })
                 .map(|slot| slot.notes.clone())
+                .or_else(|| {
+                    state
+                        .running
+                        .iter()
+                        .find(|r| r.agent.id == agent_id)
+                        .map(|r| r.notes.clone())
+                })
         };
         match routed {
             Some(notes) => notes
@@ -288,16 +309,68 @@ impl PipelineControl {
                 .iter()
                 .map(|slot| (slot.group.id.clone(), slot.state))
                 .collect(),
-            running_agents: state.running.clone(),
+            running_agents: state
+                .groups
+                .iter()
+                .filter_map(|slot| slot.agent.clone())
+                .chain(state.running.iter().map(|r| r.agent.clone()))
+                .collect(),
             findings: self
                 .ctl
                 .run
                 .get()
-                .map(|run| run.findings().len())
-                .unwrap_or(0),
+                .map(|run| finding_counts(&run.findings()))
+                .unwrap_or_default(),
             open_questions: self.ctl.questions.load(Ordering::Relaxed),
         }
     }
+}
+
+/// Severity in report order: declaration order (Bug, Risk, Nit, Question).
+const SEVERITY_ORDER: [Severity; 4] = [
+    Severity::Bug,
+    Severity::Risk,
+    Severity::Nit,
+    Severity::Question,
+];
+
+/// Finding state in report order: declaration order.
+const STATE_ORDER: [FindingState; 8] = [
+    FindingState::Draft,
+    FindingState::Kept,
+    FindingState::DroppedByUser,
+    FindingState::DroppedByVerifier,
+    FindingState::Posted,
+    FindingState::Addressed,
+    FindingState::StillPresent,
+    FindingState::Outdated,
+];
+
+/// Count `findings` by `(severity, state)`, sorted by [`SEVERITY_ORDER`]
+/// then [`STATE_ORDER`]; empty pairs are omitted.
+fn finding_counts(findings: &[Finding]) -> Vec<(Severity, FindingState, u32)> {
+    let mut counts: BTreeMap<(u8, u8), u32> = BTreeMap::new();
+    for finding in findings {
+        let severity = SEVERITY_ORDER
+            .iter()
+            .position(|s| *s == finding.severity)
+            .expect("every severity is in the order");
+        let state = STATE_ORDER
+            .iter()
+            .position(|s| *s == finding.state)
+            .expect("every state is in the order");
+        *counts.entry((severity as u8, state as u8)).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|((severity, state), count)| {
+            (
+                SEVERITY_ORDER[severity as usize],
+                STATE_ORDER[state as usize],
+                count,
+            )
+        })
+        .collect()
 }
 
 /// The shared orchestrator state. One mutex, always taken briefly and
@@ -322,7 +395,17 @@ struct Ctl {
 struct RunCtl {
     stages: Vec<(StageKind, StageStatus)>,
     groups: Vec<GroupSlot>,
-    running: Vec<AgentRef>,
+    /// Stage agents not tied to a group (scout, challenger, verifier,
+    /// assembler, lookup); group reviewers are tracked on their slots.
+    running: Vec<RunningAgent>,
+}
+
+/// A running non-group agent and the note queue [`PipelineControl::note_all`]
+/// pushes into, so a broadcast note reaches it without draining the global
+/// list for everyone else.
+struct RunningAgent {
+    agent: AgentRef,
+    notes: Arc<Mutex<VecDeque<String>>>,
 }
 
 /// One brief group plus everything the scheduler needs to steer it.
@@ -394,7 +477,7 @@ impl Ctl {
     }
 
     /// Take the next startable group in `order`, marking it Running and
-    /// seeding its note queue from the global one.
+    /// seeding its note queue with a clone of the broadcast list.
     fn take_next_pending(&self, order: &[usize]) -> Option<(usize, Group, AgentControl)> {
         let mut state = self.state();
         for &idx in order {
@@ -406,9 +489,9 @@ impl Ctl {
             let group = slot.group.clone();
             let notes = slot.notes.clone();
             {
+                let global = self.global_notes.lock().unwrap_or_else(|e| e.into_inner());
                 let mut queue = notes.lock().unwrap_or_else(|e| e.into_inner());
-                let mut global = self.global_notes.lock().unwrap_or_else(|e| e.into_inner());
-                queue.append(&mut global);
+                *queue = global.clone();
             }
             let ctl = AgentControl {
                 cancel: slot.cancel.clone(),
@@ -421,14 +504,12 @@ impl Ctl {
     }
 
     fn set_group_agent(&self, idx: usize, agent: &AgentRef) {
-        let mut state = self.state();
-        state.groups[idx].agent = Some(agent.clone());
-        state.running.push(agent.clone());
+        self.state().groups[idx].agent = Some(agent.clone());
     }
 
     fn end_agent(&self, agent: &AgentRef) {
         let mut state = self.state();
-        state.running.retain(|running| running.id != agent.id);
+        state.running.retain(|running| running.agent.id != agent.id);
         for slot in state.groups.iter_mut() {
             if slot.agent.as_ref().is_some_and(|a| a.id == agent.id) {
                 slot.agent = None;
@@ -496,12 +577,34 @@ impl Ctl {
         self.budget > 0 && spent > self.budget
     }
 
-    /// Control handles for a stage agent that is not tied to a group.
-    fn agent_ctl(&self) -> AgentControl {
+    /// Control handle for a stage agent that is not tied to a group: it
+    /// gets its own note queue seeded with a clone of the broadcast list
+    /// and is registered so [`PipelineControl::note_all`] reaches it while
+    /// it runs.
+    fn agent_ctl(&self, agent: &AgentRef) -> AgentControl {
+        let notes = Arc::new(Mutex::new(
+            self.global_notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        ));
+        self.state().running.push(RunningAgent {
+            agent: agent.clone(),
+            notes: notes.clone(),
+        });
         AgentControl {
             cancel: self.cancel.clone(),
             pause: self.pause.subscribe(),
-            notes: self.global_notes.clone(),
+            notes,
+        }
+    }
+
+    /// A control handle for a template that never runs an agent itself.
+    fn unregistered_ctl(&self) -> AgentControl {
+        AgentControl {
+            cancel: self.cancel.clone(),
+            pause: self.pause.subscribe(),
+            notes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -590,7 +693,7 @@ pub fn start_pipeline(
             prepare: None,
         },
         llm: inputs.llm.clone(),
-        ctl: ctl.agent_ctl(),
+        ctl: ctl.unregistered_ctl(),
         events: tx.clone(),
         settings: inputs.settings.clone(),
         repo: inputs.repo_settings.clone(),
@@ -605,7 +708,7 @@ pub fn start_pipeline(
         .clone()
         .unwrap_or_else(|| inputs.llm.clone());
     let spawner = Arc::new(PipelineSpawner {
-        base: stage_clone(&template, lookup_llm, ctl.agent_ctl()),
+        base: stage_clone(&template, lookup_llm, ctl.unregistered_ctl()),
         ctl: ctl.clone(),
     });
     let mut template = template;
@@ -656,8 +759,11 @@ async fn orchestrate(
         label: SCOUT_LABEL.to_string(),
     };
     let tally = Arc::new(Tally::default());
-    let inputs = stage_clone(&base, tracked_llm(&base, tally.clone()), ctl.agent_ctl());
-    ctl.state().running.push(scout.clone());
+    let inputs = stage_clone(
+        &base,
+        tracked_llm(&base, tally.clone()),
+        ctl.agent_ctl(&scout),
+    );
     let _ = tx.send(PipelineEvent::AgentStarted {
         agent: scout.clone(),
         group: None,
@@ -669,6 +775,10 @@ async fn orchestrate(
         Err(error) => {
             let reason = error_text(&error);
             let status = if ctl.cancel.is_cancelled() {
+                ctl.stage(
+                    StageKind::Scout,
+                    StageStatus::Failed("cancelled".to_string()),
+                );
                 RunStatus::Cancelled
             } else {
                 ctl.stage(StageKind::Scout, StageStatus::Failed(reason.clone()));
@@ -693,6 +803,10 @@ async fn orchestrate(
         ctl.stage(StageKind::Review, StageStatus::Started);
         budget_hit = review_pass(&base, &ctl, &brief).await;
         if ctl.cancel.is_cancelled() {
+            ctl.stage(
+                StageKind::Review,
+                StageStatus::Failed("cancelled".to_string()),
+            );
             return finish_run(
                 &ctl,
                 &run,
@@ -724,8 +838,11 @@ async fn orchestrate(
                 label: format!("challenger:{}", group.id),
             };
             let tally = Arc::new(Tally::default());
-            let inputs = stage_clone(&base, tracked_llm(&base, tally.clone()), ctl.agent_ctl());
-            ctl.state().running.push(agent.clone());
+            let inputs = stage_clone(
+                &base,
+                tracked_llm(&base, tally.clone()),
+                ctl.agent_ctl(&agent),
+            );
             let _ = tx.send(PipelineEvent::AgentStarted {
                 agent: agent.clone(),
                 group: Some(group.id.clone()),
@@ -741,6 +858,10 @@ async fn orchestrate(
             }
         }
         if ctl.cancel.is_cancelled() {
+            ctl.stage(
+                StageKind::Challenge,
+                StageStatus::Failed("cancelled".to_string()),
+            );
             return finish_run(
                 &ctl,
                 &run,
@@ -768,8 +889,11 @@ async fn orchestrate(
                 label: format!("verifier:{}", path.replace('/', "-")),
             };
             let tally = Arc::new(Tally::default());
-            let inputs = stage_clone(&base, tracked_llm(&base, tally.clone()), ctl.agent_ctl());
-            ctl.state().running.push(agent.clone());
+            let inputs = stage_clone(
+                &base,
+                tracked_llm(&base, tally.clone()),
+                ctl.agent_ctl(&agent),
+            );
             let _ = tx.send(PipelineEvent::AgentStarted {
                 agent: agent.clone(),
                 group: None,
@@ -785,6 +909,10 @@ async fn orchestrate(
             }
         }
         if ctl.cancel.is_cancelled() {
+            ctl.stage(
+                StageKind::Verify,
+                StageStatus::Failed("cancelled".to_string()),
+            );
             return finish_run(
                 &ctl,
                 &run,
@@ -812,8 +940,11 @@ async fn orchestrate(
         label: ASSEMBLER_LABEL.to_string(),
     };
     let tally = Arc::new(Tally::default());
-    let inputs = stage_clone(&base, tracked_llm(&base, tally.clone()), ctl.agent_ctl());
-    ctl.state().running.push(assembler.clone());
+    let inputs = stage_clone(
+        &base,
+        tracked_llm(&base, tally.clone()),
+        ctl.agent_ctl(&assembler),
+    );
     let _ = tx.send(PipelineEvent::AgentStarted {
         agent: assembler.clone(),
         group: None,
@@ -825,6 +956,10 @@ async fn orchestrate(
         Err(error) => {
             let reason = error_text(&error);
             let status = if ctl.cancel.is_cancelled() {
+                ctl.stage(
+                    StageKind::Assemble,
+                    StageStatus::Failed("cancelled".to_string()),
+                );
                 RunStatus::Cancelled
             } else {
                 ctl.stage(StageKind::Assemble, StageStatus::Failed(reason.clone()));
@@ -1175,7 +1310,10 @@ impl Spawner for PipelineSpawner {
         let spec = AgentSpec {
             agent: agent.clone(),
             system: system_prompt(AgentRole::Lookup, &agent.label),
-            initial: vec![review_llm::Message::user_text(question.to_string())],
+            initial: vec![review_llm::Message::user_text(with_bash_note(
+                question.to_string(),
+                self.base.bash_disabled.as_deref(),
+            ))],
             registry,
             max_turns: LOOKUP_MAX_TURNS,
             finish_tool: None,
@@ -1187,7 +1325,6 @@ impl Spawner for PipelineSpawner {
             inner: self.base.llm.clone(),
             tally: tally.clone(),
         });
-        self.ctl.state().running.push(agent.clone());
         let _ = self.ctl.events.send(PipelineEvent::AgentStarted {
             agent: agent.clone(),
             group: None,
@@ -1196,7 +1333,7 @@ impl Spawner for PipelineSpawner {
             spec,
             cx,
             llm,
-            self.ctl.agent_ctl(),
+            self.ctl.agent_ctl(&agent),
             self.base.events.clone(),
         )
         .await;
@@ -1227,12 +1364,17 @@ impl Spawner for PipelineSpawner {
 
 #[cfg(test)]
 mod tests {
-    use super::{Group, cut_words, risk_rank, schedule_order, verifier_batches};
-    use crate::ai::review::{Evidence, Finding, FindingAnchor, FindingState};
+    use super::{
+        AgentControl, Ctl, Finding, Group, GroupState, PipelineControl, cut_words, finding_counts,
+        risk_rank, schedule_order, verifier_batches,
+    };
+    use crate::ai::review::{Evidence, FindingAnchor, FindingState, Severity};
     use crate::ai::stages::scout::Risk;
     use crate::ai::tools::{AgentRef, AgentRole};
     use crate::model::comment::Anchor;
     use crate::model::diff::Side;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn group(id: &str, risk: Risk, skim: bool) -> Group {
         Group {
@@ -1246,6 +1388,20 @@ mod tests {
             ci_notes: Vec::new(),
             skim,
         }
+    }
+
+    /// A control handle over registered groups with no run behind it:
+    /// enough to exercise the steering commands.
+    fn control_with(groups: &[Group]) -> (PipelineControl, Arc<Ctl>) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctl = Arc::new(Ctl::new(0, tx));
+        ctl.register_groups(groups);
+        (PipelineControl { ctl: ctl.clone() }, ctl)
+    }
+
+    fn drain_notes(ctl: &AgentControl) -> Vec<String> {
+        let mut queue = ctl.notes.lock().unwrap_or_else(|e| e.into_inner());
+        queue.drain(..).collect()
     }
 
     #[test]
@@ -1342,5 +1498,179 @@ mod tests {
         assert_eq!(cut_words("one two three", 5), "one two three");
         assert_eq!(cut_words("one two three", 2), "one two […]");
         assert_eq!(cut_words("", 3), "");
+    }
+
+    #[test]
+    fn finding_counts_sorts_by_severity_then_state() {
+        let mut bug_draft = finding(1, "a.rs", 1);
+        bug_draft.severity = Severity::Bug;
+        let mut bug_draft_again = finding(2, "a.rs", 2);
+        bug_draft_again.severity = Severity::Bug;
+        let mut bug_kept = finding(3, "a.rs", 3);
+        bug_kept.severity = Severity::Bug;
+        bug_kept.state = FindingState::Kept;
+        let mut nit_draft = finding(4, "a.rs", 4);
+        nit_draft.severity = Severity::Nit;
+        let mut question_draft = finding(5, "a.rs", 5);
+        question_draft.severity = Severity::Question;
+
+        let counts = finding_counts(&[
+            question_draft,
+            nit_draft,
+            bug_kept,
+            bug_draft_again,
+            bug_draft,
+        ]);
+        assert_eq!(
+            counts,
+            vec![
+                (Severity::Bug, FindingState::Draft, 2),
+                (Severity::Bug, FindingState::Kept, 1),
+                (Severity::Nit, FindingState::Draft, 1),
+                (Severity::Question, FindingState::Draft, 1),
+            ],
+            "Bug first, then Risk, Nit, Question; states in declaration order; empty pairs omitted"
+        );
+        assert!(finding_counts(&[]).is_empty());
+    }
+
+    #[test]
+    fn rerun_and_skip_reject_finished_groups() {
+        let (control, ctl) = control_with(&[group("g1", Risk::High, false)]);
+        for finished in [GroupState::Done, GroupState::Failed, GroupState::Skipped] {
+            ctl.state().groups[0].state = finished;
+            let rerun = control.rerun_group("g1").unwrap_err();
+            assert!(rerun.contains("already finished"), "{rerun}");
+            let skip = control.skip_group("g1").unwrap_err();
+            assert!(skip.contains("already finished"), "{skip}");
+            // The rejection left the state alone.
+            assert_eq!(ctl.state().groups[0].state, finished);
+        }
+        assert!(
+            control
+                .rerun_group("nope")
+                .unwrap_err()
+                .contains("no group")
+        );
+    }
+
+    #[test]
+    fn skip_pending_marks_the_group_skipped() {
+        let (control, _ctl) = control_with(&[group("g1", Risk::High, false)]);
+        control.skip_group("g1").unwrap();
+        assert_eq!(
+            control.status().groups,
+            vec![("g1".to_string(), GroupState::Skipped)]
+        );
+    }
+
+    #[test]
+    fn skip_running_cancels_only_that_group() {
+        let (control, ctl) = control_with(&[
+            group("g1", Risk::High, false),
+            group("g2", Risk::Medium, false),
+        ]);
+        {
+            let mut state = ctl.state();
+            state.groups[0].state = GroupState::Running;
+            state.groups[1].state = GroupState::Running;
+        }
+        control.skip_group("g1").unwrap();
+        let state = ctl.state();
+        assert_eq!(state.groups[0].state, GroupState::Skipped);
+        assert!(state.groups[0].cancel.is_cancelled());
+        assert_eq!(state.groups[1].state, GroupState::Running);
+        assert!(
+            !state.groups[1].cancel.is_cancelled(),
+            "the other reviewer keeps running"
+        );
+    }
+
+    #[test]
+    fn rerun_while_running_sets_the_flag_and_cancels_the_reviewer() {
+        let (control, ctl) = control_with(&[
+            group("g1", Risk::High, false),
+            group("g2", Risk::Medium, false),
+        ]);
+        {
+            let mut state = ctl.state();
+            state.groups[0].state = GroupState::Running;
+            state.groups[1].state = GroupState::Running;
+        }
+        control.rerun_group("g1").unwrap();
+        let state = ctl.state();
+        assert!(state.groups[0].rerun);
+        assert!(state.groups[0].cancel.is_cancelled());
+        assert_eq!(
+            state.groups[0].state,
+            GroupState::Running,
+            "the group goes back to Pending only when the cancel lands"
+        );
+        assert!(!state.groups[1].rerun);
+        assert!(!state.groups[1].cancel.is_cancelled());
+    }
+
+    #[test]
+    fn add_lead_and_check_need_a_pending_group() {
+        let (control, ctl) = control_with(&[group("g1", Risk::High, false)]);
+        control.add_lead("g1", "check error paths").unwrap();
+        control.add_check("g1", "docs updated").unwrap();
+        {
+            let state = ctl.state();
+            assert_eq!(state.groups[0].group.leads, vec!["check error paths"]);
+            assert_eq!(state.groups[0].group.extra_checks, vec!["docs updated"]);
+        }
+        ctl.state().groups[0].state = GroupState::Running;
+        let lead = control.add_lead("g1", "late").unwrap_err();
+        assert!(lead.contains("already started"), "{lead}");
+        let check = control.add_check("g1", "late").unwrap_err();
+        assert!(check.contains("already started"), "{check}");
+    }
+
+    #[test]
+    fn note_all_broadcasts_without_draining() {
+        let (control, ctl) = control_with(&[
+            group("g1", Risk::High, false),
+            group("g2", Risk::Medium, false),
+        ]);
+        control.note_all("focus on error paths");
+
+        // A group that started running gets later notes pushed onto its
+        // own queue, once.
+        ctl.state().groups[0].state = GroupState::Running;
+        control.note_all("second note");
+        {
+            let state = ctl.state();
+            let queue = state.groups[0]
+                .notes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                queue.iter().cloned().collect::<Vec<_>>(),
+                vec!["second note".to_string()],
+                "the running reviewer gets the new note directly, once"
+            );
+        }
+
+        // The broadcast list is never drained: every later agent is seeded
+        // with a clone of it.
+        let (_idx, _group, first) = ctl.take_next_pending(&[1]).unwrap();
+        assert_eq!(
+            drain_notes(&first),
+            vec![
+                "focus on error paths".to_string(),
+                "second note".to_string()
+            ]
+        );
+        ctl.state().groups[0].state = GroupState::Pending; // e.g. a rerun
+        let (_idx, _group, second) = ctl.take_next_pending(&[0]).unwrap();
+        assert_eq!(
+            drain_notes(&second),
+            vec![
+                "focus on error paths".to_string(),
+                "second note".to_string()
+            ],
+            "the next agent still sees every note"
+        );
     }
 }

@@ -503,16 +503,6 @@ fn draft_step(verdict: &str, rationale: &str) -> ScriptStep {
     )])
 }
 
-/// Three text-only turns: the reviewer runs out of coverage reminders and
-/// the stage records the gaps as skipped — a normal completion.
-fn reviewer_gives_up() -> Vec<ScriptStep> {
-    vec![
-        ScriptStep::Text("looks fine".into()),
-        ScriptStep::Text("really, done".into()),
-        ScriptStep::Text("last word".into()),
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -746,6 +736,16 @@ async fn cancel_ends_the_run_cancelled_and_persists_partial_findings() {
         )),
         "the UI is told the run was cancelled"
     );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            PipelineEvent::Stage {
+                stage: StageKind::Review,
+                status: StageStatus::Failed(reason),
+            } if reason == "cancelled"
+        )),
+        "the in-flight review stage gets a terminal status, not a stuck Started"
+    );
 
     // The finding the reviewer recorded before the cancel is persisted.
     let findings = s.store.finding_list(s.session).expect("finding rows");
@@ -867,6 +867,61 @@ async fn add_lead_after_group_started_is_rejected() {
 }
 
 #[tokio::test]
+async fn note_all_reaches_running_and_future_reviewers() {
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_two_plain_groups()));
+    // g1 (High) starts first; its `read_file` parks it in `spawn_blocking`
+    // so the note lands while g1 runs and g2 is still pending. The global
+    // list is a broadcast list: g1 gets it pushed onto its live queue and
+    // g2 is seeded with a clone when it starts.
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            ScriptStep::ToolCalls(vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]),
+            core_review_step(),
+            ScriptStep::Text("all checked".into()),
+            asset_review_step(),
+            ScriptStep::Text("asset checked".into()),
+            ScriptStep::Text("really".into()),
+            ScriptStep::Text("last word".into()),
+        ],
+    );
+    scripts.insert(
+        "verifier".into(),
+        vec![verdicts_step(&[1]), verdicts_step(&[2])],
+    );
+    scripts.insert(
+        "assembler".into(),
+        vec![draft_step("comment", "a risk and a nit")],
+    );
+
+    let mut s = start(scripts);
+    drain_until(&mut s.rx, |e| {
+        matches!(
+            e,
+            PipelineEvent::ToolCall { name, agent, .. }
+                if name == "read_file" && agent.role == AgentRole::Reviewer
+        )
+    })
+    .await;
+    s.control.note_all("check the docs too");
+
+    let status = s.handle.await.expect("the orchestrator joins");
+    assert_eq!(status, RunStatus::Completed);
+
+    let note = "[note from the user] check the docs too";
+    for label in ["reviewer:g1", "reviewer:g2"] {
+        let reached = s.llm.requests_for("reviewer").iter().any(|r| {
+            r.system
+                .as_deref()
+                .is_some_and(|s| s.starts_with(&format!("# agent: {label}")))
+                && request_text(r).contains(note)
+        });
+        assert!(reached, "{label}'s requests carry the broadcast note");
+    }
+}
+
+#[tokio::test]
 async fn token_budget_stops_early_but_still_assembles() {
     let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
     scripts.insert("scout".into(), scout_step(brief_two_plain_groups()));
@@ -913,7 +968,24 @@ async fn token_budget_stops_early_but_still_assembles() {
 async fn bash_disabled_drops_the_tools_and_says_why() {
     let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
     scripts.insert("scout".into(), scout_step(brief_one_group()));
-    scripts.insert("reviewer".into(), reviewer_gives_up());
+    // The reviewer asks a lookup, so the lookup agent's seed and tools
+    // are checked too (ruling 2: every agent gets the bash note).
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            ScriptStep::ToolCalls(vec![(
+                "ask_lookup".to_string(),
+                json!({"question": "where does the real helper live?"}),
+            )]),
+            ScriptStep::Text("looks fine".into()),
+            ScriptStep::Text("really, done".into()),
+            ScriptStep::Text("last word".into()),
+        ],
+    );
+    scripts.insert(
+        "lookup".into(),
+        vec![ScriptStep::Text("src/util.rs:3 has the helper".into())],
+    );
     scripts.insert(
         "assembler".into(),
         vec![draft_step("approve", "nothing was found")],
@@ -930,7 +1002,7 @@ async fn bash_disabled_drops_the_tools_and_says_why() {
     assert_eq!(status, RunStatus::Completed);
 
     let note = format!("bash is unavailable in this review: {reason}");
-    for prefix in ["scout", "reviewer", "assembler"] {
+    for prefix in ["scout", "reviewer", "lookup", "assembler"] {
         let requests = s.llm.requests_for(prefix);
         assert!(!requests.is_empty(), "{prefix} ran");
         let text = request_text(&requests[0]);
