@@ -189,6 +189,9 @@ pub struct ScriptedLlm {
     model: ModelSettings,
     /// Whether `stream` routes by the `# agent: <label>` line.
     per_agent: bool,
+    /// The `Usage` every scripted `Done` carries; zero by default, set with
+    /// [`ScriptedLlm::usage_per_call`] by tests that watch token budgets.
+    usage: review_llm::Usage,
     script: Mutex<LlmScript>,
 }
 
@@ -198,6 +201,7 @@ impl ScriptedLlm {
         ScriptedLlm {
             model,
             per_agent: false,
+            usage: review_llm::Usage::default(),
             script: Mutex::new(LlmScript {
                 steps: steps.into(),
                 next_tool_use: 1,
@@ -214,6 +218,7 @@ impl ScriptedLlm {
         ScriptedLlm {
             model,
             per_agent: true,
+            usage: review_llm::Usage::default(),
             script: Mutex::new(LlmScript {
                 agents: scripts
                     .into_iter()
@@ -222,6 +227,19 @@ impl ScriptedLlm {
                 next_tool_use: 1,
                 ..LlmScript::default()
             }),
+        }
+    }
+
+    /// Report `input`/`output` tokens on every reply's `Done` usage, so a
+    /// test can drive token-budget logic against a scripted model.
+    pub fn usage_per_call(self, input: u64, output: u64) -> ScriptedLlm {
+        ScriptedLlm {
+            usage: review_llm::Usage {
+                input,
+                output,
+                ..review_llm::Usage::default()
+            },
+            ..self
         }
     }
 
@@ -266,11 +284,13 @@ fn scripted_meta(model: &str) -> review_llm::CallMeta {
 }
 
 /// The full event sequence for one scripted step. `first_tool_use` is the
-/// `tu_<n>` id of the step's first tool call.
+/// `tu_<n>` id of the step's first tool call; `usage` is what the `Done`
+/// reply reports.
 fn step_events(
     step: &ScriptStep,
     first_tool_use: u64,
     model: &str,
+    usage: &review_llm::Usage,
 ) -> Vec<review_llm::StreamEvent> {
     use review_llm::{BlockStart, ContentBlock, Reply, StopReason, StreamEvent, Usage};
 
@@ -329,7 +349,7 @@ fn step_events(
     events.push(StreamEvent::Done(Reply {
         content,
         stop,
-        usage: Usage::default(),
+        usage: *usage,
         meta: scripted_meta(model),
     }));
     events
@@ -387,7 +407,7 @@ impl crate::ai::model::Llm for ScriptedLlm {
         };
         let events = match step {
             ScriptStep::Fail(e) => vec![Err(e)],
-            step => step_events(&step, first_tool_use, &model)
+            step => step_events(&step, first_tool_use, &model, &self.usage)
                 .into_iter()
                 .map(Ok)
                 .collect(),

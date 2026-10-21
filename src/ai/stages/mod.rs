@@ -41,6 +41,11 @@ pub struct StageInputs {
     /// This repo's settings: the configured commands and the checkout folder
     /// (spec §4 step 1, §8.1).
     pub repo: RepoAiSettings,
+    /// Why `bash` is unavailable in this run (spec §8.2 — e.g. `bwrap` is
+    /// missing). `Some(reason)`: no registry includes `bash` or
+    /// `request_prepare`, and every agent's seed message ends with
+    /// [`bash_note`]'s line.
+    pub bash_disabled: Option<String>,
 }
 
 /// Why a stage stopped without producing its artifact.
@@ -52,6 +57,41 @@ pub enum StageError {
     Failed(String),
     /// The run was cancelled.
     Cancelled,
+}
+
+/// The exact line every seed message ends with when bash is unavailable
+/// (spec §8.2): the agent must know *why* the tool is missing, not just
+/// that it is.
+pub(crate) fn bash_note(bash_disabled: Option<&str>) -> Option<String> {
+    bash_disabled.map(|reason| format!("bash is unavailable in this review: {reason}"))
+}
+
+/// Appends [`bash_note`] as the final line of a seed task message.
+pub(crate) fn with_bash_note(mut text: String, bash_disabled: Option<&str>) -> String {
+    if let Some(note) = bash_note(bash_disabled) {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&note);
+        text.push('\n');
+    }
+    text
+}
+
+/// Drops `bash` and `request_prepare` from `tools` when bash is unavailable
+/// (spec §8.2): without a shell there is nothing for the prepare request to
+/// offer either.
+pub(crate) fn without_bash(
+    tools: Vec<Arc<dyn Tool>>,
+    bash_disabled: Option<&str>,
+) -> Vec<Arc<dyn Tool>> {
+    if bash_disabled.is_none() {
+        return tools;
+    }
+    tools
+        .into_iter()
+        .filter(|tool| !matches!(tool.definition().name.as_str(), "bash" | "request_prepare"))
+        .collect()
 }
 
 /// Runs a reviewer's side question through a fresh lookup agent (spec §5.4).
@@ -77,8 +117,9 @@ pub(crate) fn next_agent_id() -> u32 {
 /// `bash` — reviewers run tests, and approvals flow through `Interaction`),
 /// the snapshot `gh_*` tools, `load_skill`, the interaction tools, and the
 /// record tools. The challenger runs the same set (spec §5.4), so it lives
-/// here as the single source of truth.
-pub(crate) fn reviewer_tools() -> Vec<Arc<dyn Tool>> {
+/// here as the single source of truth. `bash_disabled` drops `bash` and
+/// `request_prepare` (spec §8.2).
+pub(crate) fn reviewer_tools(bash_disabled: Option<&str>) -> Vec<Arc<dyn Tool>> {
     const NAMES: [&str; 21] = [
         "bash",
         "read_file",
@@ -102,10 +143,11 @@ pub(crate) fn reviewer_tools() -> Vec<Arc<dyn Tool>> {
         "record_check",
         "done",
     ];
-    crate::ai::tools::all()
+    let tools: Vec<Arc<dyn Tool>> = crate::ai::tools::all()
         .into_iter()
         .filter(|tool| NAMES.contains(&tool.definition().name.as_str()))
-        .collect()
+        .collect();
+    without_bash(tools, bash_disabled)
 }
 
 /// The ids of the findings `agent` has recorded so far. Stages diff this
@@ -191,4 +233,65 @@ pub(crate) fn thread_text(thread: &ReviewThread) -> String {
         ""
     };
     format!("{}:{line} {author}: {head}{cut}{resolved}", thread.path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bash_note, reviewer_tools, with_bash_note, without_bash};
+    use crate::ai::tools;
+
+    #[test]
+    fn bash_note_is_the_exact_line() {
+        assert_eq!(bash_note(None), None);
+        assert_eq!(
+            bash_note(Some("bwrap is not installed")).as_deref(),
+            Some("bash is unavailable in this review: bwrap is not installed")
+        );
+    }
+
+    #[test]
+    fn bash_note_ends_the_seed_message() {
+        // Nothing is appended when bash is available.
+        assert_eq!(with_bash_note("seed\n".to_string(), None), "seed\n");
+
+        // A seed ending in text gets a newline before the note; the note is
+        // the last line either way.
+        let text = with_bash_note("seed".to_string(), Some("no bwrap"));
+        assert_eq!(text, "seed\nbash is unavailable in this review: no bwrap\n");
+        let text = with_bash_note("seed\n".to_string(), Some("no bwrap"));
+        assert_eq!(text, "seed\nbash is unavailable in this review: no bwrap\n");
+    }
+
+    #[test]
+    fn without_bash_drops_bash_and_request_prepare_only() {
+        let all = tools::all();
+        let names: Vec<String> = all.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"bash".to_string()));
+        assert!(names.contains(&"request_prepare".to_string()));
+
+        // Available: the list passes through untouched.
+        assert_eq!(without_bash(all.clone(), None).len(), all.len());
+
+        // Disabled: exactly those two tools disappear.
+        let kept = without_bash(all.clone(), Some("no bwrap"));
+        let kept_names: Vec<String> = kept.iter().map(|t| t.definition().name).collect();
+        assert_eq!(kept.len(), all.len() - 2);
+        assert!(!kept_names.contains(&"bash".to_string()));
+        assert!(!kept_names.contains(&"request_prepare".to_string()));
+        assert!(kept_names.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn reviewer_registry_follows_bash_disabled() {
+        let with_bash = reviewer_tools(None);
+        let names: Vec<String> = with_bash.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"bash".to_string()));
+        assert!(names.contains(&"request_prepare".to_string()));
+
+        let without = reviewer_tools(Some("no bwrap"));
+        let names: Vec<String> = without.iter().map(|t| t.definition().name).collect();
+        assert!(!names.contains(&"bash".to_string()));
+        assert!(!names.contains(&"request_prepare".to_string()));
+        assert_eq!(without.len(), with_bash.len() - 2);
+    }
 }

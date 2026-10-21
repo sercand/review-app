@@ -24,7 +24,8 @@ use crate::ai::prompts::system_prompt;
 use crate::ai::review::{Finding, FindingAnchor, FindingState, RunState};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::{
-    StageError, StageInputs, anchor_text, evidence_text, next_agent_id, persist_seed, thread_text,
+    StageError, StageInputs, anchor_text, evidence_text, persist_seed, thread_text, with_bash_note,
+    without_bash,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedVerdicts, SubmitVerdicts, Tool};
 use crate::model::comment::Anchor;
@@ -35,7 +36,7 @@ const MAX_TURNS: u32 = 20;
 /// Finish nudges before the loop gives up on `submit_verdicts`.
 const MAX_FINISH_REMINDERS: u32 = 2;
 /// Findings per verifier batch (spec §5.5: batched by file, bounded).
-const MAX_BATCH: usize = 8;
+pub(crate) const MAX_BATCH: usize = 8;
 /// CI annotation lines shown for the batch's path.
 const MAX_ANNOTATIONS: usize = 20;
 
@@ -114,7 +115,11 @@ fn line_range(anchor: &Anchor) -> (u32, u32) {
 /// read-only tools and finishes through `submit_verdicts`. Running out of
 /// finish nudges or turns is a *normal completion*: whatever verdicts made
 /// it in are applied, and the rest stay drafts.
-pub async fn run_verifier(inputs: &StageInputs, batch: Vec<Finding>) -> Result<(), StageError> {
+pub async fn run_verifier(
+    inputs: &StageInputs,
+    agent: &AgentRef,
+    batch: Vec<Finding>,
+) -> Result<(), StageError> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -133,23 +138,22 @@ pub async fn run_verifier(inputs: &StageInputs, batch: Vec<Finding>) -> Result<(
         batch.iter().all(|finding| finding.anchor.path() == path),
         "one batch, one path"
     );
-    let label = format!("verifier:{}", path.replace('/', "-"));
-    let agent = AgentRef {
-        id: next_agent_id(),
-        role: AgentRole::Verifier,
-        label: label.clone(),
-    };
+    let agent = agent.clone();
+    let label = agent.label.clone();
     let mut cx = inputs.cx.clone();
     cx.agent = agent.clone();
 
     let ids: Vec<i64> = batch.iter().map(|finding| finding.id).collect();
     let submitted: SharedVerdicts = Arc::new(Mutex::new(None));
-    let registry = Registry::new(verifier_tools(Arc::new(SubmitVerdicts::new(
-        ids,
-        submitted.clone(),
-    ))));
+    let registry = Registry::new(verifier_tools(
+        Arc::new(SubmitVerdicts::new(ids, submitted.clone())),
+        inputs.bash_disabled.as_deref(),
+    ));
 
-    let text = initial_message(&batch, cx.snapshot.as_deref(), cx.context.as_deref());
+    let text = with_bash_note(
+        initial_message(&batch, cx.snapshot.as_deref(), cx.context.as_deref()),
+        inputs.bash_disabled.as_deref(),
+    );
     persist_seed(&cx, &label, &text);
 
     let cell = submitted.clone();
@@ -204,7 +208,7 @@ pub async fn run_verifier(inputs: &StageInputs, batch: Vec<Finding>) -> Result<(
 /// `gh_*` tools, `load_skill`, the interaction tools, `done`, and its
 /// finish tool `submit_verdicts`. No record tools — it judges, it does not
 /// review.
-fn verifier_tools(submit: Arc<dyn Tool>) -> Vec<Arc<dyn Tool>> {
+fn verifier_tools(submit: Arc<dyn Tool>, bash_disabled: Option<&str>) -> Vec<Arc<dyn Tool>> {
     const NAMES: [&str; 18] = [
         "bash",
         "read_file",
@@ -230,7 +234,7 @@ fn verifier_tools(submit: Arc<dyn Tool>) -> Vec<Arc<dyn Tool>> {
         .filter(|tool| NAMES.contains(&tool.definition().name.as_str()))
         .collect();
     tools.push(submit);
-    tools
+    without_bash(tools, bash_disabled)
 }
 
 /// Apply the verdicts (spec §5.5): `keep` changes nothing; `drop` moves the
@@ -390,7 +394,7 @@ mod tests {
     use crate::ai::context::{InstructionFile, RepoContext};
     use crate::ai::events::PipelineEvent;
     use crate::ai::review::{Evidence, NewFinding, Severity};
-    use crate::ai::stages::StageInputs;
+    use crate::ai::stages::{StageInputs, next_agent_id};
     use crate::ai::store::{PrKey, RunKind, Store};
     use crate::ai::testing::{ScriptStep, ScriptedInteraction, ScriptedLlm};
     use crate::ai::tools::{AgentRef, AgentRole, ToolCx};
@@ -469,6 +473,15 @@ mod tests {
 
     /// A `StageInputs` over a temp-dir [`LocalHost`] carrying `snapshot`
     /// and `run`.
+    /// The verifier agent reference for `path`, as the pipeline injects it.
+    fn verifier_agent(path: &str) -> AgentRef {
+        AgentRef {
+            id: next_agent_id(),
+            role: AgentRole::Verifier,
+            label: format!("verifier:{}", path.replace('/', "-")),
+        }
+    }
+
     fn stage_inputs(
         dir: &tempfile::TempDir,
         snapshot: PrSnapshot,
@@ -505,6 +518,7 @@ mod tests {
             events: tx,
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
+            bash_disabled: None,
         }
     }
 
@@ -719,7 +733,7 @@ mod tests {
         for id in [drop_id, downgrade_id, duplicate_id] {
             assert_eq!(rx.try_recv(), Ok(PipelineEvent::FindingAdded { id }));
         }
-        run_verifier(&inputs, findings)
+        run_verifier(&inputs, &verifier_agent("src/a.rs"), findings)
             .await
             .expect("a finished verifier");
 
@@ -843,7 +857,7 @@ mod tests {
             })
             .expect("finding");
 
-        run_verifier(&inputs, run.findings())
+        run_verifier(&inputs, &verifier_agent("src/a.rs"), run.findings())
             .await
             .expect("running out of nudges is a normal completion");
 

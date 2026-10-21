@@ -25,7 +25,7 @@ use crate::ai::prompts::system_prompt;
 use crate::ai::review::{CheckResult, CoverageEntry, Finding, FindingAnchor, Severity};
 use crate::ai::stages::scout::Brief;
 use crate::ai::stages::{
-    StageError, StageInputs, anchor_text, evidence_text, next_agent_id, persist_seed,
+    StageError, StageInputs, anchor_text, evidence_text, persist_seed, with_bash_note,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedDraft, SubmitReviewDraft, Tool};
 
@@ -156,15 +156,12 @@ fn digest_line(label: &str, counts: &[u32; 4]) -> String {
 /// the floor note ([`verdict_floor`]) is applied to the returned draft.
 pub async fn run_assembler(
     inputs: &StageInputs,
+    agent: &AgentRef,
     brief: &Brief,
     kept: &[Finding],
     coverage: &[CoverageEntry],
 ) -> Result<ReviewDraft, StageError> {
-    let agent = AgentRef {
-        id: next_agent_id(),
-        role: AgentRole::Assembler,
-        label: LABEL.to_string(),
-    };
+    let agent = agent.clone();
     let mut cx = inputs.cx.clone();
     cx.agent = agent.clone();
 
@@ -175,7 +172,10 @@ pub async fn run_assembler(
         submitted.clone(),
     ))));
 
-    let text = initial_message(brief, kept, coverage);
+    let text = with_bash_note(
+        initial_message(brief, kept, coverage),
+        inputs.bash_disabled.as_deref(),
+    );
     persist_seed(&cx, LABEL, &text);
 
     let cell = submitted.clone();
@@ -333,6 +333,7 @@ mod tests {
 
     use crate::ai::agent::AgentControl;
     use crate::ai::review::{CheckResult, Evidence, FindingAnchor, FindingState, Severity};
+    use crate::ai::stages::next_agent_id;
     use crate::ai::stages::scout::Brief;
     use crate::ai::testing::{ScriptStep, ScriptedInteraction, ScriptedLlm};
     use crate::ai::tools::{AgentRef, AgentRole, ToolCx};
@@ -353,6 +354,15 @@ mod tests {
 
     /// A `StageInputs` over a temp-dir [`LocalHost`]; the assembler needs no
     /// snapshot and no repo tools, so the template carries neither.
+    /// The assembler agent reference, as the pipeline injects it.
+    fn assembler_agent() -> AgentRef {
+        AgentRef {
+            id: next_agent_id(),
+            role: AgentRole::Assembler,
+            label: LABEL.to_string(),
+        }
+    }
+
     fn stage_inputs(dir: &tempfile::TempDir, llm: Arc<ScriptedLlm>) -> StageInputs {
         let host = LocalHost::new(dir.path()).expect("local host");
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -384,6 +394,7 @@ mod tests {
             events: tx,
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
+            bash_disabled: None,
         }
     }
 
@@ -575,7 +586,7 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm.clone());
 
-        let draft = run_assembler(&inputs, &brief(), &kept, &[])
+        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &[])
             .await
             .expect("the resubmitted draft finishes the stage");
 
@@ -642,7 +653,7 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm.clone());
 
-        let draft = run_assembler(&inputs, &brief(), &kept, &coverage)
+        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &coverage)
             .await
             .expect("a submitted draft");
         assert_eq!(
@@ -727,7 +738,7 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm);
 
-        let err = run_assembler(&inputs, &brief(), &[], &[])
+        let err = run_assembler(&inputs, &assembler_agent(), &brief(), &[], &[])
             .await
             .expect_err("a review draft is mandatory here");
         assert_eq!(err, StageError::NoFinish);

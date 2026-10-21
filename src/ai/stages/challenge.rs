@@ -21,8 +21,8 @@ use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::reviewer::{find_file, patch_text, risk_slug};
 use crate::ai::stages::scout::{Brief, Group, Risk};
 use crate::ai::stages::{
-    StageError, StageInputs, agent_findings, anchor_text, evidence_text, next_agent_id,
-    persist_seed, reviewer_tools,
+    StageError, StageInputs, agent_findings, anchor_text, evidence_text, persist_seed,
+    reviewer_tools, with_bash_note,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry};
 
@@ -55,15 +55,12 @@ pub fn needs_challenge(group: &Group, findings: &[Finding]) -> bool {
 /// turns) ends the pass.
 pub async fn run_challenger(
     inputs: &StageInputs,
+    agent: &AgentRef,
     brief: &Brief,
     group: &Group,
 ) -> Result<Vec<i64>, StageError> {
-    let label = format!("challenger:{}", group.id);
-    let agent = AgentRef {
-        id: next_agent_id(),
-        role: AgentRole::Challenger,
-        label: label.clone(),
-    };
+    let agent = agent.clone();
+    let label = agent.label.clone();
     let mut cx = inputs.cx.clone();
     cx.agent = agent.clone();
     let snapshot = cx
@@ -79,14 +76,17 @@ pub async fn run_challenger(
         .filter(|finding| finding.agent.label == reviewer)
         .collect();
 
-    let text = initial_message(brief, group, &snapshot, &findings);
+    let text = with_bash_note(
+        initial_message(brief, group, &snapshot, &findings),
+        inputs.bash_disabled.as_deref(),
+    );
     persist_seed(&cx, &label, &text);
 
     let spec = AgentSpec {
         agent: agent.clone(),
         system: system_prompt(AgentRole::Challenger, &label),
         initial: vec![Message::user_text(text)],
-        registry: Registry::new(reviewer_tools()),
+        registry: Registry::new(reviewer_tools(inputs.bash_disabled.as_deref())),
         max_turns: MAX_TURNS,
         finish_tool: Some("done"),
         // No coverage enforcement here: the challenger's findings are
@@ -199,7 +199,16 @@ mod tests {
     use crate::ai::agent::AgentControl;
     use crate::ai::review::{Evidence, FindingAnchor, FindingState, NewFinding};
     use crate::ai::stages::scout::GroupFile;
-    use crate::ai::stages::{StageError, StageInputs};
+    use crate::ai::stages::{StageError, StageInputs, next_agent_id};
+
+    /// The challenger agent reference, as the pipeline injects it.
+    fn challenger_agent() -> AgentRef {
+        AgentRef {
+            id: next_agent_id(),
+            role: AgentRole::Challenger,
+            label: "challenger:g1".to_string(),
+        }
+    }
     use crate::ai::testing::{ScriptStep, ScriptedInteraction, ScriptedLlm};
     use crate::ai::tools::{AgentRef, AgentRole, ToolCx};
     use crate::github::files::LoadedFile;
@@ -319,6 +328,7 @@ mod tests {
             events: tx,
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
+            bash_disabled: None,
         }
     }
 
@@ -429,7 +439,7 @@ mod tests {
             .expect("reviewer finding");
         let brief = brief_with(vec![group("g1", Risk::High, &["src/a.rs"])]);
 
-        let ids = run_challenger(&inputs, &brief, &brief.groups[0])
+        let ids = run_challenger(&inputs, &challenger_agent(), &brief, &brief.groups[0])
             .await
             .expect("a finished challenger");
 
@@ -482,7 +492,7 @@ mod tests {
         inputs.cx.snapshot = None;
         let brief = brief_with(vec![group("g1", Risk::High, &["src/a.rs"])]);
 
-        let err = run_challenger(&inputs, &brief, &brief.groups[0])
+        let err = run_challenger(&inputs, &challenger_agent(), &brief, &brief.groups[0])
             .await
             .expect_err("no snapshot means no patches");
         assert!(matches!(err, StageError::Failed(_)), "{err:?}");

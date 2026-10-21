@@ -25,8 +25,8 @@ use crate::ai::review::{CheckResult, CoverageEntry, RunState};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::scout::{Brief, Group, GroupFile, Risk};
 use crate::ai::stages::{
-    StageError, StageInputs, agent_findings, next_agent_id, persist_seed, reviewer_tools,
-    thread_text,
+    StageError, StageInputs, agent_findings, persist_seed, reviewer_tools, thread_text,
+    with_bash_note,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry};
 use crate::github::files::{LoadedFile, PatchState};
@@ -59,15 +59,12 @@ pub struct ReviewerOutcome {
 /// recorded as [`CheckResult::Skipped`] before the stage returns.
 pub async fn run_reviewer(
     inputs: &StageInputs,
+    agent: &AgentRef,
     brief: &Brief,
     group: &Group,
 ) -> Result<ReviewerOutcome, StageError> {
-    let label = format!("reviewer:{}", group.id);
-    let agent = AgentRef {
-        id: next_agent_id(),
-        role: AgentRole::Reviewer,
-        label: label.clone(),
-    };
+    let agent = agent.clone();
+    let label = agent.label.clone();
     let mut cx = inputs.cx.clone();
     cx.agent = agent.clone();
     let snapshot = cx
@@ -111,13 +108,16 @@ pub async fn run_reviewer(
         }));
     }
 
-    let text = initial_message(
-        brief,
-        group,
-        &snapshot,
-        cx.context.as_deref(),
-        &assigned,
-        &cx.run.qa(),
+    let text = with_bash_note(
+        initial_message(
+            brief,
+            group,
+            &snapshot,
+            cx.context.as_deref(),
+            &assigned,
+            &cx.run.qa(),
+        ),
+        inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &label, &text);
 
@@ -127,7 +127,7 @@ pub async fn run_reviewer(
         agent: agent.clone(),
         system: system_prompt(AgentRole::Reviewer, &label),
         initial: vec![Message::user_text(text)],
-        registry: Registry::new(reviewer_tools()),
+        registry: Registry::new(reviewer_tools(inputs.bash_disabled.as_deref())),
         max_turns: MAX_TURNS,
         // The coverage check *is* the finish decision, and spec §5.4 wants
         // it consulted both when the model ends a turn without tool calls
@@ -625,6 +625,7 @@ mod tests {
             events: tx,
             settings: AiSettings::default(),
             repo,
+            bash_disabled: None,
         }
     }
 
@@ -639,6 +640,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The reviewer agent reference, as the pipeline injects it.
+    fn reviewer_agent() -> AgentRef {
+        AgentRef {
+            id: 2,
+            role: AgentRole::Reviewer,
+            label: "reviewer:g1".to_string(),
+        }
     }
 
     /// The `(src/a.rs, item)` pairs a source file is assigned.
@@ -673,7 +683,7 @@ mod tests {
         let brief = brief_with(vec![group("g1", "core", Risk::High, &["src/a.rs"])]);
         let assigned = source_pairs("src/a.rs");
 
-        let outcome = run_reviewer(&inputs, &brief, &brief.groups[0])
+        let outcome = run_reviewer(&inputs, &reviewer_agent(), &brief, &brief.groups[0])
             .await
             .expect("running out of reminders is a normal completion");
 
@@ -770,7 +780,7 @@ mod tests {
             .expect("other finding");
         let brief = brief_with(vec![group("g1", "core", Risk::Medium, &["src/a.rs"])]);
 
-        let outcome = run_reviewer(&inputs, &brief, &brief.groups[0])
+        let outcome = run_reviewer(&inputs, &reviewer_agent(), &brief, &brief.groups[0])
             .await
             .expect("a finished reviewer");
 
@@ -1009,7 +1019,7 @@ mod tests {
         inputs.cx.snapshot = None;
         let brief = brief_with(vec![group("g1", "core", Risk::Low, &["src/a.rs"])]);
 
-        let err = run_reviewer(&inputs, &brief, &brief.groups[0])
+        let err = run_reviewer(&inputs, &reviewer_agent(), &brief, &brief.groups[0])
             .await
             .expect_err("no snapshot means no review");
         assert!(matches!(err, StageError::Failed(_)), "{err:?}");

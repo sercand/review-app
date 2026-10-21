@@ -12,6 +12,7 @@ pub mod events;
 pub mod interaction;
 pub mod llm;
 pub mod model;
+pub mod pipeline;
 pub mod prompts;
 pub mod review;
 pub mod snapshot;

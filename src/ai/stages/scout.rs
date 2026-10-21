@@ -18,7 +18,7 @@ use crate::ai::checklist::{self, FileKind};
 use crate::ai::context::RepoContext;
 use crate::ai::prompts::system_prompt;
 use crate::ai::snapshot::PrSnapshot;
-use crate::ai::stages::{StageError, StageInputs};
+use crate::ai::stages::{StageError, StageInputs, with_bash_note, without_bash};
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedBrief, SubmitBrief, Tool, ToolCx};
 use crate::github::files::{LoadedFile, PatchState};
 use crate::model::diff::{Hunk, LineKind};
@@ -105,12 +105,12 @@ pub struct Brief {
 /// only then. On success the brief is normalized ([`normalize_groups`]), the
 /// suggestion lists are dropped when the repo already has configured
 /// commands (spec §4 step 1), and the result is stored as the session brief.
-pub async fn run_scout(inputs: &StageInputs, prev: Option<&Brief>) -> Result<Brief, StageError> {
-    let agent = AgentRef {
-        id: 1,
-        role: AgentRole::Scout,
-        label: SCOUT_LABEL.to_string(),
-    };
+pub async fn run_scout(
+    inputs: &StageInputs,
+    agent: &AgentRef,
+    prev: Option<&Brief>,
+) -> Result<Brief, StageError> {
+    let agent = agent.clone();
     let mut cx = inputs.cx.clone();
     cx.agent = agent.clone();
     let snapshot = cx
@@ -119,13 +119,19 @@ pub async fn run_scout(inputs: &StageInputs, prev: Option<&Brief>) -> Result<Bri
         .ok_or_else(|| StageError::Failed("scout: no PR snapshot attached".to_string()))?;
 
     let submitted: SharedBrief = Arc::new(Mutex::new(None));
-    let registry = Registry::new(scout_tools(Arc::new(SubmitBrief::new(submitted.clone()))));
+    let registry = Registry::new(scout_tools(
+        Arc::new(SubmitBrief::new(submitted.clone())),
+        inputs.bash_disabled.as_deref(),
+    ));
 
-    let text = initial_message(
-        &snapshot,
-        cx.context.as_deref(),
-        &inputs.repo.commands,
-        prev,
+    let text = with_bash_note(
+        initial_message(
+            &snapshot,
+            cx.context.as_deref(),
+            &inputs.repo.commands,
+            prev,
+        ),
+        inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &text);
 
@@ -193,10 +199,10 @@ pub async fn run_scout(inputs: &StageInputs, prev: Option<&Brief>) -> Result<Bri
     }
 }
 
-/// The scout's tools (spec §5.2): the read-only repo tools, the snapshot
-/// `gh_*` tools, `load_skill`, `bash` (test-less inspection; approvals still
-/// ask), and its finish tool `submit_brief`.
-fn scout_tools(submit: Arc<dyn Tool>) -> Vec<Arc<dyn Tool>> {
+/// The read-only repo tools every exploring agent gets (spec §5.2): the
+/// read-only repo tools, the snapshot `gh_*` tools, and `load_skill`.
+/// Shared by the scout and the pipeline's lookup agents.
+pub(crate) fn read_only_tools() -> Vec<Arc<dyn Tool>> {
     const READ_ONLY: [&str; 15] = [
         "bash",
         "read_file",
@@ -214,12 +220,23 @@ fn scout_tools(submit: Arc<dyn Tool>) -> Vec<Arc<dyn Tool>> {
         "gh_checks",
         "load_skill",
     ];
-    let mut tools: Vec<Arc<dyn Tool>> = crate::ai::tools::all()
+    crate::ai::tools::all()
         .into_iter()
         .filter(|tool| READ_ONLY.contains(&tool.definition().name.as_str()))
-        .collect();
+        .collect()
+}
+
+/// The scout's tools (spec §5.2): the read-only repo tools, the snapshot
+/// `gh_*` tools, `load_skill`, `bash` (test-less inspection; approvals still
+/// ask), and its finish tool `submit_brief`. `bash_disabled` drops `bash`
+/// and `request_prepare` (spec §8.2).
+pub(crate) fn scout_tools(
+    submit: Arc<dyn Tool>,
+    bash_disabled: Option<&str>,
+) -> Vec<Arc<dyn Tool>> {
+    let mut tools = read_only_tools();
     tools.push(submit);
-    tools
+    without_bash(tools, bash_disabled)
 }
 
 /// Appends the seed task message through the run's store. A failure is
@@ -640,6 +657,15 @@ mod tests {
         }
     }
 
+    /// The scout's agent reference, as the pipeline injects it.
+    fn scout_agent() -> AgentRef {
+        AgentRef {
+            id: 1,
+            role: AgentRole::Scout,
+            label: SCOUT_LABEL.to_string(),
+        }
+    }
+
     /// A `StageInputs` over a temp-dir [`LocalHost`] carrying `snapshot`.
     fn stage_inputs(
         dir: &tempfile::TempDir,
@@ -678,6 +704,7 @@ mod tests {
             events: tx,
             settings: AiSettings::default(),
             repo,
+            bash_disabled: None,
         }
     }
 
@@ -946,7 +973,9 @@ mod tests {
         );
         let run = inputs.cx.run.clone();
 
-        let brief = run_scout(&inputs, None).await.expect("a normalized brief");
+        let brief = run_scout(&inputs, &scout_agent(), None)
+            .await
+            .expect("a normalized brief");
 
         assert_eq!(brief.groups.len(), 2);
         assert_eq!(brief.groups[0].id, "g1", "ids assigned");
@@ -1009,7 +1038,9 @@ mod tests {
         };
         let inputs = stage_inputs(&dir, snapshot, llm, ScriptedInteraction::new(), repo);
 
-        let brief = run_scout(&inputs, None).await.expect("brief");
+        let brief = run_scout(&inputs, &scout_agent(), None)
+            .await
+            .expect("brief");
 
         assert!(
             brief.suggested_commands.is_empty(),
@@ -1041,7 +1072,7 @@ mod tests {
             RepoAiSettings::default(),
         );
 
-        let err = run_scout(&inputs, None)
+        let err = run_scout(&inputs, &scout_agent(), None)
             .await
             .expect_err("no submit_brief call means no finish");
         assert_eq!(err, StageError::NoFinish);

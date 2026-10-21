@@ -14,6 +14,10 @@ license = "MIT"
 # drive the worker. Unit tests compile them unconditionally.
 ai-testing = []
 
+[[test]]
+name = "ai_pipeline"
+required-features = ["ai-testing"]
+
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"
