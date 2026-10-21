@@ -463,6 +463,10 @@ fn render_files_pane(
     let include = |f: &PrFile| matches(f, &session.filters, &session.viewed);
     let tree = build_tree(pr_files, &include);
     let counts = crate::state::pr_detail::comment_counts(&session.threads, &session.pending);
+    #[cfg(unix)]
+    let ai_drafts = crate::state::pr_detail::ai_draft_counts(&session.ai);
+    #[cfg(not(unix))]
+    let ai_drafts = std::collections::HashMap::new();
     let rows = flatten_visible(
         &tree,
         &session.collapsed_dirs,
@@ -471,6 +475,7 @@ fn render_files_pane(
         &session.viewed,
         session.last_opened_file.as_deref(),
         &counts,
+        &ai_drafts,
         session.tree_order,
     );
 

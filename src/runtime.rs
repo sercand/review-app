@@ -462,6 +462,19 @@ pub enum Command {
         /// The pending-comment link to record with it.
         pending_local_id: Option<u64>,
     },
+    /// Rewrite an AI finding's body after the inline editor saved it
+    /// (spec §12, AI Task 5).
+    #[cfg(unix)]
+    AiEditFinding {
+        /// The session that asked.
+        session: SessionId,
+        /// The PR the finding belongs to.
+        key: crate::ai::store::PrKey,
+        /// The finding's row id.
+        id: i64,
+        /// The edited text.
+        body: String,
+    },
     /// Restore one unrestored checkout record from the crash-recovery dialog
     /// (spec §7.3). Not PR-scoped: the record names its own repository, and
     /// no run is live for it.
@@ -1635,6 +1648,13 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         } => ctx
             .ai
             .finding_state(session, id, state, pending_local_id, &events),
+        #[cfg(unix)]
+        Command::AiEditFinding {
+            session,
+            key: _,
+            id,
+            body,
+        } => ctx.ai.finding_edit(session, id, body, &events),
         #[cfg(unix)]
         Command::AiRecoverRestore { id } => {
             ctx.ai.recover_restore(id, &events).await;

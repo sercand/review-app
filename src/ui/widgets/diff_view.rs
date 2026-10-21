@@ -159,6 +159,20 @@ pub enum DiffAction {
         /// The pending comment's local id.
         local_id: u64,
     },
+    /// Keep an inline AI draft: into the pending review (a line finding) or
+    /// the review body (a summary item) (AI Task 5).
+    #[cfg(unix)]
+    AiKeep(i64),
+    /// Save the inline editor's text for finding `id` (AI Task 5). The
+    /// session has already written it to the finding; the app persists it.
+    #[cfg(unix)]
+    AiEdit(i64, String),
+    /// Drop an inline AI draft (AI Task 5).
+    #[cfg(unix)]
+    AiDrop(i64),
+    /// Ask the AI tab why it flagged finding `id` (AI Task 5).
+    #[cfg(unix)]
+    AiWhy(i64),
 }
 
 /// The height one line needs, in points.
@@ -858,7 +872,160 @@ fn render_row(
                 actions.extend(composer_actions.into_iter().map(DiffAction::Composer));
             });
         }
+        RowRef::AiDraft { finding } => {
+            #[cfg(unix)]
+            {
+                let id = *finding;
+                let indent = comment_indent(mode);
+                let width = ctx.full_width;
+                full_width_row(row, ctx, |ui, ctx| {
+                    let Some(finding) = ctx.session.ai.findings.get(&id).cloned() else {
+                        return;
+                    };
+                    let blocked = crate::state::pr_detail::keep_blocked(ctx.session);
+                    render_ai_draft(
+                        ui,
+                        &finding,
+                        ctx.session,
+                        width,
+                        indent,
+                        blocked.as_deref(),
+                        actions,
+                    );
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = finding;
+                blank_all(row, mode);
+            }
+        }
     }
+}
+
+/// Draw one inline AI draft: the ✦ tag, severity and title, its body and
+/// evidence, and the Keep / Edit / Drop / Why? controls (spec §12, AI Task 5).
+#[cfg(unix)]
+fn render_ai_draft(
+    ui: &mut egui::Ui,
+    finding: &crate::ai::review::Finding,
+    session: &mut PrSession,
+    width: f32,
+    indent: f32,
+    blocked: Option<&str>,
+    actions: &mut Vec<DiffAction>,
+) {
+    use crate::ai::review::FindingState;
+
+    let p = palette_of(ui);
+    let color = crate::ui::widgets::ai_panel::severity_color(p, finding.severity);
+    let inner = (width - indent - 28.0).max(180.0);
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0, p.ai))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::ui::icons::SPARKLES.to_string())
+                        .color(p.ai)
+                        .size(13.0),
+                );
+                ui.label(
+                    egui::RichText::new(finding.severity.label())
+                        .color(color)
+                        .size(11.0)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(&finding.title).strong().size(12.0));
+                if finding.state == FindingState::DroppedByVerifier {
+                    ui.label(
+                        egui::RichText::new("dropped by verifier")
+                            .color(p.muted)
+                            .size(11.0),
+                    );
+                }
+            });
+            if finding.state == FindingState::DroppedByVerifier
+                && let Some(reason) = &finding.state_reason
+            {
+                ui.label(
+                    egui::RichText::new(reason)
+                        .color(p.muted)
+                        .size(11.5)
+                        .italics(),
+                );
+            }
+            if session.ai.editing(finding.id) {
+                if let Some(buffer) = session.ai.edit_buffer_mut() {
+                    ui.add(
+                        egui::TextEdit::multiline(buffer)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked()
+                        && let Some((id, text)) = session.ai.save_edit()
+                    {
+                        actions.push(DiffAction::AiEdit(id, text));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        session.ai.cancel_edit();
+                    }
+                });
+                return;
+            }
+            ui.label(egui::RichText::new(&finding.body).size(12.0));
+            if !finding.evidence.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("evidence:").color(p.muted).size(11.0));
+                    for evidence in &finding.evidence {
+                        let label = match evidence.line {
+                            Some(line) => format!("{}:{}", evidence.path, line),
+                            None => evidence.path.clone(),
+                        };
+                        match session
+                            .files
+                            .iter()
+                            .position(|loaded| loaded.file.path == evidence.path)
+                        {
+                            Some(index) => {
+                                if ui.link(egui::RichText::new(label).size(11.0)).clicked() {
+                                    actions.push(DiffAction::SelectFile(index as u32));
+                                }
+                            }
+                            None => {
+                                ui.label(egui::RichText::new(label).color(p.muted).size(11.0))
+                                    .on_hover_text(&evidence.note);
+                            }
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if finding.state == FindingState::Draft {
+                    let keep = ui.add_enabled(blocked.is_none(), egui::Button::new("Keep"));
+                    if keep.clicked() {
+                        actions.push(DiffAction::AiKeep(finding.id));
+                    }
+                    if let Some(why) = blocked {
+                        keep.on_disabled_hover_text(why);
+                    }
+                }
+                if ui.button("Edit").clicked() {
+                    session.ai.start_edit(finding.id, finding.body.clone());
+                }
+                if finding.state == FindingState::Draft && ui.button("Drop").clicked() {
+                    actions.push(DiffAction::AiDrop(finding.id));
+                }
+                if ui.button("Why?").clicked() {
+                    actions.push(DiffAction::AiWhy(finding.id));
+                }
+            });
+        });
 }
 
 /// How far a comment row sits in from the table's left edge: past both

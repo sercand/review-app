@@ -25,6 +25,9 @@ pub const PENDING_H: f32 = 110.0;
 /// The default height of the composer row.
 pub const COMPOSER_H: f32 = 220.0;
 
+/// The default height of an inline AI draft row (Task 5).
+pub const AI_DRAFT_H: f32 = 152.0;
+
 /// Where an inline item sits within its file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -81,6 +84,48 @@ pub fn place_thread(t: &ReviewThread, idx: u32, files: &[LoadedFile]) -> Option<
     })
 }
 
+/// Decide where `f` — an AI finding — sits inline, or `None` when its file is
+/// not on this page of the PR or it is a whole-file remark (spec §12).
+///
+/// A line finding sits under the row holding its line. When the diff no
+/// longer carries that line (the head moved, or the line is context far
+/// above/below the hunk) there is nothing to anchor it to, so it renders at
+/// the end of the file like an outdated thread.
+#[cfg(unix)]
+pub fn place_ai_draft(f: &crate::ai::review::Finding, files: &[LoadedFile]) -> Option<InlineItem> {
+    use crate::ai::review::FindingAnchor;
+
+    let FindingAnchor::Line(anchor) = &f.anchor else {
+        return None;
+    };
+    let file = files.iter().position(|l| l.file.path == anchor.path)? as u32;
+    let placement = if has_line(&files[file as usize], anchor.side, anchor.line) {
+        Placement::AfterLine {
+            side: anchor.side,
+            line: anchor.line,
+        }
+    } else {
+        Placement::EndOfFile
+    };
+    Some(InlineItem {
+        file,
+        placement,
+        row: RowRef::AiDraft { finding: f.id },
+    })
+}
+
+/// Whether `file`'s diff carries `line` on `side`.
+#[cfg(unix)]
+fn has_line(file: &LoadedFile, side: Side, line: u32) -> bool {
+    file.diff.as_ref().is_some_and(|diff| {
+        diff.hunks.iter().any(|hunk| {
+            hunk.rows
+                .iter()
+                .any(|row| coordinate(row, side) == Some(line))
+        })
+    })
+}
+
 /// Insert `items` into `model`, rebuilding `file_ranges` and the heights.
 ///
 /// Rows already inserted by a previous call are dropped first, so annotating
@@ -130,6 +175,7 @@ pub fn annotate(model: &RowModel, files: &[LoadedFile], items: &[InlineItem]) ->
         let height = match item.row {
             RowRef::Thread { .. } => THREAD_H,
             RowRef::Pending { .. } => PENDING_H,
+            RowRef::AiDraft { .. } => AI_DRAFT_H,
             _ => COMPOSER_H,
         };
         out.push(item.row.clone(), height);
@@ -174,7 +220,7 @@ fn coordinate(row: &DiffRow, side: Side) -> Option<u32> {
 fn is_comment_row(row: &RowRef) -> bool {
     matches!(
         row,
-        RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer
+        RowRef::Thread { .. } | RowRef::Pending { .. } | RowRef::Composer | RowRef::AiDraft { .. }
     )
 }
 
@@ -183,7 +229,8 @@ fn kind_rank(row: &RowRef) -> u8 {
     match row {
         RowRef::Thread { .. } => 0,
         RowRef::Pending { .. } => 1,
-        _ => 2,
+        RowRef::AiDraft { .. } => 2,
+        _ => 3,
     }
 }
 
@@ -505,6 +552,82 @@ mod tests {
             Some(&RowRef::Thread { thread: 0 }),
             "an anchor outside the diff renders at the file's end"
         );
+    }
+
+    /// The AI draft splice (spec §12, Plan 3 Task 5): a line draft lands
+    /// under the row holding its line, a summary item is not placed inline
+    /// at all, a line the diff no longer carries falls back to the file's
+    /// end, and a second annotate pass replaces the rows instead of
+    /// duplicating them.
+    #[test]
+    #[cfg(unix)]
+    fn ai_drafts_are_placed_after_their_line_and_summary_items_are_not() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::{ai_finding, line_anchor};
+
+        let files = vec![loaded("a.rs", "@@ -1,2 +1,2 @@\n-x\n+y\n z\n")];
+        let draft = |id: i64, anchor: FindingAnchor| {
+            ai_finding(
+                id,
+                anchor,
+                Severity::Bug,
+                FindingState::Draft,
+                "panics on empty input",
+                "line 1 indexes without a length check",
+            )
+        };
+
+        let line = draft(1, FindingAnchor::Line(line_anchor("a.rs", 1)));
+        let item = place_ai_draft(&line, &files).expect("the draft's file is in the diff");
+        assert_eq!(item.file, 0);
+        assert_eq!(
+            item.placement,
+            Placement::AfterLine {
+                side: Side::Right,
+                line: 1
+            }
+        );
+        assert_eq!(item.row, RowRef::AiDraft { finding: 1 });
+
+        let model = annotate(&build(&files), &files, std::slice::from_ref(&item));
+        let pos = model
+            .rows
+            .iter()
+            .position(|row| *row == RowRef::AiDraft { finding: 1 })
+            .expect("the draft row is spliced in");
+        assert_eq!(
+            model.rows[pos - 1],
+            RowRef::Line {
+                file: 0,
+                hunk: 0,
+                row: 1
+            },
+            "right after \"+y\" (new line 1)"
+        );
+
+        // A whole-file finding has no line to sit under.
+        let summary = draft(
+            2,
+            FindingAnchor::Summary {
+                path: "a.rs".into(),
+            },
+        );
+        assert!(place_ai_draft(&summary, &files).is_none());
+
+        // Head moved: the anchored line is gone from the diff on screen.
+        let gone = draft(3, FindingAnchor::Line(line_anchor("a.rs", 9)));
+        assert_eq!(
+            place_ai_draft(&gone, &files).map(|item| item.placement),
+            Some(Placement::EndOfFile)
+        );
+
+        // A finding on a file this page of the PR does not carry is dropped.
+        let elsewhere = draft(4, FindingAnchor::Line(line_anchor("b.rs", 1)));
+        assert!(place_ai_draft(&elsewhere, &files).is_none());
+
+        // Draft rows are comment rows: re-annotating replaces them.
+        let twice = annotate(&model, &files, std::slice::from_ref(&item));
+        assert_eq!(twice.rows, model.rows);
     }
 
     #[test]

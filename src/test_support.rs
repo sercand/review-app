@@ -150,6 +150,37 @@ fn parse(patch: &str) -> Vec<crate::model::diff::Hunk> {
     crate::diff::parse::parse_patch(patch).expect("the test patch should parse")
 }
 
+/// An [`crate::ai::review::Finding`] in `state`, anchored to `anchor`, from
+/// the run's first reviewer.
+#[cfg(unix)]
+pub fn ai_finding(
+    id: i64,
+    anchor: crate::ai::review::FindingAnchor,
+    severity: crate::ai::review::Severity,
+    state: crate::ai::review::FindingState,
+    title: &str,
+    body: &str,
+) -> crate::ai::review::Finding {
+    crate::ai::review::Finding {
+        id,
+        run_id: 1,
+        agent: crate::ai::tools::AgentRef {
+            id: 1,
+            role: crate::ai::tools::AgentRole::Reviewer,
+            label: "reviewer:g1".to_owned(),
+        },
+        anchor,
+        severity,
+        title: title.to_owned(),
+        body: body.to_owned(),
+        evidence: Vec::new(),
+        checklist_item: None,
+        state,
+        state_reason: None,
+        pending_local_id: None,
+    }
+}
+
 /// A single-line [`crate::model::comment::Anchor`] on the RIGHT side of `path`
 /// at `line`, with no range.
 pub fn line_anchor(path: &str, line: u32) -> crate::model::comment::Anchor {

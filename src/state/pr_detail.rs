@@ -987,6 +987,12 @@ impl PrSession {
                 row: RowRef::Composer,
             });
         }
+        #[cfg(unix)]
+        for finding in self.ai.inline_drafts() {
+            if let Some(item) = crate::diff::annotate::place_ai_draft(finding, &self.files) {
+                items.push(item);
+            }
+        }
         items
     }
 
@@ -1670,6 +1676,84 @@ fn wider_expand(a: Expand, b: Expand) -> Expand {
         (Expand::Up(x), Expand::Up(y)) => Expand::Up(x.max(y)),
         (Expand::Down(x), Expand::Down(y)) => Expand::Down(x.max(y)),
         _ => Expand::All,
+    }
+}
+
+/// The result of keeping one draft finding (Task 5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeepResult {
+    /// The pending comment the finding became; `None` for summary items,
+    /// which only extend the review body.
+    pub pending_local_id: Option<u64>,
+}
+
+/// Why Keep is unavailable right now, or `None` when it is available: the
+/// pending review is pinned to another commit than the diff on screen
+/// (spec §7.2, §12).
+#[cfg(unix)]
+pub fn keep_blocked(session: &PrSession) -> Option<String> {
+    let pinned = session.pending.commit_id.as_deref()?;
+    let head = session.diff_head_sha.as_deref()?;
+    (pinned != head).then(|| pin_blocked_message(pinned))
+}
+
+/// The banner Keep shows while the pending review is pinned elsewhere
+/// (spec §7.2).
+#[cfg(unix)]
+fn pin_blocked_message(pinned: &str) -> String {
+    format!(
+        "Submit or discard your pending review (pinned to {}) before keeping \
+         drafts from the new commit.",
+        sha7(pinned)
+    )
+}
+
+/// How many open (`Draft`) findings each file has, for the tree's ✦ badge
+/// (spec §12). Kept, posted and dropped findings are not open any more.
+#[cfg(unix)]
+pub fn ai_draft_counts(ai: &crate::state::ai_review::AiReviewState) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for finding in ai.findings.values() {
+        if finding.state == crate::ai::review::FindingState::Draft {
+            *counts.entry(finding.anchor.path().to_owned()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Move one AI draft into the local pending review: a line finding becomes a
+/// pending comment carrying its severity, a summary item extends the review
+/// body (spec §5.6, §12).
+#[cfg(unix)]
+pub fn keep_draft(session: &mut PrSession, id: i64) -> Result<KeepResult, String> {
+    if let Some(why) = keep_blocked(session) {
+        return Err(why);
+    }
+    let finding = session
+        .ai
+        .findings
+        .get(&id)
+        .ok_or_else(|| format!("finding #{id} is not loaded"))?
+        .clone();
+    match &finding.anchor {
+        crate::ai::review::FindingAnchor::Line(anchor) => {
+            let body = crate::ai::review::kept_body(finding.severity, &finding.body);
+            match add_pending(session, anchor.clone(), body) {
+                Ok(local_id) => Ok(KeepResult {
+                    pending_local_id: Some(local_id),
+                }),
+                Err(PendingError::PinnedToOtherCommit { pinned }) => {
+                    Err(pin_blocked_message(&pinned))
+                }
+            }
+        }
+        crate::ai::review::FindingAnchor::Summary { path } => {
+            let body = format!("\n\n**{path}:** {} — {}", finding.title, finding.body);
+            session.pending.body.push_str(&body);
+            session.mark_session_dirty(Instant::now());
+            session.save_pending_draft();
+            Ok(KeepResult::default())
+        }
     }
 }
 
@@ -3612,5 +3696,213 @@ mod tests {
             s.repo_settings.is_none(),
             "the stale settings must not land"
         );
+    }
+
+    /// A session that neither reads nor writes the real config root, for the
+    /// AI draft tests that assert on the pending review from an empty start.
+    #[cfg(unix)]
+    fn clean_session(files: &[(&str, &str)]) -> (PrSession, tempfile::TempDir) {
+        let dir = tempdir();
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        let loaded_files = files
+            .iter()
+            .map(|(path, patch)| loaded(path, patch))
+            .collect();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: loaded_files,
+            done: true,
+        });
+        (s, dir)
+    }
+
+    /// Keeping a line draft puts it in the pending review, prefixed with its
+    /// severity, pinned to the diff on screen (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn keep_line_draft_adds_pending_with_severity_prefix() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "panics on empty input",
+                "line 1 indexes without a length check",
+            ),
+        );
+        s.rebuild_rows();
+        assert!(
+            s.row_model.rows.contains(&RowRef::AiDraft { finding: 1 }),
+            "a draft finding shows inline while it is a draft"
+        );
+
+        let kept = keep_draft(&mut s, 1).expect("the draft keeps into the pending review");
+        let local_id = kept
+            .pending_local_id
+            .expect("a line draft becomes a pending comment");
+        assert_eq!(s.pending.comments.len(), 1);
+        let comment = &s.pending.comments[0];
+        assert_eq!(comment.local_id, local_id);
+        assert_eq!(comment.anchor, line_anchor("a.rs", 1));
+        assert_eq!(
+            comment.body, "**Bug:** line 1 indexes without a length check",
+            "the kept body carries its severity"
+        );
+        assert_eq!(
+            s.pending.commit_id.as_deref(),
+            Some("sha1"),
+            "pinned to the commit the diff on screen came from"
+        );
+    }
+
+    /// A draft pinned to another commit blocks Keep before anything is added
+    /// — both the action and the row's disabled state say why (spec §7.2).
+    #[test]
+    #[cfg(unix)]
+    fn keep_is_blocked_while_pending_is_pinned_to_another_commit() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.pending
+            .add(
+                line_anchor("a.rs", 2),
+                "written against the old head".into(),
+                "sha0",
+            )
+            .unwrap();
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Risk,
+                FindingState::Draft,
+                "the retry hides a failure",
+                "the warning path swallows the error",
+            ),
+        );
+
+        assert_eq!(
+            keep_draft(&mut s, 1).unwrap_err(),
+            "Submit or discard your pending review (pinned to sha0) before \
+             keeping drafts from the new commit."
+        );
+        assert_eq!(s.pending.comments.len(), 1, "nothing was added");
+        assert!(
+            keep_blocked(&s).is_some_and(|why| why.contains("sha0")),
+            "the row disables Keep for the same reason"
+        );
+
+        // An unpinned draft (or one pinned to this head) does not block.
+        s.pending.clear();
+        assert!(keep_blocked(&s).is_none());
+    }
+
+    /// A whole-file finding has no line to comment on, so Keep appends it to
+    /// the review body instead (spec §5.6, §12).
+    #[test]
+    #[cfg(unix)]
+    fn keep_summary_item_appends_to_review_body() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("logo.png", PATCH)]);
+        s.set_pending_body("Overall this looks right.".into());
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Summary {
+                    path: "logo.png".into(),
+                },
+                Severity::Nit,
+                FindingState::Draft,
+                "regenerate the asset",
+                "it was exported at 1x",
+            ),
+        );
+
+        let kept = keep_draft(&mut s, 1).expect("a summary item keeps into the body");
+        assert_eq!(kept.pending_local_id, None, "no comment to link");
+        assert_eq!(
+            s.pending.body,
+            "Overall this looks right.\n\n**logo.png:** regenerate the asset — it was exported at 1x"
+        );
+        assert!(s.pending.comments.is_empty());
+        assert!(s.pending.commit_id.is_none(), "a summary item pins nothing");
+    }
+
+    /// The tree's ✦ badge counts the open (draft) findings per file; kept and
+    /// dropped ones are not open any more (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn tree_counts_open_ai_drafts() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("src/a.rs", PATCH), ("src/b.rs", PATCH)]);
+        for finding in [
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("src/a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "one",
+                "b",
+            ),
+            ai_finding(
+                2,
+                FindingAnchor::Summary {
+                    path: "src/a.rs".into(),
+                },
+                Severity::Nit,
+                FindingState::Draft,
+                "two",
+                "b",
+            ),
+            ai_finding(
+                3,
+                FindingAnchor::Line(line_anchor("src/a.rs", 1)),
+                Severity::Risk,
+                FindingState::Kept,
+                "kept",
+                "b",
+            ),
+            ai_finding(
+                4,
+                FindingAnchor::Line(line_anchor("src/b.rs", 1)),
+                Severity::Question,
+                FindingState::Draft,
+                "three",
+                "b",
+            ),
+            ai_finding(
+                5,
+                FindingAnchor::Line(line_anchor("src/b.rs", 1)),
+                Severity::Nit,
+                FindingState::DroppedByVerifier,
+                "dropped",
+                "b",
+            ),
+        ] {
+            s.ai.findings.insert(finding.id, finding);
+        }
+
+        let counts = ai_draft_counts(&s.ai);
+        assert_eq!(counts.get("src/a.rs"), Some(&2), "two open drafts");
+        assert_eq!(counts.get("src/b.rs"), Some(&1), "one open draft");
+        assert_eq!(counts.get("src/c.rs"), None, "no drafts, no badge");
     }
 }

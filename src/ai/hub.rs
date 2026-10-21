@@ -1097,6 +1097,19 @@ impl AiHub {
         }
     }
 
+    /// Rewrite finding `id`'s body after the inline editor saved it (spec
+    /// §12, AI Task 5). The UI already shows the new text; the store is the
+    /// durable copy.
+    pub fn finding_edit(&self, session: SessionId, id: i64, body: String, events: &EventSender) {
+        match self.store.finding_set_body(id, &body) {
+            Ok(()) => events.send(Event::AiPipeline {
+                session,
+                event: PipelineEvent::FindingChanged { id },
+            }),
+            Err(error) => events.send(Event::Toast(format!("could not save the finding: {error}"))),
+        }
+    }
+
     /// Restore one unrestored checkout record from the crash-recovery dialog
     /// (spec §7.3): discard whatever the abandoned review left, return to
     /// the recorded original ref, and re-apply the stash. Not PR-scoped —

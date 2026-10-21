@@ -664,6 +664,20 @@ impl Store {
         Ok(())
     }
 
+    /// Rewrite a finding's body — the inline editor's save (Task 5). Nothing
+    /// else about the row changes.
+    pub fn finding_set_body(&self, id: i64, body: &str) -> anyhow::Result<()> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE ai_findings SET body = ?2 WHERE id = ?1",
+                rusqlite::params![id, body],
+            )
+            .context("updating ai_findings body")?;
+        anyhow::ensure!(n == 1, "no ai_findings row with id {id}");
+        Ok(())
+    }
+
     /// Every finding of the session, oldest first.
     pub fn finding_list(&self, session_id: i64) -> anyhow::Result<Vec<Finding>> {
         let conn = self.conn();
@@ -1099,6 +1113,52 @@ mod tests {
         let posted = &store.finding_list(session).expect("findings")[0];
         assert_eq!(posted.state, FindingState::Posted);
         assert_eq!(posted.pending_local_id, Some(9));
+    }
+
+    #[test]
+    fn finding_set_body_rewrites_only_the_body() {
+        let store = Store::open_in_memory().expect("in-memory store");
+        let key = PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+        };
+        let session = store.session_id(&key).expect("session row");
+        let run = store
+            .run_begin(session, RunKind::Full, None, "head1")
+            .expect("run row");
+        let id = store
+            .finding_insert(
+                session,
+                &Finding {
+                    id: 0,
+                    run_id: run,
+                    agent: AgentRef {
+                        id: 1,
+                        role: crate::ai::tools::AgentRole::Reviewer,
+                        label: "reviewer 1".to_string(),
+                    },
+                    anchor: FindingAnchor::Line(crate::test_support::line_anchor("a.rs", 3)),
+                    severity: Severity::Risk,
+                    title: "t".to_string(),
+                    body: "before".to_string(),
+                    evidence: vec![],
+                    checklist_item: None,
+                    state: FindingState::Draft,
+                    state_reason: None,
+                    pending_local_id: None,
+                },
+            )
+            .expect("finding row");
+
+        store.finding_set_body(id, "after").expect("set body");
+
+        let finding = &store.finding_list(session).expect("findings")[0];
+        assert_eq!(finding.body, "after");
+        assert_eq!(finding.title, "t", "the edit leaves the title alone");
+        assert_eq!(finding.state, FindingState::Draft);
+        assert!(store.finding_set_body(id + 100, "x").is_err());
     }
 
     #[test]

@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use crate::ai::checkout::{CheckoutPlan, RestoreOutcome};
 use crate::ai::events::{PipelineEvent, RunStatus, StageKind, StageStatus};
 use crate::ai::hub::{AiSnapshotData, AiTimelineEntry};
-use crate::ai::review::{CheckResult, CoverageEntry, Finding, FindingState, Severity};
+use crate::ai::review::{
+    CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
+};
 use crate::ai::stages::assemble::ReviewDraft;
 use crate::ai::store::CheckoutRecord;
 use crate::ai::tools::{AgentRef, AgentRole};
@@ -175,6 +177,9 @@ pub struct AiReviewState {
     /// action (spec §4 step 1), read from the snapshot's stored brief. The
     /// scout only fills them when the repo has no configured commands.
     pub suggestions: Option<BriefSuggestions>,
+    /// The inline editor of one AI draft: the finding id and its buffer.
+    /// UI-local; cleared when a snapshot replaces the findings.
+    pub edit: Option<(i64, String)>,
 }
 
 /// The scout's build/test/lint suggestions for a repo with no configured
@@ -391,6 +396,46 @@ impl AiReviewState {
             .filter(move |f| f.state == FindingState::Draft && f.anchor.path() == path)
     }
 
+    /// Every finding the diff shows inline: open drafts, plus the verifier's
+    /// drops while "show dropped" is on (spec §12, Task 5).
+    pub fn inline_drafts(&self) -> impl Iterator<Item = &Finding> {
+        let show_dropped = self.show_dropped;
+        self.findings.values().filter(move |f| {
+            f.state == FindingState::Draft
+                || (show_dropped && f.state == FindingState::DroppedByVerifier)
+        })
+    }
+
+    /// Open the inline editor of finding `id`, seeded with `body`.
+    pub fn start_edit(&mut self, id: i64, body: String) {
+        self.edit = Some((id, body));
+    }
+
+    /// The editor's buffer, while one is open.
+    pub fn edit_buffer_mut(&mut self) -> Option<&mut String> {
+        self.edit.as_mut().map(|(_, buffer)| buffer)
+    }
+
+    /// Whether the inline editor of finding `id` is open.
+    pub fn editing(&self, id: i64) -> bool {
+        matches!(&self.edit, Some((open, _)) if *open == id)
+    }
+
+    /// Close the editor, discarding its buffer.
+    pub fn cancel_edit(&mut self) {
+        self.edit = None;
+    }
+
+    /// Close the editor, writing its buffer back to the finding. Returns the
+    /// id and text when there was anything to save, for the caller to
+    /// persist (Task 5's `Command::AiEditFinding`).
+    pub fn save_edit(&mut self) -> Option<(i64, String)> {
+        let (id, text) = self.edit.take()?;
+        let finding = self.findings.get_mut(&id)?;
+        finding.body = text.clone();
+        Some((id, text))
+    }
+
     /// Whether an incremental re-review makes sense: the last completed
     /// review ran against a different head, and nothing is in flight.
     pub fn can_continue(&self, head_sha: &str) -> bool {
@@ -424,6 +469,7 @@ impl AiReviewState {
         self.draft = None;
         self.usage = (0, 0);
         self.restore_decision = None;
+        self.edit = None;
     }
 
     /// Fold one forwarded pipeline event in.
@@ -762,6 +808,17 @@ fn severity_index(severity: Severity) -> usize {
         Severity::Risk => 1,
         Severity::Nit => 2,
         Severity::Question => 3,
+    }
+}
+
+/// The chat question a draft's **Why?** asks about `f` (spec §12, Task 5).
+pub fn why_question(f: &Finding) -> String {
+    match &f.anchor {
+        FindingAnchor::Line(anchor) => format!(
+            "Why did you flag #{} ({}:{})?",
+            f.id, anchor.path, anchor.line
+        ),
+        FindingAnchor::Summary { path } => format!("Why did you flag #{} ({})?", f.id, path),
     }
 }
 
@@ -1292,6 +1349,58 @@ mod tests {
         assert_eq!(st.phase, AiPhase::Finished);
         assert_eq!(st.restore_decision, None);
         assert_eq!(st.checkout, None, "nothing is held any more");
+    }
+
+    /// The inline editor (Task 5): the row seeds it with the finding's body,
+    /// saving writes the text back to the finding, and cancelling keeps the
+    /// old one.
+    #[test]
+    fn edit_reducers_seed_save_and_cancel() {
+        let mut st = AiReviewState::default();
+        let finding = line_finding(1, Severity::Bug, FindingState::Draft, "a.rs");
+        let body = finding.body.clone();
+        st.findings.insert(1, finding);
+
+        st.start_edit(1, body.clone());
+        assert!(st.editing(1));
+        assert!(!st.editing(2));
+        st.edit_buffer_mut().unwrap().push_str(" (edited)");
+        assert_eq!(st.save_edit(), Some((1, format!("{body} (edited)"))));
+        assert_eq!(
+            st.findings[&1].body,
+            format!("{body} (edited)"),
+            "the finding's body follows the editor"
+        );
+        assert!(st.edit.is_none(), "saving closes the editor");
+        assert_eq!(st.save_edit(), None, "nothing left to save");
+
+        st.start_edit(1, "scratch".to_string());
+        st.cancel_edit();
+        assert!(!st.editing(1));
+        assert_eq!(
+            st.findings[&1].body,
+            format!("{body} (edited)"),
+            "a cancelled edit changes nothing"
+        );
+    }
+
+    /// The chat question a draft row's **Why?** asks (spec §12).
+    #[test]
+    fn why_question_names_the_finding_and_its_line() {
+        let line = line_finding(7, Severity::Bug, FindingState::Draft, "src/a.rs");
+        assert_eq!(why_question(&line), "Why did you flag #7 (src/a.rs:3)?");
+
+        let summary = Finding {
+            anchor: crate::ai::review::FindingAnchor::Summary {
+                path: "logo.png".to_string(),
+            },
+            ..line_finding(8, Severity::Nit, FindingState::Draft, "logo.png")
+        };
+        assert_eq!(
+            why_question(&summary),
+            "Why did you flag #8 (logo.png)?",
+            "a summary anchor has no line to name"
+        );
     }
 
     #[test]

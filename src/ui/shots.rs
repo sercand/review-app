@@ -659,6 +659,141 @@ fn ai_detail(dark: bool, name: &str, ai: crate::state::ai_review::AiReviewState)
     save(h, name);
 }
 
+/// The diff with one inline AI draft row: ✦ tag, severity, body, evidence
+/// and the Keep / Edit / Drop / Why? controls (spec §12, AI Task 5).
+#[cfg(unix)]
+fn ai_inline_draft(dark: bool, name: &str) {
+    use crate::ai::review::{Evidence, Finding, FindingAnchor, FindingState, Severity};
+    use crate::model::comment::Anchor;
+
+    let mut s = session(DiffMode::Unified);
+    // The shared fixture opens a composer under line 83; this shot is about
+    // the AI row alone.
+    s.composer = crate::state::composer::ComposerState::default();
+    s.ai.findings.insert(
+        1,
+        Finding {
+            id: 1,
+            run_id: 9,
+            agent: crate::ai::tools::AgentRef {
+                id: 1,
+                role: crate::ai::tools::AgentRole::Reviewer,
+                label: "reviewer:g1".to_string(),
+            },
+            anchor: FindingAnchor::Line(Anchor {
+                path: "src/lib/data-tools/push.ts".into(),
+                side: Side::Right,
+                line: 8,
+                start_line: None,
+                start_side: None,
+            }),
+            severity: Severity::Bug,
+            title: "create fails when the link lookup rejects".into(),
+            body: "withDefaultLinks throws when the app was deleted; the create \
+                   path treats that as fatal and drops the template."
+                .into(),
+            evidence: vec![Evidence {
+                path: "src/lib/data-tools/push.ts".into(),
+                line: Some(78),
+                note: "the lookup sits inside the create path".into(),
+            }],
+            checklist_item: None,
+            state: FindingState::Draft,
+            state_reason: None,
+            pending_local_id: None,
+        },
+    );
+    s.rebuild_rows();
+
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        ..Default::default()
+    };
+    state.diff.wrap = true;
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
+    let h = harness(dark, move |ui| {
+        let mut diff_actions = Vec::new();
+        pr_detail::render(
+            ui,
+            &mut s,
+            &mut state,
+            &mut cache,
+            &mut diff_actions,
+            pr_detail::ScreenInputs {
+                login: "sercand",
+                write_blocked: None,
+                theme: theme::Theme::Dark,
+                system_dark: dark,
+                ai_configured: true,
+            },
+        );
+    });
+    save(h, name);
+}
+
+/// The checkout confirmation dialog over the PR (spec §4 step 2, §12).
+#[cfg(unix)]
+fn ai_checkout_dialog(dark: bool, name: &str) {
+    use crate::ai::checkout::{CheckoutPlan, PrTarget};
+    use crate::ai::store::OriginalRef;
+    use crate::ui::widgets::ai_dialogs::{self, AiDialog, DialogInputs};
+
+    let mut s = session(DiffMode::Split);
+    let dialog = AiDialog::ConfirmCheckout(CheckoutPlan {
+        repo_path: std::path::PathBuf::from("/Users/sercand/Developer/otsimo/web"),
+        remote: "origin".to_string(),
+        original: OriginalRef::Branch("main".to_string()),
+        dirty: true,
+        commands: vec![
+            "git fetch origin pull/19/head:refs/remotes/origin/pr-19".to_string(),
+            "git switch --detach refs/remotes/origin/pr-19".to_string(),
+            "git stash push --include-untracked -m \"gh-review AI #19\"".to_string(),
+        ],
+    });
+    let pr = PrTarget {
+        host: "github.com".to_string(),
+        owner: "otsimo".to_string(),
+        name: "web".to_string(),
+        number: 19,
+        head_sha: "sha1".to_string(),
+        head_branch: "feature/push-defaults".to_string(),
+    };
+    let prepare = ["npm ci".to_string()];
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        ..Default::default()
+    };
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
+    let h = harness(dark, move |ui| {
+        let mut diff_actions = Vec::new();
+        pr_detail::render(
+            ui,
+            &mut s,
+            &mut state,
+            &mut cache,
+            &mut diff_actions,
+            pr_detail::ScreenInputs {
+                login: "sercand",
+                write_blocked: None,
+                theme: theme::Theme::Dark,
+                system_dark: dark,
+                ai_configured: true,
+            },
+        );
+        ai_dialogs::render(
+            ui.ctx(),
+            &dialog,
+            &DialogInputs {
+                pr: Some(&pr),
+                prepare: &prepare,
+                error: None,
+            },
+            &mut Vec::new(),
+        );
+    });
+    save_after(h, name, 8);
+}
+
 #[test]
 #[ignore = "needs a GPU adapter; writes target/ui-shots/*.png"]
 fn shots() {
@@ -690,6 +825,8 @@ fn shots() {
         {
             ai_detail(dark, &format!("pr-ai-running-{t}"), ai_state_running());
             ai_detail(dark, &format!("pr-ai-done-{t}"), ai_state_done());
+            ai_inline_draft(dark, &format!("pr-ai-inline-draft-{t}"));
+            ai_checkout_dialog(dark, &format!("pr-checkout-dialog-{t}"));
         }
 
         let settings = Settings::default();

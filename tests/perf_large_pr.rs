@@ -58,6 +58,78 @@ fn filtering_and_folder_state_are_fast() {
     assert!(t.elapsed() < FRAME);
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore = "wall-clock guardrail; run with `cargo test --release -- --ignored`"]
+fn ai_drafts_stay_within_the_rebuild_budget() {
+    use gh_review_desktop::ai::review::{Finding, FindingAnchor, FindingState, Severity};
+    use gh_review_desktop::ai::tools::{AgentRef, AgentRole};
+    use gh_review_desktop::model::RepoRef;
+    use gh_review_desktop::model::comment::Anchor;
+    use gh_review_desktop::model::diff::Side;
+    use gh_review_desktop::runtime::{Event, SessionId};
+    use gh_review_desktop::state::pr_detail::PrSession;
+
+    let dir = tempfile::tempdir().expect("a temporary config root");
+    let (mut session, _) = PrSession::open_at(
+        dir.path(),
+        SessionId(1),
+        "github.com".to_owned(),
+        RepoRef::new("o", "r"),
+        7,
+    );
+    let files = synthetic_files(1_500, 34);
+    let paths: Vec<String> = files.iter().map(|f| f.file.path.clone()).collect();
+    session.on_event(&Event::PrFilesPage {
+        session: SessionId(1),
+        files,
+        done: true,
+    });
+
+    // 500 open drafts spread over the PR, as a full review would leave them.
+    let agent = AgentRef {
+        id: 1,
+        role: AgentRole::Reviewer,
+        label: "reviewer:g1".to_owned(),
+    };
+    for id in 0..500i64 {
+        let path = paths[(id as usize * 3) % paths.len()].clone();
+        session.ai.findings.insert(
+            id,
+            Finding {
+                id,
+                run_id: 1,
+                agent: agent.clone(),
+                anchor: FindingAnchor::Line(Anchor {
+                    path,
+                    side: Side::Right,
+                    line: 2,
+                    start_line: None,
+                    start_side: None,
+                }),
+                severity: Severity::Bug,
+                title: "a draft".to_owned(),
+                body: "the body".to_owned(),
+                evidence: Vec::new(),
+                checklist_item: None,
+                state: FindingState::Draft,
+                state_reason: None,
+                pending_local_id: None,
+            },
+        );
+    }
+
+    // Warm the caches and the syntax set the first rebuild touches.
+    session.rebuild_rows();
+    let t = Instant::now();
+    session.rebuild_rows();
+    assert!(
+        t.elapsed() < FRAME,
+        "the AI draft splice took {:?}",
+        t.elapsed()
+    );
+}
+
 #[test]
 #[ignore = "wall-clock guardrail; run with `cargo test --release -- --ignored`"]
 fn selecting_a_huge_file_stays_within_frame_budget() {

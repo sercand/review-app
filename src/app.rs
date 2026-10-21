@@ -178,6 +178,18 @@ fn ai_target(session: &PrSession) -> Option<crate::ai::checkout::PrTarget> {
     })
 }
 
+/// The store key for the open PR's AI rows, lowercased like the store's own
+/// session identity.
+#[cfg(unix)]
+fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
+    crate::ai::store::PrKey {
+        host: session.host.to_lowercase(),
+        owner: session.repo.owner.to_lowercase(),
+        repo: session.repo.name.to_lowercase(),
+        number: session.number,
+    }
+}
+
 /// Whether the repo's AI settings already name commands. The scout only
 /// proposes commands while the repo has none (spec §4 step 1), so once one
 /// is configured the tab's suggested-commands card retires.
@@ -1636,9 +1648,43 @@ impl ReviewApp {
                 key,
                 discard: None,
             }),
-            // Task 5 wires diff scrolling.
-            AiPanelAction::JumpToFinding(_) => {}
-            AiPanelAction::ShowDropped(show) => session.ai.show_dropped = show,
+            // Scroll the diff to the finding's file and line (or its file's
+            // top for a summary item), the same jump threads use.
+            AiPanelAction::JumpToFinding(id) => {
+                use crate::ai::review::FindingAnchor;
+
+                let Some(anchor) = session.ai.findings.get(&id).map(|f| f.anchor.clone()) else {
+                    return;
+                };
+                let Some(index) = session
+                    .files
+                    .iter()
+                    .position(|loaded| loaded.file.path == anchor.path())
+                else {
+                    return;
+                };
+                session.select_file(index);
+                let row = match &anchor {
+                    FindingAnchor::Line(anchor) => {
+                        session
+                            .row_model
+                            .row_of_line(&session.files, anchor.side, anchor.line)
+                    }
+                    FindingAnchor::Summary { .. } => session
+                        .row_model
+                        .file_ranges
+                        .get(index)
+                        .map(|range| range.start),
+                };
+                if let Some(row) = row {
+                    self.pr_detail.diff.scroll_to_row = Some(row);
+                }
+            }
+            AiPanelAction::ShowDropped(show) => {
+                session.ai.show_dropped = show;
+                // The diff's inline rows follow the toggle (AI Task 5).
+                session.rebuild_rows();
+            }
             AiPanelAction::AddSuggestedCommands => {
                 // Copy the scout's proposals into the repo's settings and
                 // retire the card (Task 4). The run only suggests when the
@@ -1957,6 +2003,89 @@ impl ReviewApp {
                     if let Some(session) = &mut self.session {
                         session.edit_pending_via_composer(local_id, now);
                     }
+                }
+                #[cfg(unix)]
+                DiffAction::AiKeep(id) => {
+                    use crate::ai::review::FindingState;
+
+                    let Some(session) = &mut self.session else {
+                        continue;
+                    };
+                    match crate::state::pr_detail::keep_draft(session, id) {
+                        Ok(kept) => {
+                            if let Some(finding) = session.ai.findings.get_mut(&id) {
+                                finding.state = FindingState::Kept;
+                                finding.pending_local_id = kept.pending_local_id;
+                            }
+                            session.rebuild_rows();
+                            session.mark_session_dirty(now);
+                            let command = Command::AiFindingState {
+                                session: session.id,
+                                key: pr_key(session),
+                                id,
+                                state: FindingState::Kept,
+                                pending_local_id: kept.pending_local_id,
+                            };
+                            self.worker.send(command);
+                        }
+                        Err(why) => self.toasts.push(why, now),
+                    }
+                }
+                // The widget already wrote the text into the finding; the
+                // store is the durable copy (spec §12).
+                #[cfg(unix)]
+                DiffAction::AiEdit(id, body) => {
+                    let Some(session) = &self.session else {
+                        continue;
+                    };
+                    let command = Command::AiEditFinding {
+                        session: session.id,
+                        key: pr_key(session),
+                        id,
+                        body,
+                    };
+                    self.worker.send(command);
+                }
+                #[cfg(unix)]
+                DiffAction::AiDrop(id) => {
+                    use crate::ai::review::FindingState;
+
+                    let Some(session) = &mut self.session else {
+                        continue;
+                    };
+                    if let Some(finding) = session.ai.findings.get_mut(&id) {
+                        finding.state = FindingState::DroppedByUser;
+                    }
+                    session.rebuild_rows();
+                    session.mark_session_dirty(now);
+                    let command = Command::AiFindingState {
+                        session: session.id,
+                        key: pr_key(session),
+                        id,
+                        state: FindingState::DroppedByUser,
+                        pending_local_id: None,
+                    };
+                    self.worker.send(command);
+                }
+                // Why? asks the chat agent about the finding and brings the
+                // ✦ AI tab forward to read the answer (spec §12).
+                #[cfg(unix)]
+                DiffAction::AiWhy(id) => {
+                    let Some(session) = &mut self.session else {
+                        continue;
+                    };
+                    let Some(finding) = session.ai.findings.get(&id).cloned() else {
+                        continue;
+                    };
+                    let text = crate::state::ai_review::why_question(&finding);
+                    let command = Command::AiUserMessage {
+                        session: session.id,
+                        key: pr_key(session),
+                        text: text.clone(),
+                    };
+                    self.worker.send(command);
+                    session.ai.push_chat_user(text);
+                    self.pr_detail.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
                 }
                 DiffAction::Composer(action) => {
                     let commands = self.apply_composer_action(action, &login, now);

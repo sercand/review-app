@@ -44,6 +44,16 @@ impl Severity {
         }
     }
 
+    /// The title-case label the UI shows and a kept comment leads with.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Bug => "Bug",
+            Severity::Risk => "Risk",
+            Severity::Nit => "Nit",
+            Severity::Question => "Question",
+        }
+    }
+
     /// Inverse of [`Severity::as_str`].
     pub fn parse(raw: &str) -> anyhow::Result<Severity> {
         match raw {
@@ -54,6 +64,12 @@ impl Severity {
             _ => anyhow::bail!("unrecognised severity {raw:?}"),
         }
     }
+}
+
+/// The comment body a kept line finding carries: its severity, then the text
+/// (spec §12, Task 5).
+pub fn kept_body(severity: Severity, body: &str) -> String {
+    format!("**{}:** {body}", severity.label())
 }
 
 /// What became of a finding, in the spec §11 spelling.

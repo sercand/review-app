@@ -661,7 +661,7 @@ fn mono_line(ui: &mut egui::Ui, text: &str) {
 }
 
 /// The accent for a finding's severity, matching the diff's draft styling.
-fn severity_color(p: &theme::Palette, severity: crate::ai::review::Severity) -> Color32 {
+pub(crate) fn severity_color(p: &theme::Palette, severity: crate::ai::review::Severity) -> Color32 {
     use crate::ai::review::Severity;
     match severity {
         Severity::Bug => p.bad,
