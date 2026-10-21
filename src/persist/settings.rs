@@ -38,8 +38,24 @@ pub struct Layout {
     pub right_pane: f32,
     /// Whether the metadata pane is open.
     pub right_open: bool,
-    /// Which details tab the pane last showed (redesign Task 13).
+    /// Which details tab the pane last showed (redesign Task 13). The AI
+    /// tab is unix-only, so on Windows an `Ai` selection loads as
+    /// `Overview` (Plan 3).
+    #[serde(default, deserialize_with = "load_details_tab")]
     pub details_tab: crate::ui::widgets::metadata_panel::DetailsTab,
+}
+
+/// [`Layout`]'s tab loader: the stored tab as-is on unix, with the AI tab
+/// flattened to `Overview` on Windows (see
+/// [`DetailsTab::for_platform`](crate::ui::widgets::metadata_panel::DetailsTab::for_platform)).
+fn load_details_tab<'de, D>(
+    deserializer: D,
+) -> Result<crate::ui::widgets::metadata_panel::DetailsTab, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(crate::ui::widgets::metadata_panel::DetailsTab::deserialize(deserializer)?.for_platform())
 }
 
 /// User settings, persisted as `settings.toml` in the config directory.
@@ -359,6 +375,23 @@ mod tests {
         assert_eq!(
             Settings::load_or_default(dir.path()).layout.details_tab,
             crate::ui::widgets::metadata_panel::DetailsTab::Checks
+        );
+    }
+
+    /// The AI tab is unix-only: on Windows a saved `Ai` selection loads as
+    /// `Overview`, so the pane never opens an empty tab (Plan 3).
+    #[test]
+    #[cfg(not(unix))]
+    fn ai_tab_hidden_on_windows_loads_as_overview() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[layout]\ndetails_tab = \"Ai\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.details_tab,
+            crate::ui::widgets::metadata_panel::DetailsTab::Overview
         );
     }
 

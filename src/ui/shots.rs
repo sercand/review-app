@@ -360,6 +360,303 @@ fn detail(mode: DiffMode, dark: bool, name: &str) {
     save(h, name);
 }
 
+/// A live AI review: stage strip, a running reviewer, an unanswered question
+/// and a pending command approval (spec §12).
+#[cfg(unix)]
+fn ai_state_running() -> crate::state::ai_review::AiReviewState {
+    use crate::ai::events::{StageKind, StageStatus};
+    use crate::ai::review::{
+        CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
+    };
+    use crate::ai::tools::{AgentRef, AgentRole};
+    use crate::ai::ui_interaction::ApprovalKind;
+    use crate::model::comment::Anchor;
+    use crate::model::diff::Side;
+    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+
+    let reviewer = AgentRef {
+        id: 1,
+        role: AgentRole::Reviewer,
+        label: "reviewer:g1".to_string(),
+    };
+    let scout = AgentRef {
+        id: 2,
+        role: AgentRole::Scout,
+        label: "scout".to_string(),
+    };
+    let mut st = AiReviewState {
+        phase: AiPhase::Running,
+        timeline: vec![
+            TimelineEntry::Stage {
+                stage: StageKind::Scout,
+                status: StageStatus::Done,
+            },
+        TimelineEntry::Agent {
+            agent: scout,
+            group: None,
+            tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
+            text: "Grouped the 6 changed files into 2 review groups.".into(),
+            stop: Some("finished".into()),
+        },
+        TimelineEntry::Stage {
+            stage: StageKind::Review,
+            status: StageStatus::Started,
+        },
+        TimelineEntry::Agent {
+            agent: reviewer.clone(),
+            group: Some("notifications".into()),
+            tools: vec![
+                ("read_file".into(), "src/lib/data-tools/push.ts".into()),
+                ("grep".into(), "withDefaultLinks".into()),
+            ],
+            text: "The create path looks up links even when the author set them. Checking whether the lookup can fail the create.".into(),
+            stop: None,
+        },
+        TimelineEntry::Question {
+            id: 7,
+            agent: reviewer.clone(),
+            text: "Is an empty notification list allowed here?".into(),
+            options: vec!["yes".into(), "no".into()],
+            answer: None,
+        },
+        TimelineEntry::Approval {
+            id: 3,
+            agent: reviewer.clone(),
+            kind: ApprovalKind::Command {
+                command: "cargo test -p notifier".into(),
+                reason: "it runs code".into(),
+            },
+            decided: None,
+        },
+            TimelineEntry::Finding { id: 1 },
+            TimelineEntry::Notice {
+                text: "the agent shell is unsandboxed: no bwrap".into(),
+            },
+        ],
+        coverage: vec![CoverageEntry {
+            file: "package-lock.json".into(),
+            item: "errors".into(),
+            result: CheckResult::Skipped,
+            note: String::new(),
+        }],
+        usage: (48_213, 3_904),
+        ..AiReviewState::default()
+    };
+    st.findings.insert(
+        1,
+        Finding {
+            id: 1,
+            run_id: 9,
+            agent: reviewer,
+            anchor: FindingAnchor::Line(Anchor {
+                path: "src/lib/data-tools/push.ts".into(),
+                side: Side::Right,
+                line: 83,
+                start_line: None,
+                start_side: None,
+            }),
+            severity: Severity::Bug,
+            title: "create fails when the link lookup rejects".into(),
+            body: "body".into(),
+            evidence: vec![],
+            checklist_item: None,
+            state: FindingState::Draft,
+            state_reason: None,
+            pending_local_id: None,
+        },
+    );
+    st
+}
+
+/// A finished AI review: answered question, decided approval, a chat
+/// exchange, findings including verifier drops and prior states (spec §12).
+#[cfg(unix)]
+fn ai_state_done() -> crate::state::ai_review::AiReviewState {
+    use crate::ai::events::{StageKind, StageStatus};
+    use crate::ai::review::{
+        CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
+    };
+    use crate::ai::tools::{AgentRef, AgentRole};
+    use crate::ai::ui_interaction::ApprovalKind;
+    use crate::model::comment::Anchor;
+    use crate::model::diff::Side;
+    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+
+    let reviewer = AgentRef {
+        id: 1,
+        role: AgentRole::Reviewer,
+        label: "reviewer:g1".to_string(),
+    };
+    let finding = |id: i64, severity, state, title: &str| Finding {
+        id,
+        run_id: 12,
+        agent: reviewer.clone(),
+        anchor: FindingAnchor::Line(Anchor {
+            path: "src/lib/data-tools/push.ts".into(),
+            side: Side::Right,
+            line: 83,
+            start_line: None,
+            start_side: None,
+        }),
+        severity,
+        title: title.into(),
+        body: "body".into(),
+        evidence: vec![],
+        checklist_item: None,
+        state,
+        state_reason: None,
+        pending_local_id: None,
+    };
+    let mut st = AiReviewState {
+        phase: AiPhase::Done,
+        last_reviewed_sha: Some("sha1".into()),
+        timeline: vec![
+            TimelineEntry::Stage {
+                stage: StageKind::Scout,
+                status: StageStatus::Done,
+            },
+            TimelineEntry::Stage {
+                stage: StageKind::Review,
+                status: StageStatus::Done,
+            },
+            TimelineEntry::Stage {
+                stage: StageKind::Verify,
+                status: StageStatus::Done,
+            },
+            TimelineEntry::Stage {
+                stage: StageKind::Assemble,
+                status: StageStatus::Done,
+            },
+            TimelineEntry::Agent {
+                agent: reviewer.clone(),
+                group: Some("notifications".into()),
+                tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
+                text:
+                    "The create path fails when the link lookup rejects; the warning path is fine."
+                        .into(),
+                stop: Some("finished".into()),
+            },
+            TimelineEntry::Question {
+                id: 7,
+                agent: reviewer.clone(),
+                text: "Is an empty notification list allowed here?".into(),
+                options: vec!["yes".into(), "no".into()],
+                answer: Some("yes".into()),
+            },
+            TimelineEntry::Approval {
+                id: 3,
+                agent: reviewer.clone(),
+                kind: ApprovalKind::Command {
+                    command: "cargo test -p notifier".into(),
+                    reason: "it runs code".into(),
+                },
+                decided: Some("For this review".into()),
+            },
+            TimelineEntry::Finding { id: 1 },
+            TimelineEntry::Finding { id: 2 },
+            TimelineEntry::ChatUser {
+                text: "focus on the create path".into(),
+            },
+            TimelineEntry::ChatReply {
+                text: "Both reviewers now cover the create path; one bug found.".into(),
+            },
+        ],
+        coverage: vec![
+            CoverageEntry {
+                file: "package-lock.json".into(),
+                item: "errors".into(),
+                result: CheckResult::Skipped,
+                note: String::new(),
+            },
+            CoverageEntry {
+                file: "src/lib/revision.ts".into(),
+                item: "errors".into(),
+                result: CheckResult::Skipped,
+                note: String::new(),
+            },
+            CoverageEntry {
+                file: "src/lib/data-tools/push.ts".into(),
+                item: "errors".into(),
+                result: CheckResult::Ok,
+                note: String::new(),
+            },
+        ],
+        usage: (128_900, 12_450),
+        ..AiReviewState::default()
+    };
+    for f in [
+        finding(
+            1,
+            Severity::Bug,
+            FindingState::Kept,
+            "create fails when the link lookup rejects",
+        ),
+        finding(
+            2,
+            Severity::Risk,
+            FindingState::Draft,
+            "warning path hides a failed default-links write",
+        ),
+        finding(
+            3,
+            Severity::Nit,
+            FindingState::DroppedByVerifier,
+            "stale comment on probeRevisions",
+        ),
+        finding(
+            4,
+            Severity::Question,
+            FindingState::Kept,
+            "should prefilled defaults be logged?",
+        ),
+        finding(
+            5,
+            Severity::Bug,
+            FindingState::Addressed,
+            "mask paths resolved twice",
+        ),
+        finding(
+            6,
+            Severity::Risk,
+            FindingState::StillPresent,
+            "revision version race",
+        ),
+    ] {
+        st.findings.insert(f.id, f);
+    }
+    st
+}
+
+/// The PR detail screen with the ✦ AI tab open on `ai`.
+#[cfg(unix)]
+fn ai_detail(dark: bool, name: &str, ai: crate::state::ai_review::AiReviewState) {
+    let mut s = session(DiffMode::Split);
+    s.ai = ai;
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        ..Default::default()
+    };
+    state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
+    let h = harness(dark, move |ui| {
+        let mut diff_actions = Vec::new();
+        pr_detail::render(
+            ui,
+            &mut s,
+            &mut state,
+            &mut cache,
+            &mut diff_actions,
+            pr_detail::ScreenInputs {
+                login: "sercand",
+                write_blocked: None,
+                theme: theme::Theme::Dark,
+                system_dark: dark,
+            },
+        );
+    });
+    save(h, name);
+}
+
 #[test]
 #[ignore = "needs a GPU adapter; writes target/ui-shots/*.png"]
 fn shots() {
@@ -385,6 +682,13 @@ fn shots() {
 
         detail(DiffMode::Split, dark, &format!("pr-split-{t}"));
         detail(DiffMode::Unified, dark, &format!("pr-unified-{t}"));
+
+        // The ✦ AI tab (spec §12), rendered only on Unix like the feature.
+        #[cfg(unix)]
+        {
+            ai_detail(dark, &format!("pr-ai-running-{t}"), ai_state_running());
+            ai_detail(dark, &format!("pr-ai-done-{t}"), ai_state_done());
+        }
 
         let settings = Settings::default();
         let vm = login::login_vm(&crate::auth::device_flow::AuthState::Idle, &settings);

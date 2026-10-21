@@ -166,6 +166,9 @@ pub struct AiReviewState {
     pub restore_decision: Option<Vec<String>>,
     /// The chat composer's draft text (UI-local; survives snapshots).
     pub chat_input: String,
+    /// Whether the tab shows the verifier-dropped findings (UI-local;
+    /// survives snapshots, like [`Self::chat_input`]).
+    pub show_dropped: bool,
     /// The head the last completed review ran against (spec §5.8).
     pub last_reviewed_sha: Option<String>,
 }
@@ -279,6 +282,13 @@ impl AiReviewState {
             (AiPhase::Paused, false) => self.phase = AiPhase::Running,
             _ => {}
         }
+    }
+
+    /// Append the user's chat message to the timeline as soon as the
+    /// composer sends it (Task 3); the chat agent's own echo arrives with
+    /// Task 7's [`Event::AiChat`].
+    pub fn push_chat_user(&mut self, text: String) {
+        self.timeline.push(TimelineEntry::ChatUser { text });
     }
 
     /// The stage strip: one entry per stage that has announced itself, in

@@ -162,6 +162,20 @@ fn write_blocked_label(
     }
 }
 
+/// Who the AI run should act on, taken from the session's loaded metadata.
+#[cfg(unix)]
+fn ai_target(session: &PrSession) -> Option<crate::ai::checkout::PrTarget> {
+    let meta = session.metadata.as_ref()?;
+    Some(crate::ai::checkout::PrTarget {
+        host: session.host.clone(),
+        owner: session.repo.owner.clone(),
+        name: session.repo.name.clone(),
+        number: session.number,
+        head_sha: meta.head_sha.clone(),
+        head_branch: meta.head_ref.clone(),
+    })
+}
+
 /// The error an event carries, if it carries one. Every such event toasts
 /// it, so this is where the app notices a write-blocking failure.
 fn event_error(event: &Event) -> Option<&GhError> {
@@ -448,8 +462,10 @@ impl ReviewApp {
                     .test_results
                     .insert(provider, result);
             }
-            // The AI tab (Tasks 2+) renders these; for now a failed start
-            // still deserves the toast (Task 1).
+            // The AI tab's events fold into the open session's reducer
+            // through `apply_session_event` (the stale-event rule lives in
+            // `PrSession::on_event`); a failed start also toasts (Task 1).
+            // `AiUnrestored` opens Task 4's recovery dialog.
             #[cfg(unix)]
             Event::AiCheckoutFailed { message, .. } => self.toasts.push(message, now),
             #[cfg(unix)]
@@ -955,7 +971,9 @@ impl ReviewApp {
             left_pane: self.settings.layout.left_pane,
             right_pane: self.settings.layout.right_pane,
             right_open: self.settings.layout.right_open,
-            details_tab: self.settings.layout.details_tab,
+            // The AI tab is unix-only; a saved `Ai` loads as `Overview` on
+            // Windows (Plan 3).
+            details_tab: self.settings.layout.details_tab.for_platform(),
             merge_form: merge_panel::MergeForm::with_method(self.settings.merge_method),
             ..PrDetailState::default()
         };
@@ -1120,6 +1138,8 @@ impl ReviewApp {
                         self.step_file(true, now);
                     }
                 },
+                #[cfg(unix)]
+                PrDetailAction::Ai(action) => self.apply_ai_action(action, now),
             }
         }
     }
@@ -1277,6 +1297,163 @@ impl ReviewApp {
                     }]
                 })
                 .unwrap_or_default(),
+        }
+    }
+
+    /// Fold one ✦ AI tab control into the open session and send its worker
+    /// command (spec §12).
+    ///
+    /// Commands carry the open session's id so the stale-event rule keeps
+    /// working while a run outlives the PR screen; the local half of each
+    /// answer/decision is recorded on the reducer immediately, because the
+    /// hub emits no "answered" event.
+    #[cfg(unix)]
+    fn apply_ai_action(
+        &mut self,
+        action: crate::ui::widgets::ai_panel::AiPanelAction,
+        now: Instant,
+    ) {
+        use crate::ai::hub::SnapshotInputs;
+        use crate::ai::pipeline::RunMode;
+        use crate::ai::store::PrKey;
+        use crate::ui::widgets::ai_panel::{self, AiPanelAction};
+
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        // The store keys checkouts and runs by the lowercased repo identity.
+        let key = PrKey {
+            host: session.host.to_lowercase(),
+            owner: session.repo.owner.to_lowercase(),
+            repo: session.repo.name.to_lowercase(),
+            number: session.number,
+        };
+        match action {
+            AiPanelAction::Start => {
+                // Until Task 4's folder dialog, an unconfigured repository
+                // just gets pointed at Settings → AI.
+                if self
+                    .settings
+                    .ai
+                    .repo(&session.host, &session.repo.owner, &session.repo.name)
+                    .is_none()
+                {
+                    self.toasts.push(
+                        "no AI checkout folder for this repository — pick one in Settings → AI"
+                            .to_owned(),
+                        now,
+                    );
+                    return;
+                }
+                let Some(pr) = ai_target(session) else {
+                    return; // no metadata yet: nothing to check out
+                };
+                self.worker.send(Command::AiPlanCheckout {
+                    session: session.id,
+                    key,
+                    pr,
+                });
+            }
+            AiPanelAction::Continue => {
+                if self
+                    .settings
+                    .ai
+                    .repo(&session.host, &session.repo.owner, &session.repo.name)
+                    .is_none()
+                {
+                    self.toasts.push(
+                        "no AI checkout folder for this repository — pick one in Settings → AI"
+                            .to_owned(),
+                        now,
+                    );
+                    return;
+                }
+                // An incremental re-review runs against the head the last
+                // completed review saw (spec §5.8); the tab only offers
+                // Continue when that head exists.
+                let (Some(pr), Some(since_sha), Some(snapshot_inputs)) = (
+                    ai_target(session),
+                    session.ai.last_reviewed_sha.clone(),
+                    session.metadata.as_ref().map(|meta| SnapshotInputs {
+                        files: session.files.clone(),
+                        metadata: meta.clone(),
+                    }),
+                ) else {
+                    return;
+                };
+                self.worker.send(Command::AiStart {
+                    session: session.id,
+                    key,
+                    pr,
+                    snapshot_inputs,
+                    mode: RunMode::Incremental { since_sha },
+                });
+            }
+            AiPanelAction::Answer { id, answer } => {
+                self.worker.send(Command::AiAnswer {
+                    session: session.id,
+                    key,
+                    question_id: id,
+                    answer: answer.clone(),
+                });
+                session.ai.record_answer(id, answer);
+            }
+            AiPanelAction::Approve { id, decision } => {
+                self.worker.send(Command::AiApprove {
+                    session: session.id,
+                    key,
+                    approval_id: id,
+                    decision: decision.clone(),
+                });
+                session
+                    .ai
+                    .record_approval(id, ai_panel::decision_text(&decision).to_owned());
+            }
+            AiPanelAction::ApprovePrepare { id, ok } => {
+                self.worker.send(Command::AiApprovePrepare {
+                    session: session.id,
+                    key,
+                    approval_id: id,
+                    ok,
+                });
+                session
+                    .ai
+                    .record_approval(id, if ok { "Run" } else { "No" }.to_owned());
+            }
+            AiPanelAction::SendChat(text) => {
+                self.worker.send(Command::AiUserMessage {
+                    session: session.id,
+                    key,
+                    text: text.clone(),
+                });
+                session.ai.push_chat_user(text);
+            }
+            AiPanelAction::Pause => {
+                self.worker.send(Command::AiPause {
+                    session: session.id,
+                    key,
+                });
+                session.ai.set_paused(true);
+            }
+            AiPanelAction::Resume => {
+                self.worker.send(Command::AiResume {
+                    session: session.id,
+                    key,
+                });
+                session.ai.set_paused(false);
+            }
+            AiPanelAction::Cancel => self.worker.send(Command::AiCancel {
+                session: session.id,
+                key,
+            }),
+            AiPanelAction::Finish => self.worker.send(Command::AiFinish {
+                session: session.id,
+                key,
+                discard: None,
+            }),
+            // Task 5 wires diff scrolling.
+            AiPanelAction::JumpToFinding(_) => {}
+            AiPanelAction::ShowDropped(show) => session.ai.show_dropped = show,
         }
     }
 

@@ -716,6 +716,27 @@ impl PrSession {
                 self.phase = LoadPhase::Failed;
                 Vec::new()
             }
+            // The ✦ AI tab's events fold into the reducer (Task 2), which
+            // never emits commands of its own. The session guard here is the
+            // stale-event rule: a run keeps going when the PR is left, and
+            // its events must not touch a different PR's tab (spec §12).
+            // `AiUnrestored` is app-wide, not PR-scoped, so it is not here.
+            #[cfg(unix)]
+            Event::AiSnapshot { session, .. }
+            | Event::AiCheckoutPlanned { session, .. }
+            | Event::AiCheckoutFailed { session, .. }
+            | Event::AiPrepareOutput { session, .. }
+            | Event::AiPipeline { session, .. }
+            | Event::AiQuestion { session, .. }
+            | Event::AiApprovalRequest { session, .. }
+            | Event::AiChat { session, .. }
+            | Event::AiRestoreNeedsDecision { session, .. }
+            | Event::AiRestored { session, .. }
+                if *session == self.id =>
+            {
+                self.ai.apply(event);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -2267,6 +2288,57 @@ mod tests {
             error: GhError::NotFound,
         });
         assert!(s.error.is_none());
+    }
+
+    /// The AI tab's events fold into `session.ai` — and only the open
+    /// session's do (the stale-event rule, spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn ai_events_fold_into_the_tab_state_and_stale_ones_are_dropped() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::tools::{AgentRef, AgentRole};
+        use crate::state::ai_review::{AiPhase, TimelineEntry};
+
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        let agent = AgentRef {
+            id: 1,
+            role: AgentRole::Reviewer,
+            label: "reviewer:g1".to_string(),
+        };
+
+        s.on_event(&Event::AiQuestion {
+            session: SessionId(2),
+            id: 7,
+            agent: agent.clone(),
+            text: "for another PR".to_string(),
+            options: vec![],
+        });
+        assert!(
+            s.ai.timeline.is_empty(),
+            "a question for a PR the user left never reaches this tab"
+        );
+
+        let commands = s.on_event(&Event::AiQuestion {
+            session: SessionId(1),
+            id: 7,
+            agent,
+            text: "is empty input allowed?".to_string(),
+            options: vec![],
+        });
+        assert!(commands.is_empty(), "the reducer never emits commands");
+        assert!(matches!(
+            s.ai.timeline.as_slice(),
+            [TimelineEntry::Question { id: 7, .. }]
+        ));
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::Stage {
+                stage: crate::ai::events::StageKind::Scout,
+                status: crate::ai::events::StageStatus::Started,
+            },
+        });
+        assert_eq!(s.ai.phase, AiPhase::Running);
     }
 
     #[test]

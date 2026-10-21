@@ -63,6 +63,9 @@ pub enum PrDetailAction {
     FileHeader(FileHeaderAction),
     /// A control in the file footer bar (Task 7).
     FileFooter(FileFooterAction),
+    /// A control in the ✦ AI tab (spec §12). Unix-only with the AI surface.
+    #[cfg(unix)]
+    Ai(crate::ui::widgets::ai_panel::AiPanelAction),
 }
 
 /// The screen's own layout state, owned across frames by the app.
@@ -151,6 +154,9 @@ pub fn render(
     let write_blocked = inputs.write_blocked;
     let mut actions = Vec::new();
     let mut tree_actions = Vec::new();
+    // The ✦ AI tab's controls, reported through `PrDetailAction::Ai`.
+    #[cfg(unix)]
+    let mut ai_actions: Vec<crate::ui::widgets::ai_panel::AiPanelAction> = Vec::new();
 
     // The file tree and the summary work from `PrFile`s; the session keeps the
     // loaded files. Built once per frame and shared by the tree build, the row
@@ -258,24 +264,39 @@ pub fn render(
         .default_size(state.right_pane)
         .show_collapsible(ui, &mut state.right_open, |ui| {
             // The whole right pane is the tabbed details panel: Overview,
-            // Conversation, Commits, and Checks (Tasks 50, 51, and 13).
+            // Conversation, Commits, Checks, and the ✦ AI tab (Tasks 50,
+            // 51, 13, and Plan 3).
             let web = endpoints_for(&session.host).web;
             let counts = metadata_panel::tab_counts(session);
-            metadata_panel::render(
-                ui,
-                metadata_panel::PanelInputs {
-                    metadata: session.metadata.as_ref(),
-                    commits: &session.commits,
-                    check_runs: &session.check_runs,
-                    combined: session.combined_status.as_ref(),
-                    reviews: &session.reviews,
-                    conversation: &session.conversation,
-                    web: &web,
-                    repo: &session.repo,
-                },
-                &mut state.details_tab,
-                counts,
-            );
+            let inputs = metadata_panel::PanelInputs {
+                metadata: session.metadata.as_ref(),
+                commits: &session.commits,
+                check_runs: &session.check_runs,
+                combined: session.combined_status.as_ref(),
+                reviews: &session.reviews,
+                conversation: &session.conversation,
+                web: &web,
+                repo: &session.repo,
+            };
+            metadata_panel::render_tab_strip(ui, &mut state.details_tab, counts);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("metadata-panel")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    #[cfg(unix)]
+                    if state.details_tab == metadata_panel::DetailsTab::Ai {
+                        // The AI tab reads the session's reducer state and
+                        // reports its own actions (spec §12).
+                        ai_actions = crate::ui::widgets::ai_panel::render(
+                            ui,
+                            &session.ai,
+                            session.ai.show_dropped,
+                        );
+                        return;
+                    }
+                    metadata_panel::render_body(ui, &inputs, state.details_tab);
+                });
         });
     // Only capture while open: the close animation slides the panel through
     // every smaller width on its way out, and none of those are the size the
@@ -285,6 +306,8 @@ pub fn render(
     {
         state.right_pane = right.response.rect.width();
     }
+    #[cfg(unix)]
+    actions.extend(ai_actions.into_iter().map(PrDetailAction::Ai));
 
     // The review draft is edited and submitted from the top bar's popover
     // now (Task 12); the banners it used to carry moved to the strip above

@@ -1,7 +1,7 @@
 //! The right-pane details panel (Task 51, tabbed by redesign Task 13):
-//! Overview, Conversation, Commits, and Checks behind a tab strip.
-//! Everything here is read-only — the review draft is edited in the review
-//! popover in the top bar (Task 12).
+//! Overview, Conversation, Commits, Checks, and — on unix — the ✦ AI tab
+//! behind a tab strip. Everything here is read-only — the review draft is
+//! edited in the review popover in the top bar (Task 12).
 
 use eframe::egui::{self, Color32, Frame, Margin, RichText};
 
@@ -19,6 +19,10 @@ use crate::ui::widgets::{checks, commit_list, markdown};
 use crate::ui::{fonts, icons, theme};
 
 /// Which details tab the pane shows (Task 13); persisted in `Layout`.
+///
+/// `Ai` exists on every platform because `Layout` is serialized, but the AI
+/// surface is Unix-only (Plan 3): on Windows the tab is never shown and a
+/// saved `Ai` selection loads as [`Self::Overview`] — see [`Self::for_platform`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DetailsTab {
     /// Title, author, branches, labels, linked issues, description, reviewers.
@@ -30,16 +34,37 @@ pub enum DetailsTab {
     Commits,
     /// The checks list.
     Checks,
+    /// The ✦ AI review session (spec §12; unix-only, like [`crate::ai`]).
+    Ai,
+}
+
+impl DetailsTab {
+    /// The tab this selection may show on the current platform: the AI tab
+    /// is unix-only, so on Windows a saved (or hand-edited) `Ai` selection
+    /// loads as `Overview`. The pure form of the Windows rule; called where
+    /// the layout's tab is applied and where settings load it.
+    pub fn for_platform(self) -> DetailsTab {
+        #[cfg(not(unix))]
+        if self == Self::Ai {
+            return Self::Overview;
+        }
+        self
+    }
 }
 
 /// Per-tab counts for the tab strip, in [`DetailsTab`] order. `None` means
 /// the tab never shows a count; `Some(0)` is drawn as no count either.
-pub fn tab_counts(session: &PrSession) -> [Option<usize>; 4] {
+pub fn tab_counts(session: &PrSession) -> [Option<usize>; 5] {
     [
         None,
         Some(timeline(&session.reviews, &session.conversation).len()),
         Some(session.commits.len()),
         Some(session.check_runs.len()),
+        // The AI tab counts its live findings; no AI state on Windows.
+        #[cfg(unix)]
+        Some(session.ai.counts().by_severity.iter().sum::<u32>() as usize),
+        #[cfg(not(unix))]
+        None,
     ]
 }
 
@@ -91,45 +116,67 @@ pub struct PanelInputs<'a> {
 }
 
 /// Draw the tabbed pane: the strip on top, the selected tab below.
+///
+/// The Ai tab is not drawn here: the screen renders it through
+/// [`crate::ui::widgets::ai_panel`] because it needs the session's AI state
+/// and reports actions. This path is what the tests and any non-screen
+/// caller use.
 pub fn render(
     ui: &mut egui::Ui,
     inputs: PanelInputs<'_>,
     tab: &mut DetailsTab,
-    counts: [Option<usize>; 4],
+    counts: [Option<usize>; 5],
 ) {
     render_tab_strip(ui, tab, counts);
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt("metadata-panel")
         .auto_shrink([false, false])
-        .show(ui, |ui| match *tab {
-            DetailsTab::Overview => render_overview(ui, &inputs),
-            DetailsTab::Conversation => render_conversation(ui, &inputs),
-            DetailsTab::Commits => render_commits(ui, &inputs),
-            DetailsTab::Checks => render_checks(ui, &inputs),
-        });
+        .show(ui, |ui| render_body(ui, &inputs, *tab));
 }
 
-/// The tab strip: Overview by name, the rest as icon tabs with faint counts.
-fn render_tab_strip(ui: &mut egui::Ui, tab: &mut DetailsTab, counts: [Option<usize>; 4]) {
+/// The selected GitHub tab's body (everything but the strip and its scroll
+/// area). `Ai` paints nothing here — see [`render`].
+pub fn render_body(ui: &mut egui::Ui, inputs: &PanelInputs<'_>, tab: DetailsTab) {
+    match tab {
+        DetailsTab::Overview => render_overview(ui, inputs),
+        DetailsTab::Conversation => render_conversation(ui, inputs),
+        DetailsTab::Commits => render_commits(ui, inputs),
+        DetailsTab::Checks => render_checks(ui, inputs),
+        DetailsTab::Ai => {}
+    }
+}
+
+/// The tab strip: Overview by name, the rest as icon tabs with faint
+/// counts, and the ✦ AI tab on unix (spec §12).
+pub fn render_tab_strip(ui: &mut egui::Ui, tab: &mut DetailsTab, counts: [Option<usize>; 5]) {
     let p = theme::palette_of(ui);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        for (index, (icon, label, value)) in [
-            (icons::FILE_TEXT, "Overview", DetailsTab::Overview),
-            (
+        for (index, slot) in [
+            Some((icons::FILE_TEXT, "Overview", DetailsTab::Overview)),
+            Some((
                 icons::MESSAGES_SQUARE,
                 "Conversation",
                 DetailsTab::Conversation,
-            ),
-            (icons::GIT_COMMIT_HORIZONTAL, "Commits", DetailsTab::Commits),
-            (icons::CIRCLE_CHECK, "Checks", DetailsTab::Checks),
+            )),
+            Some((icons::GIT_COMMIT_HORIZONTAL, "Commits", DetailsTab::Commits)),
+            Some((icons::CIRCLE_CHECK, "Checks", DetailsTab::Checks)),
+            // The AI tab exists on all platforms but only shows on unix,
+            // where `crate::ai` and the tab's state live.
+            #[cfg(unix)]
+            Some((icons::SPARKLES, "AI review", DetailsTab::Ai)),
+            #[cfg(not(unix))]
+            None,
         ]
         .into_iter()
         .enumerate()
         {
+            let Some((icon, label, value)) = slot else {
+                continue;
+            };
             let selected = *tab == value;
-            let text = if index == 0 {
+            let text = if index == 0 || value == DetailsTab::Ai {
                 RichText::new(icons::icon_text(icon, label))
             } else {
                 RichText::new(icon.to_string())
@@ -427,9 +474,28 @@ mod tests {
             files: vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")],
             done: true,
         });
-        assert_eq!(tab_counts(&s), [None, Some(0), Some(0), Some(0)]);
+        let counts = tab_counts(&s);
+        assert_eq!(&counts[..4], [None, Some(0), Some(0), Some(0)]);
         s.commits = parse_commits(fixture!("commits_page.json")).unwrap();
         assert_eq!(tab_counts(&s)[2], Some(2));
+    }
+
+    /// The pure Windows rule: every tab survives, `Ai` loads as `Overview`
+    /// off unix. (The unix arm is what macOS/Linux CI actually exercise.)
+    #[test]
+    fn for_platform_keeps_the_github_tabs_and_gates_ai() {
+        for tab in [
+            DetailsTab::Overview,
+            DetailsTab::Conversation,
+            DetailsTab::Commits,
+            DetailsTab::Checks,
+        ] {
+            assert_eq!(tab.for_platform(), tab);
+        }
+        #[cfg(unix)]
+        assert_eq!(DetailsTab::Ai.for_platform(), DetailsTab::Ai);
+        #[cfg(not(unix))]
+        assert_eq!(DetailsTab::Ai.for_platform(), DetailsTab::Overview);
     }
 
     #[test]
@@ -468,6 +534,7 @@ mod tests {
             DetailsTab::Conversation,
             DetailsTab::Commits,
             DetailsTab::Checks,
+            DetailsTab::Ai,
         ] {
             let mut tab = tab;
             egui::__run_test_ui(|ui| {
@@ -484,7 +551,7 @@ mod tests {
                         repo: &r,
                     },
                     &mut tab,
-                    [None, Some(3), Some(2), Some(2)],
+                    [None, Some(3), Some(2), Some(2), Some(1)],
                 );
                 render(
                     ui,
@@ -499,7 +566,7 @@ mod tests {
                         repo: &r,
                     },
                     &mut tab,
-                    [None, None, None, None],
+                    [None, None, None, None, None],
                 );
             });
         }

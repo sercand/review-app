@@ -1,5 +1,7 @@
 //! Shared widgets, one module per widget.
 
+#[cfg(unix)]
+pub mod ai_panel;
 pub mod checks;
 pub mod command_palette;
 pub mod comment_composer;
