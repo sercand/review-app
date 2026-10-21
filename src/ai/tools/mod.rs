@@ -21,6 +21,7 @@
 //! subset through [`Registry::new`].
 
 mod bash;
+mod brief;
 mod files;
 mod gh;
 mod git;
@@ -40,6 +41,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use brief::{SharedBrief, SubmitBrief};
 pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
 pub use git::validate_rev;
 pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};
@@ -154,7 +156,9 @@ impl ToolOutput {
 ///
 /// Later pipeline pieces add their shared state here by name (`snapshot`, `run`,
 /// `interaction`, `context`, `spawner`, …), so a tool takes one context argument
-/// and its signature never changes.
+/// and its signature never changes. Cloning shares every `Arc` and copies the
+/// paths; a stage clones the pipeline's template and fills in its own agent.
+#[derive(Clone)]
 pub struct ToolCx {
     /// The sandbox every file and command op runs through.
     pub sandbox: Arc<dyn review_sandbox::SandboxOps>,

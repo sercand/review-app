@@ -15,6 +15,7 @@ pub mod model;
 pub mod prompts;
 pub mod review;
 pub mod snapshot;
+pub mod stages;
 pub mod store;
 #[cfg(any(test, feature = "ai-testing"))]
 pub mod testing;
