@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 
 use crate::ai::checkout::{CheckoutPlan, RestoreOutcome};
 use crate::ai::events::{PipelineEvent, RunStatus, StageKind, StageStatus};
-use crate::ai::hub::{AiSnapshotData, AiTimelineEntry};
+use crate::ai::hub::{AiSnapshotData, AiTimelineEntry, ChatEvent};
 use crate::ai::review::{
     CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
 };
@@ -123,6 +123,13 @@ pub enum TimelineEntry {
         /// The reply text.
         text: String,
     },
+    /// A tool the chat agent called (Task 7).
+    ChatTool {
+        /// The tool name.
+        name: String,
+        /// A one-line summary of its input.
+        summary: String,
+    },
     /// A notice the app produced: a cancelled or budget-stopped run, the
     /// unsandboxed shell, a stash conflict.
     Notice {
@@ -168,6 +175,10 @@ pub struct AiReviewState {
     pub restore_decision: Option<Vec<String>>,
     /// The chat composer's draft text (UI-local; survives snapshots).
     pub chat_input: String,
+    /// Whether the current chat reply is still streaming. A tool call (or a
+    /// new user message) closes it, so later text starts a new bubble.
+    /// UI-local; reset by snapshots like [`Self::chat_input`].
+    pub chat_reply_open: bool,
     /// Whether the tab shows the verifier-dropped findings (UI-local;
     /// survives snapshots, like [`Self::chat_input`]).
     pub show_dropped: bool,
@@ -194,9 +205,9 @@ pub struct BriefSuggestions {
 }
 
 impl AiReviewState {
-    /// Fold one runtime event in. Non-AI events, [`Event::AiUnrestored`]
-    /// (app-wide; Task 4's recovery dialog reads it in `app.rs`) and
-    /// [`Event::AiChat`] (Task 7) are ignored here.
+    /// Fold one runtime event in. Non-AI events and [`Event::AiUnrestored`]
+    /// (app-wide; Task 4's recovery dialog reads it in `app.rs`) are ignored
+    /// here.
     ///
     /// The caller has already dropped events whose session is not the open
     /// one (the stale-event rule), so the session fields are not rechecked.
@@ -243,6 +254,7 @@ impl AiReviewState {
                 }
             }
             Event::AiPipeline { event, .. } => self.apply_pipeline(event),
+            Event::AiChat { event, .. } => self.apply_chat(event),
             Event::AiQuestion {
                 id,
                 agent,
@@ -323,10 +335,50 @@ impl AiReviewState {
     }
 
     /// Append the user's chat message to the timeline as soon as the
-    /// composer sends it (Task 3); the chat agent's own echo arrives with
-    /// Task 7's [`Event::AiChat`].
+    /// composer sends it (Task 3). The chat task echoes the same message back
+    /// through [`Event::AiChat`]; [`Self::apply_chat`] drops that echo when it
+    /// matches the last entry.
     pub fn push_chat_user(&mut self, text: String) {
         self.timeline.push(TimelineEntry::ChatUser { text });
+        self.chat_reply_open = false;
+    }
+
+    /// Fold one chat-stream event (spec §6.5, Task 7).
+    fn apply_chat(&mut self, event: &ChatEvent) {
+        match event {
+            ChatEvent::User { text } => {
+                let already = matches!(
+                    self.timeline.last(),
+                    Some(TimelineEntry::ChatUser { text: last }) if last == text
+                );
+                if !already {
+                    self.timeline
+                        .push(TimelineEntry::ChatUser { text: text.clone() });
+                }
+                self.chat_reply_open = false;
+            }
+            ChatEvent::Text { delta } => {
+                if self.chat_reply_open
+                    && let Some(TimelineEntry::ChatReply { text }) = self.timeline.last_mut()
+                {
+                    text.push_str(delta);
+                } else {
+                    self.timeline.push(TimelineEntry::ChatReply {
+                        text: delta.clone(),
+                    });
+                    self.chat_reply_open = true;
+                }
+            }
+            ChatEvent::ToolCall { name, summary } => {
+                self.timeline.push(TimelineEntry::ChatTool {
+                    name: name.clone(),
+                    summary: summary.clone(),
+                });
+                // Later text is a new bubble, not a continuation.
+                self.chat_reply_open = false;
+            }
+            ChatEvent::TurnDone => self.chat_reply_open = false,
+        }
     }
 
     /// The user cancelled a plan that was awaiting confirmation (Task 4's
@@ -470,6 +522,7 @@ impl AiReviewState {
         self.usage = (0, 0);
         self.restore_decision = None;
         self.edit = None;
+        self.chat_reply_open = false;
     }
 
     /// Fold one forwarded pipeline event in.
@@ -1044,6 +1097,81 @@ mod tests {
                 },
                 decided: Some("Once".to_string()),
             }
+        );
+    }
+
+    /// The chat-stream fold (Task 7): the optimistic user entry absorbs its
+    /// echo, text deltas coalesce into one reply bubble, a tool call closes
+    /// the bubble so later text starts a new one, and `TurnDone` closes it
+    /// too.
+    #[test]
+    fn chat_stream_folds_into_the_timeline() {
+        let chat = |event: ChatEvent| Event::AiChat {
+            session: SESSION,
+            event,
+        };
+        let mut st = AiReviewState::default();
+        st.push_chat_user("why is this flagged?".to_string());
+        // The chat task echoes the same message: no second entry.
+        st.apply(&chat(ChatEvent::User {
+            text: "why is this flagged?".to_string(),
+        }));
+        assert_eq!(
+            st.timeline,
+            vec![TimelineEntry::ChatUser {
+                text: "why is this flagged?".to_string()
+            }],
+            "the echo reconciles with the optimistic entry"
+        );
+
+        // A message with no optimistic twin (the hub echoed one the composer
+        // did not push) is appended.
+        st.apply(&chat(ChatEvent::User {
+            text: "look at the migration again".to_string(),
+        }));
+
+        st.apply(&chat(ChatEvent::Text {
+            delta: "Because ".to_string(),
+        }));
+        st.apply(&chat(ChatEvent::Text {
+            delta: "the guard moved.".to_string(),
+        }));
+        st.apply(&chat(ChatEvent::ToolCall {
+            name: "get_finding".to_string(),
+            summary: "{\"id\":3}".to_string(),
+        }));
+        st.apply(&chat(ChatEvent::Text {
+            delta: "See finding #3.".to_string(),
+        }));
+        st.apply(&chat(ChatEvent::TurnDone));
+        st.apply(&chat(ChatEvent::Text {
+            delta: "a stray delta".to_string(),
+        }));
+
+        assert_eq!(
+            st.timeline,
+            vec![
+                TimelineEntry::ChatUser {
+                    text: "why is this flagged?".to_string()
+                },
+                TimelineEntry::ChatUser {
+                    text: "look at the migration again".to_string()
+                },
+                TimelineEntry::ChatReply {
+                    text: "Because the guard moved.".to_string()
+                },
+                TimelineEntry::ChatTool {
+                    name: "get_finding".to_string(),
+                    summary: "{\"id\":3}".to_string(),
+                },
+                TimelineEntry::ChatReply {
+                    text: "See finding #3.".to_string()
+                },
+                TimelineEntry::ChatReply {
+                    text: "a stray delta".to_string()
+                },
+            ],
+            "deltas coalesce; a tool call or TurnDone closes the bubble"
         );
     }
 

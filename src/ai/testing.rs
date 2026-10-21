@@ -257,6 +257,23 @@ impl ScriptedLlm {
             .unwrap_or_default()
     }
 
+    /// Queue one more step for the agent keyed `prefix` (per-agent mode).
+    ///
+    /// A test seam for replies that depend on a value only known at runtime:
+    /// a question id, a reviewer's agent id. The key is created on demand,
+    /// so a test can script the very first chat turn after learning the id.
+    pub fn push_agent_step(&self, prefix: &str, step: ScriptStep) {
+        assert!(
+            self.per_agent,
+            "push_agent_step needs a per-agent ScriptedLlm"
+        );
+        self.lock()
+            .agents
+            .entry(prefix.to_string())
+            .or_default()
+            .push_back(step);
+    }
+
     /// Never held across an `.await`, and poisoning is recovered rather than
     /// propagated, as in [`ScriptedInteraction::lock`].
     fn lock(&self) -> MutexGuard<'_, LlmScript> {

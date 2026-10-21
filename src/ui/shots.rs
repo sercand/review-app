@@ -558,6 +558,10 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
             TimelineEntry::ChatUser {
                 text: "focus on the create path".into(),
             },
+            TimelineEntry::ChatTool {
+                name: "note_agent".into(),
+                summary: "{\"agent_id\":4,\"text\":\"focus on the create path\"}".into(),
+            },
             TimelineEntry::ChatReply {
                 text: "Both reviewers now cover the create path; one bug found.".into(),
             },

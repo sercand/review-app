@@ -33,6 +33,7 @@ mod prior;
 mod record;
 mod search;
 mod skills;
+pub mod steer;
 mod truncate;
 mod verdict;
 

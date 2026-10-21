@@ -403,7 +403,9 @@ pub enum Command {
         /// Whether the prepare commands may run.
         ok: bool,
     },
-    /// Queue a user note for every agent of the live run (spec §10.5).
+    /// Send the user a message to the run's chat agent (spec §10.5,
+    /// Task 7): the first message of a run spawns the chat task, later
+    /// ones reuse it.
     #[cfg(unix)]
     AiUserMessage {
         /// The session that sent it.

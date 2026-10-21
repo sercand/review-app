@@ -46,6 +46,13 @@ enum Pending {
     Prepare(oneshot::Sender<bool>),
 }
 
+/// One `ask_user` call waiting for an answer.
+struct ParkedQuestion {
+    tx: oneshot::Sender<String>,
+    /// The question text, for the chat digest (spec §6.5).
+    text: String,
+}
+
 /// The live UI side of [`Interaction`], shared between the hub and the
 /// pipeline's tasks.
 pub struct UiInteraction {
@@ -54,7 +61,7 @@ pub struct UiInteraction {
     session: Arc<Mutex<SessionId>>,
     /// The repo's configured prepare commands, shown with a prepare request.
     prepare_commands: Vec<String>,
-    questions: Mutex<HashMap<u64, oneshot::Sender<String>>>,
+    questions: Mutex<HashMap<u64, ParkedQuestion>>,
     approvals: Mutex<HashMap<u64, Pending>>,
     next_approval: AtomicU64,
 }
@@ -94,9 +101,23 @@ impl UiInteraction {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&question_id)
         {
-            Some(tx) => tx.send(text).is_ok(),
+            Some(parked) => parked.tx.send(text).is_ok(),
             None => false,
         }
+    }
+
+    /// Every question still waiting for an answer, by id, for the chat
+    /// agent's status digest (spec §6.5). Sorted so the digest is stable.
+    pub fn open_questions(&self) -> Vec<(u64, String)> {
+        let mut open: Vec<(u64, String)> = self
+            .questions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, parked)| (*id, parked.text.clone()))
+            .collect();
+        open.sort_by_key(|(id, _)| *id);
+        open
     }
 
     /// Decide a parked command approval. `false` when nothing is waiting.
@@ -147,7 +168,7 @@ impl UiInteraction {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .drain()
-                .map(|(_, tx)| tx)
+                .map(|(_, parked)| parked.tx)
                 .collect()
         };
         for tx in questions {
@@ -181,7 +202,13 @@ impl Interaction for UiInteraction {
         self.questions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(question.id, tx);
+            .insert(
+                question.id,
+                ParkedQuestion {
+                    tx,
+                    text: question.text.clone(),
+                },
+            );
         self.events.send(Event::AiQuestion {
             session: self.current_session(),
             id: question.id,

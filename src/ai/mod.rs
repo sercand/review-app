@@ -5,6 +5,7 @@
 //! gated the same way.
 
 pub mod agent;
+pub mod chat;
 pub mod checklist;
 pub mod checkout;
 pub mod context;

@@ -158,6 +158,7 @@ pub fn entry_title(entry: &TimelineEntry) -> String {
         TimelineEntry::Finding { id } => format!("Finding #{id}"),
         TimelineEntry::ChatUser { .. } => "You".to_string(),
         TimelineEntry::ChatReply { .. } => "Chat".to_string(),
+        TimelineEntry::ChatTool { name, .. } => format!("Chat · {name}"),
         TimelineEntry::Notice { .. } => "Notice".to_string(),
     }
 }
@@ -497,6 +498,14 @@ fn render_entry(
         TimelineEntry::ChatReply { text } => {
             ui.label(RichText::new("Chat").font(fonts::semibold(12.5)));
             markdown::render(ui, &markdown::to_doc(text));
+        }
+        TimelineEntry::ChatTool { name, summary } => {
+            ui.label(
+                RichText::new(format!("{name} {summary}"))
+                    .monospace()
+                    .color(p.muted)
+                    .size(11.5),
+            );
         }
         TimelineEntry::Notice { text } => {
             ui.colored_label(p.pending, text);

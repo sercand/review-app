@@ -24,7 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+use crate::ai::chat::{self, ChatHandle, ChatSetup};
 
 use crate::ai::checkout::{
     CheckoutError, CheckoutPlan, PrTarget, PrepareOutput, RestoreOutcome, execute_checkout,
@@ -150,12 +153,19 @@ pub struct RunHandle {
     pub interaction: Arc<UiInteraction>,
     /// The checkout this run holds until [`AiHub::finish`].
     pub checkout: CheckoutRecord,
-    /// The chat agent's task (Task 7).
-    pub chat: Option<JoinHandle<()>>,
+    /// The chat's message sender (Task 7); `None` before the run starts or
+    /// after it closes.
+    pub chat: Option<ChatHandle>,
     /// Why the agent shell is unsandboxed (spec §8.2).
     pub bash_disabled: Option<String>,
     /// Whether the pipeline is still running; the forwarder clears it.
     live: Arc<AtomicBool>,
+    /// The chat task, spawned on the first user message.
+    chat_task: Option<JoinHandle<()>>,
+    /// What the first message spawns the chat task with.
+    chat_setup: Option<ChatSetup>,
+    /// The chat's receiver, held until the first message spawns the task.
+    chat_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// True while `AiStart` is still working through checkout, prepare, and
     /// sandbox: the placeholder handle holds the PR's slot so a concurrent
     /// Start is rejected before it can touch the checkout (spec §10.3).
@@ -190,6 +200,9 @@ impl RunHandle {
             chat: None,
             bash_disabled: None,
             live: Arc::new(AtomicBool::new(true)),
+            chat_task: None,
+            chat_setup: None,
+            chat_rx: None,
             starting: true,
             pipeline: None,
             tmp_dir: None,
@@ -753,6 +766,7 @@ impl AiHub {
             session_cell.clone(),
             repo_settings.prepare.clone(),
         );
+        let elide_threshold = f64::from(settings.context_threshold);
         let (control, mut rx, pipeline) = start_pipeline(PipelineInputs {
             store: self.store.clone(),
             session_id: ai_session_id,
@@ -761,7 +775,7 @@ impl AiHub {
             sandbox,
             settings,
             repo_settings,
-            llm,
+            llm: llm.clone(),
             lookup_llm,
             interaction: interaction.clone() as Arc<dyn Interaction>,
             mode,
@@ -772,6 +786,37 @@ impl AiHub {
         }
 
         let live = Arc::new(AtomicBool::new(true));
+        // The chat (spec §6.5) shares the run's model, findings, snapshot and
+        // cancellation; it spawns on the first user message.
+        let (chat_send, chat_rx) = ChatHandle::channel();
+        let chat_setup = match (
+            control.run_state(),
+            control.chat_tool_cx(chat::chat_agent()),
+        ) {
+            (Some(run), Some(cx)) => {
+                let run_id = run.run_id();
+                Some(ChatSetup {
+                    llm,
+                    run,
+                    store: self.store.clone(),
+                    session_id: ai_session_id,
+                    run_id,
+                    cx,
+                    control: Some(control.clone()),
+                    interaction: interaction.clone(),
+                    live: live.clone(),
+                    session: session_cell.clone(),
+                    events: events.clone(),
+                    bash_disabled: bash_disabled.clone(),
+                    elide_threshold,
+                    cancel: control.cancel_token(),
+                })
+            }
+            _ => {
+                tracing::warn!("ai hub: the pipeline has no chat setup");
+                None
+            }
+        };
         self.runs.lock().unwrap_or_else(|e| e.into_inner()).insert(
             key.clone(),
             RunHandle {
@@ -779,9 +824,12 @@ impl AiHub {
                 session: session_cell.clone(),
                 interaction: interaction.clone(),
                 checkout: rec,
-                chat: None,
+                chat: Some(chat_send),
                 bash_disabled: bash_disabled.clone(),
                 live: live.clone(),
+                chat_task: None,
+                chat_setup,
+                chat_rx: Some(chat_rx),
                 starting: false,
                 pipeline: Some(pipeline),
                 tmp_dir: Some(tmp_dir),
@@ -791,6 +839,13 @@ impl AiHub {
         let forward_events = events.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                // The run is over once the orchestrator reports its end:
+                // the chat's steering tools answer "the review has finished"
+                // from here on, even though the handle (and its checkout)
+                // stays until `finish`.
+                if matches!(event, PipelineEvent::RunEnded { .. }) {
+                    live.store(false, Ordering::SeqCst);
+                }
                 let session = *session_cell.lock().unwrap_or_else(|e| e.into_inner());
                 forward_events.send(Event::AiPipeline { session, event });
             }
@@ -846,27 +901,44 @@ impl AiHub {
         }
     }
 
-    /// Queue `text` as a user note for every agent of the live run.
+    /// Hand `text` to the run's chat agent (spec §10.5). The first message
+    /// of a run spawns the long-lived chat task; later ones reuse it
+    /// (Task 7). The message goes to the chat only — typing never pauses
+    /// or notes the pipeline itself (spec §6.5).
     pub fn user_message(
         &self,
-        session: SessionId,
+        _session: SessionId,
         key: &PrKey,
         text: String,
         events: &EventSender,
     ) {
-        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key).and_then(|run| run.control.as_ref()) {
-            Some(control) => {
-                control.note_all(&text);
-                events.send(Event::AiChat {
-                    session,
-                    event: ChatEvent::User { text },
-                });
-            }
-            None => events.send(Event::Toast(
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(run) = runs.get_mut(key) else {
+            events.send(Event::Toast(
                 "no AI review is running for this PR".to_owned(),
-            )),
+            ));
+            return;
+        };
+        let Some(chat) = run.chat.as_ref() else {
+            events.send(Event::Toast(
+                "no AI review is running for this PR".to_owned(),
+            ));
+            return;
+        };
+        // The first message spawns the chat task; the receiver and its setup
+        // live in the handle until then.
+        if run.chat_task.is_none()
+            && let (Some(messages), Some(setup)) = (run.chat_rx.take(), run.chat_setup.take())
+        {
+            run.chat_task = Some(tokio::spawn(chat::run_chat(messages, setup)));
         }
+        if !chat.send(text) {
+            events.send(Event::Toast(
+                "the chat agent has stopped; start a new review to chat again".to_owned(),
+            ));
+        }
+        // The chat task echoes the message back into the stream itself, so
+        // the UI's optimistic entry and the echo reconcile in the reducer.
     }
 
     /// Pause every running agent before its next model call.
@@ -929,6 +1001,9 @@ impl AiHub {
                 chat: run.chat.take(),
                 bash_disabled: run.bash_disabled.clone(),
                 live: run.live.clone(),
+                chat_task: run.chat_task.take(),
+                chat_setup: run.chat_setup.take(),
+                chat_rx: run.chat_rx.take(),
                 starting: run.starting,
                 pipeline: run.pipeline.take(),
                 tmp_dir: run.tmp_dir.clone(),
@@ -1149,9 +1224,12 @@ impl AiHub {
 /// remove the agent temp dir.
 fn close_run_handle(run: RunHandle) {
     run.interaction.cancel_all();
-    if let Some(chat) = run.chat {
+    if let Some(chat) = run.chat_task {
         chat.abort();
     }
+    // Dropping the sender ends the chat loop even if the task is between
+    // turns.
+    drop(run.chat);
     if let Some(dir) = &run.tmp_dir {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1496,6 +1574,9 @@ mod tests {
         events: EventReceiver,
         #[allow(dead_code)]
         store: Arc<Store>,
+        /// The scripted model, so a test can queue late steps and read the
+        /// requests each agent made.
+        llm: Arc<ScriptedLlm>,
         client: GithubClient,
         _dir: TempDir,
         clone: PathBuf,
@@ -1571,6 +1652,7 @@ mod tests {
 
         let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
         let llm: Arc<ScriptedLlm> = Arc::new(ScriptedLlm::per_agent(model(), scripts));
+        let llm_for_fixture = llm.clone();
         let llms: LlmFactory = Arc::new(move |_settings: &AiSettings, _tokens: &dyn TokenStore| {
             let main: Arc<dyn Llm> = llm.clone();
             let lookup: Option<Arc<dyn Llm>> = None;
@@ -1597,6 +1679,7 @@ mod tests {
             tx,
             events,
             store,
+            llm: llm_for_fixture,
             client,
             _dir: dir,
             clone,
@@ -2053,6 +2136,280 @@ mod tests {
         assert!(
             fx.store.checkouts_unrestored().expect("list").is_empty(),
             "the holding record is restored"
+        );
+    }
+
+    // --- the chat agent (Task 7) ---
+
+    /// Collect this turn's chat events up to and including `TurnDone`,
+    /// discarding everything else on the stream.
+    fn wait_chat_turn(rx: &EventReceiver) -> Vec<ChatEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut events = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx
+                .recv_timeout(remaining)
+                .expect("the chat turn finished in time")
+            {
+                Event::AiChat { event, .. } => {
+                    let done = matches!(event, ChatEvent::TurnDone);
+                    events.push(event);
+                    if done {
+                        return events;
+                    }
+                }
+                Event::WorkerPanicked(message) => panic!("worker panicked: {message}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// Every text an agent's request carries: text blocks and tool results.
+    fn all_text(messages: &[review_llm::Message]) -> String {
+        let mut out = String::new();
+        for message in messages {
+            for block in &message.content {
+                match block {
+                    review_llm::ContentBlock::Text { text } => {
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    review_llm::ContentBlock::ToolResult { content, .. } => {
+                        for part in content {
+                            if let review_llm::ToolResultPart::Text { text } = part {
+                                out.push_str(text);
+                                out.push('\n');
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// The live run's chat task id, or `None` before the first message.
+    fn chat_task_id(fx: &HubFixture) -> Option<tokio::task::Id> {
+        fx.hub
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&fx.key)
+            .and_then(|run| run.chat_task.as_ref())
+            .map(tokio::task::JoinHandle::id)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_message_spawns_chat_and_later_messages_reuse_it() {
+        let mut scripts = clean_scripts();
+        scripts.insert(
+            "chat".into(),
+            vec![
+                ScriptStep::Text("the helper is new code".into()),
+                ScriptStep::Text("the tests cover it".into()),
+            ],
+        );
+        let fx = harness(scripts, host_launcher()).await;
+        fx.start();
+        wait_for(&fx.events, |e| matches!(e, Event::AiSnapshot { .. }));
+        assert!(
+            chat_task_id(&fx).is_none(),
+            "the chat task spawns on the first message, not at start"
+        );
+
+        fx.hub.user_message(
+            SessionId(1),
+            &fx.key,
+            "what does the PR do?".to_string(),
+            &fx.tx,
+        );
+        let turn = wait_chat_turn(&fx.events);
+        assert!(
+            turn.contains(&ChatEvent::User {
+                text: "what does the PR do?".to_string()
+            }),
+            "the message is echoed into the stream: {turn:?}"
+        );
+        assert!(
+            turn.contains(&ChatEvent::Text {
+                delta: "the helper is new code".into()
+            }),
+            "the reply streams: {turn:?}"
+        );
+        let first = chat_task_id(&fx).expect("the first message spawned the chat task");
+
+        fx.hub
+            .user_message(SessionId(1), &fx.key, "and the tests?".to_string(), &fx.tx);
+        let turn = wait_chat_turn(&fx.events);
+        assert_eq!(
+            turn.last(),
+            Some(&ChatEvent::TurnDone),
+            "the second turn ended"
+        );
+        assert_eq!(
+            chat_task_id(&fx),
+            Some(first),
+            "the second message reused the same chat task"
+        );
+
+        // One model turn per message, and the second turn carried the first
+        // message: the long-lived task kept its history.
+        let requests = fx.llm.requests_for("chat");
+        assert_eq!(requests.len(), 2, "one model call per message");
+        assert!(
+            all_text(&requests[1].messages).contains("what does the PR do?"),
+            "the first message rode along on the second turn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chat_can_pause_and_note_a_running_reviewer() {
+        let fx = harness(ask_then_clean_scripts(), host_launcher()).await;
+        fx.start();
+        let question = wait_for(&fx.events, |e| matches!(e, Event::AiQuestion { .. }));
+        let (question_id, reviewer_id) = match &question {
+            Event::AiQuestion { id, agent, .. } => (*id, agent.id),
+            _ => unreachable!(),
+        };
+
+        // The chat's turn is scripted once the reviewer's id is known.
+        fx.llm.push_agent_step(
+            "chat",
+            ScriptStep::ToolCalls(vec![
+                ("pause_run".to_string(), serde_json::json!({})),
+                (
+                    "note_agent".to_string(),
+                    serde_json::json!({
+                        "agent_id": reviewer_id,
+                        "text": "focus on the parser",
+                    }),
+                ),
+            ]),
+        );
+        fx.llm
+            .push_agent_step("chat", ScriptStep::Text("paused and noted".into()));
+
+        fx.hub.user_message(
+            SessionId(1),
+            &fx.key,
+            "pause it and tell the reviewer to focus on the parser".to_string(),
+            &fx.tx,
+        );
+        // Typing never pauses the chat itself (spec §6.5): the turn runs to
+        // completion even though its first tool pauses the pipeline.
+        let turn = wait_chat_turn(&fx.events);
+        let tools: Vec<&str> = turn
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolCall { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, vec!["pause_run", "note_agent"], "{turn:?}");
+
+        // The pipeline is held, and the reviewer — awake now that the
+        // question is answered — stops before its next model call.
+        let paused = fx
+            .hub
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&fx.key)
+            .and_then(|run| run.control.as_ref())
+            .map(|control| control.is_paused())
+            .expect("the live run has control");
+        assert!(paused, "pause_run held the pipeline");
+        fx.hub
+            .answer(&fx.key, question_id, "the old one".to_string());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.llm.requests_for("reviewer").len(),
+            1,
+            "the pause holds the reviewer before its next model call"
+        );
+
+        // Resume: the reviewer continues, and its next request carries the
+        // note the chat delivered.
+        fx.hub.resume(&fx.key, &fx.tx);
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        let requests = fx.llm.requests_for("reviewer");
+        assert!(requests.len() >= 2, "the reviewer continued");
+        assert!(
+            all_text(&requests[1].messages).contains("[note from the user] focus on the parser"),
+            "note_agent's note reached the reviewer's next turn"
+        );
+
+        // RunEnded clears the run's liveness: from here the chat's steering
+        // tools answer "the review has finished" (spec §6.5).
+        let live = fx
+            .hub
+            .runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&fx.key)
+            .map(|run| run.live.load(Ordering::SeqCst));
+        assert_eq!(
+            live,
+            Some(false),
+            "the forwarder cleared `live` on RunEnded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn answer_question_resolves_the_pending_ask() {
+        let fx = harness(ask_then_clean_scripts(), host_launcher()).await;
+        fx.start();
+        let question = wait_for(&fx.events, |e| matches!(e, Event::AiQuestion { .. }));
+        let question_id = match &question {
+            Event::AiQuestion { id, .. } => *id,
+            _ => unreachable!(),
+        };
+
+        fx.llm.push_agent_step(
+            "chat",
+            ScriptStep::ToolCalls(vec![(
+                "answer_question".to_string(),
+                serde_json::json!({
+                    "question_id": question_id,
+                    "answer": "the old one",
+                }),
+            )]),
+        );
+        fx.llm
+            .push_agent_step("chat", ScriptStep::Text("answered it for you".into()));
+
+        fx.hub.user_message(
+            SessionId(1),
+            &fx.key,
+            "the reviewer asks about style; say the old one".to_string(),
+            &fx.tx,
+        );
+        let turn = wait_chat_turn(&fx.events);
+        assert_eq!(turn.last(), Some(&ChatEvent::TurnDone));
+
+        // The digest the chat got listed the parked question by its id —
+        // that is where the model learned which id to answer.
+        let chat_requests = fx.llm.requests_for("chat");
+        assert!(
+            all_text(&chat_requests[0].messages)
+                .contains(&format!("open questions: #{question_id}")),
+            "the digest carries the open question id"
+        );
+
+        // No hub-level answer was given: the chat's tool resolved the parked
+        // ask, the reviewer continued, and its next turn carries the answer.
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        let requests = fx.llm.requests_for("reviewer");
+        assert!(requests.len() >= 2, "the reviewer continued");
+        assert!(
+            all_text(&requests[1].messages).contains("the old one"),
+            "the chat's answer reached the parked ask_user"
         );
     }
 }

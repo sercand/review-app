@@ -329,6 +329,36 @@ impl PipelineControl {
             open_questions: self.ctl.questions.load(Ordering::Relaxed),
         }
     }
+
+    /// Whether the run is held at a [`Self::pause`] (spec §6.2). Read by the
+    /// chat agent's status digest.
+    pub fn is_paused(&self) -> bool {
+        *self.ctl.pause.borrow()
+    }
+
+    /// The run's cancellation token. The chat agent runs under it, but with
+    /// its own unpaused watch receiver: typing never pauses the review
+    /// (spec §6.5).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.ctl.cancel.clone()
+    }
+
+    /// The run's shared findings/coverage state, once the orchestrator has
+    /// created it. The chat's record tools write here.
+    pub fn run_state(&self) -> Option<Arc<RunState>> {
+        self.ctl.run.get().cloned()
+    }
+
+    /// A [`ToolCx`] for the chat agent (spec §6.5): the run's frozen
+    /// snapshot, sandbox, context, interaction and findings, with `agent` as
+    /// the caller and no checklist assignment (`record_check` then accepts
+    /// any pair). `None` before the orchestrator's template exists.
+    pub fn chat_tool_cx(&self, agent: AgentRef) -> Option<ToolCx> {
+        let mut cx = self.ctl.chat_template.get()?.clone();
+        cx.agent = agent;
+        cx.assigned = Arc::new(Vec::new());
+        Some(cx)
+    }
 }
 
 /// Severity in report order: declaration order (Bug, Risk, Nit, Question).
@@ -395,6 +425,9 @@ struct Ctl {
     events: mpsc::UnboundedSender<PipelineEvent>,
     /// Set once the run state exists, for [`PipelineControl::status`].
     run: OnceLock<Arc<RunState>>,
+    /// The context template the chat agent clones (spec §6.5); set by
+    /// [`start_pipeline`] once the lookup spawner is attached.
+    chat_template: OnceLock<ToolCx>,
 }
 
 struct RunCtl {
@@ -448,6 +481,7 @@ impl Ctl {
             total: Tally::default(),
             events,
             run: OnceLock::new(),
+            chat_template: OnceLock::new(),
         }
     }
 
@@ -742,6 +776,7 @@ pub fn start_pipeline(
     });
     let mut template = template;
     template.cx.spawner = Some(spawner);
+    let _ = ctl.chat_template.set(template.cx.clone());
 
     let control = PipelineControl { ctl: ctl.clone() };
     let handle = tokio::spawn(orchestrate(
