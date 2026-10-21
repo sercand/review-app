@@ -1090,6 +1090,28 @@ mod tests {
         assert_eq!(st.drafts_for("b.rs").count(), 0, "b.rs has none in Draft");
     }
 
+    /// The diff's inline rows follow the "show dropped" toggle: open drafts
+    /// always, verifier drops only when it is on (spec §12).
+    #[test]
+    fn inline_drafts_shows_open_drafts_and_drops_only_when_asked() {
+        let mut st = AiReviewState::default();
+        for f in [
+            line_finding(1, Severity::Bug, FindingState::Draft, "a.rs"),
+            line_finding(2, Severity::Risk, FindingState::DroppedByVerifier, "a.rs"),
+            line_finding(3, Severity::Nit, FindingState::Kept, "a.rs"),
+        ] {
+            st.findings.insert(f.id, f);
+        }
+        let ids = |st: &AiReviewState| st.inline_drafts().map(|f| f.id).collect::<Vec<_>>();
+        assert_eq!(ids(&st), vec![1], "only the open draft is inline");
+        st.show_dropped = true;
+        assert_eq!(
+            ids(&st),
+            vec![1, 2],
+            "the verifier drop joins it when asked"
+        );
+    }
+
     #[test]
     fn can_continue_only_when_head_moved_and_not_running() {
         let mut st = AiReviewState::default();

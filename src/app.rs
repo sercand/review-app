@@ -2085,6 +2085,9 @@ impl ReviewApp {
                     };
                     self.worker.send(command);
                     session.ai.push_chat_user(text);
+                    // Open the pane too: the ✦ tab renders only inside the
+                    // right panel, which starts closed in the default layout.
+                    self.pr_detail.right_open = true;
                     self.pr_detail.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
                 }
                 DiffAction::Composer(action) => {

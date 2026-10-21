@@ -85,15 +85,25 @@ fn ai_drafts_stay_within_the_rebuild_budget() {
         files,
         done: true,
     });
+    // `rebuild_rows` renders one file. Select it explicitly, then seed most
+    // of the drafts on it: those are the rows the timed splice must insert.
+    session.select_file(0);
+    let shown_path = session.files[0].file.path.clone();
+    const DRAFTS_ON_SHOWN_FILE: usize = 200;
 
-    // 500 open drafts spread over the PR, as a full review would leave them.
+    // 500 open drafts, 200 on the rendered file and the rest spread over the
+    // PR so the path scans are exercised too.
     let agent = AgentRef {
         id: 1,
         role: AgentRole::Reviewer,
         label: "reviewer:g1".to_owned(),
     };
     for id in 0..500i64 {
-        let path = paths[(id as usize * 3) % paths.len()].clone();
+        let (path, line) = if (id as usize) < DRAFTS_ON_SHOWN_FILE {
+            (shown_path.clone(), (id as u32 % 34) + 1)
+        } else {
+            (paths[(id as usize * 3) % paths.len()].clone(), 2)
+        };
         session.ai.findings.insert(
             id,
             Finding {
@@ -103,7 +113,7 @@ fn ai_drafts_stay_within_the_rebuild_budget() {
                 anchor: FindingAnchor::Line(Anchor {
                     path,
                     side: Side::Right,
-                    line: 2,
+                    line,
                     start_line: None,
                     start_side: None,
                 }),
@@ -121,6 +131,16 @@ fn ai_drafts_stay_within_the_rebuild_budget() {
 
     // Warm the caches and the syntax set the first rebuild touches.
     session.rebuild_rows();
+    let draft_rows = session
+        .row_model
+        .rows
+        .iter()
+        .filter(|row| matches!(row, RowRef::AiDraft { .. }))
+        .count();
+    assert_eq!(
+        draft_rows, DRAFTS_ON_SHOWN_FILE,
+        "the timed model carries every draft seeded on the rendered file"
+    );
     let t = Instant::now();
     session.rebuild_rows();
     assert!(
