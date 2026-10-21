@@ -185,7 +185,7 @@ impl Tool for RecordFinding {
 }
 
 /// Maps the tool's `side` string; absent or empty means RIGHT (spec §5.4).
-fn resolve_side(raw: Option<&str>) -> Result<Side, ToolOutput> {
+pub(crate) fn resolve_side(raw: Option<&str>) -> Result<Side, ToolOutput> {
     match raw
         .map(str::trim)
         .filter(|s| !s.is_empty())

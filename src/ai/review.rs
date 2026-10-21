@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -280,12 +281,25 @@ impl RunState {
         run_id: i64,
         events: mpsc::UnboundedSender<PipelineEvent>,
     ) -> RunState {
+        // Answered questions belong to the session, not one run: preload
+        // them so an incremental run's agents see the previous run's Q&A
+        // (spec §12). A read failure just means this run starts without.
+        let qa = match store.qa_list(session_id) {
+            Ok(qa) => qa,
+            Err(error) => {
+                tracing::warn!(%error, "loading session Q&A");
+                Vec::new()
+            }
+        };
         RunState {
             store,
             session_id,
             run_id,
             events,
-            inner: Mutex::new(RunCache::default()),
+            inner: Mutex::new(RunCache {
+                qa,
+                ..RunCache::default()
+            }),
         }
     }
 
@@ -351,11 +365,31 @@ impl RunState {
         state: FindingState,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
+        self.set_finding_state_and_anchor(id, state, reason, None)
+    }
+
+    /// Move finding `id` to a new state and, when `anchor` is given,
+    /// re-anchor it (the prior check's corrected anchor, spec §12). Store
+    /// row and cache update together, with exactly one change event.
+    pub fn set_finding_state_and_anchor(
+        &self,
+        id: i64,
+        state: FindingState,
+        reason: Option<String>,
+        anchor: Option<FindingAnchor>,
+    ) -> anyhow::Result<()> {
+        let anchor_json = match &anchor {
+            Some(anchor) => Some(serde_json::to_string(anchor).context("serializing anchor")?),
+            None => None,
+        };
         self.store
-            .finding_update(id, state, None, reason.as_deref())?;
+            .finding_update(id, state, None, reason.as_deref(), anchor_json.as_deref())?;
         if let Some(finding) = self.cache().findings.iter_mut().find(|f| f.id == id) {
             finding.state = state;
-            finding.state_reason = reason;
+            finding.state_reason = reason.clone();
+            if let Some(anchor) = anchor {
+                finding.anchor = anchor;
+            }
         }
         let _ = self.events.send(PipelineEvent::FindingChanged { id });
         Ok(())
@@ -370,8 +404,13 @@ impl RunState {
         severity: Severity,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
-        self.store
-            .finding_update(id, FindingState::Draft, Some(severity), reason.as_deref())?;
+        self.store.finding_update(
+            id,
+            FindingState::Draft,
+            Some(severity),
+            reason.as_deref(),
+            None,
+        )?;
         if let Some(finding) = self.cache().findings.iter_mut().find(|f| f.id == id) {
             finding.severity = severity;
             finding.state = FindingState::Draft;

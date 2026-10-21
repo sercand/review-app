@@ -13,7 +13,9 @@ use anyhow::Context;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::ai::review::{CheckResult, CoverageEntry, Evidence, Finding, FindingState, Severity};
+use crate::ai::review::{
+    CheckResult, CoverageEntry, Evidence, Finding, FindingAnchor, FindingState, Severity,
+};
 use crate::ai::tools::AgentRef;
 
 /// Migration 1: creates every table from spec §11 so later milestones need
@@ -586,24 +588,40 @@ impl Store {
 
     /// Move finding `id` to a new `state`, change its `severity` when one is
     /// given (the verifier's downgrade, spec §5.5), with an optional reason.
+    /// When `anchor_json` is given the finding is re-anchored to it (the
+    /// prior check's corrected anchor, spec §12); the `path` column follows
+    /// the new anchor.
     pub fn finding_update(
         &self,
         id: i64,
         state: FindingState,
         severity: Option<Severity>,
         reason: Option<&str>,
+        anchor_json: Option<&str>,
     ) -> anyhow::Result<()> {
+        let new_path: Option<String> = match anchor_json {
+            Some(json) => {
+                let anchor: FindingAnchor =
+                    serde_json::from_str(json).context("parsing finding anchor")?;
+                Some(anchor.path().to_string())
+            }
+            None => None,
+        };
         let n = self
             .conn()
             .execute(
                 "UPDATE ai_findings
-                    SET state = ?2, severity = COALESCE(?3, severity), state_reason = ?4
+                    SET state = ?2, severity = COALESCE(?3, severity), state_reason = ?4,
+                        anchor_json = COALESCE(?5, anchor_json),
+                        path = COALESCE(?6, path)
                   WHERE id = ?1",
                 rusqlite::params![
                     id,
                     state.as_str(),
                     severity.map(|severity| severity.as_str()),
-                    reason
+                    reason,
+                    anchor_json,
+                    new_path
                 ],
             )
             .context("updating ai_findings row")?;

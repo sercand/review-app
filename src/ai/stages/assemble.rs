@@ -25,7 +25,7 @@ use crate::ai::prompts::system_prompt;
 use crate::ai::review::{CheckResult, CoverageEntry, Finding, FindingAnchor, Severity};
 use crate::ai::stages::scout::Brief;
 use crate::ai::stages::{
-    StageError, StageInputs, anchor_text, evidence_text, persist_seed, with_bash_note,
+    StageError, StageInputs, anchor_text, evidence_text, persist_seed, seed_message,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedDraft, SubmitReviewDraft, Tool};
 
@@ -172,8 +172,9 @@ pub async fn run_assembler(
         submitted.clone(),
     ))));
 
-    let text = with_bash_note(
+    let text = seed_message(
         initial_message(brief, kept, coverage),
+        &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, LABEL, &text);
@@ -395,6 +396,8 @@ mod tests {
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
             bash_disabled: None,
+            incremental: None,
+            incremental_log: None,
         }
     }
 

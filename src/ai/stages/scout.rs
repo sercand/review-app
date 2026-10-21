@@ -18,7 +18,7 @@ use crate::ai::checklist::{self, FileKind};
 use crate::ai::context::RepoContext;
 use crate::ai::prompts::system_prompt;
 use crate::ai::snapshot::PrSnapshot;
-use crate::ai::stages::{StageError, StageInputs, with_bash_note, without_bash};
+use crate::ai::stages::{StageError, StageInputs, seed_message, without_bash};
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedBrief, SubmitBrief, Tool, ToolCx};
 use crate::github::files::{LoadedFile, PatchState};
 use crate::model::diff::{Hunk, LineKind};
@@ -124,13 +124,16 @@ pub async fn run_scout(
         inputs.bash_disabled.as_deref(),
     ));
 
-    let text = with_bash_note(
+    let text = seed_message(
         initial_message(
             &snapshot,
             cx.context.as_deref(),
             &inputs.repo.commands,
             prev,
+            inputs.incremental.as_deref(),
+            inputs.incremental_log.as_deref(),
         ),
+        &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &text);
@@ -260,12 +263,15 @@ fn persist_seed(cx: &ToolCx, text: &str) {
 
 /// The scout's single task message (spec §5.1, §5.2): the PR overview, the
 /// file list with +/− and kinds, the CI summary, the repo's own rules and
-/// commands, and — on a re-review — the previous brief.
+/// commands, and — on a re-review — the previous brief and, for an
+/// incremental run, the changed files and new commits (spec §12).
 fn initial_message(
     snapshot: &PrSnapshot,
     context: Option<&RepoContext>,
     commands: &[String],
     prev: Option<&Brief>,
+    incremental: Option<&[String]>,
+    commits: Option<&str>,
 ) -> String {
     let meta = &snapshot.metadata;
     let mut out = String::from("## Pull request\n\n");
@@ -355,6 +361,23 @@ fn initial_message(
             "\n\n## New commits since last review\n\nThe previous review ran against a \
              different head; re-check anything time-sensitive.\n",
         );
+    }
+
+    if let Some(changed) = incremental {
+        out.push_str("\n## Changed since last review\n\n");
+        if changed.is_empty() {
+            out.push_str("(no files changed since the last review)\n");
+        }
+        for path in changed {
+            out.push_str(path);
+            out.push('\n');
+        }
+        out.push_str("Group around these files; the rest was already reviewed.\n");
+    }
+    if let Some(commits) = commits {
+        out.push_str("\n## Commits since last review\n\n");
+        out.push_str(commits.trim_end());
+        out.push('\n');
     }
     out
 }
@@ -705,6 +728,8 @@ mod tests {
             settings: AiSettings::default(),
             repo,
             bash_disabled: None,
+            incremental: None,
+            incremental_log: None,
         }
     }
 
@@ -879,6 +904,8 @@ mod tests {
             Some(&context),
             &["cargo test".to_string()],
             Some(&prev),
+            None,
+            None,
         );
 
         let order = [
@@ -923,9 +950,46 @@ mod tests {
         assert!(text.contains("different head"), "{text}");
 
         // Without a previous brief the re-review sections are gone.
-        let text = initial_message(&snapshot, None, &[], None);
+        let text = initial_message(&snapshot, None, &[], None, None, None);
         assert!(!text.contains("## Previous brief"), "{text}");
         assert!(!text.contains("## Repo commands"), "{text}");
+    }
+
+    #[test]
+    fn initial_message_carries_the_incremental_sections() {
+        let snapshot = snapshot_with(&["src/a.rs", "src/b.rs"]);
+        let prev = brief_with(Vec::new());
+
+        // Incremental run: the changed files and the new commits are shown,
+        // after the previous brief.
+        let text = initial_message(
+            &snapshot,
+            None,
+            &[],
+            Some(&prev),
+            Some(&["src/a.rs".to_string()]),
+            Some("abc1234 add three"),
+        );
+        let order = [
+            "## Previous brief",
+            "## Changed since last review",
+            "## Commits since last review",
+        ];
+        let mut last = 0;
+        for section in order {
+            let at = text
+                .find(section)
+                .unwrap_or_else(|| panic!("missing {section}:\n{text}"));
+            assert!(at >= last, "{section} is out of order:\n{text}");
+            last = at;
+        }
+        assert!(text.contains("src/a.rs\n"), "{text}");
+        assert!(text.contains("abc1234 add three"), "{text}");
+
+        // Full run: neither section appears.
+        let text = initial_message(&snapshot, None, &[], None, None, None);
+        assert!(!text.contains("## Changed since last review"), "{text}");
+        assert!(!text.contains("## Commits since last review"), "{text}");
     }
 
     #[tokio::test]

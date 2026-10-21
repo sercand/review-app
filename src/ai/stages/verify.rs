@@ -24,7 +24,7 @@ use crate::ai::prompts::system_prompt;
 use crate::ai::review::{Finding, FindingAnchor, FindingState, RunState};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::{
-    StageError, StageInputs, anchor_text, evidence_text, persist_seed, thread_text, with_bash_note,
+    StageError, StageInputs, anchor_text, evidence_text, persist_seed, seed_message, thread_text,
     without_bash,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedVerdicts, SubmitVerdicts, Tool};
@@ -150,8 +150,9 @@ pub async fn run_verifier(
         inputs.bash_disabled.as_deref(),
     ));
 
-    let text = with_bash_note(
+    let text = seed_message(
         initial_message(&batch, cx.snapshot.as_deref(), cx.context.as_deref()),
+        &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &label, &text);
@@ -519,6 +520,8 @@ mod tests {
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
             bash_disabled: None,
+            incremental: None,
+            incremental_log: None,
         }
     }
 

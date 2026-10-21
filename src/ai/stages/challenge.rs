@@ -22,7 +22,7 @@ use crate::ai::stages::reviewer::{find_file, patch_text, risk_slug};
 use crate::ai::stages::scout::{Brief, Group, Risk};
 use crate::ai::stages::{
     StageError, StageInputs, agent_findings, anchor_text, evidence_text, persist_seed,
-    reviewer_tools, with_bash_note,
+    reviewer_tools, seed_message,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry};
 
@@ -76,8 +76,9 @@ pub async fn run_challenger(
         .filter(|finding| finding.agent.label == reviewer)
         .collect();
 
-    let text = with_bash_note(
+    let text = seed_message(
         initial_message(brief, group, &snapshot, &findings),
+        &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &label, &text);
@@ -329,6 +330,8 @@ mod tests {
             settings: AiSettings::default(),
             repo: RepoAiSettings::default(),
             bash_disabled: None,
+            incremental: None,
+            incremental_log: None,
         }
     }
 

@@ -4,6 +4,7 @@
 
 pub mod assemble;
 pub mod challenge;
+pub mod prior;
 pub mod reviewer;
 pub mod scout;
 pub mod verify;
@@ -46,6 +47,13 @@ pub struct StageInputs {
     /// `request_prepare`, and every agent's seed message ends with
     /// [`bash_note`]'s line.
     pub bash_disabled: Option<String>,
+    /// Files changed since the previous run's head (spec §12), `None` for a
+    /// full review. The scout narrows its grouping with it, and the
+    /// pipeline skips review groups it does not touch.
+    pub incremental: Option<Vec<String>>,
+    /// `git log --oneline` since the previous run's head, shown to the
+    /// scout; `None` for a full review.
+    pub incremental_log: Option<String>,
 }
 
 /// Why a stage stopped without producing its artifact.
@@ -76,6 +84,28 @@ pub(crate) fn with_bash_note(mut text: String, bash_disabled: Option<&str>) -> S
         text.push('\n');
     }
     text
+}
+
+/// Builds a seed task message: `text`, then the run's answered questions
+/// as `## Known facts from the user` (spec §5.4 — every agent gets them,
+/// so a user answer constrains all of them), then [`with_bash_note`] —
+/// the bash note stays the very last line (spec §8.2).
+pub(crate) fn seed_message(
+    text: String,
+    qa: &[(String, String)],
+    bash_disabled: Option<&str>,
+) -> String {
+    let mut text = text;
+    if !qa.is_empty() {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("\n## Known facts from the user\n\n");
+        for (question, answer) in qa {
+            text.push_str(&format!("Q: {question}\nA: {answer}\n"));
+        }
+    }
+    with_bash_note(text, bash_disabled)
 }
 
 /// Drops `bash` and `request_prepare` from `tools` when bash is unavailable
@@ -237,7 +267,7 @@ pub(crate) fn thread_text(thread: &ReviewThread) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bash_note, reviewer_tools, with_bash_note, without_bash};
+    use super::{bash_note, reviewer_tools, seed_message, with_bash_note, without_bash};
     use crate::ai::tools;
 
     #[test]
@@ -260,6 +290,28 @@ mod tests {
         assert_eq!(text, "seed\nbash is unavailable in this review: no bwrap\n");
         let text = with_bash_note("seed\n".to_string(), Some("no bwrap"));
         assert_eq!(text, "seed\nbash is unavailable in this review: no bwrap\n");
+    }
+
+    #[test]
+    fn seed_message_appends_known_facts_then_bash_note() {
+        let qa = vec![("is empty allowed?".to_string(), "yes".to_string())];
+
+        // No questions: exactly what with_bash_note produces.
+        assert_eq!(
+            seed_message("seed\n".to_string(), &[], Some("no bwrap")),
+            "seed\nbash is unavailable in this review: no bwrap\n"
+        );
+        assert_eq!(seed_message("seed\n".to_string(), &[], None), "seed\n");
+
+        // Questions come after the task text; the bash note stays last.
+        assert_eq!(
+            seed_message("seed\n".to_string(), &qa, Some("no bwrap")),
+            "seed\n\n## Known facts from the user\n\nQ: is empty allowed?\nA: yes\nbash is unavailable in this review: no bwrap\n"
+        );
+        assert_eq!(
+            seed_message("seed".to_string(), &qa, None),
+            "seed\n\n## Known facts from the user\n\nQ: is empty allowed?\nA: yes\n"
+        );
     }
 
     #[test]

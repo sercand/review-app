@@ -25,8 +25,8 @@ use crate::ai::review::{CheckResult, CoverageEntry, RunState};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::scout::{Brief, Group, GroupFile, Risk};
 use crate::ai::stages::{
-    StageError, StageInputs, agent_findings, persist_seed, reviewer_tools, thread_text,
-    with_bash_note,
+    StageError, StageInputs, agent_findings, persist_seed, reviewer_tools, seed_message,
+    thread_text,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry};
 use crate::github::files::{LoadedFile, PatchState};
@@ -108,7 +108,7 @@ pub async fn run_reviewer(
         }));
     }
 
-    let text = with_bash_note(
+    let text = seed_message(
         initial_message(
             brief,
             group,
@@ -117,6 +117,7 @@ pub async fn run_reviewer(
             &assigned,
             &cx.run.qa(),
         ),
+        &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
     persist_seed(&cx, &label, &text);
@@ -626,6 +627,8 @@ mod tests {
             settings: AiSettings::default(),
             repo,
             bash_disabled: None,
+            incremental: None,
+            incremental_log: None,
         }
     }
 

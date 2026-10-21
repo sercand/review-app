@@ -9,6 +9,7 @@ pub mod checklist;
 pub mod checkout;
 pub mod context;
 pub mod events;
+pub mod incremental;
 pub mod interaction;
 pub mod llm;
 pub mod model;

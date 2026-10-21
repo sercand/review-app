@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ai::agent::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
 use crate::ai::context::load_repo_context;
 use crate::ai::events::{PipelineEvent, StageKind, StageStatus};
+use crate::ai::incremental::{IncrementalScope, commits_since, incremental_files};
 use crate::ai::interaction::{ApprovalDecision, Interaction, Question};
 use crate::ai::model::Llm;
 use crate::ai::prompts::system_prompt;
@@ -32,11 +33,12 @@ use crate::ai::review::{Finding, FindingState, RunState, Severity};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::assemble::run_assembler;
 use crate::ai::stages::challenge::{needs_challenge, run_challenger};
+use crate::ai::stages::prior::{PRIOR_LABEL, run_prior_check};
 use crate::ai::stages::reviewer::run_reviewer;
 use crate::ai::stages::scout::{Brief, Group, Risk, SCOUT_LABEL, read_only_tools, run_scout};
 use crate::ai::stages::verify::{MAX_BATCH, dedupe, run_verifier};
 use crate::ai::stages::{
-    Spawner, StageError, StageInputs, next_agent_id, with_bash_note, without_bash,
+    Spawner, StageError, StageInputs, next_agent_id, seed_message, without_bash,
 };
 use crate::ai::store::RunKind;
 use crate::ai::tools::{AgentRef, AgentRole, Registry, ToolCx};
@@ -558,6 +560,27 @@ impl Ctl {
         }
     }
 
+    /// Mark every pending group that no changed file touches as skipped
+    /// (spec §12): the previous run reviewed it and nothing since has
+    /// touched it. Event-free — the scheduler simply never starts those
+    /// reviewers.
+    fn skip_untouched_groups(&self, changed: &[String]) {
+        let mut state = self.state();
+        for slot in state.groups.iter_mut() {
+            if slot.state != GroupState::Pending {
+                continue;
+            }
+            let touched = slot
+                .group
+                .files
+                .iter()
+                .any(|file| changed.iter().any(|path| path == &file.path));
+            if !touched {
+                slot.state = GroupState::Skipped;
+            }
+        }
+    }
+
     /// Cancel the reviewers that are running right now.
     fn cancel_running(&self) {
         let state = self.state();
@@ -698,6 +721,9 @@ pub fn start_pipeline(
         settings: inputs.settings.clone(),
         repo: inputs.repo_settings.clone(),
         bash_disabled: inputs.bash_disabled.clone(),
+        // Filled by the orchestrator once the incremental scope is known.
+        incremental: None,
+        incremental_log: None,
     };
 
     // The lookup spawner holds its own template (with `spawner: None`, so
@@ -715,7 +741,15 @@ pub fn start_pipeline(
     template.cx.spawner = Some(spawner);
 
     let control = PipelineControl { ctl: ctl.clone() };
-    let handle = tokio::spawn(orchestrate(template, ctl, run, run_id, head_sha, tx));
+    let handle = tokio::spawn(orchestrate(
+        template,
+        inputs.mode.clone(),
+        ctl,
+        run,
+        run_id,
+        head_sha,
+        tx,
+    ));
     (control, rx, handle)
 }
 
@@ -730,6 +764,8 @@ fn stage_clone(base: &StageInputs, llm: Arc<dyn Llm>, ctl: AgentControl) -> Stag
         settings: base.settings.clone(),
         repo: base.repo.clone(),
         bash_disabled: base.bash_disabled.clone(),
+        incremental: base.incremental.clone(),
+        incremental_log: base.incremental_log.clone(),
     }
 }
 
@@ -744,14 +780,120 @@ fn tracked_llm(base: &StageInputs, tally: Arc<Tally>) -> Arc<dyn Llm> {
 /// The orchestrator task (spec §5 flow). Every stage runs inline here; only
 /// reviewers get their own tasks, so the scheduler can steer them.
 async fn orchestrate(
-    base: StageInputs,
+    mut base: StageInputs,
+    mode: RunMode,
     ctl: Arc<Ctl>,
     run: Arc<RunState>,
     run_id: i64,
     head_sha: String,
     tx: mpsc::UnboundedSender<PipelineEvent>,
 ) -> RunStatus {
-    // 1. Scout. Its failure ends the whole run (spec §5.2).
+    // 0. Incremental scope (spec §12): which files the new commits touched,
+    // and what became of the findings still open from previous runs. A
+    // force-push (or a git that cannot run) degrades the run to a full
+    // review of this head; the run row keeps its incremental kind.
+    let mut changed: Option<Vec<String>> = None;
+    let mut prior_over = false;
+    if let RunMode::Incremental { since_sha } = &mode {
+        let repo = &base.cx.repo_root;
+        match incremental_files(repo, since_sha, &head_sha).await {
+            Ok(IncrementalScope::Files(files)) => {
+                base.incremental_log = match commits_since(repo, since_sha, &head_sha, 50).await {
+                    Ok(log) => Some(log),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "pipeline: the commit log for the incremental run failed"
+                        );
+                        None
+                    }
+                };
+                changed = Some(files);
+            }
+            Ok(IncrementalScope::FullFallback { reason }) => {
+                tracing::info!(%reason, "pipeline: incremental run falls back to a full review");
+                let _ = tx.send(PipelineEvent::AgentText {
+                    agent: AgentRef {
+                        id: 0,
+                        role: AgentRole::App,
+                        label: "app".to_string(),
+                    },
+                    delta: reason,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(%error, "pipeline: incremental scope failed; running a full review");
+            }
+        }
+        base.incremental = changed.clone();
+
+        // The prior-findings check, before the scout so its verdicts shape
+        // the run (spec §12). No open findings: no stage, no events.
+        let open = match run.store().finding_list(run.session_id()) {
+            Ok(findings) => findings
+                .into_iter()
+                .filter(|finding| {
+                    matches!(
+                        finding.state,
+                        FindingState::Draft | FindingState::Kept | FindingState::Posted
+                    )
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(%error, "pipeline: loading the open findings failed");
+                Vec::new()
+            }
+        };
+        if !open.is_empty() {
+            ctl.stage(StageKind::PriorCheck, StageStatus::Started);
+            let agent = AgentRef {
+                id: next_agent_id(),
+                role: AgentRole::PriorCheck,
+                label: PRIOR_LABEL.to_string(),
+            };
+            let tally = Arc::new(Tally::default());
+            let inputs = stage_clone(
+                &base,
+                tracked_llm(&base, tally.clone()),
+                ctl.agent_ctl(&agent),
+            );
+            let _ = tx.send(PipelineEvent::AgentStarted {
+                agent: agent.clone(),
+                group: None,
+            });
+            let outcome = run_prior_check(&inputs, &agent, open).await;
+            prior_over = agent_finished(&ctl, &tally, &agent, stop_of(&outcome));
+            match outcome {
+                Ok(()) => ctl.stage(StageKind::PriorCheck, StageStatus::Done),
+                Err(_) if ctl.cancel.is_cancelled() => {
+                    ctl.stage(
+                        StageKind::PriorCheck,
+                        StageStatus::Failed("cancelled".to_string()),
+                    );
+                    return finish_run(
+                        &ctl,
+                        &run,
+                        run_id,
+                        RunStatus::Cancelled,
+                        Some("cancelled".to_string()),
+                        &head_sha,
+                        false,
+                    );
+                }
+                Err(error) => {
+                    // Like a verifier failure: the stage failed, the run goes on.
+                    ctl.stage(
+                        StageKind::PriorCheck,
+                        StageStatus::Failed(error_text(&error)),
+                    );
+                }
+            }
+        }
+    }
+
+    // 1. Scout. Its failure ends the whole run (spec §5.2). An incremental
+    // scout builds on the previous brief (spec §12).
+    let prev = changed.as_ref().and_then(|_| previous_brief(&run));
     ctl.stage(StageKind::Scout, StageStatus::Started);
     let scout = AgentRef {
         id: 1,
@@ -768,7 +910,7 @@ async fn orchestrate(
         agent: scout.clone(),
         group: None,
     });
-    let scouted = run_scout(&inputs, &scout, None).await;
+    let scouted = run_scout(&inputs, &scout, prev.as_ref()).await;
     let over = agent_finished(&ctl, &tally, &scout, stop_of(&scouted));
     let brief = match scouted {
         Ok(brief) => brief,
@@ -790,10 +932,15 @@ async fn orchestrate(
     ctl.stage(StageKind::Scout, StageStatus::Done);
     let _ = tx.send(PipelineEvent::BriefReady);
     ctl.register_groups(&brief.groups);
+    if let Some(changed) = &changed {
+        // Groups no changed file touches were reviewed in the previous run:
+        // they are Skipped before the scheduler ever sees them (spec §12).
+        ctl.skip_untouched_groups(changed);
+    }
 
     // The budget is checked after every agent; once it is spent the rest
     // of the review is skipped but the assembler still runs (spec §6.3).
-    let mut budget_hit = over;
+    let mut budget_hit = over || prior_over;
     if budget_hit {
         ctl.skip_pending();
     }
@@ -978,6 +1125,19 @@ async fn orchestrate(
     };
     let reason = budget_hit.then(|| "token budget".to_string());
     finish_run(&ctl, &run, run_id, status, reason, &head_sha, true)
+}
+
+/// The session's stored brief, shown to an incremental scout (spec §12);
+/// a stored brief that no longer parses is dropped with a warning.
+fn previous_brief(run: &RunState) -> Option<Brief> {
+    let json = run.store().session_brief(run.session_id()).ok().flatten()?;
+    match serde_json::from_str(&json) {
+        Ok(brief) => Some(brief),
+        Err(error) => {
+            tracing::warn!(%error, "pipeline: the stored brief did not parse");
+            None
+        }
+    }
 }
 
 /// Run every group through a reviewer under the parallel cap, handling
@@ -1310,8 +1470,9 @@ impl Spawner for PipelineSpawner {
         let spec = AgentSpec {
             agent: agent.clone(),
             system: system_prompt(AgentRole::Lookup, &agent.label),
-            initial: vec![review_llm::Message::user_text(with_bash_note(
+            initial: vec![review_llm::Message::user_text(seed_message(
                 question.to_string(),
+                &cx.run.qa(),
                 self.base.bash_disabled.as_deref(),
             ))],
             registry,

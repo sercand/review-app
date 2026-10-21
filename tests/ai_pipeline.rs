@@ -144,12 +144,14 @@ fn meta(head_sha: &str) -> PrMetadata {
     }
 }
 
-/// The frozen PR: `src/a.rs` with a parsed patch, `assets/logo.png` binary.
-fn snapshot() -> PrSnapshot {
+/// The frozen PR: `src/a.rs` with a parsed patch, `assets/logo.png` binary,
+/// with `head_sha` as the metadata head, so git commands against the
+/// checkout (the incremental scope) resolve.
+fn snapshot_at(head_sha: &str) -> PrSnapshot {
     PrSnapshot {
         repo: RepoRef::new("o", "r"),
         number: 7,
-        metadata: meta("head_sha_1"),
+        metadata: meta(head_sha),
         files: vec![
             LoadedFile {
                 file: PrFile {
@@ -204,6 +206,8 @@ fn model() -> ModelSettings {
 
 /// A started run with every handle the test needs; `_repo` keeps the
 /// checkout (and with it the `LocalHost` root) alive for the whole test.
+/// The repo is shared so a second run can follow the first on the same
+/// checkout and store (the incremental re-review tests).
 struct Started {
     control: PipelineControl,
     rx: mpsc::UnboundedReceiver<PipelineEvent>,
@@ -211,33 +215,66 @@ struct Started {
     llm: Arc<ScriptedLlm>,
     store: Arc<Store>,
     session: i64,
-    _repo: TempDir,
+    _repo: Arc<TempDir>,
 }
 
 fn start(scripts: BTreeMap<String, Vec<ScriptStep>>) -> Started {
     start_with(scripts, AiSettings::default(), None, None)
 }
 
-/// Start a run over the fixture repo: one parallel reviewer, the per-agent
-/// script, and optional `bash_disabled` reason and per-call token usage.
+/// Start a full run over a fresh fixture repo and store: one parallel
+/// reviewer, the per-agent script, and optional `bash_disabled` reason and
+/// per-call token usage.
 fn start_with(
     scripts: BTreeMap<String, Vec<ScriptStep>>,
-    mut settings: AiSettings,
+    settings: AiSettings,
     bash_disabled: Option<String>,
     usage_per_call: Option<(u64, u64)>,
 ) -> Started {
-    settings.max_parallel_reviewers = 1;
-    let repo = fixture_repo();
-    let host = LocalHost::new(repo.path()).expect("local host");
-    let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
-    let session = store
+    start_in(
+        Arc::new(fixture_repo()),
+        fresh_store(),
+        scripts,
+        settings,
+        bash_disabled,
+        usage_per_call,
+        RunMode::Full,
+    )
+}
+
+fn fresh_store() -> Arc<Store> {
+    Arc::new(Store::open_in_memory().expect("in-memory store"))
+}
+
+/// The session row for `o/r` #7 in `store`; get-or-create, so it is stable
+/// across runs and tests.
+fn session_of(store: &Store) -> i64 {
+    store
         .session_id(&PrKey {
             host: "github.com".to_string(),
             owner: "o".to_string(),
             repo: "r".to_string(),
             number: 7,
         })
-        .expect("session row");
+        .expect("session row")
+}
+
+/// Start a run over `repo` and `store` with the given `mode`: one parallel
+/// reviewer, the per-agent script, and optional `bash_disabled` reason and
+/// per-call token usage.
+fn start_in(
+    repo: Arc<TempDir>,
+    store: Arc<Store>,
+    scripts: BTreeMap<String, Vec<ScriptStep>>,
+    mut settings: AiSettings,
+    bash_disabled: Option<String>,
+    usage_per_call: Option<(u64, u64)>,
+    mode: RunMode,
+) -> Started {
+    settings.max_parallel_reviewers = 1;
+    let host = LocalHost::new(repo.path()).expect("local host");
+    let session = session_of(&store);
+    let head_sha = rev_parse(repo.path(), "HEAD");
     let mut llm = ScriptedLlm::per_agent(model(), scripts);
     if let Some((input, output)) = usage_per_call {
         llm = llm.usage_per_call(input, output);
@@ -249,7 +286,7 @@ fn start_with(
     let (control, rx, handle) = start_pipeline(PipelineInputs {
         store: store.clone(),
         session_id: session,
-        snapshot: Arc::new(snapshot()),
+        snapshot: Arc::new(snapshot_at(&head_sha)),
         repo_root: repo.path().to_path_buf(),
         sandbox,
         settings,
@@ -257,7 +294,7 @@ fn start_with(
         llm: main_llm,
         lookup_llm: None,
         interaction,
-        mode: RunMode::Full,
+        mode,
         bash_disabled,
     });
     Started {
@@ -269,6 +306,21 @@ fn start_with(
         session,
         _repo: repo,
     }
+}
+
+/// The full SHA `rev` resolves to in `repo`.
+fn rev_parse(repo: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", rev])
+        .output()
+        .expect("git on PATH");
+    assert!(
+        out.status.success(),
+        "git rev-parse {rev} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// The next event, failing the test rather than hanging forever.
@@ -1017,4 +1069,271 @@ async fn bash_disabled_drops_the_tools_and_says_why() {
             "{prefix}: {names:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn incremental_run_reviews_only_touched_groups_and_passes_qa() {
+    let repo = Arc::new(fixture_repo());
+    let store = fresh_store();
+
+    // Run 1: the full review, same script as the full-review test, so the
+    // session ends with two open (Draft) findings: 1 = asset summary,
+    // 2 = the src/a.rs duplication.
+    let mut first: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    first.insert("scout".into(), scout_step(brief_two_groups()));
+    first.insert(
+        "reviewer".into(),
+        vec![
+            asset_review_step(),
+            ScriptStep::Text("asset checked".into()),
+            core_review_step(),
+            ScriptStep::Text("all checked".into()),
+        ],
+    );
+    first.insert(
+        "verifier".into(),
+        vec![verdicts_step(&[1]), verdicts_step(&[2])],
+    );
+    first.insert(
+        "assembler".into(),
+        vec![draft_step(
+            "comment",
+            "a duplication risk and a heavy asset",
+        )],
+    );
+    let mut s1 = start_in(
+        repo.clone(),
+        store.clone(),
+        first,
+        AiSettings::default(),
+        None,
+        None,
+        RunMode::Full,
+    );
+    drain_until_end(&mut s1.rx, |_| {}).await;
+    assert_eq!(s1.handle.await.expect("run 1 joins"), RunStatus::Completed);
+
+    // The PR moves: one new commit touching only `src/a.rs`. The user also
+    // answered a question in the meantime, which belongs to the session.
+    let since = rev_parse(repo.path(), "HEAD");
+    std::fs::write(
+        repo.path().join("src/a.rs"),
+        "fn one() {}\nfn two() {}\nfn helper_dup() {\n    helper();\n}\nfn three() {}\n",
+    )
+    .expect("write a head2");
+    gitx(repo.path(), &["add", "-A"]);
+    gitx(repo.path(), &["commit", "-m", "add three"]);
+    store
+        .qa_insert(s1.session, "is empty allowed?", Some("yes"))
+        .expect("qa row");
+
+    // Run 2: incremental from the previous head. The prior check marks both
+    // open findings addressed; only g1 (src/a.rs) is re-reviewed.
+    let mut second: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    second.insert(
+        "prior_check".into(),
+        vec![ScriptStep::ToolCalls(vec![(
+            "submit_prior_states".to_string(),
+            json!({"states": [
+                {"finding_id": 1, "state": "addressed", "reason": "the logo was compressed"},
+                {"finding_id": 2, "state": "addressed", "reason": "helper_dup now calls util::helper"},
+            ]}),
+        )])],
+    );
+    second.insert("scout".into(), scout_step(brief_two_groups()));
+    second.insert(
+        "reviewer".into(),
+        vec![core_review_step(), ScriptStep::Text("all checked".into())],
+    );
+    // Only the new finding (id 3, the ids continue across runs) is verified.
+    second.insert("verifier".into(), vec![verdicts_step(&[3])]);
+    second.insert(
+        "assembler".into(),
+        vec![draft_step("comment", "the re-review found one issue")],
+    );
+
+    let mut s = start_in(
+        repo.clone(),
+        store.clone(),
+        second,
+        AiSettings::default(),
+        None,
+        None,
+        RunMode::Incremental { since_sha: since },
+    );
+    let events = drain_until_end(&mut s.rx, |_| {}).await;
+    assert_eq!(
+        s.handle.await.expect("the orchestrator joins"),
+        RunStatus::Completed
+    );
+
+    // The prior check ran before the scout.
+    let markers = markers(&events);
+    let prior_started = markers
+        .iter()
+        .position(|m| m == "prior_check:started")
+        .expect("the prior check started");
+    let prior_done = markers
+        .iter()
+        .position(|m| m == "prior_check:done")
+        .expect("the prior check finished");
+    let scout_started = markers
+        .iter()
+        .position(|m| m == "scout:started")
+        .expect("the scout started");
+    assert!(
+        prior_started < prior_done && prior_done < scout_started,
+        "prior check before the scout: {markers:?}"
+    );
+
+    // Only the group a changed file touches was reviewed.
+    let groups = s.control.status().groups;
+    assert_eq!(
+        groups,
+        vec![
+            ("g1".to_string(), GroupState::Done),
+            ("g2".to_string(), GroupState::Skipped),
+        ],
+        "g2 (assets) was untouched"
+    );
+    assert_eq!(
+        s.llm.requests_for("reviewer").len(),
+        2,
+        "one reviewer turn plus its closing text"
+    );
+
+    // The prior check saw both open findings and the changed files.
+    let prior_seed = request_text(&s.llm.requests_for("prior_check").remove(0));
+    assert!(
+        prior_seed.contains("## Open findings from previous reviews"),
+        "{prior_seed}"
+    );
+    assert!(prior_seed.contains("### #1"), "{prior_seed}");
+    assert!(prior_seed.contains("### #2"), "{prior_seed}");
+    assert!(
+        prior_seed.contains("## Changed files since last review"),
+        "{prior_seed}"
+    );
+    assert!(prior_seed.contains("src/a.rs"), "{prior_seed}");
+
+    // The scout built on the previous brief and saw the new files and commits.
+    let scout_seed = request_text(&s.llm.requests_for("scout").remove(0));
+    assert!(scout_seed.contains("## Previous brief"), "{scout_seed}");
+    assert!(
+        scout_seed.contains("## Changed since last review"),
+        "{scout_seed}"
+    );
+    assert!(
+        scout_seed.contains("## Commits since last review"),
+        "{scout_seed}"
+    );
+    assert!(scout_seed.contains("add three"), "{scout_seed}");
+
+    // Every agent's seed carries the session's answered question — the
+    // reviewer here is the one that never asked it.
+    let reviewer_seed = request_text(&s.llm.requests_for("reviewer").remove(0));
+    assert!(
+        reviewer_seed.contains("## Known facts from the user"),
+        "{reviewer_seed}"
+    );
+    assert!(
+        reviewer_seed.contains("Q: is empty allowed?\nA: yes"),
+        "{reviewer_seed}"
+    );
+
+    // Both prior findings moved to Addressed, with the reasons, in the store
+    // as well as through events.
+    let findings = s.store.finding_list(s.session).expect("findings");
+    let first = findings.iter().find(|f| f.id == 1).expect("finding 1");
+    let second = findings.iter().find(|f| f.id == 2).expect("finding 2");
+    assert_eq!(first.state, FindingState::Addressed);
+    assert_eq!(
+        first.state_reason.as_deref(),
+        Some("the logo was compressed")
+    );
+    assert_eq!(second.state, FindingState::Addressed);
+    assert_eq!(
+        second.state_reason.as_deref(),
+        Some("helper_dup now calls util::helper")
+    );
+    for id in [1, 2] {
+        assert!(
+            count_events(&events, |e| matches!(
+                e,
+                PipelineEvent::FindingChanged { id: changed } if *changed == id
+            )) == 1,
+            "finding {id} announced once"
+        );
+    }
+
+    // The re-review produced its own finding, verified and drafted.
+    let new_finding = findings.iter().find(|f| f.id == 3).expect("finding 3");
+    assert_eq!(new_finding.state, FindingState::Draft);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PipelineEvent::DraftReady { .. })),
+        "the draft is ready"
+    );
+}
+
+#[tokio::test]
+async fn prior_check_skipped_when_no_open_findings() {
+    let repo = Arc::new(fixture_repo());
+    let since = rev_parse(repo.path(), "HEAD~1");
+
+    // An incremental run on a session with no previous findings: the prior
+    // check stage does not exist for this run at all — no events, no agent.
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_two_groups()));
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            asset_review_step(),
+            ScriptStep::Text("asset checked".into()),
+            core_review_step(),
+            ScriptStep::Text("all checked".into()),
+        ],
+    );
+    scripts.insert(
+        "verifier".into(),
+        vec![verdicts_step(&[1]), verdicts_step(&[2])],
+    );
+    scripts.insert(
+        "assembler".into(),
+        vec![draft_step(
+            "comment",
+            "a duplication risk and a heavy asset",
+        )],
+    );
+
+    let mut s = start_in(
+        repo,
+        fresh_store(),
+        scripts,
+        AiSettings::default(),
+        None,
+        None,
+        RunMode::Incremental { since_sha: since },
+    );
+    let events = drain_until_end(&mut s.rx, |_| {}).await;
+    assert_eq!(
+        s.handle.await.expect("the orchestrator joins"),
+        RunStatus::Completed
+    );
+
+    assert!(
+        !markers(&events)
+            .iter()
+            .any(|m| m.starts_with("prior_check")),
+        "no prior-check stage: {:?}",
+        markers(&events)
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            PipelineEvent::AgentStarted { agent, .. } if agent.role == AgentRole::PriorCheck
+        )),
+        "no prior-check agent"
+    );
 }

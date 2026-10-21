@@ -29,6 +29,7 @@ mod gh;
 mod git;
 mod inspect;
 mod interact;
+mod prior;
 mod record;
 mod search;
 mod skills;
@@ -49,6 +50,8 @@ pub use brief::{SharedBrief, SubmitBrief};
 pub use draft::{SharedDraft, SubmitReviewDraft};
 pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
 pub use git::validate_rev;
+pub use prior::{NewAnchor, PriorState, PriorStateKind, SharedPriorStates, SubmitPriorStates};
+pub(crate) use record::resolve_side;
 pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};
 pub use verdict::{SharedVerdicts, SubmitVerdicts, Verdict, VerdictKind};
 
