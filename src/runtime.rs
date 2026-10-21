@@ -731,13 +731,17 @@ pub enum Event {
         message: String,
     },
     /// The plan found another PR still holding the repository's checkout
-    /// (spec §4 step 7); the UI offers to finish that review first.
+    /// (spec §4 step 7); the UI offers to finish that review first, or — when
+    /// its review is already over — to restore the checkout right there.
     #[cfg(unix)]
     AiCheckoutHeld {
         /// The session that asked.
         session: SessionId,
         /// The holding PR's number.
         pr_number: u64,
+        /// The holding record's id when no live run can finish it, so the
+        /// dialog can restore the checkout (Task 4 review finding 2).
+        restore: Option<i64>,
     },
     /// A notice for the AI tab's timeline: the state a left-as-is checkout
     /// was stopped in (spec §7.3 step 1), folded into a

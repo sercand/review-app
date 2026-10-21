@@ -298,6 +298,13 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
         {
             actions.push(AiPanelAction::Continue);
         }
+        // A plan waiting for confirmation can be abandoned from here too:
+        // the confirm dialog is the usual path, but a dialog that never
+        // reached the screen (or was replaced) must not strand a spinner
+        // with no way out (Task 4 review findings 1 and 3).
+        if st.phase == AiPhase::Planning && ui.button("Cancel").clicked() {
+            actions.push(AiPanelAction::Cancel);
+        }
     });
 }
 
@@ -980,5 +987,25 @@ mod tests {
             vec![AiPanelAction::Start],
             "a restored run can be started again from the tab"
         );
+    }
+
+    /// A tab waiting for a checkout confirmation offers its own way out of
+    /// the spinner, so a dialog that never reached the screen (or was
+    /// replaced by the recovery list) cannot strand it (Task 4 review
+    /// findings 1 and 3).
+    #[test]
+    fn a_planning_tab_can_cancel_from_the_panel() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = panel_harness(AiReviewState {
+            phase: AiPhase::Planning,
+            ..AiReviewState::default()
+        });
+        harness.get_by_label("Cancel").click();
+        // The planning spinner asks for a repaint every frame, so the
+        // harness cannot settle: step the click frame and the one after.
+        harness.step();
+        harness.step();
+        assert_eq!(*harness.state(), vec![AiPanelAction::Cancel]);
     }
 }

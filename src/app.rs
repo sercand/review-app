@@ -504,29 +504,33 @@ impl ReviewApp {
                 // The failure toasts for any PR (the run may outlive the
                 // screen), and ends that PR's flow's dialog; the app-wide
                 // recovery dialog belongs to no PR and stays.
-                if self.ai_screen_is(session)
-                    && !matches!(
-                        self.ai_dialog,
-                        Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
-                    )
-                {
+                if self.ai_screen_is(session) && !self.recovery_dialog_open() {
                     self.ai_dialog = None;
                 }
                 self.toasts.push(message, now);
             }
             #[cfg(unix)]
-            Event::AiCheckoutPlanned { session, plan } if self.ai_screen_is(session) => {
+            Event::AiCheckoutPlanned { session, plan }
+                if self.ai_screen_is(session) && !self.recovery_dialog_open() =>
+            {
                 self.ai_dialog = Some(crate::ui::widgets::ai_dialogs::AiDialog::ConfirmCheckout(
                     plan,
                 ));
                 self.ai_dialog_error = None;
             }
             #[cfg(unix)]
-            Event::AiCheckoutHeld { session, pr_number } if self.ai_screen_is(session) => {
-                self.ai_dialog = Some(crate::ui::widgets::ai_dialogs::AiDialog::Held { pr_number });
+            Event::AiCheckoutHeld {
+                session,
+                pr_number,
+                restore,
+            } if self.ai_screen_is(session) && !self.recovery_dialog_open() => {
+                self.ai_dialog =
+                    Some(crate::ui::widgets::ai_dialogs::AiDialog::Held { pr_number, restore });
             }
             #[cfg(unix)]
-            Event::AiRestoreNeedsDecision { session, changes } if self.ai_screen_is(session) => {
+            Event::AiRestoreNeedsDecision { session, changes }
+                if self.ai_screen_is(session) && !self.recovery_dialog_open() =>
+            {
                 self.ai_dialog =
                     Some(crate::ui::widgets::ai_dialogs::AiDialog::Restore { lines: changes });
             }
@@ -534,10 +538,7 @@ impl ReviewApp {
             Event::AiRestored { session, .. } if self.ai_screen_is(session) => {
                 // A recovery restore (from the app-wide dialog) has no
                 // session and never lands here.
-                if !matches!(
-                    self.ai_dialog,
-                    Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
-                ) {
+                if !self.recovery_dialog_open() {
                     self.ai_dialog = None;
                 }
             }
@@ -657,9 +658,29 @@ impl ReviewApp {
 
     /// Leave the detail screen for the list, flushing the session first:
     /// it stays loaded for a fast return, but its owed writes do not wait.
+    /// The PR-scoped AI dialogs go with it — a Confirm dialog left floating
+    /// over the list would run `ConfirmCheckout` against the PR just left
+    /// (Task 4 review finding 1); the recovery list is app-wide and stays.
     fn close_detail(&mut self) {
         self.flush_session();
+        #[cfg(unix)]
+        self.close_ai_flow_dialog();
         self.screen = ScreenKind::PrList;
+    }
+
+    /// Close the PR-scoped AI dialogs. The crash-recovery dialog belongs to
+    /// no PR (its records name their own repositories), so it survives
+    /// navigation the way it survives `open_pr`.
+    #[cfg(unix)]
+    fn close_ai_flow_dialog(&mut self) {
+        if !self
+            .ai_dialog
+            .as_ref()
+            .is_some_and(crate::ui::widgets::ai_dialogs::survives_navigation)
+        {
+            self.ai_dialog = None;
+            self.ai_dialog_error = None;
+        }
     }
 
     /// Store the token and cache the account for the next launch.
@@ -1037,13 +1058,7 @@ impl ReviewApp {
         // The AI dialogs belong to the PR being left (Task 4); the
         // crash-recovery dialog is app-wide and stays open.
         #[cfg(unix)]
-        if !matches!(
-            self.ai_dialog,
-            Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
-        ) {
-            self.ai_dialog = None;
-            self.ai_dialog_error = None;
-        }
+        self.close_ai_flow_dialog();
         // The diff layout is a global preference (Task 7): every PR opens
         // the way the reviewer left the last one.
         let prefs = self.settings.diff;
@@ -1408,6 +1423,17 @@ impl ReviewApp {
         self.screen == ScreenKind::PrDetail && self.session_is(session)
     }
 
+    /// Whether the app-wide crash-recovery dialog is open. While the user is
+    /// answering it, no PR-scoped flow dialog may replace it — the list would
+    /// be lost until the next launch (Task 4 review finding 3).
+    #[cfg(unix)]
+    fn recovery_dialog_open(&self) -> bool {
+        matches!(
+            self.ai_dialog,
+            Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(_))
+        )
+    }
+
     /// Drop the tab's suggested-commands card once the repo's settings name
     /// commands: the scout's proposals are for repos that have none (spec
     /// §4 step 1), and a stored brief keeps carrying them.
@@ -1591,6 +1617,15 @@ impl ReviewApp {
                     key,
                 });
                 session.ai.set_paused(false);
+            }
+            // A cancelled plan has no run to cancel in the worker: the tab's
+            // own `Planning` is cleared here. That is the backstop when a
+            // plan's dialog never reached the screen (Task 4 review
+            // findings 1 and 3).
+            AiPanelAction::Cancel
+                if session.ai.phase == crate::state::ai_review::AiPhase::Planning =>
+            {
+                session.ai.cancel_planning();
             }
             AiPanelAction::Cancel => self.worker.send(Command::AiCancel {
                 session: session.id,
@@ -1824,13 +1859,19 @@ impl ReviewApp {
             }
             AiDialogAction::RecoverRestore(id) => {
                 self.worker.send(Command::AiRecoverRestore { id });
-                // Drop the restored row from the dialog; close it when the
-                // last one goes. The worker toasts the outcome.
-                if let Some(AiDialog::Recovery(records)) = &mut self.ai_dialog {
-                    records.retain(|record| record.id != id);
-                    if records.is_empty() {
-                        self.ai_dialog = None;
+                // Drop the restored row from the recovery list (closing it
+                // when the last one goes), and close a Held dialog — the
+                // restore it offered is on its way and the toast reports
+                // the outcome.
+                match &mut self.ai_dialog {
+                    Some(AiDialog::Recovery(records)) => {
+                        records.retain(|record| record.id != id);
+                        if records.is_empty() {
+                            self.ai_dialog = None;
+                        }
                     }
+                    Some(AiDialog::Held { .. }) => self.ai_dialog = None,
+                    _ => {}
                 }
             }
             AiDialogAction::RecoverLater => self.ai_dialog = None,
@@ -2080,7 +2121,7 @@ impl ReviewApp {
             "find" => self.pr_detail.find_open = true,
             "settings" => self.open_settings(),
             "help" => self.help_open = !self.help_open,
-            "close" => self.dispatch_close(),
+            "close" => self.dispatch_close(now),
             "next_file" => self.step_file(true, now),
             "prev_file" => self.step_file(false, now),
             "next_hunk" => self.step_hunk(true),
@@ -2165,7 +2206,7 @@ impl ReviewApp {
     /// hidden session's open composer must not swallow the `Esc` that was
     /// meant for the visible screen. Leaving for the list flushes the
     /// session's debounced writes (spec §11).
-    fn dispatch_close(&mut self) {
+    fn dispatch_close(&mut self, now: Instant) {
         if self.palette.open {
             self.palette.close();
             return;
@@ -2176,6 +2217,16 @@ impl ReviewApp {
         }
         if self.settings_window.open {
             self.settings_window.close();
+            return;
+        }
+        // An AI dialog floats over the screen and owns `Esc` before it: the
+        // key answers the dialog (or is refused by the restore decision) and
+        // must never also leave the PR behind it (Task 4 review finding 1).
+        #[cfg(unix)]
+        if let Some(dialog) = self.ai_dialog.clone() {
+            if let Some(action) = crate::ui::widgets::ai_dialogs::dismiss_action(&dialog) {
+                self.apply_ai_dialog_action(action, now);
+            }
             return;
         }
         if self.screen != ScreenKind::PrDetail {

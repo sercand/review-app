@@ -412,8 +412,29 @@ impl AiHub {
             }
             // The held case gets its own event so the UI can name the
             // holding PR (spec §4 step 7); every other failure toasts.
-            Ok(Err(CheckoutError::Held { pr_number })) => {
-                events.send(Event::AiCheckoutHeld { session, pr_number });
+            Ok(Err(CheckoutError::Held {
+                pr_number,
+                record_id,
+            })) => {
+                // A holding record with no live run cannot be finished —
+                // Finish would toast "no AI review is running" — so offer
+                // the restore instead (Task 4 review finding 2).
+                let live = self
+                    .runs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys()
+                    .any(|run| {
+                        run.number == pr_number
+                            && run.host.eq_ignore_ascii_case(&key.host)
+                            && run.owner.eq_ignore_ascii_case(&key.owner)
+                            && run.repo.eq_ignore_ascii_case(&key.repo)
+                    });
+                events.send(Event::AiCheckoutHeld {
+                    session,
+                    pr_number,
+                    restore: (!live).then_some(record_id),
+                });
             }
             Ok(Err(error)) => events.send(Event::AiCheckoutFailed {
                 session,
@@ -1138,7 +1159,8 @@ fn short(sha: &str) -> &str {
 
 /// The Notice text for a checkout the user chose to leave as is (spec §7.3
 /// step 1): where the tree stands, what holds their original work, and how
-/// the checkout gets restored later.
+/// the checkout gets restored later — the Held dialog offers the restore on
+/// the next review in this repo, and the launch recovery list names it.
 fn left_as_is_text(rec: &CheckoutRecord, changes: usize) -> String {
     let stash = match &rec.stash_sha {
         Some(sha) => format!(
@@ -1149,7 +1171,8 @@ fn left_as_is_text(rec: &CheckoutRecord, changes: usize) -> String {
     };
     format!(
         "left the checkout as is: {} is still on PR #{}'s head with {changes} change(s) from \
-         the review; {} is recorded and {stash}. The next start offers to restore it.",
+         the review; {} is recorded and {stash}. Starting a review on another pull request in \
+         this repository offers to restore it, and so does the next launch.",
         rec.repo_path.display(),
         rec.pr_number,
         original_ref_text(&rec.original),
@@ -1912,6 +1935,10 @@ mod tests {
                 assert_eq!(session, SessionId(1));
                 assert!(text.contains("left the checkout as is"), "{text}");
                 assert!(text.contains("branch main"), "{text}");
+                assert!(
+                    text.contains("another pull request"),
+                    "the advice names the route that exists: {text}"
+                );
             }
             _ => unreachable!(),
         }
@@ -1953,6 +1980,66 @@ mod tests {
         assert!(
             fx.store.checkouts_unrestored().expect("list").is_empty(),
             "the record is restored"
+        );
+    }
+
+    /// After Keep the record still holds the repo with no run behind it, so
+    /// "finish that review" can never work. A review on another PR in the
+    /// same repo must get a Held event that carries the record, letting the
+    /// dialog restore it right there (Task 4 review finding 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_after_keep_offers_the_restore_finish_cannot() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        std::fs::write(fx.clone.join("a.txt"), "my local edit\n").expect("dirty");
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        // The run's own change makes Keep the only option that keeps it.
+        std::fs::write(fx.clone.join("stray.txt"), "agent wrote me\n").expect("stray");
+        fx.hub
+            .finish(SessionId(1), &fx.key, Some(false), &fx.tx)
+            .await;
+        wait_for(&fx.events, |e| matches!(e, Event::AiNotice { .. }));
+        let rec = fx
+            .store
+            .checkouts_unrestored()
+            .expect("the recovery list")
+            .into_iter()
+            .next()
+            .expect("#7 still holds the repo");
+
+        // A review on PR #8 in the same repository is held — and told where
+        // the checkout can be restored from.
+        let mut other_pr = fx.pr.clone();
+        other_pr.number = 8;
+        let other_key = PrKey {
+            number: 8,
+            ..fx.key.clone()
+        };
+        fx.hub
+            .plan_checkout(SessionId(1), other_key, other_pr, &fx.tx)
+            .await;
+        match wait_for(&fx.events, |e| matches!(e, Event::AiCheckoutHeld { .. })) {
+            Event::AiCheckoutHeld {
+                pr_number, restore, ..
+            } => {
+                assert_eq!(pr_number, 7, "the holding PR is named");
+                assert_eq!(
+                    restore,
+                    Some(rec.id),
+                    "the dialog gets the record, not only the number"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // That restore is real: #8's next plan is free to proceed.
+        fx.hub.recover_restore(rec.id, &fx.tx).await;
+        wait_for(&fx.events, |e| matches!(e, Event::Toast(_)));
+        assert!(
+            fx.store.checkouts_unrestored().expect("list").is_empty(),
+            "the holding record is restored"
         );
     }
 }

@@ -38,6 +38,10 @@ pub enum AiDialog {
     Held {
         /// The holding PR's number.
         pr_number: u64,
+        /// The holding record's id when its review has no live run to
+        /// finish; the dialog then offers to restore it right here instead
+        /// of pointing at a Finish that would toast "no review is running".
+        restore: Option<i64>,
     },
 }
 
@@ -123,7 +127,9 @@ pub struct DialogInputs<'a> {
 
 /// Paint the dialog over every screen; `ctx` hosts the window the way the
 /// settings window and palette do. The frame, header and width follow those
-/// modals, and the X/Esc dismiss what the dialog's own Cancel would.
+/// modals. The X reports [`dismiss_action`]; `Esc` is the app's
+/// `dispatch_close`, which reports the same action — one owner, so the key
+/// can never dismiss the dialog *and* leave the PR behind it.
 pub fn render(
     ctx: &egui::Context,
     dialog: &AiDialog,
@@ -154,44 +160,50 @@ pub fn render(
                 AiDialog::ConfirmCheckout(plan) => confirm_checkout(ui, plan, inputs, actions),
                 AiDialog::Restore { lines } => restore(ui, lines, actions),
                 AiDialog::Recovery(records) => recovery(ui, records, actions),
-                AiDialog::Held { pr_number } => held(ui, *pr_number, actions),
+                AiDialog::Held { pr_number, restore } => held(ui, *pr_number, *restore, actions),
             }
         });
-    // Esc is the X. A dialog with no dismiss (the restore decision) must be
-    // answered: Escape cannot silently stop the run.
-    let escaped = dismiss.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    // The X reports the same answer Esc does; Esc itself is the app's
+    // `dispatch_close`, which reads [`dismiss_action`] — one owner for the
+    // key, so it cannot both dismiss the dialog and leave the PR.
     if let Some(action) = dismiss
-        && (closed || escaped)
+        && closed
     {
         actions.push(action);
     }
 }
 
+/// What the X (and `Esc`, via the app's close chain) does to `dialog`: its
+/// non-destructive answer, or `None` when the user must answer it — the
+/// restore decision cannot be silently dropped.
+pub fn dismiss_action(dialog: &AiDialog) -> Option<AiDialogAction> {
+    match dialog {
+        AiDialog::PickFolder { .. } | AiDialog::ConfirmCheckout(_) | AiDialog::Held { .. } => {
+            Some(AiDialogAction::CancelCheckout)
+        }
+        AiDialog::Restore { .. } => None,
+        AiDialog::Recovery(_) => Some(AiDialogAction::RecoverLater),
+    }
+}
+
+/// Whether a dialog outlives the PR screen it opened over: only the app-wide
+/// recovery list does. The rest are PR-scoped, and a flow dialog left
+/// floating over the list could act on the session the user just left
+/// (Task 4 review finding 1).
+pub fn survives_navigation(dialog: &AiDialog) -> bool {
+    matches!(dialog, AiDialog::Recovery(_))
+}
+
 /// A dialog's title, width, and what its X/Esc means (`None`: it must be
 /// answered).
 fn dialog_meta(dialog: &AiDialog, inputs: &DialogInputs) -> (String, f32, Option<AiDialogAction>) {
+    let dismiss = dismiss_action(dialog);
     match dialog {
-        AiDialog::PickFolder { .. } => (
-            "Pick the repository folder".to_string(),
-            440.0,
-            Some(AiDialogAction::CancelCheckout),
-        ),
-        AiDialog::ConfirmCheckout(_) => (
-            checkout_title(inputs.pr),
-            500.0,
-            Some(AiDialogAction::CancelCheckout),
-        ),
-        AiDialog::Restore { .. } => ("Changes made during the review".to_string(), 500.0, None),
-        AiDialog::Recovery(_) => (
-            "Unrestored AI checkouts".to_string(),
-            580.0,
-            Some(AiDialogAction::RecoverLater),
-        ),
-        AiDialog::Held { .. } => (
-            "Repository in use".to_string(),
-            400.0,
-            Some(AiDialogAction::CancelCheckout),
-        ),
+        AiDialog::PickFolder { .. } => ("Pick the repository folder".to_string(), 440.0, dismiss),
+        AiDialog::ConfirmCheckout(_) => (checkout_title(inputs.pr), 500.0, dismiss),
+        AiDialog::Restore { .. } => ("Changes made during the review".to_string(), 500.0, dismiss),
+        AiDialog::Recovery(_) => ("Unrestored AI checkouts".to_string(), 580.0, dismiss),
+        AiDialog::Held { .. } => ("Repository in use".to_string(), 400.0, dismiss),
     }
 }
 
@@ -343,14 +355,43 @@ fn recovery(ui: &mut egui::Ui, records: &[CheckoutRecord], actions: &mut Vec<AiD
     }
 }
 
-/// Another PR holds this repository's checkout (spec §4 step 7).
-fn held(ui: &mut egui::Ui, pr_number: u64, actions: &mut Vec<AiDialogAction>) {
-    ui.label(format!(
-        "PR #{pr_number} is still checked out in this repository. \
-         Finish that review before starting one here."
-    ));
-    if Btn::new(BtnKind::Primary, "OK").show(ui).clicked() {
-        actions.push(AiDialogAction::CancelCheckout);
+/// Another PR holds this repository's checkout (spec §4 step 7). When its
+/// review has no live run, the dialog offers the restore the old advice
+/// ("finish that review") could not deliver — the run is gone, so only a
+/// restore unlocks the repo.
+fn held(
+    ui: &mut egui::Ui,
+    pr_number: u64,
+    restore: Option<i64>,
+    actions: &mut Vec<AiDialogAction>,
+) {
+    match restore {
+        Some(id) => {
+            ui.label(format!(
+                "PR #{pr_number} still holds this repository's checkout, but its review is \
+                 over. Restore that checkout to start a review here."
+            ));
+            ui.horizontal(|ui| {
+                if Btn::new(BtnKind::Primary, "Restore it now")
+                    .show(ui)
+                    .clicked()
+                {
+                    actions.push(AiDialogAction::RecoverRestore(id));
+                }
+                if Btn::new(BtnKind::Ghost, "Not now").show(ui).clicked() {
+                    actions.push(AiDialogAction::CancelCheckout);
+                }
+            });
+        }
+        None => {
+            ui.label(format!(
+                "PR #{pr_number} is still checked out in this repository. \
+                 Finish that review before starting one here."
+            ));
+            if Btn::new(BtnKind::Primary, "OK").show(ui).clicked() {
+                actions.push(AiDialogAction::CancelCheckout);
+            }
+        }
     }
 }
 
@@ -522,7 +563,14 @@ mod tests {
             "closing the recovery list leaves the checkouts as they are"
         );
         assert_eq!(
-            dialog_meta(&AiDialog::Held { pr_number: 9 }, &inputs).2,
+            dialog_meta(
+                &AiDialog::Held {
+                    pr_number: 9,
+                    restore: None,
+                },
+                &inputs
+            )
+            .2,
             Some(AiDialogAction::CancelCheckout)
         );
         assert_eq!(
@@ -575,7 +623,14 @@ mod tests {
                 lines: vec!["?? stray.txt".to_string()],
             },
             AiDialog::Recovery(vec![record]),
-            AiDialog::Held { pr_number: 9 },
+            AiDialog::Held {
+                pr_number: 9,
+                restore: None,
+            },
+            AiDialog::Held {
+                pr_number: 9,
+                restore: Some(3),
+            },
         ] {
             let mut actions = Vec::new();
             let inputs = DialogInputs {
@@ -588,5 +643,115 @@ mod tests {
             });
             assert!(actions.is_empty(), "{dialog:?} reported {actions:?}");
         }
+    }
+
+    /// `Esc` (through the app's close chain) resolves to each dialog's safe
+    /// answer, and the restore decision has none: it must be answered
+    /// (Task 4 review finding 1).
+    #[test]
+    fn escaping_a_dialog_maps_to_its_safe_action() {
+        let plan = CheckoutPlan {
+            repo_path: PathBuf::from("/repo"),
+            remote: "origin".to_string(),
+            original: OriginalRef::Branch("main".to_string()),
+            dirty: false,
+            commands: Vec::new(),
+        };
+        assert_eq!(
+            dismiss_action(&AiDialog::PickFolder { key: key() }),
+            Some(AiDialogAction::CancelCheckout)
+        );
+        assert_eq!(
+            dismiss_action(&AiDialog::ConfirmCheckout(plan)),
+            Some(AiDialogAction::CancelCheckout)
+        );
+        assert_eq!(
+            dismiss_action(&AiDialog::Held {
+                pr_number: 9,
+                restore: Some(3),
+            }),
+            Some(AiDialogAction::CancelCheckout),
+            "the held notice's safe answer never restores by accident"
+        );
+        assert_eq!(
+            dismiss_action(&AiDialog::Recovery(Vec::new())),
+            Some(AiDialogAction::RecoverLater)
+        );
+        assert_eq!(
+            dismiss_action(&AiDialog::Restore {
+                lines: vec!["?? stray.txt".to_string()],
+            }),
+            None,
+            "Esc cannot silently stop the restore"
+        );
+    }
+
+    /// Leaving the PR closes the flow dialogs — a Confirm left floating over
+    /// the list would check out and run against the session just left — but
+    /// the app-wide recovery list stays (Task 4 review finding 1).
+    #[test]
+    fn only_the_recovery_list_survives_leaving_the_pr() {
+        let plan = CheckoutPlan {
+            repo_path: PathBuf::from("/repo"),
+            remote: "origin".to_string(),
+            original: OriginalRef::Branch("main".to_string()),
+            dirty: false,
+            commands: Vec::new(),
+        };
+        for dialog in [
+            AiDialog::PickFolder { key: key() },
+            AiDialog::ConfirmCheckout(plan),
+            AiDialog::Restore {
+                lines: vec!["?? stray.txt".to_string()],
+            },
+            AiDialog::Held {
+                pr_number: 9,
+                restore: Some(3),
+            },
+        ] {
+            assert!(!survives_navigation(&dialog), "{dialog:?} is PR-scoped");
+        }
+        assert!(
+            survives_navigation(&AiDialog::Recovery(Vec::new())),
+            "the recovery list belongs to no PR"
+        );
+    }
+
+    /// A held repository whose review is over offers the restore its old
+    /// advice ("finish that review") could not deliver (Task 4 review
+    /// finding 2).
+    #[test]
+    fn a_finished_reviews_held_checkout_offers_a_restore() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([600.0, 400.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, actions: &mut Vec<AiDialogAction>| {
+                    let inputs = DialogInputs {
+                        pr: None,
+                        prepare: &[],
+                        error: None,
+                    };
+                    render(
+                        ui.ctx(),
+                        &AiDialog::Held {
+                            pr_number: 7,
+                            restore: Some(3),
+                        },
+                        &inputs,
+                        actions,
+                    );
+                },
+                Vec::new(),
+            );
+        harness.get_by_label("Restore it now").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiDialogAction::RecoverRestore(3)],
+            "the button restores the record that holds the repo"
+        );
     }
 }

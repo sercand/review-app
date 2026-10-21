@@ -81,6 +81,9 @@ pub enum CheckoutError {
     Held {
         /// The other PR's number.
         pr_number: u64,
+        /// The holding record's id, so a UI with no live run for that PR
+        /// can offer to restore it (Task 4 review finding 2).
+        record_id: i64,
     },
     /// The working tree has changes made during the review; the user must
     /// choose to discard them or leave the checkout in place (§7.3 step 1).
@@ -278,6 +281,7 @@ pub fn plan_checkout(
     {
         return Err(CheckoutError::Held {
             pr_number: rec.pr_number,
+            record_id: rec.id,
         });
     }
 
@@ -1058,8 +1062,14 @@ mod tests {
         };
         let err = plan_checkout(&clone, &other, &store).unwrap_err();
         assert!(
-            matches!(err, CheckoutError::Held { pr_number: 7 }),
-            "expected Held {{ pr_number: 7 }}, got {err:?}"
+            matches!(
+                err,
+                CheckoutError::Held {
+                    pr_number: 7,
+                    record_id: 1
+                }
+            ),
+            "expected Held {{ pr_number: 7, record_id: 1 }}, got {err:?}"
         );
 
         // The same PR may be re-planned (retry after a failed attempt).

@@ -1150,6 +1150,7 @@ mod tests {
         st.apply(&Event::AiCheckoutHeld {
             session: SESSION,
             pr_number: 9,
+            restore: Some(4),
         });
         assert!(
             matches!(&st.phase, AiPhase::Failed(message) if message.contains("#9")),
