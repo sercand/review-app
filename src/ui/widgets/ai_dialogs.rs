@@ -279,7 +279,7 @@ fn confirm_checkout(
         ));
     }
     ui.weak(plan.repo_path.display().to_string());
-    if plan.dirty {
+    if plan.dirty && !plan.skip_stash {
         ui.colored_label(
             p.pending,
             "Your uncommitted changes will be stashed and restored afterwards.",
@@ -547,6 +547,7 @@ mod tests {
             remote: "origin".to_string(),
             original: OriginalRef::Branch("main".to_string()),
             dirty: false,
+            skip_stash: false,
             commands: Vec::new(),
         };
         assert_eq!(
@@ -595,6 +596,7 @@ mod tests {
             remote: "origin".to_string(),
             original: OriginalRef::Branch("main".to_string()),
             dirty: true,
+            skip_stash: false,
             commands: vec!["git fetch origin pull/7/head".to_string()],
         };
         let pr = PrTarget {
@@ -655,6 +657,7 @@ mod tests {
             remote: "origin".to_string(),
             original: OriginalRef::Branch("main".to_string()),
             dirty: false,
+            skip_stash: false,
             commands: Vec::new(),
         };
         assert_eq!(
@@ -696,6 +699,7 @@ mod tests {
             remote: "origin".to_string(),
             original: OriginalRef::Branch("main".to_string()),
             dirty: false,
+            skip_stash: false,
             commands: Vec::new(),
         };
         for dialog in [

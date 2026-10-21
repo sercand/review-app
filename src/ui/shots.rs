@@ -748,6 +748,7 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
         remote: "origin".to_string(),
         original: OriginalRef::Branch("main".to_string()),
         dirty: true,
+        skip_stash: false,
         commands: vec![
             "git fetch origin pull/19/head:refs/remotes/origin/pr-19".to_string(),
             "git switch --detach refs/remotes/origin/pr-19".to_string(),

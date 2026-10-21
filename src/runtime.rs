@@ -485,6 +485,11 @@ pub enum Command {
         /// The `ai_checkout` row id to restore, discarding stray changes.
         id: i64,
     },
+    /// The window is closing: ask the hub whether any AI run still holds a
+    /// checkout (spec §7.3, Task 8). Answers with [`Event::AiQuitHeld`] or
+    /// [`Event::AiQuitClear`]. Not PR-scoped — it covers every run.
+    #[cfg(unix)]
+    AiQuitCheck,
 }
 
 /// A result handed from the worker back to the UI.
@@ -841,6 +846,18 @@ pub enum Event {
     /// (spec §7.3). Not PR-scoped: the UI matches them to sessions by path.
     #[cfg(unix)]
     AiUnrestored(Vec<crate::ai::store::CheckoutRecord>),
+    /// The answer to [`Command::AiQuitCheck`]: these runs still hold a
+    /// checkout, so the app must run the Finish flow for each before the
+    /// window closes (spec §7.3, Task 8).
+    #[cfg(unix)]
+    AiQuitHeld {
+        /// Each held run: the PR to finish and the session its events carry.
+        runs: Vec<crate::ai::hub::RunCloseState>,
+    },
+    /// The answer to [`Command::AiQuitCheck`] when no run holds a checkout:
+    /// the app may close the window (spec §7.3, Task 8).
+    #[cfg(unix)]
+    AiQuitClear,
 }
 
 /// Sends [`Event`]s from worker tasks to the UI thread.
@@ -1660,6 +1677,17 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         #[cfg(unix)]
         Command::AiRecoverRestore { id } => {
             ctx.ai.recover_restore(id, &events).await;
+        }
+        #[cfg(unix)]
+        Command::AiQuitCheck => {
+            // A state read, not I/O: the hub reports what a window close
+            // must finish first, or clears the way to close (spec §7.3).
+            let state = ctx.ai.close_state();
+            if crate::ai::hub::close_requires_finish(&state) {
+                events.send(Event::AiQuitHeld { runs: state.runs });
+            } else {
+                events.send(Event::AiQuitClear);
+            }
         }
         Command::ExpandContext {
             session,

@@ -170,6 +170,12 @@ pub struct RunHandle {
     /// sandbox: the placeholder handle holds the PR's slot so a concurrent
     /// Start is rejected before it can touch the checkout (spec §10.3).
     starting: bool,
+    /// True while a [`Self::finish`] is restoring this run's checkout: a
+    /// second finish — a quit re-check landing mid-restore, or a double
+    /// clicked dialog answer — stands down instead of moving the tree
+    /// twice (Task 8). Cleared when the run is put back awaiting a
+    /// decision, so a stalled decision can be re-raised.
+    finishing: bool,
     /// The orchestrator's handle, awaited by [`AiHub::finish`] so the agents
     /// are gone before the working tree is restored.
     pipeline: Option<JoinHandle<RunStatus>>,
@@ -204,11 +210,55 @@ impl RunHandle {
             chat_setup: None,
             chat_rx: None,
             starting: true,
+            finishing: false,
             pipeline: None,
             tmp_dir: None,
         }
     }
 }
+
+/// One run's part of the window-close decision (spec §7.3, Task 8): what
+/// the GUI thread needs in order to run the Finish flow for it, copied out
+/// of the hub so the decision itself is a pure function over
+/// [`HubCloseState`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunCloseState {
+    /// The PR the run belongs to; `AiFinish { discard: None }` goes to it.
+    pub key: PrKey,
+    /// The run's current session, so the finish's events route like the
+    /// run's other ones (spec §10.2).
+    pub session: SessionId,
+    /// Whether the run holds its repository's checkout. Every real run
+    /// does until `finish` gives it back; a `starting` placeholder has no
+    /// checkout yet and does not hold the window open — closing over a
+    /// start leaves any checkout it makes to the startup recovery, the
+    /// same as a force-quit.
+    pub holds_checkout: bool,
+}
+
+/// The hub state the quit decision reads (spec §7.3, Task 8): one entry
+/// per run handle, with no locks, tasks, or I/O in sight.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HubCloseState {
+    /// One entry per run the hub holds.
+    pub runs: Vec<RunCloseState>,
+}
+
+/// Whether closing the app must run the Finish flow first (spec §7.3):
+/// true when any run still holds a checkout. Closing over one would leave
+/// the repository stashed and detached without asking — the startup
+/// recovery is the fallback for a crash, not the plan for a normal quit.
+pub fn close_requires_finish(hub_state: &HubCloseState) -> bool {
+    hub_state.runs.iter().any(|run| run.holds_checkout)
+}
+
+/// The toast for a control aimed at a run whose `AiStart` is still working
+/// through checkout, prepare, and sandbox; shared by `finish`, `cancel`,
+/// `pause`, and `resume` (Task 8).
+const STILL_STARTING: &str = "the AI review is still starting";
+
+/// The toast for a control aimed at a PR with no run at all.
+const NO_RUN: &str = "no AI review is running for this PR";
 
 /// The worker's AI surface: live runs, confirmed checkout plans, and the
 /// settings the runs read.
@@ -315,6 +365,24 @@ impl AiHub {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Snapshot the run state for the window-close decision (spec §7.3,
+    /// Task 8): every run handle, saying whether it holds a checkout.
+    /// Locks the run map only — no I/O — so the GUI thread may call it
+    /// directly, the way it calls [`Self::set_settings`].
+    pub fn close_state(&self) -> HubCloseState {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        HubCloseState {
+            runs: runs
+                .iter()
+                .map(|(key, run)| RunCloseState {
+                    key: key.clone(),
+                    session: *run.session.lock().unwrap_or_else(|e| e.into_inner()),
+                    holds_checkout: !run.starting,
+                })
+                .collect(),
+        }
     }
 
     fn repo_settings(&self, key: &PrKey) -> Option<RepoAiSettings> {
@@ -831,6 +899,7 @@ impl AiHub {
                 chat_setup,
                 chat_rx: Some(chat_rx),
                 starting: false,
+                finishing: false,
                 pipeline: Some(pipeline),
                 tmp_dir: Some(tmp_dir),
             },
@@ -914,15 +983,11 @@ impl AiHub {
     ) {
         let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
         let Some(run) = runs.get_mut(key) else {
-            events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            ));
+            events.send(Event::Toast(NO_RUN.to_owned()));
             return;
         };
         let Some(chat) = run.chat.as_ref() else {
-            events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            ));
+            events.send(Event::Toast(NO_RUN.to_owned()));
             return;
         };
         // The first message spawns the chat task; the receiver and its setup
@@ -941,36 +1006,50 @@ impl AiHub {
         // the UI's optimistic entry and the echo reconcile in the reducer.
     }
 
-    /// Pause every running agent before its next model call.
+    /// Pause every running agent before its next model call. A start still
+    /// in progress gets the "still starting" refusal, mirroring
+    /// [`Self::finish`] (Task 8).
     pub fn pause(&self, key: &PrKey, events: &EventSender) {
         let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key).and_then(|run| run.control.as_ref()) {
-            Some(control) => control.pause(),
-            None => events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            )),
+        match runs.get(key) {
+            Some(run) if run.starting => {
+                events.send(Event::Toast(STILL_STARTING.to_owned()));
+            }
+            Some(run) => match run.control.as_ref() {
+                Some(control) => control.pause(),
+                None => events.send(Event::Toast(NO_RUN.to_owned())),
+            },
+            None => events.send(Event::Toast(NO_RUN.to_owned())),
         }
     }
 
     /// Release a [`Self::pause`].
     pub fn resume(&self, key: &PrKey, events: &EventSender) {
         let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key).and_then(|run| run.control.as_ref()) {
-            Some(control) => control.resume(),
-            None => events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            )),
+        match runs.get(key) {
+            Some(run) if run.starting => {
+                events.send(Event::Toast(STILL_STARTING.to_owned()));
+            }
+            Some(run) => match run.control.as_ref() {
+                Some(control) => control.resume(),
+                None => events.send(Event::Toast(NO_RUN.to_owned())),
+            },
+            None => events.send(Event::Toast(NO_RUN.to_owned())),
         }
     }
 
     /// Stop the run; the checkout stays held so a re-run is cheap (spec §10.3).
     pub fn cancel(&self, key: &PrKey, events: &EventSender) {
         let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key).and_then(|run| run.control.as_ref()) {
-            Some(control) => control.cancel(),
-            None => events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            )),
+        match runs.get(key) {
+            Some(run) if run.starting => {
+                events.send(Event::Toast(STILL_STARTING.to_owned()));
+            }
+            Some(run) => match run.control.as_ref() {
+                Some(control) => control.cancel(),
+                None => events.send(Event::Toast(NO_RUN.to_owned())),
+            },
+            None => events.send(Event::Toast(NO_RUN.to_owned())),
         }
     }
 
@@ -991,32 +1070,45 @@ impl AiHub {
         discard: Option<bool>,
         events: &EventSender,
     ) {
+        // `None`: no run at all. `Some(None)`: a finish is already
+        // restoring it — the quit flow re-checks while a restore is in
+        // flight — and its events are already on the way (Task 8).
         let taken = {
             let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-            runs.get_mut(key).map(|run| RunHandle {
-                control: run.control.take(),
-                session: run.session.clone(),
-                interaction: run.interaction.clone(),
-                checkout: run.checkout.clone(),
-                chat: run.chat.take(),
-                bash_disabled: run.bash_disabled.clone(),
-                live: run.live.clone(),
-                chat_task: run.chat_task.take(),
-                chat_setup: run.chat_setup.take(),
-                chat_rx: run.chat_rx.take(),
-                starting: run.starting,
-                pipeline: run.pipeline.take(),
-                tmp_dir: run.tmp_dir.clone(),
-            })
+            match runs.get_mut(key) {
+                Some(run) if run.finishing => Some(None),
+                Some(run) => {
+                    run.finishing = true;
+                    Some(Some(RunHandle {
+                        control: run.control.take(),
+                        session: run.session.clone(),
+                        interaction: run.interaction.clone(),
+                        checkout: run.checkout.clone(),
+                        chat: run.chat.take(),
+                        bash_disabled: run.bash_disabled.clone(),
+                        live: run.live.clone(),
+                        chat_task: run.chat_task.take(),
+                        chat_setup: run.chat_setup.take(),
+                        chat_rx: run.chat_rx.take(),
+                        starting: run.starting,
+                        // The clone is what `put_back` re-installs; a run
+                        // put back awaits a decision, not a restore.
+                        finishing: false,
+                        pipeline: run.pipeline.take(),
+                        tmp_dir: run.tmp_dir.clone(),
+                    }))
+                }
+                None => None,
+            }
         };
-        let Some(mut run) = taken else {
-            events.send(Event::Toast(
-                "no AI review is running for this PR".to_owned(),
-            ));
+        let Some(Some(mut run)) = taken else {
+            if taken.is_none() {
+                events.send(Event::Toast(NO_RUN.to_owned()));
+            }
             return;
         };
         if run.starting {
-            events.send(Event::Toast("the AI review is still starting".to_owned()));
+            events.send(Event::Toast(STILL_STARTING.to_owned()));
             self.put_back(key, run);
             return;
         }
@@ -1724,6 +1816,26 @@ mod tests {
         }
     }
 
+    /// Start `pr` on the hub as a task, mirroring what the worker does for
+    /// a confirmed `AiStart`.
+    fn start_run(fx: &HubFixture, pr: PrTarget, mode: RunMode) {
+        let hub = fx.hub.clone();
+        let client = fx.client.clone();
+        let key = fx.key.clone();
+        let inputs = snapshot_inputs(&pr.head_sha);
+        let events = fx.tx.clone();
+        tokio::spawn(async move {
+            hub.start(client, SessionId(1), key, pr, inputs, mode, &events)
+                .await;
+        });
+    }
+
+    /// The canonical path [`crate::ai::checkout::plan_checkout`] stores
+    /// checkout records under.
+    fn canonical(fx: &HubFixture) -> PathBuf {
+        fx.clone.canonicalize().expect("the fixture clone exists")
+    }
+
     fn is_run_end(event: &Event) -> bool {
         matches!(
             event,
@@ -2136,6 +2248,257 @@ mod tests {
         assert!(
             fx.store.checkouts_unrestored().expect("list").is_empty(),
             "the holding record is restored"
+        );
+    }
+
+    // --- the lifecycle (Task 8) ---
+
+    /// A finish over a clean tree is a restore, not a question: the run
+    /// closes with `AiRestored` and no `AiRestoreNeedsDecision` ever
+    /// interrupts (spec §7.3, Task 8).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finish_with_clean_tree_restores_without_asking() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        assert!(
+            close_requires_finish(&fx.hub.close_state()),
+            "the finished run still holds the checkout"
+        );
+
+        fx.hub.finish(SessionId(1), &fx.key, None, &fx.tx).await;
+        loop {
+            let event = fx
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .expect("an event");
+            assert!(
+                !matches!(event, Event::AiRestoreNeedsDecision { .. }),
+                "a clean tree must not ask: {event:?}"
+            );
+            if matches!(event, Event::AiRestored { .. }) {
+                break;
+            }
+        }
+
+        assert_eq!(
+            gitx(&fx.clone, &["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert!(
+            !fx.hub.runs.lock().unwrap().contains_key(&fx.key),
+            "the run is closed"
+        );
+        assert!(
+            !close_requires_finish(&fx.hub.close_state()),
+            "nothing holds a checkout any more"
+        );
+    }
+
+    /// One repository, one checkout: while PR #7's run holds it, a plan for
+    /// PR #8 is rejected with `Held` naming #7 — and once #7's review is
+    /// over with no run left to finish, the event carries the record so the
+    /// dialog can offer the restore right there (spec §4 step 7, Task 8).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_repo_rejects_second_pr() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+
+        // The run (finished, unrestored) still holds the checkout: #8 is
+        // held, and its dialog points at that run's Finish, not a restore.
+        let other_pr = PrTarget {
+            number: 8,
+            ..fx.pr.clone()
+        };
+        let other_key = PrKey {
+            number: 8,
+            ..fx.key.clone()
+        };
+        fx.hub
+            .plan_checkout(SessionId(1), other_key.clone(), other_pr.clone(), &fx.tx)
+            .await;
+        match wait_for(&fx.events, |e| matches!(e, Event::AiCheckoutHeld { .. })) {
+            Event::AiCheckoutHeld {
+                pr_number, restore, ..
+            } => {
+                assert_eq!(pr_number, 7, "the holding PR is named");
+                assert_eq!(restore, None, "the live Finish is the way out");
+            }
+            other => unreachable!("expected a held checkout: {other:?}"),
+        }
+
+        // The review's own change makes Keep the option that leaves the
+        // checkout held with no run behind it.
+        std::fs::write(fx.clone.join("stray.txt"), "agent wrote me\n").expect("stray");
+        fx.hub
+            .finish(SessionId(1), &fx.key, Some(false), &fx.tx)
+            .await;
+        wait_for(&fx.events, |e| matches!(e, Event::AiNotice { .. }));
+        let rec = fx
+            .store
+            .checkouts_unrestored()
+            .expect("the recovery list")
+            .into_iter()
+            .next()
+            .expect("#7 still holds the repo");
+
+        // #8 is still held — and now the event carries the record, so the
+        // dialog offers the restore that is the only way out.
+        fx.hub
+            .plan_checkout(SessionId(1), other_key, other_pr, &fx.tx)
+            .await;
+        match wait_for(&fx.events, |e| matches!(e, Event::AiCheckoutHeld { .. })) {
+            Event::AiCheckoutHeld {
+                pr_number, restore, ..
+            } => {
+                assert_eq!(pr_number, 7);
+                assert_eq!(restore, Some(rec.id), "the dialog gets the restore");
+            }
+            other => unreachable!("expected a held checkout: {other:?}"),
+        }
+    }
+
+    /// Continue review while this PR still holds the checkout: the tree is
+    /// already the PR head, so the plan skips the stash step (stashing
+    /// would bury the review's build output under a new stash), the run
+    /// re-fetches and checks out the NEW head, and the held record's stash
+    /// and original ref carry into the new row (Task 8 ruling 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continue_while_held_refetches_without_stash() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        // The user's own work: the first checkout stashes it.
+        std::fs::write(fx.clone.join("a.txt"), "my local edit\n").expect("dirty");
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        let first = fx
+            .store
+            .checkout_holding(&canonical(&fx))
+            .expect("store")
+            .expect("the run holds the checkout");
+        let stash_sha = first
+            .stash_sha
+            .clone()
+            .expect("the dirty start stashed the user's work");
+
+        // The review's build output lands in the tree, and the PR head
+        // moves: a new commit reaches `refs/pull/7/head`.
+        std::fs::write(fx.clone.join("build-output.txt"), "from the review\n").expect("build");
+        std::fs::write(fx.clone.join("ship.txt"), "ship\n").expect("ship");
+        gitx(&fx.clone, &["add", "ship.txt"]);
+        gitx(&fx.clone, &["commit", "-m", "second"]);
+        gitx(&fx.clone, &["push", "origin", "HEAD:refs/pull/7/head"]);
+        let new_head = gitx(&fx.clone, &["rev-parse", "HEAD"]);
+        gitx(&fx.clone, &["checkout", "--detach", &fx.pr.head_sha]);
+        assert!(!fx.clone.join("ship.txt").exists(), "back on the old head");
+
+        // The continue plan: the same commands minus the stash line.
+        let next = PrTarget {
+            head_sha: new_head.clone(),
+            ..fx.pr.clone()
+        };
+        fx.hub
+            .plan_checkout(SessionId(1), fx.key.clone(), next.clone(), &fx.tx)
+            .await;
+        let plan = match wait_for(&fx.events, |e| matches!(e, Event::AiCheckoutPlanned { .. })) {
+            Event::AiCheckoutPlanned { plan, .. } => plan,
+            other => unreachable!("expected a plan: {other:?}"),
+        };
+        assert!(plan.dirty, "the build output is still in the tree");
+        assert!(plan.skip_stash, "the held checkout skips the stash step");
+        assert!(
+            !plan.commands.iter().any(|c| c.contains("stash")),
+            "no stash line: {:?}",
+            plan.commands
+        );
+        assert_eq!(
+            plan.commands,
+            vec![
+                "git fetch origin pull/7/head".to_string(),
+                format!("git checkout --detach {new_head}"),
+            ]
+        );
+
+        // The continue run: the new head is fetched and checked out, no new
+        // stash is created, and the original stash and ref ride along. The
+        // scripted model consumes its steps, so run two gets its own copy.
+        for (agent, steps) in clean_scripts() {
+            for step in steps {
+                fx.llm.push_agent_step(&agent, step);
+            }
+        }
+        start_run(&fx, next, RunMode::Full);
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        assert_eq!(gitx(&fx.clone, &["rev-parse", "HEAD"]), new_head);
+        assert_eq!(
+            gitx(&fx.clone, &["stash", "list", "--format=%H"]),
+            stash_sha,
+            "exactly the original stash entry, no new one"
+        );
+        let held = fx
+            .store
+            .checkout_holding(&canonical(&fx))
+            .expect("store")
+            .expect("the new run holds the checkout");
+        assert_eq!(held.stash_sha.as_deref(), Some(stash_sha.as_str()));
+        assert_eq!(held.original, OriginalRef::Branch("main".to_string()));
+        assert_eq!(held.head_sha, new_head);
+        assert_eq!(
+            fx.store.checkouts_unrestored().expect("list").len(),
+            1,
+            "only the new row is a recovery target"
+        );
+    }
+
+    /// The pure quit decision: the window may close freely when no run
+    /// holds a checkout; any held checkout means the app must run the
+    /// Finish flow first (spec §7.3, Task 8).
+    #[test]
+    fn quit_with_held_checkout_runs_finish() {
+        let key = PrKey {
+            host: "github.com".to_string(),
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            number: 7,
+        };
+        assert!(
+            !close_requires_finish(&HubCloseState::default()),
+            "no runs, nothing to finish"
+        );
+        assert!(
+            !close_requires_finish(&HubCloseState {
+                runs: vec![RunCloseState {
+                    key: key.clone(),
+                    session: SessionId(1),
+                    holds_checkout: false,
+                }],
+            }),
+            "a start placeholder holds no checkout"
+        );
+        assert!(
+            close_requires_finish(&HubCloseState {
+                runs: vec![
+                    RunCloseState {
+                        key: key.clone(),
+                        session: SessionId(1),
+                        holds_checkout: false,
+                    },
+                    RunCloseState {
+                        key: key.clone(),
+                        session: SessionId(2),
+                        holds_checkout: true,
+                    },
+                ],
+            }),
+            "one held checkout is enough to hold the window open"
         );
     }
 

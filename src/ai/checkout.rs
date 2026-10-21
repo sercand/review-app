@@ -235,6 +235,12 @@ pub struct CheckoutPlan {
     pub original: OriginalRef,
     /// Whether the working tree is dirty (untracked files included).
     pub dirty: bool,
+    /// The repository is still held by this PR's own unrestored checkout
+    /// and the tree sits on that checkout's head (a re-review after Keep
+    /// or a cancel): the tree's changes are the review's own output, so
+    /// the plan runs no stash step and [`execute_checkout`] carries the
+    /// held record's stash and `original` ref into the new row (Task 8).
+    pub skip_stash: bool,
     /// Exact display strings for the commands the checkout will run.
     pub commands: Vec<String>,
 }
@@ -260,7 +266,10 @@ fn stash_message(number: u64) -> String {
 ///
 /// Fails with [`CheckoutError::Held`] when the store shows a different PR
 /// still checked out in this repo; a record for the *same* PR is allowed (a
-/// retry after a failed attempt).
+/// retry after a failed attempt, or a re-review while the previous checkout
+/// is still held — the latter sets [`CheckoutPlan::skip_stash`] and drops
+/// the stash line from `commands` when the tree sits on that checkout's
+/// head).
 pub fn plan_checkout(
     repo: &Path,
     pr: &PrTarget,
@@ -276,7 +285,7 @@ pub fn plan_checkout(
     let holding = store
         .checkout_holding(&repo)
         .map_err(CheckoutError::Store)?;
-    if let Some(rec) = holding
+    if let Some(rec) = &holding
         && rec.pr_number != pr.number
     {
         return Err(CheckoutError::Held {
@@ -289,8 +298,18 @@ pub fn plan_checkout(
     let original = current_original_ref(&repo)?;
     let dirty = !git(&repo, &["status", "--porcelain"])?.trim().is_empty();
 
+    // Held by this PR's own unrestored checkout with the tree still on
+    // that checkout's head: this is a re-review (Continue), not a fresh
+    // checkout. The tree's changes are the review's own output — stashing
+    // them would bury build output under a new stash — so the plan runs
+    // no stash step and `execute_checkout` carries the held record's
+    // stash and original ref into the new row (Task 8).
+    let skip_stash = holding.as_ref().is_some_and(|rec| {
+        rec.pr_number == pr.number && original == OriginalRef::Detached(rec.head_sha.clone())
+    });
+
     let mut commands = Vec::new();
-    if dirty {
+    if dirty && !skip_stash {
         commands.push(format!(
             "git stash push --include-untracked -m \"{}\"",
             stash_message(pr.number)
@@ -304,6 +323,7 @@ pub fn plan_checkout(
         remote,
         original,
         dirty,
+        skip_stash,
         commands,
     })
 }
@@ -314,11 +334,16 @@ pub fn plan_checkout(
 /// [`CheckoutError::PlanStale`], and so is a failed original-ref probe (e.g.
 /// `HEAD` went missing); a failed `git status` propagates as
 /// [`CheckoutError::Git`] instead.
+///
+/// The dirty comparison is skipped for a [`CheckoutPlan::skip_stash`] plan:
+/// the flag exists to protect the stash step, and this plan has none — the
+/// tree's changes are the review's own output and may come and go while the
+/// confirmation dialog is open.
 fn check_plan_current(plan: &CheckoutPlan) -> Result<(), CheckoutError> {
     let dirty = !git(&plan.repo_path, &["status", "--porcelain"])?
         .trim()
         .is_empty();
-    if dirty != plan.dirty {
+    if dirty != plan.dirty && !plan.skip_stash {
         return Err(CheckoutError::PlanStale);
     }
     let unchanged = match &plan.original {
@@ -367,14 +392,18 @@ fn check_plan_current(plan: &CheckoutPlan) -> Result<(), CheckoutError> {
 /// the tree.
 ///
 /// Same-PR retry: when the store still holds a `Started`/`Active`/`Failed`
-/// record for the *same* PR (a retry after a failed attempt), that row is
+/// record for the *same* PR (a retry after a failed attempt, or a
+/// re-review of a PR whose checkout was never restored), that row is
 /// marked `Superseded` and both its stash SHA and its `original` ref are
 /// carried into the new record, so the repo lock, the user's stash and the
 /// real pre-checkout state move to the new row instead of leaking. A
 /// superseded row is neither a lock holder nor a recovery target. The
 /// `original` is only taken over when this plan's `original` is
-/// `Detached(pr.head_sha)`, i.e. the retry starts from our own previous
-/// checkout; otherwise the plan's value describes a genuine user state.
+/// `Detached(pr.head_sha)` or `Detached(superseded.head_sha)`, i.e. the
+/// retry starts from our own previous checkout; otherwise the plan's value
+/// describes a genuine user state. A [`CheckoutPlan::skip_stash`] plan —
+/// the same-PR re-review — runs no stash step, so the held stash carries
+/// over even though the tree is dirty with the review's own output.
 /// (A retry that *does* stash new work supersedes the old record but leaves
 /// the old stash entry in `git stash list` unreferenced; nothing is dropped.)
 pub fn execute_checkout(
@@ -391,17 +420,22 @@ pub fn execute_checkout(
         .checkout_holding(&plan.repo_path)
         .map_err(CheckoutError::Store)?
         .filter(|old| old.pr_number == pr.number);
-    let carried_stash = if plan.dirty {
+    let stash_now = plan.dirty && !plan.skip_stash;
+    let carried_stash = if stash_now {
         None
     } else {
         superseded.as_ref().and_then(|old| old.stash_sha.clone())
     };
     // A retry runs on top of our own previous checkout, so the plan says
-    // `Detached(pr.head_sha)` — not a user state worth returning to. Keep the
-    // superseded row's original (e.g. `Branch("main")`) so restore still
-    // returns the user to where they really were (§7.3).
+    // `Detached(pr.head_sha)` — or, for a re-review of a moved head, the
+    // superseded record's own head — neither is a user state worth
+    // returning to. Keep the superseded row's original (e.g.
+    // `Branch("main")`) so restore still returns the user to where they
+    // really were (§7.3).
     let original = match (&superseded, &plan.original) {
-        (Some(old), OriginalRef::Detached(sha)) if *sha == pr.head_sha => old.original.clone(),
+        (Some(old), OriginalRef::Detached(sha)) if *sha == pr.head_sha || *sha == old.head_sha => {
+            old.original.clone()
+        }
         _ => plan.original.clone(),
     };
     let mut rec = CheckoutRecord {
@@ -431,7 +465,7 @@ pub fn execute_checkout(
         }
     }
 
-    if plan.dirty {
+    if stash_now {
         let msg = stash_message(pr.number);
         if let Err(e) = git(
             repo.as_path(),
@@ -1290,6 +1324,68 @@ mod tests {
         assert!(gitx(&clone, &["stash", "list"]).is_empty());
         assert!(store.checkout_holding(&second.repo_path).unwrap().is_none());
         assert!(store.checkouts_unrestored().unwrap().is_empty());
+    }
+
+    /// A re-review while the same PR still holds the checkout: the plan
+    /// skips the stash step (the tree's changes are the review's own
+    /// output), the new head is fetched and checked out, and the held
+    /// record's stash and original ref carry into the new row (Task 8).
+    #[test]
+    fn continue_while_held_skips_the_stash_and_carries_the_record() {
+        let dir = tempdir();
+        let db = dir.path().join("ai.sqlite");
+        let store = Store::open(&db).unwrap();
+        let (_git_dir, clone, pr) = fixture();
+        write_file(&clone.join("a.txt"), "mine\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        let first = execute_checkout(&plan, &pr, &store).unwrap();
+        let stash_sha = first.stash_sha.clone().expect("first attempt stashed");
+
+        // The review's build output lands in the tree, and the PR head
+        // moves: a new commit reaches `refs/pull/7/head`.
+        write_file(&clone.join("build.txt"), "output\n");
+        write_file(&clone.join("ship.txt"), "ship\n");
+        gitx(&clone, &["add", "ship.txt"]);
+        gitx(&clone, &["commit", "-m", "second"]);
+        gitx(&clone, &["push", "origin", "HEAD:refs/pull/7/head"]);
+        let new_head = gitx(&clone, &["rev-parse", "HEAD"]);
+        gitx(&clone, &["checkout", "--detach", &pr.head_sha]);
+        let moved = PrTarget {
+            head_sha: new_head.clone(),
+            ..pr.clone()
+        };
+
+        // The continue plan: dirty, but no stash line.
+        let plan2 = plan_checkout(&clone, &moved, &store).unwrap();
+        assert!(plan2.dirty, "the build output is still in the tree");
+        assert!(plan2.skip_stash, "the held checkout skips the stash step");
+        assert_eq!(
+            plan2.commands,
+            vec![
+                "git fetch origin pull/7/head".to_string(),
+                format!("git checkout --detach {new_head}"),
+            ]
+        );
+
+        // The continue checkout: the new head is checked out, no new stash
+        // is created, and the original stash and ref ride along.
+        let second = execute_checkout(&plan2, &moved, &store).unwrap();
+        assert_eq!(second.stash_sha.as_deref(), Some(stash_sha.as_str()));
+        assert_eq!(second.original, OriginalRef::Branch("main".to_string()));
+        assert_eq!(gitx(&clone, &["rev-parse", "HEAD"]), new_head);
+        assert_eq!(gitx(&clone, &["stash", "list", "--format=%H"]), stash_sha);
+
+        // The restore still returns the user to main with their work back.
+        assert_eq!(
+            restore(&second, true, &store).unwrap(),
+            RestoreOutcome::Restored
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "mine\n"
+        );
+        assert!(gitx(&clone, &["stash", "list"]).is_empty());
+        assert_eq!(gitx(&clone, &["symbolic-ref", "--short", "HEAD"]), "main");
     }
 
     #[test]

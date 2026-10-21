@@ -283,9 +283,14 @@ impl AiReviewState {
             }
             Event::AiRestored { outcome, .. } => {
                 if let RestoreOutcome::StashConflict { stash_sha } = outcome {
+                    // Task 8: the Notice carries the SHA, the exact command
+                    // to apply the stash later, and where the entry lives
+                    // until then (spec §7.3).
                     self.timeline.push(TimelineEntry::Notice {
                         text: format!(
-                            "the stash did not apply cleanly; your changes are still in stash {stash_sha}"
+                            "the stash did not apply cleanly; your changes are safe in stash \
+                             {stash_sha} — apply them later with `git stash apply {stash_sha}` \
+                             (the entry stays in `git stash list` until you drop it)"
                         ),
                     });
                 }
@@ -1342,6 +1347,7 @@ mod tests {
                 remote: "origin".to_string(),
                 original: OriginalRef::Branch("main".to_string()),
                 dirty: false,
+                skip_stash: false,
                 commands: Vec::new(),
             }),
             ..AiReviewState::default()
@@ -1499,6 +1505,39 @@ mod tests {
         assert_eq!(st.phase, AiPhase::Finished);
         assert_eq!(st.restore_decision, None);
         assert_eq!(st.checkout, None, "nothing is held any more");
+    }
+
+    /// A stash that did not apply cleanly leaves the user's work in the
+    /// stash: the Notice names the SHA, the exact apply command, and where
+    /// the entry lives until it is dropped (spec §7.3, Task 8).
+    #[test]
+    fn stash_conflict_notice_carries_the_apply_command() {
+        let mut st = AiReviewState {
+            phase: AiPhase::Restoring,
+            ..AiReviewState::default()
+        };
+        st.apply(&Event::AiRestored {
+            session: SESSION,
+            outcome: RestoreOutcome::StashConflict {
+                stash_sha: "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567".to_string(),
+            },
+        });
+        let Some(TimelineEntry::Notice { text }) = st.timeline.last() else {
+            panic!("the conflict lands on the timeline as a Notice: {st:?}");
+        };
+        assert!(
+            text.contains("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"),
+            "{text}"
+        );
+        assert!(
+            text.contains("`git stash apply 0a1b2c3d4e5f60718293a4b5c6d7e8f901234567`"),
+            "the exact command to apply it later: {text}"
+        );
+        assert!(
+            text.contains("git stash list"),
+            "where the entry stays: {text}"
+        );
+        assert_eq!(st.phase, AiPhase::Finished);
     }
 
     /// The inline editor (Task 5): the row seeds it with the finding's body,

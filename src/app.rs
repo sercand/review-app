@@ -251,6 +251,30 @@ pub struct ReviewApp {
     /// (Task 4); `None` when no picker is open.
     #[cfg(unix)]
     folder_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    /// A window close the app is holding open (Task 8, spec §7.3): the hub
+    /// reported runs still holding checkouts, the Finish flow is running
+    /// for them, and the window closes once the hub answers
+    /// `AiQuitClear`.
+    #[cfg(unix)]
+    quit_pending: bool,
+    /// The held runs from the latest `AiQuitHeld`, so a Restore dialog the
+    /// quit flow raised can answer for a run the user is not looking at
+    /// (Task 8).
+    #[cfg(unix)]
+    quit_held: Vec<crate::ai::hub::RunCloseState>,
+    /// The held run the open Restore dialog is answering for, when the
+    /// quit flow raised it for a PR other than the open one (Task 8).
+    #[cfg(unix)]
+    quit_restore: Option<(crate::ai::store::PrKey, SessionId)>,
+    /// Set for the frame after `AiQuitClear`; `ui()` turns it into
+    /// `ViewportCommand::Close` (Task 8).
+    #[cfg(unix)]
+    quit_close_now: bool,
+    /// The `since_sha` of the Continue review whose checkout plan awaits
+    /// confirmation: the confirm dialog then starts the run Incremental
+    /// instead of Full (Task 8, spec §5.8).
+    #[cfg(unix)]
+    ai_continue_since: Option<String>,
 }
 
 impl ReviewApp {
@@ -345,6 +369,16 @@ impl ReviewApp {
             ai_dialog_error: None,
             #[cfg(unix)]
             folder_picker: None,
+            #[cfg(unix)]
+            quit_pending: false,
+            #[cfg(unix)]
+            quit_held: Vec::new(),
+            #[cfg(unix)]
+            quit_restore: None,
+            #[cfg(unix)]
+            quit_close_now: false,
+            #[cfg(unix)]
+            ai_continue_since: None,
         }
     }
 
@@ -362,6 +396,16 @@ impl ReviewApp {
         let pr_gone = pr_is_gone(&event, self.session.as_ref().map(|session| session.id));
         if let Some(error) = event_error(&event) {
             self.note_write_blocked(error);
+        }
+
+        // Task 8: while a quit is pending, every terminal finish event
+        // (`AiRestored`, or the `AiNotice` that closes a kept checkout)
+        // re-asks the hub — it either names the next held run with a fresh
+        // decision prompt or answers `AiQuitClear`, which closes the
+        // window (spec §7.3).
+        #[cfg(unix)]
+        if self.quit_pending && matches!(event, Event::AiRestored { .. } | Event::AiNotice { .. }) {
+            self.worker.send(Command::AiQuitCheck);
         }
 
         match event {
@@ -507,6 +551,7 @@ impl ReviewApp {
                 if self.ai_screen_is(session) && !self.recovery_dialog_open() {
                     self.ai_dialog = None;
                 }
+                self.ai_continue_since = None;
                 self.toasts.push(message, now);
             }
             #[cfg(unix)]
@@ -526,20 +571,61 @@ impl ReviewApp {
             } if self.ai_screen_is(session) && !self.recovery_dialog_open() => {
                 self.ai_dialog =
                     Some(crate::ui::widgets::ai_dialogs::AiDialog::Held { pr_number, restore });
+                self.ai_continue_since = None;
             }
             #[cfg(unix)]
             Event::AiRestoreNeedsDecision { session, changes }
-                if self.ai_screen_is(session) && !self.recovery_dialog_open() =>
+                if (self.ai_screen_is(session) || self.quit_pending)
+                    && !self.recovery_dialog_open() =>
             {
+                // A decision raised by the quit flow can concern a run the
+                // user is not looking at; remember its PR so the dialog's
+                // answer targets the right run (Task 8).
+                self.quit_restore = if self.ai_screen_is(session) {
+                    None
+                } else {
+                    self.quit_held
+                        .iter()
+                        .find(|run| run.session == session)
+                        .map(|run| (run.key.clone(), run.session))
+                };
                 self.ai_dialog =
                     Some(crate::ui::widgets::ai_dialogs::AiDialog::Restore { lines: changes });
             }
             #[cfg(unix)]
-            Event::AiRestored { session, .. } if self.ai_screen_is(session) => {
+            Event::AiRestored { session, .. }
+                if self.ai_screen_is(session) || self.quit_pending =>
+            {
                 // A recovery restore (from the app-wide dialog) has no
                 // session and never lands here.
+                self.quit_restore = None;
                 if !self.recovery_dialog_open() {
                     self.ai_dialog = None;
+                }
+            }
+            // Task 8: the quit flow's two answers. `AiQuitHeld` starts the
+            // ask-first finish for every held run; `AiQuitClear` means the
+            // window may close.
+            #[cfg(unix)]
+            Event::AiQuitHeld { runs } => {
+                if self.quit_pending {
+                    for run in runs.iter().filter(|run| run.holds_checkout) {
+                        self.worker.send(Command::AiFinish {
+                            session: run.session,
+                            key: run.key.clone(),
+                            discard: None,
+                        });
+                    }
+                    self.quit_held = runs;
+                }
+            }
+            #[cfg(unix)]
+            Event::AiQuitClear => {
+                if self.quit_pending {
+                    self.quit_pending = false;
+                    self.quit_held.clear();
+                    self.quit_restore = None;
+                    self.quit_close_now = true;
                 }
             }
             #[cfg(unix)]
@@ -680,6 +766,13 @@ impl ReviewApp {
         {
             self.ai_dialog = None;
             self.ai_dialog_error = None;
+        }
+        // A Continue plan that never reached the screen must not leak its
+        // incremental mode into the next Start (Task 8); the quit flow's
+        // dialog routing dies with its dialog too.
+        self.ai_continue_since = None;
+        if !self.quit_pending {
+            self.quit_restore = None;
         }
     }
 
@@ -1467,8 +1560,6 @@ impl ReviewApp {
         action: crate::ui::widgets::ai_panel::AiPanelAction,
         now: Instant,
     ) {
-        use crate::ai::hub::SnapshotInputs;
-        use crate::ai::pipeline::RunMode;
         use crate::ai::store::PrKey;
         use crate::ui::widgets::ai_panel::{self, AiPanelAction};
 
@@ -1484,6 +1575,9 @@ impl ReviewApp {
         };
         match action {
             AiPanelAction::Start => {
+                // A fresh Full review: any Continue mode left over from an
+                // abandoned re-review must not ride along (Task 8).
+                self.ai_continue_since = None;
                 // No folder for this repo: ask for one now (Task 4). The
                 // pick dialog validates the choice, saves it, and plans the
                 // checkout right away (spec §4 step 2).
@@ -1542,27 +1636,25 @@ impl ReviewApp {
                 }
                 // An incremental re-review runs against the head the last
                 // completed review saw (spec §5.8); the tab only offers
-                // Continue when that head exists.
-                let (Some(pr), Some(since_sha), Some(snapshot_inputs)) = (
-                    ai_target(session),
-                    session.ai.last_reviewed_sha.clone(),
-                    session.metadata.as_ref().map(|meta| SnapshotInputs {
-                        files: session.files.clone(),
-                        metadata: meta.clone(),
-                    }),
-                ) else {
+                // Continue when that head exists. Like Start, it confirms
+                // the checkout first (Task 8): the plan arrives as
+                // `AiCheckoutPlanned`, and the remembered `since_sha` makes
+                // the confirmed start Incremental. While this PR still
+                // holds the checkout the hub's plan skips the stash line.
+                let (Some(pr), Some(since_sha)) =
+                    (ai_target(session), session.ai.last_reviewed_sha.clone())
+                else {
                     self.toasts.push(
                         "the pull request is still loading — try again in a moment".to_owned(),
                         now,
                     );
                     return;
                 };
-                self.worker.send(Command::AiStart {
+                self.ai_continue_since = Some(since_sha);
+                self.worker.send(Command::AiPlanCheckout {
                     session: session.id,
                     key,
                     pr,
-                    snapshot_inputs,
-                    mode: RunMode::Incremental { since_sha },
                 });
             }
             AiPanelAction::Answer { id, answer } => {
@@ -1833,6 +1925,13 @@ impl ReviewApp {
             }
             AiDialogAction::ConfirmCheckout => {
                 self.ai_dialog = None;
+                // A Continue's confirmation starts Incremental against the
+                // last reviewed head; any other confirmation is a Full run
+                // (Task 8, spec §5.8).
+                let mode = match self.ai_continue_since.take() {
+                    Some(since_sha) => RunMode::Incremental { since_sha },
+                    None => RunMode::Full,
+                };
                 let Some(session) = &mut self.session else {
                     return;
                 };
@@ -1856,7 +1955,7 @@ impl ReviewApp {
                     key,
                     pr,
                     snapshot_inputs,
-                    mode: RunMode::Full,
+                    mode,
                 });
             }
             AiDialogAction::CancelCheckout => {
@@ -1866,6 +1965,8 @@ impl ReviewApp {
                 let was_confirm = matches!(self.ai_dialog, Some(AiDialog::ConfirmCheckout(_)));
                 self.ai_dialog = None;
                 self.ai_dialog_error = None;
+                self.ai_continue_since = None;
+                self.quit_restore = None;
                 if was_confirm && let Some(session) = &mut self.session {
                     session.ai.cancel_planning();
                 }
@@ -1876,6 +1977,17 @@ impl ReviewApp {
                 // `AiNotice` (spec §7.3 step 1).
                 let discard = action == AiDialogAction::RestoreDiscard;
                 self.ai_dialog = None;
+                // A decision the quit flow raised for a run the user is not
+                // looking at answers that run, not the open session
+                // (Task 8).
+                if let Some((key, session)) = self.quit_restore.take() {
+                    self.worker.send(Command::AiFinish {
+                        session,
+                        key,
+                        discard: Some(discard),
+                    });
+                    return;
+                }
                 let Some(session) = &mut self.session else {
                     return;
                 };
@@ -2612,6 +2724,23 @@ impl eframe::App for ReviewApp {
 
         let ctx = ui.ctx().clone();
         self.apply_theme(&ctx);
+
+        // Task 8: closing the window while an AI review still holds a
+        // checkout runs the Finish flow first (spec §7.3): the close is
+        // cancelled, the hub reports the held runs (`AiQuitHeld`), each
+        // gets the ask-first finish, and the `AiQuitClear` that follows
+        // the last restore closes the window. A decision the user ignores
+        // keeps the app open — a repo is never left stashed silently.
+        #[cfg(unix)]
+        if ui.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.quit_pending = true;
+            self.worker.send(Command::AiQuitCheck);
+        }
+        #[cfg(unix)]
+        if std::mem::take(&mut self.quit_close_now) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         // Menu bar clicks run like shortcuts, before the screens draw.
         let clicked = match &mut self.menu {
