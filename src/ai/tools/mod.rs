@@ -23,6 +23,7 @@
 
 mod bash;
 mod brief;
+mod draft;
 mod files;
 mod gh;
 mod git;
@@ -45,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use brief::{SharedBrief, SubmitBrief};
+pub use draft::{SharedDraft, SubmitReviewDraft};
 pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
 pub use git::validate_rev;
 pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};

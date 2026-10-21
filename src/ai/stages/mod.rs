@@ -2,6 +2,7 @@
 //! prompt, tool subset, and structured finish tool. [`StageInputs`] is what
 //! every stage gets; [`StageError`] is how every stage fails.
 
+pub mod assemble;
 pub mod challenge;
 pub mod reviewer;
 pub mod scout;
