@@ -32,6 +32,7 @@ mod record;
 mod search;
 mod skills;
 mod truncate;
+mod verdict;
 
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,7 @@ pub use brief::{SharedBrief, SubmitBrief};
 pub use files::{IMAGE_MAX_PASSTHROUGH, IMAGE_MAX_SIDE, image_options};
 pub use git::validate_rev;
 pub use truncate::{MAX_TOOL_OUTPUT, truncate_middle};
+pub use verdict::{SharedVerdicts, SubmitVerdicts, Verdict, VerdictKind};
 
 /// Which kind of agent a tool call belongs to.
 ///

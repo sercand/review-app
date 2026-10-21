@@ -584,18 +584,27 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Move finding `id` to a new `state` with an optional reason.
+    /// Move finding `id` to a new `state`, change its `severity` when one is
+    /// given (the verifier's downgrade, spec §5.5), with an optional reason.
     pub fn finding_update(
         &self,
         id: i64,
         state: FindingState,
+        severity: Option<Severity>,
         reason: Option<&str>,
     ) -> anyhow::Result<()> {
         let n = self
             .conn()
             .execute(
-                "UPDATE ai_findings SET state = ?2, state_reason = ?3 WHERE id = ?1",
-                rusqlite::params![id, state.as_str(), reason],
+                "UPDATE ai_findings
+                    SET state = ?2, severity = COALESCE(?3, severity), state_reason = ?4
+                  WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    state.as_str(),
+                    severity.map(|severity| severity.as_str()),
+                    reason
+                ],
             )
             .context("updating ai_findings row")?;
         anyhow::ensure!(n == 1, "no ai_findings row with id {id}");

@@ -351,9 +351,30 @@ impl RunState {
         state: FindingState,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
-        self.store.finding_update(id, state, reason.as_deref())?;
+        self.store
+            .finding_update(id, state, None, reason.as_deref())?;
         if let Some(finding) = self.cache().findings.iter_mut().find(|f| f.id == id) {
             finding.state = state;
+            finding.state_reason = reason;
+        }
+        let _ = self.events.send(PipelineEvent::FindingChanged { id });
+        Ok(())
+    }
+
+    /// Move finding `id` to a lower `severity`, keeping it a
+    /// [`FindingState::Draft`] and recording why (the verifier's downgrade,
+    /// spec §5.5).
+    pub fn downgrade_finding(
+        &self,
+        id: i64,
+        severity: Severity,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .finding_update(id, FindingState::Draft, Some(severity), reason.as_deref())?;
+        if let Some(finding) = self.cache().findings.iter_mut().find(|f| f.id == id) {
+            finding.severity = severity;
+            finding.state = FindingState::Draft;
             finding.state_reason = reason;
         }
         let _ = self.events.send(PipelineEvent::FindingChanged { id });

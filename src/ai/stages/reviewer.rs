@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use review_llm::{ContentBlock, Message};
+use review_llm::Message;
 
 use crate::ai::agent::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
 use crate::ai::checklist;
@@ -24,8 +24,11 @@ use crate::ai::prompts::system_prompt;
 use crate::ai::review::{CheckResult, CoverageEntry, RunState};
 use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::scout::{Brief, Group, GroupFile, Risk};
-use crate::ai::stages::{StageError, StageInputs, next_agent_id};
-use crate::ai::tools::{AgentRef, AgentRole, Registry, Tool, ToolCx};
+use crate::ai::stages::{
+    StageError, StageInputs, agent_findings, next_agent_id, persist_seed, reviewer_tools,
+    thread_text,
+};
+use crate::ai::tools::{AgentRef, AgentRole, Registry};
 use crate::github::files::{LoadedFile, PatchState};
 use crate::model::diff::{Hunk, LineKind};
 
@@ -35,8 +38,6 @@ const MAX_TURNS: u32 = 40;
 const MAX_FINISH_REMINDERS: u32 = 2;
 /// One file's patch is trimmed to this many characters in the task message.
 const MAX_PATCH_CHARS: usize = 20_000;
-/// Thread bodies shown per thread in the task message.
-const MAX_THREAD_BODY_CHARS: usize = 200;
 /// Missing pairs listed in one coverage reminder before the list is cut.
 const MAX_REMINDER_PAIRS: usize = 20;
 
@@ -175,40 +176,6 @@ pub async fn run_reviewer(
     }
 }
 
-/// The reviewer's tools (spec §5.4, §6.3): the read-only repo tools (with
-/// `bash` — reviewers run tests, and approvals flow through `Interaction`),
-/// the snapshot `gh_*` tools, `load_skill`, the interaction tools, and the
-/// record tools.
-fn reviewer_tools() -> Vec<Arc<dyn Tool>> {
-    const NAMES: [&str; 21] = [
-        "bash",
-        "read_file",
-        "glob",
-        "grep",
-        "list_dir",
-        "asset_stats",
-        "git_show",
-        "git_log",
-        "git_diff",
-        "gh_pr",
-        "gh_pr_files",
-        "gh_pr_patch",
-        "gh_threads",
-        "gh_checks",
-        "load_skill",
-        "ask_lookup",
-        "ask_user",
-        "request_prepare",
-        "record_finding",
-        "record_check",
-        "done",
-    ];
-    crate::ai::tools::all()
-        .into_iter()
-        .filter(|tool| NAMES.contains(&tool.definition().name.as_str()))
-        .collect()
-}
-
 /// The `(file, item)` pairs this group must cover: [`checklist::assign`]
 /// per file (kind defaults, matching repo checks, the scout's extras),
 /// deduplicated in group order.
@@ -263,34 +230,6 @@ fn record_skips(run: &RunState, assigned: &[(String, String)]) -> Vec<(String, S
         }
     }
     missing
-}
-
-/// The ids of the findings `agent` has recorded so far.
-fn agent_findings(run: &RunState, agent: &AgentRef) -> Vec<i64> {
-    run.findings()
-        .iter()
-        .filter(|finding| &finding.agent == agent)
-        .map(|finding| finding.id)
-        .collect()
-}
-
-/// Appends the seed task message through the run's store. A failure is
-/// logged and skipped, exactly as the loop's own appends treat theirs.
-fn persist_seed(cx: &ToolCx, label: &str, text: &str) {
-    let content = vec![ContentBlock::Text {
-        text: text.to_string(),
-    }];
-    let Ok(content_json) = serde_json::to_string(&content) else {
-        tracing::warn!("reviewer: seed message did not serialize");
-        return;
-    };
-    if let Err(error) = cx
-        .run
-        .store()
-        .message_append(cx.run.run_id(), label, "user", &content_json)
-    {
-        tracing::warn!(%error, "reviewer: seed message append failed");
-    }
 }
 
 /// The reviewer's single task message (spec §5.4): the intent, the group,
@@ -396,29 +335,7 @@ fn initial_message(
     if !threads.is_empty() {
         out.push_str("\n## Existing threads\n\n");
         for thread in threads {
-            let line = thread
-                .line
-                .or(thread.start_line)
-                .map(|line| line.to_string())
-                .unwrap_or_default();
-            let root = thread.comments.first();
-            let author = root.map(|c| c.author.as_str()).unwrap_or("?");
-            let body = root.map(|c| c.body.as_str()).unwrap_or("");
-            let head: String = body.chars().take(MAX_THREAD_BODY_CHARS).collect();
-            let cut = if body.chars().count() > MAX_THREAD_BODY_CHARS {
-                "…"
-            } else {
-                ""
-            };
-            let resolved = if thread.is_resolved {
-                " [resolved]"
-            } else {
-                ""
-            };
-            out.push_str(&format!(
-                "- {}:{line} {author}: {head}{cut}{resolved}\n",
-                thread.path
-            ));
+            out.push_str(&format!("- {}\n", thread_text(thread)));
         }
     }
 
@@ -433,7 +350,7 @@ fn initial_message(
 
 /// The file's patch text for the task message: the raw patch, or the
 /// hunks inside a hunk-range group file, capped at [`MAX_PATCH_CHARS`].
-fn patch_text(snapshot: &PrSnapshot, file: &GroupFile) -> String {
+pub(crate) fn patch_text(snapshot: &PrSnapshot, file: &GroupFile) -> String {
     let Some(loaded) = find_file(snapshot, &file.path) else {
         return "(the PR does not carry this file)".to_string();
     };
@@ -520,14 +437,14 @@ fn item_text(item: &str, context: Option<&RepoContext>) -> Option<String> {
         })
 }
 
-fn find_file<'a>(snapshot: &'a PrSnapshot, path: &str) -> Option<&'a LoadedFile> {
+pub(crate) fn find_file<'a>(snapshot: &'a PrSnapshot, path: &str) -> Option<&'a LoadedFile> {
     snapshot
         .files
         .iter()
         .find(|loaded| loaded.file.path == path)
 }
 
-fn risk_slug(risk: Risk) -> &'static str {
+pub(crate) fn risk_slug(risk: Risk) -> &'static str {
     match risk {
         Risk::High => "high",
         Risk::Medium => "medium",
