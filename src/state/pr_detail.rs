@@ -160,6 +160,10 @@ pub struct PrSession {
     pub merging: bool,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
+    /// The ✦ AI tab's state for this PR (spec §12). Unix-only: the AI
+    /// surface has no Windows backend (Plan 3).
+    #[cfg(unix)]
+    pub ai: crate::state::ai_review::AiReviewState,
     /// The live pending-review draft (Phase F submits it), pinned to one
     /// commit while it has comments (spec §7.2). Restored from the session
     /// file on open and saved immediately after every mutation; while it is
@@ -325,6 +329,8 @@ impl PrSession {
             combined_status: None,
             conversation: Vec::new(),
             composer: ComposerState::default(),
+            #[cfg(unix)]
+            ai: crate::state::ai_review::AiReviewState::default(),
             pending,
             fallback: None,
             head_blobs: HashMap::new(),
