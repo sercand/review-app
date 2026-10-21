@@ -18,7 +18,7 @@ use crate::ai::checklist::{self, FileKind};
 use crate::ai::context::RepoContext;
 use crate::ai::prompts::system_prompt;
 use crate::ai::snapshot::PrSnapshot;
-use crate::ai::stages::{StageError, StageInputs, seed_message, without_bash};
+use crate::ai::stages::{StageError, StageInputs, ci_section, seed_message, without_bash};
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedBrief, SubmitBrief, Tool, ToolCx};
 use crate::github::files::{LoadedFile, PatchState};
 use crate::model::diff::{Hunk, LineKind};
@@ -36,8 +36,6 @@ const MAX_GROUP_FILES: usize = 8;
 const MAX_GROUP_LINES: u32 = 1_500;
 /// The PR body is trimmed to this many characters in the task message.
 const MAX_BODY_CHARS: usize = 2_000;
-/// Annotation lines shown per failed check.
-const MAX_ANNOTATION_LINES: usize = 3;
 
 /// How seriously the scout rates a group (spec §5.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +154,7 @@ pub async fn run_scout(
             }
         }),
         max_finish_reminders: MAX_FINISH_REMINDERS,
+        elide_threshold: f64::from(inputs.settings.context_threshold),
     };
     let ctl = AgentControl {
         cancel: inputs.ctl.cancel.clone(),
@@ -303,21 +302,8 @@ fn initial_message(
         ));
     }
 
-    if !snapshot.checks.is_empty() {
-        out.push_str("\n## CI\n\n");
-        for check in &snapshot.checks {
-            out.push_str(&format!(
-                "{}: {}\n",
-                check.name,
-                check.conclusion.as_deref().unwrap_or("pending")
-            ));
-            for annotation in check.annotations.iter().take(MAX_ANNOTATION_LINES) {
-                out.push_str(&format!(
-                    "  - {}:{} {}\n",
-                    annotation.path, annotation.start_line, annotation.message
-                ));
-            }
-        }
+    if let Some(ci) = ci_section(&snapshot.checks) {
+        out.push_str(&ci);
     }
 
     if let Some(rules) = context.and_then(|ctx| ctx.review_md.as_deref()) {

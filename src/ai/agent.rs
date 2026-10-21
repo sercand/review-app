@@ -2,7 +2,8 @@
 //!
 //! [`run_agent`] drives one agent: before every model call it waits out a
 //! pause, delivers queued user notes, and elides old tool results once the
-//! context estimate passes [`ELIDE_THRESHOLD`] of the model's window. Each
+//! context estimate passes [`AgentSpec::elide_threshold`] of the model's
+//! window. Each
 //! turn streams the model (forwarding text deltas as
 //! [`PipelineEvent::AgentText`]) and runs the reply's tool calls **in order**,
 //! each raced against cancellation, answering unknown tools with an error
@@ -30,9 +31,6 @@ use crate::ai::events::PipelineEvent;
 use crate::ai::model::Llm;
 use crate::ai::tools::{AgentRef, Registry, ToolCx, ToolOutput};
 use crate::persist::settings::ModelSettings;
-
-/// Fraction of the model's context window at which eliding starts (spec §6.2).
-const ELIDE_THRESHOLD: f64 = 0.8;
 
 /// The verdict an agent's finish check reaches (spec §9.2 rule 3).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +63,10 @@ pub struct AgentSpec {
     pub on_finish: Arc<dyn Fn() -> FinishCheck + Send + Sync>,
     /// Combined allowance for `on_finish` reminders and finish-tool nudges.
     pub max_finish_reminders: u32,
+    /// Fraction of the model's context window at which eliding starts
+    /// (spec §6.2): the app passes `AiSettings::context_threshold`. Values
+    /// outside `0.1..=0.95` are clamped before use.
+    pub elide_threshold: f64,
 }
 
 /// The loop's control handles: cancel, pause, and the user's note queue.
@@ -139,7 +141,12 @@ pub async fn run_agent(
             persist_message(&cx, &agent, &note);
             history.push(note);
         }
-        elide_if_needed(llm.model(), &spec.system, &mut history);
+        elide_if_needed(
+            llm.model(),
+            spec.elide_threshold.clamp(0.1, 0.95),
+            &spec.system,
+            &mut history,
+        );
 
         let request = GenerateRequest {
             system: Some(spec.system.clone()),
@@ -410,11 +417,11 @@ fn elided_text(name: &str, input_json: &str) -> String {
 }
 
 /// Replaces the text of the oldest `tool_result`s, oldest first, until the
-/// estimate fits `ELIDE_THRESHOLD × context_window` or nothing is left that
-/// may be elided. `tool_use` blocks, ids and the result↔call pairing are
+/// estimate fits `threshold × context_window` or nothing is left that may be
+/// elided. `tool_use` blocks, ids and the result↔call pairing are
 /// never removed or reordered (spec §6.2, trim_history semantics).
-fn elide_if_needed(model: &ModelSettings, system: &str, messages: &mut [Message]) {
-    let budget = ELIDE_THRESHOLD * f64::from(model.context_window);
+fn elide_if_needed(model: &ModelSettings, threshold: f64, system: &str, messages: &mut [Message]) {
+    let budget = threshold * f64::from(model.context_window);
     while estimate_tokens(system, messages) as f64 > budget {
         let protected = protected_ids(messages);
         let mut target: Option<(usize, usize, String)> = None;
@@ -462,7 +469,7 @@ mod tests {
 
     use review_llm::{ContentBlock, ToolResultPart};
 
-    use super::{AgentControl, AgentSpec, AgentStop, ELIDE_THRESHOLD, FinishCheck, run_agent};
+    use super::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
     use crate::ai::events::PipelineEvent;
     use crate::ai::testing::{ScriptStep, ScriptedInteraction, ScriptedLlm};
     use crate::ai::tools::{AgentRef, AgentRole, Registry, Tool, ToolCx, ToolOutput};
@@ -507,7 +514,8 @@ mod tests {
     }
 
     /// A spec with the defaults every test shares: one task message, ten
-    /// turns, no finish tool, an accepting finish check.
+    /// turns, no finish tool, an accepting finish check, and the pre-setting
+    /// elision threshold of 0.8.
     fn base_spec(registry: Registry) -> AgentSpec {
         AgentSpec {
             agent: agent(),
@@ -518,6 +526,7 @@ mod tests {
             finish_tool: None,
             on_finish: Arc::new(|| FinishCheck::Accept),
             max_finish_reminders: 2,
+            elide_threshold: 0.8,
         }
     }
 
@@ -1072,7 +1081,7 @@ mod tests {
         let last = llm.requests().pop().expect("four requests");
         assert!(
             super::estimate_tokens(&last.system.clone().unwrap_or_default(), &last.messages)
-                > (ELIDE_THRESHOLD * f64::from(window)) as usize,
+                > (0.8 * f64::from(window)) as usize,
             "the run is over budget even after eliding: eliding had to do something"
         );
 
@@ -1105,6 +1114,59 @@ mod tests {
             elided,
             vec!["[elided: big {\"n\":1}]".to_string()],
             "the oldest result, and only it (the latest two turns are protected), is stubbed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_elide_threshold_elides_where_the_default_would_not() {
+        let dir = crate::test_support::tempdir();
+        let cx = cx_in(&dir);
+        let mut spec = base_spec(Registry::new(vec![Arc::new(Big)]));
+        // Below the 0.1 clamp floor, so this also pins the clamp: the budget
+        // is 0.1 × 8000 = 800 tokens, not 0.05 × 8000.
+        spec.elide_threshold = 0.05;
+        let mut roomy = model();
+        roomy.context_window = 8_000;
+        // Three 4000-byte results ≈ 3k tokens: under the default 0.8 budget
+        // (6400) the history would ride unelided.
+        let llm = Arc::new(ScriptedLlm::new(
+            roomy,
+            vec![
+                ScriptStep::ToolCalls(vec![("big".into(), json!({"n": 1}))]),
+                ScriptStep::ToolCalls(vec![("big".into(), json!({"n": 2}))]),
+                ScriptStep::ToolCalls(vec![("big".into(), json!({"n": 3}))]),
+                ScriptStep::Text("done".into()),
+            ],
+        ));
+        let (ctl, _pause, _notes) = control();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let out = run_agent(
+            spec,
+            cx,
+            llm.clone() as Arc<dyn crate::ai::model::Llm>,
+            ctl,
+            tx,
+        )
+        .await;
+        assert_eq!(out.stop, AgentStop::Finished);
+
+        let last = llm.requests().pop().expect("four requests");
+        let elided = last.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content, .. }
+                        if matches!(
+                            content.as_slice(),
+                            [ToolResultPart::Text { text }] if text.starts_with("[elided: ")
+                        )
+                )
+            })
+        });
+        assert!(
+            elided,
+            "the configured low threshold elides old tool results the default would keep"
         );
     }
 

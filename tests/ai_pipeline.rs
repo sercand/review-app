@@ -806,6 +806,42 @@ async fn cancel_ends_the_run_cancelled_and_persists_partial_findings() {
 }
 
 #[tokio::test]
+async fn cancel_while_paused_ends_the_run() {
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_one_group()));
+    // The `read_file` parks the reviewer in `spawn_blocking`; it then loops
+    // back into the pause wait, where the cancel has to wake it out.
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            ScriptStep::ToolCalls(vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]),
+            full_review_step(),
+            ScriptStep::Text("all checked".into()),
+        ],
+    );
+    scripts.insert("assembler".into(), vec![draft_step("comment", "unused")]);
+
+    let mut s = start(scripts);
+    drain_until(&mut s.rx, |e| {
+        matches!(
+            e,
+            PipelineEvent::ToolCall { name, agent, .. }
+                if name == "read_file" && agent.role == AgentRole::Reviewer
+        )
+    })
+    .await;
+    s.control.pause();
+    s.control.cancel();
+
+    // A regression parks the reviewer in the pause forever: fail, don't hang.
+    let status = tokio::time::timeout(Duration::from_secs(5), s.handle)
+        .await
+        .expect("the cancelled run ends instead of parking in the pause")
+        .expect("the orchestrator joins");
+    assert_eq!(status, RunStatus::Cancelled);
+}
+
+#[tokio::test]
 async fn pause_and_note_reach_a_running_reviewer() {
     let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
     scripts.insert("scout".into(), scout_step(brief_one_group()));
@@ -1267,6 +1303,29 @@ async fn incremental_run_reviews_only_touched_groups_and_passes_qa() {
             "finding {id} announced once"
         );
     }
+
+    // The assembler's seed lists what the prior check resolved (§5.7.3).
+    let assembler_seed = request_text(
+        s.llm
+            .requests_for("assembler")
+            .first()
+            .expect("the assembler ran"),
+    );
+    assert!(
+        assembler_seed.contains("## Prior findings resolved since last review"),
+        "{assembler_seed}"
+    );
+    assert!(
+        assembler_seed.contains("#1 [addressed] the logo grew to 4 KB — the logo was compressed"),
+        "{assembler_seed}"
+    );
+    assert!(
+        assembler_seed.contains(
+            "#2 [addressed] duplicates the src/util.rs helper — \
+             helper_dup now calls util::helper"
+        ),
+        "{assembler_seed}"
+    );
 
     // The re-review produced its own finding, verified and drafted.
     let new_finding = findings.iter().find(|f| f.id == 3).expect("finding 3");

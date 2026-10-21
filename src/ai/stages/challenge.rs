@@ -21,8 +21,8 @@ use crate::ai::snapshot::PrSnapshot;
 use crate::ai::stages::reviewer::{find_file, patch_text, risk_slug};
 use crate::ai::stages::scout::{Brief, Group, Risk};
 use crate::ai::stages::{
-    StageError, StageInputs, agent_findings, anchor_text, evidence_text, persist_seed,
-    reviewer_tools, seed_message,
+    StageError, StageInputs, agent_findings, anchor_text, challenger_tools, evidence_text,
+    persist_seed, seed_message,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry};
 
@@ -87,13 +87,14 @@ pub async fn run_challenger(
         agent: agent.clone(),
         system: system_prompt(AgentRole::Challenger, &label),
         initial: vec![Message::user_text(text)],
-        registry: Registry::new(reviewer_tools(inputs.bash_disabled.as_deref())),
+        registry: Registry::new(challenger_tools(inputs.bash_disabled.as_deref())),
         max_turns: MAX_TURNS,
         finish_tool: Some("done"),
         // No coverage enforcement here: the challenger's findings are
         // filtered by the verifier like every other finding (spec §5.4).
         on_finish: Arc::new(|| FinishCheck::Accept),
         max_finish_reminders: MAX_FINISH_REMINDERS,
+        elide_threshold: f64::from(inputs.settings.context_threshold),
     };
     let ctl = AgentControl {
         cancel: inputs.ctl.cancel.clone(),

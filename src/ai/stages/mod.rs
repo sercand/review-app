@@ -146,9 +146,8 @@ pub(crate) fn next_agent_id() -> u32 {
 /// The reviewer's tools (spec §5.4, §6.3): the read-only repo tools (with
 /// `bash` — reviewers run tests, and approvals flow through `Interaction`),
 /// the snapshot `gh_*` tools, `load_skill`, the interaction tools, and the
-/// record tools. The challenger runs the same set (spec §5.4), so it lives
-/// here as the single source of truth. `bash_disabled` drops `bash` and
-/// `request_prepare` (spec §8.2).
+/// record tools. `bash_disabled` drops `bash` and `request_prepare`
+/// (spec §8.2).
 pub(crate) fn reviewer_tools(bash_disabled: Option<&str>) -> Vec<Arc<dyn Tool>> {
     const NAMES: [&str; 21] = [
         "bash",
@@ -178,6 +177,16 @@ pub(crate) fn reviewer_tools(bash_disabled: Option<&str>) -> Vec<Arc<dyn Tool>> 
         .filter(|tool| NAMES.contains(&tool.definition().name.as_str()))
         .collect();
     without_bash(tools, bash_disabled)
+}
+
+/// The challenger's tools (spec §5.4): the reviewer's set minus
+/// `request_prepare` — `ToolCx::prepare` is never wired for a challenger,
+/// so offering the tool could only ever answer with an error.
+pub(crate) fn challenger_tools(bash_disabled: Option<&str>) -> Vec<Arc<dyn Tool>> {
+    reviewer_tools(bash_disabled)
+        .into_iter()
+        .filter(|tool| tool.definition().name != "request_prepare")
+        .collect()
 }
 
 /// The ids of the findings `agent` has recorded so far. Stages diff this
@@ -237,6 +246,34 @@ pub(crate) fn evidence_text(evidence: &Evidence) -> String {
     format!("{}{line} — {}", evidence.path, evidence.note)
 }
 
+/// Annotation lines one check may contribute to a seed's `## CI` section.
+const MAX_ANNOTATION_LINES: usize = 3;
+
+/// The `## CI` section shared by the scout and assembler seeds (spec §5.2,
+/// §5.6): `name: conclusion` per check, each with up to
+/// [`MAX_ANNOTATION_LINES`] annotation lines. `None` when there are no
+/// checks, so the section is omitted.
+pub(crate) fn ci_section(checks: &[crate::ai::snapshot::CheckSummary]) -> Option<String> {
+    if checks.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\n## CI\n\n");
+    for check in checks {
+        out.push_str(&format!(
+            "{}: {}\n",
+            check.name,
+            check.conclusion.as_deref().unwrap_or("pending")
+        ));
+        for annotation in check.annotations.iter().take(MAX_ANNOTATION_LINES) {
+            out.push_str(&format!(
+                "  - {}:{} {}\n",
+                annotation.path, annotation.start_line, annotation.message
+            ));
+        }
+    }
+    Some(out)
+}
+
 /// Thread bodies shown per thread in a task message.
 pub(crate) const MAX_THREAD_BODY_CHARS: usize = 200;
 
@@ -267,7 +304,9 @@ pub(crate) fn thread_text(thread: &ReviewThread) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bash_note, reviewer_tools, seed_message, with_bash_note, without_bash};
+    use super::{
+        bash_note, challenger_tools, reviewer_tools, seed_message, with_bash_note, without_bash,
+    };
     use crate::ai::tools;
 
     #[test]
@@ -345,5 +384,30 @@ mod tests {
         assert!(!names.contains(&"bash".to_string()));
         assert!(!names.contains(&"request_prepare".to_string()));
         assert_eq!(without.len(), with_bash.len() - 2);
+    }
+
+    #[test]
+    fn challenger_tools_drop_request_prepare() {
+        // `ToolCx::prepare` is never wired for a challenger, so the tool
+        // must not be offered to it.
+        let names: Vec<String> = challenger_tools(None)
+            .iter()
+            .map(|t| t.definition().name)
+            .collect();
+        assert!(
+            !names.contains(&"request_prepare".to_string()),
+            "no prepare tool for challengers: {names:?}"
+        );
+        assert!(names.contains(&"bash".to_string()));
+        assert!(names.contains(&"record_finding".to_string()));
+        assert_eq!(names.len(), reviewer_tools(None).len() - 1);
+
+        // `bash_disabled` still strips bash on top.
+        let names: Vec<String> = challenger_tools(Some("no bwrap"))
+            .iter()
+            .map(|t| t.definition().name)
+            .collect();
+        assert!(!names.contains(&"bash".to_string()));
+        assert!(!names.contains(&"request_prepare".to_string()));
     }
 }

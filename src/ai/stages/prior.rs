@@ -91,6 +91,7 @@ pub async fn run_prior_check(
             }
         }),
         max_finish_reminders: MAX_FINISH_REMINDERS,
+        elide_threshold: f64::from(inputs.settings.context_threshold),
     };
     let ctl = AgentControl {
         cancel: inputs.ctl.cancel.clone(),

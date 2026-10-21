@@ -3,8 +3,9 @@
 //! [`run_assembler`] runs one agent with **no repo tools** — everything it
 //! needs is in the seed task message: the brief's intent, the kept findings
 //! in full, the summary-anchored findings called out separately (they can
-//! never become inline comments), and the [`coverage_digest`] so even a
-//! clean review says what it looked at. It finishes through
+//! never become inline comments), the [`coverage_digest`] so even a clean
+//! review says what it looked at, the prior-check updates on an incremental
+//! run (spec §5.7.3), and the PR's CI section (spec §5.6). It finishes through
 //! `submit_review_draft`; unlike the verifier, a draft is mandatory here,
 //! so running out of nudges or turns is [`StageError::NoFinish`].
 //!
@@ -23,9 +24,10 @@ use serde::{Deserialize, Serialize};
 use crate::ai::agent::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
 use crate::ai::prompts::system_prompt;
 use crate::ai::review::{CheckResult, CoverageEntry, Finding, FindingAnchor, Severity};
+use crate::ai::snapshot::CheckSummary;
 use crate::ai::stages::scout::Brief;
 use crate::ai::stages::{
-    StageError, StageInputs, anchor_text, evidence_text, persist_seed, seed_message,
+    StageError, StageInputs, anchor_text, ci_section, evidence_text, persist_seed, seed_message,
 };
 use crate::ai::tools::{AgentRef, AgentRole, Registry, SharedDraft, SubmitReviewDraft, Tool};
 
@@ -154,12 +156,16 @@ fn digest_line(label: &str, counts: &[u32; 4]) -> String {
 /// shared cell; the finish check accepts only then. A draft is mandatory:
 /// running out of nudges or turns is [`StageError::NoFinish`]. On success
 /// the floor note ([`verdict_floor`]) is applied to the returned draft.
+///
+/// `prior_updates` are the findings the incremental prior-check moved since
+/// the last review (spec §5.7.3); empty on a full run.
 pub async fn run_assembler(
     inputs: &StageInputs,
     agent: &AgentRef,
     brief: &Brief,
     kept: &[Finding],
     coverage: &[CoverageEntry],
+    prior_updates: &[Finding],
 ) -> Result<ReviewDraft, StageError> {
     let agent = agent.clone();
     let mut cx = inputs.cx.clone();
@@ -172,8 +178,14 @@ pub async fn run_assembler(
         submitted.clone(),
     ))));
 
+    let checks: &[CheckSummary] = inputs
+        .cx
+        .snapshot
+        .as_deref()
+        .map(|snapshot| snapshot.checks.as_slice())
+        .unwrap_or(&[]);
     let text = seed_message(
-        initial_message(brief, kept, coverage),
+        initial_message(brief, kept, coverage, prior_updates, checks),
         &cx.run.qa(),
         inputs.bash_disabled.as_deref(),
     );
@@ -199,6 +211,7 @@ pub async fn run_assembler(
             }
         }),
         max_finish_reminders: MAX_FINISH_REMINDERS,
+        elide_threshold: f64::from(inputs.settings.context_threshold),
     };
     let ctl = AgentControl {
         cancel: inputs.ctl.cancel.clone(),
@@ -260,7 +273,13 @@ fn assembler_tools(submit: Arc<dyn Tool>) -> Vec<Arc<dyn Tool>> {
 /// The assembler's single task message (spec §5.6): the intent, the kept
 /// findings in full, the summary-anchored findings called out, the coverage
 /// digest, and the task reminder.
-fn initial_message(brief: &Brief, kept: &[Finding], coverage: &[CoverageEntry]) -> String {
+fn initial_message(
+    brief: &Brief,
+    kept: &[Finding],
+    coverage: &[CoverageEntry],
+    prior_updates: &[Finding],
+    checks: &[CheckSummary],
+) -> String {
     let mut out = String::from("## Intent\n\n");
     out.push_str(brief.intent.trim_end());
     out.push_str("\n\n## Kept findings\n\n");
@@ -308,6 +327,30 @@ fn initial_message(brief: &Brief, kept: &[Finding], coverage: &[CoverageEntry]) 
     out.push_str("## Coverage\n\n");
     out.push_str(&coverage_digest(coverage));
     out.push('\n');
+
+    // What the incremental prior check moved since the last review
+    // (spec §5.7.3): the draft should say what got resolved.
+    if !prior_updates.is_empty() {
+        out.push_str("## Prior findings resolved since last review\n\n");
+        for finding in prior_updates {
+            out.push_str(&format!(
+                "#{} [{}] {} — {}\n",
+                finding.id,
+                finding.state.as_str(),
+                finding.title,
+                finding.state_reason.clone().unwrap_or_default()
+            ));
+        }
+        out.push('\n');
+    }
+
+    // The same CI rendering the scout seed gets (spec §5.6). `ci_section`
+    // opens with a blank line for the scout's layout; here every section
+    // already ends with one, so it is trimmed and one is added at the end.
+    if let Some(ci) = ci_section(checks) {
+        out.push_str(ci.trim_start_matches('\n'));
+        out.push('\n');
+    }
 
     out.push_str(
         "## Task\n\n\
@@ -589,7 +632,7 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm.clone());
 
-        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &[])
+        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &[], &[])
             .await
             .expect("the resubmitted draft finishes the stage");
 
@@ -656,7 +699,7 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm.clone());
 
-        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &coverage)
+        let draft = run_assembler(&inputs, &assembler_agent(), &brief(), &kept, &coverage, &[])
             .await
             .expect("a submitted draft");
         assert_eq!(
@@ -741,9 +784,76 @@ mod tests {
         ));
         let inputs = stage_inputs(&dir, llm);
 
-        let err = run_assembler(&inputs, &assembler_agent(), &brief(), &[], &[])
+        let err = run_assembler(&inputs, &assembler_agent(), &brief(), &[], &[], &[])
             .await
             .expect_err("a review draft is mandatory here");
         assert_eq!(err, StageError::NoFinish);
+    }
+
+    #[test]
+    fn seed_lists_resolved_prior_findings_and_ci_in_order() {
+        let mut resolved = line(9, Severity::Bug, "src/a.rs", 12);
+        resolved.state = FindingState::Addressed;
+        resolved.state_reason = Some("fixed in the last push".to_string());
+        let mut stale = line(10, Severity::Nit, "src/b.rs", 4);
+        stale.state = FindingState::Outdated;
+        stale.state_reason = None;
+
+        let checks = vec![CheckSummary {
+            name: "test".to_string(),
+            conclusion: Some("failure".to_string()),
+            summary: None,
+            text: None,
+            annotations: (0..5)
+                .map(|i| crate::github::checks::CheckAnnotation {
+                    path: "src/a.rs".to_string(),
+                    start_line: i,
+                    end_line: i,
+                    level: "failure".to_string(),
+                    title: None,
+                    message: format!("m{i}"),
+                })
+                .collect(),
+        }];
+
+        let text = initial_message(&brief(), &[], &[], &[resolved, stale], &checks);
+
+        // The two new sections sit between Coverage and Task.
+        let mut last = 0;
+        for section in [
+            "## Intent",
+            "## Kept findings",
+            "## Summary findings",
+            "## Coverage",
+            "## Prior findings resolved since last review",
+            "## CI",
+            "## Task",
+        ] {
+            let at = text
+                .find(section)
+                .unwrap_or_else(|| panic!("missing {section}:\n{text}"));
+            assert!(at >= last, "{section} is out of order:\n{text}");
+            last = at;
+        }
+
+        assert!(
+            text.contains("#9 [addressed] f9 — fixed in the last push\n"),
+            "{text}"
+        );
+        assert!(text.contains("#10 [outdated] f10 — \n"), "{text}");
+        assert!(text.contains("test: failure"), "{text}");
+        assert_eq!(
+            text.matches("  - src/a.rs:").count(),
+            3,
+            "up to three annotation lines:\n{text}"
+        );
+
+        // Both sections vanish when there is nothing to say.
+        let bare = initial_message(&brief(), &[], &[], &[], &[]);
+        assert!(
+            !bare.contains("## Prior findings resolved since last review"),
+            "{bare}"
+        );
+        assert!(!bare.contains("## CI"), "{bare}");
     }
 }

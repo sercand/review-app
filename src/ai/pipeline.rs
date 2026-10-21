@@ -145,9 +145,12 @@ impl PipelineControl {
     }
 
     /// Stop the whole run: every agent is cancelled and the run ends
-    /// [`RunStatus::Cancelled`]. What is already persisted stays.
+    /// [`RunStatus::Cancelled`]. What is already persisted stays. A paused
+    /// run is released too: an agent parked in the loop's pause wait only
+    /// wakes on a watch change, so cancelling nudges the watch.
     pub fn cancel(&self) {
         self.ctl.cancel.cancel();
+        let _ = self.ctl.pause.send(false);
         self.ctl.notify.notify_waiters();
     }
 
@@ -794,6 +797,9 @@ async fn orchestrate(
     // review of this head; the run row keeps its incremental kind.
     let mut changed: Option<Vec<String>> = None;
     let mut prior_over = false;
+    // Findings the prior check moved, for the assembler seed (spec §5.7.3);
+    // empty on a full run.
+    let mut prior_updates: Vec<Finding> = Vec::new();
     if let RunMode::Incremental { since_sha } = &mode {
         let repo = &base.cx.repo_root;
         match incremental_files(repo, since_sha, &head_sha).await {
@@ -861,10 +867,38 @@ async fn orchestrate(
                 agent: agent.clone(),
                 group: None,
             });
-            let outcome = run_prior_check(&inputs, &agent, open).await;
+            let outcome = run_prior_check(&inputs, &agent, open.clone()).await;
             prior_over = agent_finished(&ctl, &tally, &agent, stop_of(&outcome));
             match outcome {
-                Ok(()) => ctl.stage(StageKind::PriorCheck, StageStatus::Done),
+                Ok(()) => {
+                    ctl.stage(StageKind::PriorCheck, StageStatus::Done);
+                    // Whatever the check moved goes to the assembler seed.
+                    // The run cache only holds this run's findings, so the
+                    // comparison reads the store, which the check updated.
+                    let before: BTreeMap<i64, FindingState> = open
+                        .iter()
+                        .map(|finding| (finding.id, finding.state))
+                        .collect();
+                    let after = run.store().finding_list(run.session_id());
+                    match after {
+                        Ok(findings) => {
+                            prior_updates = findings
+                                .into_iter()
+                                .filter(|finding| {
+                                    before
+                                        .get(&finding.id)
+                                        .is_some_and(|state| *state != finding.state)
+                                })
+                                .collect();
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "pipeline: reloading findings for the assembler seed failed"
+                            );
+                        }
+                    }
+                }
                 Err(_) if ctl.cancel.is_cancelled() => {
                     ctl.stage(
                         StageKind::PriorCheck,
@@ -1096,7 +1130,15 @@ async fn orchestrate(
         agent: assembler.clone(),
         group: None,
     });
-    let drafted = run_assembler(&inputs, &assembler, &brief, &kept, &run.coverage()).await;
+    let drafted = run_assembler(
+        &inputs,
+        &assembler,
+        &brief,
+        &kept,
+        &run.coverage(),
+        &prior_updates,
+    )
+    .await;
     agent_finished(&ctl, &tally, &assembler, stop_of(&drafted));
     let draft = match drafted {
         Ok(draft) => draft,
@@ -1480,6 +1522,7 @@ impl Spawner for PipelineSpawner {
             finish_tool: None,
             on_finish: Arc::new(|| FinishCheck::Accept),
             max_finish_reminders: 0,
+            elide_threshold: f64::from(self.base.settings.context_threshold),
         };
         let tally = Arc::new(Tally::default());
         let llm: Arc<dyn Llm> = Arc::new(TrackingLlm {
