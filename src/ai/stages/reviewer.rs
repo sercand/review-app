@@ -1035,6 +1035,49 @@ mod tests {
         assert!(!text.contains("## Questions"), "{text}");
     }
 
+    #[test]
+    fn reminder_caps_the_list_at_twenty_pairs() {
+        // The exact template with room to spare: nothing is cut.
+        assert_eq!(
+            missing_text(&[
+                ("a.rs".to_string(), "errors".to_string()),
+                ("b.rs".to_string(), "tests".to_string()),
+            ]),
+            "You haven't recorded these checks yet: a.rs:errors, b.rs:tests. \
+             Record each with record_check."
+        );
+
+        // Twenty-one pairs: exactly the first twenty are listed, then the
+        // ellipsis; the twenty-first never appears.
+        let pairs: Vec<(String, String)> = (1..=21)
+            .map(|i| (format!("f{i}.rs"), format!("item{i}")))
+            .collect();
+        let text = missing_text(&pairs);
+
+        assert!(
+            text.starts_with("You haven't recorded these checks yet: f1.rs:item1, "),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(", …. Record each with record_check."),
+            "{text}"
+        );
+        assert!(!text.contains("f21.rs"), "the 21st pair leaked: {text}");
+        let list = text
+            .strip_prefix("You haven't recorded these checks yet: ")
+            .and_then(|t| t.strip_suffix(". Record each with record_check."))
+            .expect("the exact reminder template");
+        let elements: Vec<&str> = list.split(", ").collect();
+        assert_eq!(
+            elements.len(),
+            21,
+            "20 pairs plus the ellipsis: {elements:?}"
+        );
+        assert_eq!(elements[0], "f1.rs:item1");
+        assert_eq!(elements[19], "f20.rs:item20");
+        assert_eq!(elements[20], "…");
+    }
+
     #[tokio::test]
     async fn reviewer_without_a_snapshot_fails() {
         let dir = crate::test_support::tempdir();
