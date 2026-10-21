@@ -7,10 +7,11 @@
 //! travels by memory, not by tool output.
 //!
 //! Validation runs **before** any normalization: every PR file must appear
-//! in exactly one group, or the call is rejected listing the missing and the
-//! duplicated paths so the model can correct itself. A valid brief is stored
-//! into the cell verbatim; ids, the Generated skim group and the size splits
-//! are the stage's to apply.
+//! in exactly one group and no group may be empty (its leads and CI notes
+//! would be silently lost), or the call is rejected listing the missing
+//! paths, the paths listed more than once, and the empty groups so the model
+//! can correct itself. A valid brief is stored into the cell verbatim; ids,
+//! the Generated skim group and the size splits are the stage's to apply.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -74,8 +75,9 @@ impl Tool for SubmitBrief {
         definition(
             "submit_brief",
             "Submit the review brief and finish scouting. Every file the PR changes must \
-             appear in exactly one group; the call is rejected listing any missing or \
-             duplicated paths. Generated files, lockfiles and vendored code belong in a \
+             appear in exactly one group and no group may be empty; the call is rejected \
+             listing any missing or duplicated paths and any empty groups. Generated \
+             files, lockfiles and vendored code belong in a \
              `skim` group.",
             json!({
                 "type": "object",
@@ -172,8 +174,9 @@ impl Tool for SubmitBrief {
     }
 }
 
-/// Every PR file in exactly one group, or the rejection text listing the
-/// missing and the duplicated paths (in snapshot / submission order).
+/// Every PR file in exactly one group and no empty groups, or the rejection
+/// text listing the missing paths, the paths listed more than once, and the
+/// empty groups (in snapshot / submission order).
 fn coverage_problem(snapshot: &PrSnapshot, raw: &RawBrief) -> Option<String> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for group in &raw.groups {
@@ -194,7 +197,13 @@ fn coverage_problem(snapshot: &PrSnapshot, raw: &RawBrief) -> Option<String> {
         .flat_map(|group| group.files.iter().map(String::as_str))
         .filter(|path| counts.get(path).copied().unwrap_or(0) > 1 && seen.insert(path))
         .collect();
-    if missing.is_empty() && duplicates.is_empty() {
+    let empty: Vec<&str> = raw
+        .groups
+        .iter()
+        .filter(|group| group.files.is_empty())
+        .map(|group| group.title.as_str())
+        .collect();
+    if missing.is_empty() && duplicates.is_empty() && empty.is_empty() {
         return None;
     }
     let mut problems = Vec::new();
@@ -202,7 +211,10 @@ fn coverage_problem(snapshot: &PrSnapshot, raw: &RawBrief) -> Option<String> {
         problems.push(format!("missing from every group: {}", missing.join(", ")));
     }
     if !duplicates.is_empty() {
-        problems.push(format!("in more than one group: {}", duplicates.join(", ")));
+        problems.push(format!("listed more than once: {}", duplicates.join(", ")));
+    }
+    if !empty.is_empty() {
+        problems.push(format!("groups with no files: {}", empty.join(", ")));
     }
     Some(format!("brief rejected — {}", problems.join("; ")))
 }
@@ -356,6 +368,69 @@ mod tests {
         assert_eq!(brief.groups.len(), 1);
         assert_eq!(brief.groups[0].id, "", "ids are the stage's to assign");
         assert_eq!(brief.unexplained, vec!["a stray rename".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn submit_brief_rejects_empty_groups() {
+        let dir = crate::test_support::tempdir();
+        let cx = cx_with(&["src/a.rs"], &dir);
+        let submitted: SharedBrief = Arc::new(Mutex::new(None));
+        let tool = SubmitBrief::new(submitted.clone());
+
+        // A group with no files: its leads and ci_notes would be lost.
+        let out = tool
+            .call(
+                json!({
+                    "intent": "x",
+                    "description_matches": true,
+                    "groups": [
+                        { "title": "notes only", "risk": "low", "reason": "r",
+                          "files": [], "leads": ["look here"] },
+                        { "title": "real", "risk": "low", "reason": "r",
+                          "files": ["src/a.rs"] },
+                    ],
+                }),
+                &cx,
+            )
+            .await;
+        assert!(out.is_error);
+        let text = text_of(&out);
+        assert!(
+            text.contains("notes only"),
+            "the empty group's title is named: {text}"
+        );
+        assert!(
+            submitted.lock().unwrap().is_none(),
+            "nothing stored on rejection"
+        );
+
+        // Folded into the same rejection when other problems exist, and a
+        // path listed twice inside one group is caught too.
+        let out = tool
+            .call(
+                json!({
+                    "intent": "x",
+                    "description_matches": true,
+                    "groups": [
+                        { "title": "empty one", "risk": "low", "reason": "r", "files": [] },
+                        { "title": "twice", "risk": "low", "reason": "r",
+                          "files": ["src/a.rs", "src/a.rs"] },
+                    ],
+                }),
+                &cx,
+            )
+            .await;
+        assert!(out.is_error);
+        let text = text_of(&out);
+        assert!(
+            text.contains("empty one"),
+            "the empty group is named: {text}"
+        );
+        assert!(text.contains("src/a.rs"), "the duplicate is named: {text}");
+        assert!(
+            text.contains("listed more than once"),
+            "same-group duplicates are worded accurately: {text}"
+        );
     }
 
     #[tokio::test]
