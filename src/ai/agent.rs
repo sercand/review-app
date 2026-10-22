@@ -136,7 +136,15 @@ pub async fn run_agent(
         if turns >= spec.max_turns {
             return outcome(AgentStop::MaxTurns, usage, last_text, turns);
         }
-        wait_while_paused(&mut ctl.pause).await;
+        // A skip or rerun issued while paused fires only this token, so the
+        // wait is raced against it and the cancel is re-checked after.
+        tokio::select! {
+            _ = wait_while_paused(&mut ctl.pause) => {}
+            _ = ctl.cancel.cancelled() => {}
+        }
+        if ctl.cancel.is_cancelled() {
+            return outcome(AgentStop::Cancelled, usage, last_text, turns);
+        }
         if let Some(note) = drain_notes(&ctl.notes) {
             persist_message(&cx, &agent, &note);
             history.push(note);
