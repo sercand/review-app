@@ -2,9 +2,10 @@
 //!
 //! Agents see only [`crate::ai::context::RepoContext::skill_index`] in their
 //! prompt; this tool hands back the SKILL.md body, frontmatter stripped, for
-//! one named skill. The file is read straight from the checkout with std fs —
-//! the context was gathered from the same tree, and the path comes from the
-//! context, never from the model's input.
+//! one named skill. The path comes from the context, never from the model's
+//! input, but the checkout is attacker-controlled, so the file goes through
+//! [`crate::ai::context::read_repo_file`] (no symlinks, size-capped) on a
+//! blocking thread.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -63,7 +64,12 @@ impl Tool for LoadSkill {
         // The path comes from the context, not the model's input, so it is
         // repo-relative by construction.
         let path = cx.repo_root.join(&skill.dir).join("SKILL.md");
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let root = cx.repo_root.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            crate::ai::context::read_repo_file(&root, &path, crate::ai::context::MAX_FILE_BYTES)
+        })
+        .await;
+        let Ok(Ok(raw)) = read else {
             return ToolOutput::error(format!("not found: {}/SKILL.md", skill.dir));
         };
         let (_keys, body) = crate::ai::context::split_frontmatter(&raw);
@@ -160,5 +166,24 @@ mod tests {
         let out = call(&cx, json!({"name": "pdf"})).await;
         assert!(out.is_error, "{:?}", out.parts);
         assert_eq!(text(&out), "no repo context attached");
+    }
+
+    #[tokio::test]
+    async fn symlinked_skill_md_is_not_read() {
+        let dir = tempdir();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude/skills/pdf")).unwrap();
+        let skill = repo.join(".claude/skills/pdf/SKILL.md");
+        std::fs::write(&skill, "---\nname: pdf\n---\nok\n").unwrap();
+        let context = Arc::new(load_repo_context(&repo));
+        // Swapped for a symlink after the index was built.
+        std::fs::remove_file(&skill).unwrap();
+        std::os::unix::fs::symlink(&secret, &skill).unwrap();
+        let cx = skill_ctx(&repo, Some(context));
+        let out = call(&cx, json!({"name": "pdf"})).await;
+        assert!(out.is_error, "{:?}", out.parts);
+        assert!(!text(&out).contains("TOP-SECRET"));
     }
 }

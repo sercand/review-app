@@ -4,6 +4,12 @@
 //!
 //! [`load_repo_context`] never fails: every unreadable file is skipped with a
 //! `tracing::debug!` that names the path, never its contents.
+//!
+//! The checkout is the PR head, so its tree is attacker-controlled and these
+//! reads happen outside the sandbox. [`read_repo_file`] therefore refuses
+//! symlinks (the file or any parent below the root), non-regular files, and
+//! caps every file and the total, so a committed link cannot pull a host file
+//! into a prompt.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -84,13 +90,14 @@ impl RepoContext {
 /// Gather the repo context from the checkout at `root`. Never fails; an
 /// unreadable file is skipped with a `tracing::debug!`.
 pub fn load_repo_context(root: &Path) -> RepoContext {
-    let review_md = read_to_string(&root.join(".github").join("REVIEW.md"));
+    let mut budget = Budget(MAX_TOTAL_BYTES);
+    let review_md = read_to_string(root, &root.join(".github").join("REVIEW.md"), &mut budget);
     let checks = review_md.as_deref().map(parse_checks).unwrap_or_default();
     RepoContext {
         review_md,
         checks,
-        instructions: load_instructions(root),
-        skills: load_skills(root),
+        instructions: load_instructions(root, &mut budget),
+        skills: load_skills(root, &mut budget),
     }
 }
 
@@ -99,13 +106,70 @@ pub fn load_repo_context(root: &Path) -> RepoContext {
 const INSTRUCTION_NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 const MAX_INSTRUCTION_FILES: usize = 50;
 
-/// Read a file, skipping it — with a debug log naming the path, never the
-/// contents — when it is missing or unreadable.
-fn read_to_string(path: &Path) -> Option<String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Some(text),
-        Err(error) => {
-            tracing::debug!(path = %path.display(), "repo context: skipping unreadable file: {error}");
+/// The most bytes read from one context file, and from all of them together.
+pub(crate) const MAX_FILE_BYTES: usize = 64 * 1024;
+const MAX_TOTAL_BYTES: usize = 256 * 1024;
+
+/// Marker appended where a file was cut at the byte cap.
+const TRUNCATED: &str = "\n[truncated: file exceeds the size cap]\n";
+
+/// Bytes left for the context files of one [`load_repo_context`] call.
+struct Budget(usize);
+
+/// Read the regular file at `path` (inside `root`) for a prompt, at most
+/// `max` bytes; a longer file is cut and ends with a marker. Refuses — with
+/// the reason as the error — a symlink at `path` or at any component between
+/// `root` and it, a non-regular file, and a path outside `root`. `root`
+/// itself may sit behind links; only the tree below it is untrusted.
+pub(crate) fn read_repo_file(root: &Path, path: &Path, max: usize) -> Result<String, String> {
+    use std::io::Read;
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| "outside the repo".to_owned())?;
+    let mut current = root.to_path_buf();
+    for part in rel.components() {
+        match part {
+            Component::Normal(name) => current.push(name),
+            _ => return Err("outside the repo".to_owned()),
+        }
+        let meta = std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if meta.file_type().is_symlink() {
+            return Err("symlink".to_owned());
+        }
+    }
+    let meta = std::fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_owned());
+    }
+    let file = std::fs::File::open(&current).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let cut = bytes.len() > max;
+    bytes.truncate(max);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        text.push_str(TRUNCATED);
+    }
+    Ok(text)
+}
+
+/// [`read_repo_file`] under the shared `budget`, skipping — with a debug log
+/// naming the path and the reason, never the contents — a file that is
+/// missing, unsafe, unreadable or past the total cap.
+fn read_to_string(root: &Path, path: &Path, budget: &mut Budget) -> Option<String> {
+    if budget.0 == 0 {
+        tracing::debug!(path = %path.display(), "repo context: skipped: total size cap reached");
+        return None;
+    }
+    match read_repo_file(root, path, budget.0.min(MAX_FILE_BYTES)) {
+        Ok(text) => {
+            budget.0 = budget.0.saturating_sub(text.len());
+            Some(text)
+        }
+        Err(reason) => {
+            tracing::debug!(path = %path.display(), "repo context: skipped: {reason}");
             None
         }
     }
@@ -186,7 +250,7 @@ fn parse_checks(markdown: &str) -> Vec<RepoCheck> {
 /// The walk honors `.gitignore` (even outside a git repository) and skips
 /// hidden directories; `.github/REVIEW.md` and `.claude/skills/` are read
 /// directly, so nothing needed lives where the walk does not look.
-fn load_instructions(root: &Path) -> Vec<InstructionFile> {
+fn load_instructions(root: &Path, budget: &mut Budget) -> Vec<InstructionFile> {
     let mut found: Vec<PathBuf> = ignore::WalkBuilder::new(root)
         .hidden(true)
         .require_git(false)
@@ -212,7 +276,7 @@ fn load_instructions(root: &Path) -> Vec<InstructionFile> {
 
     let mut files = Vec::new();
     for path in found {
-        let Some(raw) = read_to_string(&path) else {
+        let Some(raw) = read_to_string(root, &path, budget) else {
             continue;
         };
         let path = relative(root, &path);
@@ -222,7 +286,7 @@ fn load_instructions(root: &Path) -> Vec<InstructionFile> {
         };
         files.push(InstructionFile {
             dir,
-            content: expand_imports(&raw, &root.join(&path), root),
+            content: expand_imports(&raw, &root.join(&path), root, budget),
             path,
         });
     }
@@ -233,13 +297,13 @@ fn load_instructions(root: &Path) -> Vec<InstructionFile> {
 /// file's contents. Imports go one level deep — inserted content is not
 /// re-scanned — and stay inside the repo; a line whose target escapes the
 /// root or cannot be read is kept verbatim.
-fn expand_imports(content: &str, file: &Path, root: &Path) -> String {
+fn expand_imports(content: &str, file: &Path, root: &Path, budget: &mut Budget) -> String {
     let dir = file.parent().unwrap_or(root);
     let mut out = String::new();
     for line in content.lines() {
         let token = line.trim();
         let imported = if token.len() > 1 && token.starts_with('@') && token.ends_with(".md") {
-            confine(root, dir, &token[1..]).and_then(|target| read_to_string(&target))
+            confine(root, dir, &token[1..]).and_then(|target| read_to_string(root, &target, budget))
         } else {
             None
         };
@@ -284,7 +348,7 @@ fn confine(root: &Path, dir: &Path, target: &str) -> Option<PathBuf> {
 /// The `.claude/skills/*/SKILL.md` entries, sorted by directory, with the
 /// frontmatter `name` and `description` (the folder name is the fallback
 /// name).
-fn load_skills(root: &Path) -> Vec<SkillInfo> {
+fn load_skills(root: &Path, budget: &mut Budget) -> Vec<SkillInfo> {
     let skills_dir = root.join(".claude").join("skills");
     let Ok(entries) = std::fs::read_dir(&skills_dir) else {
         if skills_dir.exists() {
@@ -301,13 +365,13 @@ fn load_skills(root: &Path) -> Vec<SkillInfo> {
             }
         })
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
+        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
         .collect();
     dirs.sort();
 
     let mut skills = Vec::new();
     for dir in dirs {
-        let Some(raw) = read_to_string(&dir.join("SKILL.md")) else {
+        let Some(raw) = read_to_string(root, &dir.join("SKILL.md"), budget) else {
             continue;
         };
         let (keys, _) = split_frontmatter(&raw);
@@ -545,6 +609,119 @@ mod tests {
         let lines: Vec<&str> = index.lines().collect();
         assert_eq!(lines[0], "- pdf: Do things with PDFs.");
         assert!(lines[1].starts_with("- plain:"), "{}", lines[1]);
+    }
+
+    /// A secret file outside the repo, and the repo root beside it.
+    fn repo_with_outside_secret() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempdir();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        (dir, repo)
+    }
+
+    fn link(target: &Path, at: &Path) {
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, at).unwrap();
+    }
+
+    #[test]
+    fn symlinked_review_md_is_not_read() {
+        let (dir, repo) = repo_with_outside_secret();
+        link(
+            &dir.path().join("secret.txt"),
+            &repo.join(".github/REVIEW.md"),
+        );
+        let ctx = load_repo_context(&repo);
+        assert_eq!(ctx.review_md, None);
+        assert!(ctx.checks.is_empty());
+    }
+
+    #[test]
+    fn symlinked_agents_md_and_import_are_not_read() {
+        let (dir, repo) = repo_with_outside_secret();
+        let secret = dir.path().join("secret.txt");
+        link(&secret, &repo.join("AGENTS.md"));
+        write(&repo, "CLAUDE.md", "rules\n@leak.md\n");
+        link(&secret, &repo.join("leak.md"));
+        let ctx = load_repo_context(&repo);
+        assert!(ctx.instructions.iter().all(|f| f.path != "AGENTS.md"));
+        let claude = content_of(&ctx, "CLAUDE.md");
+        assert!(!claude.contains("TOP-SECRET"), "{claude}");
+        assert!(claude.contains("@leak.md"), "{claude}");
+    }
+
+    #[test]
+    fn symlinked_skill_and_parent_dirs_are_not_read() {
+        let (dir, repo) = repo_with_outside_secret();
+        let secret = dir.path().join("secret.txt");
+        link(&secret, &repo.join(".claude/skills/a/SKILL.md"));
+        // A whole skill folder, and the `.github` dir, linked outside.
+        let outside = dir.path().join("outside");
+        write(&outside, "SKILL.md", "---\nname: b\n---\nTOP-SECRET\n");
+        link(&outside, &repo.join(".claude/skills/b"));
+        write(&outside, "REVIEW.md", "## Checks\n- TOP-SECRET\n");
+        link(&outside, &repo.join(".github"));
+        let ctx = load_repo_context(&repo);
+        assert!(ctx.skills.is_empty(), "{:?}", ctx.skills);
+        assert_eq!(ctx.review_md, None);
+    }
+
+    #[test]
+    fn read_repo_file_rejects_symlinked_parent_and_non_files() {
+        let (dir, repo) = repo_with_outside_secret();
+        let outside = dir.path().join("outside");
+        write(&outside, "x.md", "TOP-SECRET");
+        link(&outside, &repo.join("sub"));
+        assert!(read_repo_file(&repo, &repo.join("sub/x.md"), 1024).is_err());
+        std::fs::create_dir_all(repo.join("d")).unwrap();
+        assert!(read_repo_file(&repo, &repo.join("d"), 1024).is_err());
+        assert!(read_repo_file(&repo, &dir.path().join("secret.txt"), 1024).is_err());
+        write(&repo, "ok/x.md", "fine");
+        assert_eq!(
+            read_repo_file(&repo, &repo.join("ok/x.md"), 1024).unwrap(),
+            "fine"
+        );
+    }
+
+    #[test]
+    fn oversize_file_is_truncated_with_a_marker() {
+        let dir = tempdir();
+        write(dir.path(), "AGENTS.md", &"a".repeat(MAX_FILE_BYTES + 1000));
+        let ctx = load_repo_context(dir.path());
+        let content = content_of(&ctx, "AGENTS.md");
+        assert!(content.contains("[truncated"), "{}", content.len());
+        assert!(content.len() < MAX_FILE_BYTES + 200, "{}", content.len());
+    }
+
+    #[test]
+    fn total_cap_limits_all_context_sources() {
+        let dir = tempdir();
+        let big = "b".repeat(MAX_FILE_BYTES - 100);
+        for n in 0..10 {
+            write(dir.path(), &format!("d{n}/AGENTS.md"), &big);
+        }
+        let ctx = load_repo_context(dir.path());
+        let total: usize = ctx.instructions.iter().map(|f| f.content.len()).sum();
+        assert!(total <= MAX_TOTAL_BYTES + 1024, "{total}");
+        assert!(ctx.instructions.len() < 10, "{}", ctx.instructions.len());
+    }
+
+    #[test]
+    fn regular_files_still_load() {
+        let dir = tempdir();
+        write(dir.path(), ".github/REVIEW.md", "## Checks\n- one\n");
+        write(dir.path(), "AGENTS.md", "root\n");
+        write(
+            dir.path(),
+            ".claude/skills/s/SKILL.md",
+            "---\nname: s\n---\nbody\n",
+        );
+        let ctx = load_repo_context(dir.path());
+        assert_eq!(ctx.checks.len(), 1);
+        assert_eq!(content_of(&ctx, "AGENTS.md"), "root\n");
+        assert_eq!(ctx.skills.len(), 1);
     }
 
     fn content_of(ctx: &RepoContext, path: &str) -> String {
