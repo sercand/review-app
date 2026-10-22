@@ -64,7 +64,9 @@ fn read_only_alone_approves_only_recognised_read_only_forms() {
             // Plain read-only commands.
             ("ls -la", Approve),
             ("cat README.md | head -20", Approve),
-            ("grep -rn foo src", Approve),
+            // Final review I3(b): recursive search asks (was Approve).
+            ("grep -rn foo src", Defer),
+            ("grep -n foo src/main.rs", Approve),
             ("jq '.name' package.json", Approve),
             ("wc -l < Cargo.toml", Approve),
             ("set -euo pipefail", Approve),
@@ -668,4 +670,76 @@ fn an_empty_stack_approves_nothing_that_touches_anything() {
         assert_eq!(got, if noop { Approve } else { Defer }, "{cmd:?}");
     }
     assert_eq!(classify("cd /tmp", None, &[]), Approve);
+}
+
+/// Final review I3(b): searches that recurse, or reach hidden / ignored /
+/// untracked files, can read repo-local secrets (`.env*`), so they ask. The
+/// plain forms keep running.
+#[test]
+fn recursive_hidden_and_untracked_searches_defer() {
+    check(
+        ALL_BUILTIN,
+        &[
+            ("grep -r = .", Defer),
+            ("grep -R KEY .", Defer),
+            ("grep -rn foo src", Defer),
+            ("grep -nR foo src", Defer),
+            ("grep --recursive KEY .", Defer),
+            ("grep --recurs KEY .", Defer),
+            ("grep --dereference-recursive KEY .", Defer),
+            ("grep -d recurse KEY .", Defer),
+            ("grep -drecurse KEY .", Defer),
+            ("grep --directories=recurse KEY .", Defer),
+            ("grep --directories recurse KEY .", Defer),
+            ("egrep -r KEY .", Defer),
+            ("fgrep -R KEY .", Defer),
+            ("grep -r url .git", Defer),
+            ("grep KEY file", Approve),
+            ("grep -n KEY a b", Approve),
+            // any -d value asks, not just `recurse`
+            ("grep -d skip KEY a", Defer),
+            ("grep -i -E 'a|b' f", Approve),
+            ("grep recurse f", Approve),
+            ("cat f | grep KEY", Approve),
+            ("rg -uu KEY", Defer),
+            ("rg -u KEY", Defer),
+            ("rg -uuu KEY", Defer),
+            ("rg -nu KEY", Defer),
+            ("rg --hidden KEY", Defer),
+            ("rg --no-ignore KEY", Defer),
+            ("rg --no-ignore-vcs KEY", Defer),
+            ("rg --no-ignore-dot KEY", Defer),
+            ("rg --no-ignore-parent KEY", Defer),
+            ("rg --no-ignore-global KEY", Defer),
+            ("rg --no-ignore-exclude KEY", Defer),
+            ("rg --no-ignore-files KEY", Defer),
+            ("rg --unrestricted KEY", Defer),
+            ("rg -. KEY", Defer),
+            ("rg KEY", Approve),
+            ("rg -n KEY src", Approve),
+            ("rg -i -g '*.rs' KEY", Approve),
+            ("rg --no-ignore-messages KEY", Approve),
+            ("git grep --untracked KEY", Defer),
+            ("git grep --no-index KEY", Defer),
+            ("git grep --no-exclude-standard KEY", Defer),
+            ("git grep --untr KEY", Defer),
+            ("git grep KEY", Approve),
+            ("git grep -n KEY src", Approve),
+            ("git grep --exclude-standard KEY", Approve),
+            ("ag --hidden KEY", Defer),
+            ("ag -u KEY", Defer),
+            ("ag --unrestricted KEY", Defer),
+            ("ag KEY", Approve),
+            ("ack KEY", Defer),
+            // cd into .git: `cd .git && cat config` reads the remote URL.
+            ("cd .git && cat config", Defer),
+            ("cd .git", Defer),
+            ("cd ./.git/hooks", Defer),
+            ("cd sub/.git", Defer),
+            ("cd /repo/.git/", Defer),
+            ("cd .github", Approve),
+            ("cd src/.gitlab", Approve),
+            ("cd src && ls", Approve),
+        ],
+    );
 }

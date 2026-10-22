@@ -310,6 +310,16 @@ fn classify_segment(
     }
     let binary = argv0_name(&seg.argv[0]);
     if binary == "cd" {
+        // Final review I3(c): `cd .git && cat config` would read the remote
+        // URL (which can hold a token) without naming a deny path.
+        if seg
+            .argv
+            .iter()
+            .skip(1)
+            .any(|w| w.split('/').any(|c| c == ".git"))
+        {
+            return deny_or_defer(seg, cwd, stack);
+        }
         return structural();
     }
     if is_python_tool(binary) {

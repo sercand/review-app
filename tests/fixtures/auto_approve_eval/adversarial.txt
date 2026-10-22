@@ -491,3 +491,23 @@ cat README.md | pbcopy
 xclip -sel c f
 xsel -b
 wl-copy < f
+
+# Final review I3: searches that recurse into, or past ignore rules to, repo-local
+# secrets (.env*), and a cd into .git to read config by a bare name.
+grep -r = .
+grep -R KEY .
+grep -rn password .
+grep --recursive KEY .
+egrep -r KEY .
+rg -uu KEY
+rg -uuu KEY
+rg --hidden KEY
+rg --no-ignore KEY
+rg --no-ignore-vcs KEY
+git grep --untracked KEY
+git grep --no-index KEY
+git grep --no-exclude-standard KEY
+grep -r url .git
+cd .git && cat config
+cd .git && grep url config
+cd ./.git/hooks && ls

@@ -36,7 +36,7 @@ fn classify_table() {
     let allowed = allowed();
     let run = [
         "ls -la src",
-        "grep -rn foo src | head -20",
+        "grep -n foo src/main.rs | head -20",
         "git log --oneline -5",
         "cargo test -p x -- --nocapture",
         "cargo test 2>&1 | tail -50",
@@ -47,6 +47,8 @@ fn classify_table() {
     ];
     let ask = [
         "cargo testx",
+        // Final review I3(b): recursive search can read repo-local secrets.
+        "grep -rn foo src | head -20",
         "npm install",
         "git push",
         "git -c core.x=y log",

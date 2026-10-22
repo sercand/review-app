@@ -280,6 +280,15 @@ pub const NEVER_APPROVE: &[&str] = &[
     "most",
     "man",
     "info",
+    // recursive/hidden searches read repo-local secrets; the rules vouch for
+    // the safe forms, so a segment the model sees is one they refused
+    // (final review I3)
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
     // builtins that change later commands' meaning (the shell is persistent)
     "alias",
     "unalias",
@@ -721,6 +730,12 @@ mod tests {
             "history -r f",
             "shopt -s expand_aliases",
             "set -o emacs",
+            // Final review I3: the rules refused this search, so the model
+            // may not wave it through.
+            "grep -r = .",
+            "rg -uu KEY",
+            "ack KEY",
+            "ag --hidden KEY",
             // Final review I2: tools that load and execute repo config.
             "eslint .",
             "prettier --check .",

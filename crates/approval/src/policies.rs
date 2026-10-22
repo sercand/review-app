@@ -159,10 +159,8 @@ const READ_ONLY_PURE: &[&str] = &[
     "bzcat",
     "xzcat",
     "zipinfo",
-    // Search
-    "grep",
-    "egrep",
-    "fgrep",
+    // Search: `grep`/`egrep`/`fgrep` are in `read_only_checked` (recursion
+    // reads repo-local secrets, final review I3).
     // Text processing
     "cut",
     "tr",
@@ -336,9 +334,30 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
             ) && argv.get(1).map(String::as_str) != Some("cache")
         }
         "zstdcat" => flags("o", &["output", "rm"], &[], false),
-        "rg" => flags("", &["pre", "hostname-bin"], &[], true),
-        "ag" => flags("", &["pager"], &[], true),
-        "ack" => flags("", &["pager", "output"], &[], true),
+        // Final review I3(b): recursion and the switches that reach hidden,
+        // ignored or untracked files (`.env*`) make a search ask; the plain
+        // forms (`rg KEY`, `grep KEY file`) still run. `ack` is not approved:
+        // it searches dotfiles by default.
+        "grep" | "egrep" | "fgrep" => grep_does_not_recurse(seg),
+        "rg" => flags(
+            "u.",
+            &[
+                "pre",
+                "hostname-bin",
+                "hidden",
+                "unrestricted",
+                "no-ignore",
+                "no-ignore-vcs",
+                "no-ignore-dot",
+                "no-ignore-parent",
+                "no-ignore-global",
+                "no-ignore-exclude",
+                "no-ignore-files",
+            ],
+            &[],
+            true,
+        ),
+        "ag" => flags("u", &["pager", "hidden", "unrestricted"], &[], true),
         "sort" => flags("o", &["output", "compress-program"], &[], true),
         // second operand is the output file
         "uniq" => !seg.has_dynamic() && operand_count(argv, &["-f", "-s", "-w"]) <= 1,
@@ -429,6 +448,28 @@ const XXD_VALUE_FLAGS: &[&str] = &[
     "-n",
     "-name",
 ];
+
+/// `grep` without `-r`/`-R`/`--recursive`/`-d`/`--directories` (any `-d`
+/// value is refused; `recurse` is the one that matters). Run-time words are
+/// not inspected, as before: a pattern or path is usually one.
+fn grep_does_not_recurse(seg: &Segment) -> bool {
+    const LONG: &[&str] = &["recursive", "dereference-recursive", "directories"];
+    for (i, t) in seg.argv.iter().enumerate().skip(1) {
+        if seg.is_dynamic(i) {
+            continue;
+        }
+        if t == "--" {
+            break;
+        }
+        if LONG.iter().any(|l| long_is(t, l)) {
+            return false;
+        }
+        if short_cluster(t).is_some_and(|c| c.contains(['r', 'R', 'd'])) {
+            return false;
+        }
+    }
+    true
+}
 
 /// `awk [-F fs] [-v var=val] 'program' [file…]` where the program neither
 /// runs commands nor writes: no `system`, no `getline`, no indirect call,
@@ -1096,6 +1137,15 @@ fn git_read_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
     if args
         .iter()
         .any(|t| long_is(t, "output") || long_is(t, "ext-diff"))
+    {
+        return None;
+    }
+    // Final review I3(b): `git grep` of untracked or ignored files reads
+    // repo-local secrets.
+    if sub == "grep"
+        && args.iter().any(|t| {
+            long_is(t, "untracked") || long_is(t, "no-index") || long_is(t, "no-exclude-standard")
+        })
     {
         return None;
     }
