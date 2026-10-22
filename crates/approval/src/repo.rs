@@ -70,7 +70,7 @@ impl SegmentPolicy for RepoAllow<'_> {
 pub struct DenyPaths<'a>(pub &'a [String]);
 
 impl DenyPaths<'_> {
-    fn words<'s>(seg: &'s Segment) -> impl Iterator<Item = &'s str> {
+    fn words(seg: &Segment) -> impl Iterator<Item = &str> {
         seg.argv
             .iter()
             .map(String::as_str)
