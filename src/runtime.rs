@@ -1618,11 +1618,15 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         }
         #[cfg(unix)]
         Command::ClassifierSetEnabled(enabled) => {
+            // Record the request now (in command order) and flip the live
+            // flag; the blocking task applies the newest request, so two
+            // commands that overtake each other still end on the last one.
+            ctx.ai.classifier_request(enabled);
             // Switching off can free a GPU model, which is slow: keep it off
             // the async worker.
             let ctx = ctx.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                ctx.ai.classifier_set_enabled(enabled, &events);
+                ctx.ai.classifier_apply_desired(&events);
             })
             .await;
         }

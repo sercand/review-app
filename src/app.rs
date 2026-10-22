@@ -297,6 +297,16 @@ fn quit_close_needs_intercept(close_requested: bool, self_triggered: bool) -> bo
     close_requested && !self_triggered
 }
 
+/// Fold [`Event::ClassifierState`] into the Settings window (`handle_event`'s
+/// arm; `ReviewApp` itself cannot be built without a window, so the arm is
+/// this function).
+fn apply_classifier_event(
+    window: &mut SettingsWindowState,
+    state: crate::state::classifier::ClassifierState,
+) {
+    window.set_classifier_state(state);
+}
+
 /// True exactly once, on the first call, and only when the classifier setting
 /// is on: the app then sends `ClassifierSetEnabled(true)`.
 fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
@@ -566,7 +576,9 @@ impl ReviewApp {
                     .insert(provider, result);
             }
             // App-global (no SessionId, never stale): Settings shows it.
-            Event::ClassifierState(state) => self.settings_window.set_classifier_state(state),
+            Event::ClassifierState(state) => {
+                apply_classifier_event(&mut self.settings_window, state)
+            }
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -3018,7 +3030,7 @@ mod tests {
     fn classifier_event_updates_the_settings_window_vm() {
         use crate::state::classifier::ClassifierState;
         let mut window = SettingsWindowState::default();
-        window.set_classifier_state(ClassifierState::Failed("offline".into()));
+        apply_classifier_event(&mut window, ClassifierState::Failed("offline".into()));
         assert_eq!(
             window.vm.ai.auto_approve.classifier_state,
             ClassifierState::Failed("offline".into())

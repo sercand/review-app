@@ -205,9 +205,12 @@ impl AutoApproveVm {
     /// while a classifier is available; otherwise the stored value stays.
     fn write_to(&self, s: &mut AutoApproveSettings) {
         s.enabled = self.enabled;
-        // Not editable while unavailable: keep what is stored (M4).
+        // Not editable while unavailable: keep what is stored (M4), except
+        // that it can be switched off but never on.
         if self.classifier_available {
             s.local_classifier = self.local_classifier;
+        } else {
+            s.local_classifier &= self.local_classifier;
         }
         s.classifier_timeout_ms = self
             .timeout_ms
@@ -1044,7 +1047,7 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<
     ui.checkbox(&mut vm.enabled, AUTO_APPROVE_LABEL);
     ui.label(RichText::new(AUTO_APPROVE_HINT).size(12.0).color(p.muted));
     ui.horizontal(|ui| {
-        ui.add_enabled_ui(vm.classifier_available, |ui| {
+        ui.add_enabled_ui(vm.classifier_available || vm.local_classifier, |ui| {
             ui.checkbox(
                 &mut vm.local_classifier,
                 "Also ask the local classifier (experimental)",
@@ -1748,6 +1751,27 @@ mod tests {
             ClassifierState::Downloading { done: 1, total: 2 }
         );
         assert_eq!(aa.classifier_available, classifier::COMPILED);
+    }
+
+    #[test]
+    fn an_unavailable_classifier_can_be_switched_off_but_never_on() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.local_classifier = true;
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai
+            .auto_approve
+            .set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        // Untouched: the stored true stays.
+        vm.clone().apply(&mut settings).unwrap();
+        assert!(settings.ai.auto_approve.local_classifier);
+        // Unchecked: it goes off.
+        vm.ai.auto_approve.local_classifier = false;
+        vm.clone().apply(&mut settings).unwrap();
+        assert!(!settings.ai.auto_approve.local_classifier);
+        // Checking it while unavailable does not stick.
+        vm.ai.auto_approve.local_classifier = true;
+        vm.clone().apply(&mut settings).unwrap();
+        assert!(!settings.ai.auto_approve.local_classifier);
     }
 
     #[test]

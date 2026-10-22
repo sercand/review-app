@@ -153,9 +153,8 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
 /// one, the model may block (a GPU call, a lock), so the whole classification
 /// runs on a blocking thread under [`ApprovalSetup::timeout`]; on a timeout or
 /// a panicked thread only cached model outcomes apply and no new model call
-/// is made. The
-/// slow thread is detached, never awaited past the timeout, and the in-flight
-/// guard keeps later commands off the model until it finishes.
+/// is made. The slow thread is detached, never awaited past the timeout, and
+/// the in-flight guard keeps later commands off the model until it finishes.
 ///
 /// With auto-approve off, no rule policy or model is consulted: a `Deny`
 /// (secret paths) still applies, and anything that would have run asks.
