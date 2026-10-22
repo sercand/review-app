@@ -221,6 +221,12 @@ fn classify_segment(
     stack: &[&dyn SegmentPolicy],
     depth: usize,
 ) -> Res {
+    // Deny rules see the segment as written first, so a wrapper's own
+    // redirects and arguments (`xargs cat < .env`) are checked even though
+    // the wrapped command is classified without them.
+    if is_denied(seg, cwd, stack) {
+        return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
+    }
     if !seg.redirects.iter().all(is_redirect_safe)
         || seg
             .assigns
@@ -300,15 +306,18 @@ fn consult(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> R
 /// explicit deny rule still denies, everything else defers. The model is
 /// not asked — it has nothing to add to a segment that cannot be approved.
 fn deny_or_defer(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> Res {
-    for p in stack {
-        if p.name() == ML_NAME {
-            continue;
-        }
-        if p.verify(seg, cwd) == Some(PolicyVerdict::Deny) {
-            return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
-        }
+    if is_denied(seg, cwd, stack) {
+        return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
     }
     defer(seg)
+}
+
+/// Whether any non-model policy in the stack denies this segment.
+fn is_denied(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> bool {
+    stack
+        .iter()
+        .filter(|p| p.name() != ML_NAME)
+        .any(|p| p.verify(seg, cwd) == Some(PolicyVerdict::Deny))
 }
 
 /// What a wrapper invocation boils down to.
@@ -765,6 +774,33 @@ mod tests {
 
     fn empty(cmd: &str) -> Decision {
         run(cmd, &[]).0
+    }
+
+    static DENY_DOTENV: Policy = Policy {
+        name: "test-deny-dotenv",
+        verify: |seg, _| {
+            let hit = |t: &str| t.contains(".env");
+            (seg.argv.iter().any(|a| hit(a)) || seg.redirects.iter().any(|r| hit(&r.target)))
+                .then_some(PolicyVerdict::Deny)
+        },
+    };
+
+    #[test]
+    fn deny_sees_wrapper_redirects_and_arguments() {
+        for cmd in [
+            "xargs cat < .env",
+            "timeout 5 cat < .env",
+            "env FOO=1 cat < .env",
+            "sh -c ls < .env",
+            "command cat < .env",
+            "ls | xargs cat < .env",
+        ] {
+            assert_eq!(
+                run(cmd, &[&DENY_DOTENV, &READ_ONLY]).0,
+                Decision::Deny,
+                "{cmd}"
+            );
+        }
     }
 
     #[test]
