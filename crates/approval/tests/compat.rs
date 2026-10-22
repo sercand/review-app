@@ -200,7 +200,11 @@ fn intentional_changes() {
     // Non-risky assignment prefix on a vouched command.
     runs("FOO=1 ls", &[]);
     // Wrappers are looked through when the inner command is vouched.
+    // Safe only because the sandbox's gitconfig sets `safe.bareRepository =
+    // explicit` (crates/sandbox/src/env.rs, finding C2b): a PR-committed
+    // bare-repo layout in DIR is not discovered, so its config never loads.
     runs("git -C /repo log", &[]);
+    runs("cd /repo && git log", &[]);
     // Harmless git global options are skipped before the subcommand (da behaviour).
     for c in [
         "git --no-pager log",
@@ -228,6 +232,32 @@ fn intentional_changes() {
     asks("uniq a b", &[]);
     asks("sort -o x a", &[]);
     runs("time ls", &[]);
+    // C1: path-qualified command names ask (the checkout may hold a `cat`).
+    for c in [
+        "./cat x",
+        "bin/git status",
+        "/usr/bin/ls",
+        "FOO=1 ./ls",
+        "xargs ./cat",
+        "find . -exec ./cat {} \\;",
+        "env ./ls",
+    ] {
+        asks(c, &[]);
+    }
+    // ...but a repo-allowed entry is compared as written.
+    runs("./x", &["./x".to_string()]);
+    // C2a: GIT_* overrides steer git at a PR-controlled repository.
+    for c in [
+        "GIT_DIR=sub git status",
+        "GIT_WORK_TREE=sub git status",
+        "GIT_INDEX_FILE=x git status",
+        "env GIT_DIR=sub git status",
+        "GIT_TRACE=/tmp/x git status",
+        "GIT_OBJECT_DIRECTORY=x git log",
+    ] {
+        asks(c, &[]);
+    }
+    runs("GIT_PAGER=cat git log", &[]);
     runs("env FOO=1 ls", &[]);
     runs("sh -c 'ls'", &[]);
     // ...and still ask when it is not.

@@ -941,7 +941,12 @@ pub static HELP_BYPASS: Policy = Policy {
 };
 
 fn help_bypass_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
-    if seg.argv.len() == 2 && !seg.has_dynamic() && is_help_flag(&seg.argv[1]) {
+    // C1: a path-qualified binary is not vouched for, even for --help.
+    if seg.argv.len() == 2
+        && !seg.has_dynamic()
+        && !seg.argv[0].contains('/')
+        && is_help_flag(&seg.argv[1])
+    {
         Some(Verdict::Approve)
     } else {
         None

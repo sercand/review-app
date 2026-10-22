@@ -396,22 +396,41 @@ fn macos_help_and_mkdir() {
     );
 }
 
+/// C1: a path-qualified argv[0] is never the bare tool (the checkout may
+/// hold an executable named `cat`); da stripped the directory instead.
 #[test]
-fn argv0_path_is_stripped_before_matching() {
+fn path_qualified_argv0_is_not_vouched_for() {
     check(
-        &[&READ_ONLY, &GIT_READ],
+        &[&READ_ONLY, &GIT_READ, &MKDIR_CWD, &CARGO_LOCAL, &MACOS_ONLY],
         &[
-            ("/bin/ls -la", Approve),
-            ("/usr/bin/sort in", Approve),
-            ("/usr/bin/sort -o out in", Defer),
-            ("/usr/bin/git status", Approve),
-            ("/usr/bin/git branch new", Defer),
+            ("/bin/ls -la", Defer),
+            ("./cat x", Defer),
+            ("bin/git status", Defer),
+            ("FOO=1 ./ls", Defer),
+            ("/usr/bin/sort in", Defer),
+            ("/usr/bin/git status", Defer),
+            ("./mkdir out", Defer),
+            ("./cargo check", Defer),
+            ("/usr/bin/otool -L x", Defer),
             ("./rm x", Defer),
-            ("/bin/sh -c 'ls'", Approve),
-            ("/usr/bin/env ls", Approve),
-            ("/usr/bin/env rm x", Defer),
+            ("/bin/sh -c 'ls'", Defer),
+            ("/usr/bin/env ls", Defer),
+            ("env ./ls", Defer),
+            ("command ./ls", Defer),
+            ("time ./ls", Defer),
+            ("timeout 5 ./ls", Defer),
+            ("nice ./ls", Defer),
+            ("xargs ./cat", Defer),
+            ("find . -exec ./cat {} \\;", Defer),
+            ("sh -c './cat x'", Defer),
+            ("ls | ./cat", Defer),
+            // The bare names still work.
+            ("env ls", Approve),
+            ("xargs cat", Approve),
+            ("find . -exec cat {} \\;", Approve),
         ],
     );
+    check(&[&HELP_BYPASS], &[("./evil --help", Defer), ("evil --help", Approve)]);
 }
 
 #[test]

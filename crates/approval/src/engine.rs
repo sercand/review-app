@@ -630,12 +630,13 @@ fn unwrap_find_exec(seg: &Segment) -> Option<Unwrapped> {
     Some(Unwrapped::Inner(inner))
 }
 
-/// Strip directory components from a path-like argv[0] to get the binary name.
+/// The command name policies match on. C1: a path-qualified argv[0]
+/// (`./cat`, `bin/git`, `/usr/bin/ls`) is returned whole, so it matches no
+/// rule: the checkout is attacker-controlled and may hold an executable named
+/// like a safe tool. (Deliberate divergence from da, which strips directories.)
+/// `RepoAllow` compares raw argv and is unaffected.
 pub(crate) fn argv0_name(s: &str) -> &str {
-    Path::new(s)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(s)
+    s
 }
 
 /// Prefixes under which a redirect target counts as "somewhere under
@@ -710,11 +711,6 @@ fn is_risky_env(name: &str, value: &str) -> bool {
         "VISUAL",
         "MANOPT",
         "GREP_OPTIONS",
-        "GIT_SSH",
-        "GIT_EXTERNAL_DIFF",
-        "GIT_EXEC_PATH",
-        "GIT_TEMPLATE_DIR",
-        "GIT_DIFF_OPTS",
         "JAVA_TOOL_OPTIONS",
         "_JAVA_OPTIONS",
         "FFREPORT",
@@ -722,7 +718,11 @@ fn is_risky_env(name: &str, value: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "LD_",
         "DYLD_",
-        "GIT_CONFIG",
+        // C2a: every GIT_* variable (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE,
+        // GIT_OBJECT_DIRECTORY, GIT_TRACE*, GIT_SSH, GIT_CONFIG_*, …) can point
+        // git at a PR-controlled repository or make it write a file. The one
+        // exemption is the harmless pager spelling (`GIT_PAGER=cat`) below.
+        "GIT_",
         "BASH_FUNC",
         "PERL5",
         "PERLLIB",
