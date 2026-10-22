@@ -556,6 +556,10 @@ impl ReviewApp {
                     .test_results
                     .insert(provider, result);
             }
+            // The folder probe's answer (spec §4 step 2): the dialog that asks
+            // arrives with the local-repos UI, which consumes it there.
+            #[cfg(unix)]
+            Event::AiFolderProbed { .. } => {}
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).

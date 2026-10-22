@@ -10,8 +10,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
 use tokio::task::JoinError;
 
+#[cfg(unix)]
+use crate::ai::checkout::RemoteRepo;
+#[cfg(unix)]
+use crate::ai::repo_link::{FolderStatus, folder_status};
 #[cfg(unix)]
 use secrecy::SecretString;
 
@@ -330,6 +337,17 @@ pub enum Command {
         provider: crate::persist::settings::ProviderSettings,
         /// The model to probe with.
         model: crate::persist::settings::ModelSettings,
+    },
+    /// Probe what repository a local folder is a clone of (spec §4 step 2).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiFolderProbed`], keyed
+    /// by `token` so an answer for a dialog the user has left can be dropped.
+    #[cfg(unix)]
+    AiProbeFolder {
+        /// The requesting dialog's token, echoed by the reply.
+        token: u64,
+        /// The folder to probe.
+        path: PathBuf,
     },
     /// Attach to a PR's AI review: rebinds any live run to `session` and
     /// answers with [`Event::AiSnapshot`] (spec §10.2). Unix-only with
@@ -723,6 +741,17 @@ pub enum Event {
         provider: String,
         /// The model that served the probe, or why the probe failed.
         result: Result<String, String>,
+    },
+    /// The result of a [`Command::AiProbeFolder`]: the repository the folder is
+    /// a clone of, or the reason it cannot be one (safe to show).
+    #[cfg(unix)]
+    AiFolderProbed {
+        /// The token of the [`Command::AiProbeFolder`] that asked.
+        token: u64,
+        /// The folder that was probed.
+        path: PathBuf,
+        /// The repository, or why the folder names none.
+        result: Result<RemoteRepo, String>,
     },
     /// A PR's full AI state, replayed on attach and after a run starts
     /// (spec §10.3).
@@ -1604,6 +1633,24 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             }
         }
         #[cfg(unix)]
+        Command::AiProbeFolder { token, path } => {
+            // Not PR-scoped: no SessionId, the token names the request. `git`
+            // runs as a child process, so the probe goes to the blocking pool
+            // and never occupies an async worker thread.
+            let folder = path.clone();
+            let result = match tokio::task::spawn_blocking(move || probe_folder(&folder)).await {
+                Ok(result) => result,
+                // The blocking pool lost the task (it panicked): the dialog
+                // still needs an answer.
+                Err(error) => Err(format!("the folder probe failed: {error}")),
+            };
+            events.send(Event::AiFolderProbed {
+                token,
+                path,
+                result,
+            });
+        }
+        #[cfg(unix)]
         Command::AiAttach { session, key } => {
             ctx.ai.attach(session, key, &events);
         }
@@ -1860,6 +1907,26 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
 /// GitHub's own context width for the patches it sends.
 const LOCAL_DIFF_CONTEXT: usize = 3;
 
+/// What repository `path` is a clone of, or the reason it names none (safe to
+/// show). Blocking — [`crate::ai::checkout::read_origin_repo`] runs `git` as a
+/// child process — so [`Command::AiProbeFolder`] calls it on
+/// `spawn_blocking`.
+#[cfg(unix)]
+fn probe_folder(path: &Path) -> Result<RemoteRepo, String> {
+    // `read_origin_repo` reaches the same answers through `git`, but its
+    // failures read like a git invocation ("`git rev-parse ...` failed: ...").
+    // The folder check is filesystem-only and cheap, so answer the two obvious
+    // cases plainly and leave the rest to the clone check.
+    match folder_status(path) {
+        FolderStatus::Ok => {}
+        FolderStatus::Missing => return Err(format!("{} does not exist", path.display())),
+        FolderStatus::NotARepo => {
+            return Err(format!("{} is not a git repository", path.display()));
+        }
+    }
+    crate::ai::checkout::read_origin_repo(path).map_err(|error| error.to_string())
+}
+
 /// Fetch one side of an image diff, capped at [`MAX_IMAGE_BYTES`].
 ///
 /// Over the cap the blob was never buffered and becomes `TooLarge`; a
@@ -1942,6 +2009,114 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)),
             Some(Event::WorkerPanicked(_))
         ));
+    }
+
+    /// Run `git` in `dir`, panicking on failure: the probe tests need a real
+    /// repository, and CI has `git` on PATH.
+    #[cfg(unix)]
+    fn gitx(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The folder probe names the repository a clone belongs to — echoing the
+    /// request token for the consumer to match — and says why a plain or
+    /// missing folder cannot be one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_folder_reports_remote_and_reason() {
+        let dir = crate::test_support::tempdir();
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        gitx(&clone, &["init", "-b", "main"]);
+        gitx(
+            &clone,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Acme/Widgets.git",
+            ],
+        );
+
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let ctx = Arc::new(ExecCtx::new(Arc::new(
+            crate::auth::store::MemoryStore::default(),
+        )));
+        let (tx, rx) = event_channel();
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 7,
+                path: clone.clone(),
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed {
+            token,
+            path,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 7, "the token is echoed for the consumer to match");
+        assert_eq!(path, clone);
+        assert_eq!(result.unwrap().key(), "github.com/acme/widgets");
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 8,
+                path: plain,
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed { token, result, .. }) =
+            rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 8);
+        let reason = result.expect_err("a plain directory is not a clone");
+        assert!(
+            reason.contains("not a git repository"),
+            "the reason should say why: {reason}"
+        );
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 9,
+                path: dir.path().join("gone"),
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed { token, result, .. }) =
+            rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 9);
+        let reason = result.expect_err("a missing folder is no clone");
+        assert!(
+            reason.contains("does not exist"),
+            "the reason should say why: {reason}"
+        );
     }
 
     #[test]
