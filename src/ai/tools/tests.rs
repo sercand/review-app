@@ -1727,6 +1727,37 @@ async fn bash_dangerous_flag_reaches_dialog_reason() {
     }
 }
 
+/// A cached Dangerous outcome still asks, with the "flagged" reason, while
+/// another model call is in flight (the cache is consulted, no new call).
+#[tokio::test]
+async fn bash_busy_classifier_cached_dangerous_still_asks_flagged() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Dangerous);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(out.is_error);
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    let _busy = cx.approval.try_begin_model().expect("slot free");
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(out.is_error);
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+    match interaction.calls().as_slice() {
+        [
+            InteractionCall::Approve { .. },
+            InteractionCall::Approve { reason, .. },
+        ] => assert!(reason.contains("flagged"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn bash_capability_vouches_before_the_model() {
     let (dir, host) = host();

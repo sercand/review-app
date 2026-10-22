@@ -6,7 +6,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use review_approval::model_stage::{CommandClassifier, ModelOutcome};
 use shiso_core::Backend;
@@ -110,17 +110,30 @@ impl CommandClassifier for ShisoClassifier {
 }
 
 /// The compute device: Metal on macOS, CUDA on Linux builds with
-/// `local-classifier-cuda`. Created at most once per process and shared
-/// (the outcome, error included, is cached). Creation errors and panics are
-/// both `Err`.
+/// `local-classifier-cuda`. Created at most once per process and shared. Only
+/// a success is cached: a failure (or panic) is returned as `Err` and a later
+/// call, say after the user switches the setting off and on, tries again.
 pub fn open_backend() -> Result<Arc<dyn Backend>, String> {
-    static BACKEND: OnceLock<Result<Arc<dyn Backend>, String>> = OnceLock::new();
-    BACKEND
-        .get_or_init(|| match catch_unwind(create_backend) {
-            Ok(r) => r,
-            Err(_) => Err("the GPU backend panicked while opening".into()),
-        })
-        .clone()
+    static BACKEND: Mutex<Option<Arc<dyn Backend>>> = Mutex::new(None);
+    cached(&BACKEND, || match catch_unwind(create_backend) {
+        Ok(r) => r,
+        Err(_) => Err("the GPU backend panicked while opening".into()),
+    })
+}
+
+/// The value in `slot`, else whatever `create` makes, stored only on `Ok`.
+/// Creation runs under the lock so two callers never both create.
+fn cached<T: Clone>(
+    slot: &Mutex<Option<T>>,
+    create: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(value) = guard.as_ref() {
+        return Ok(value.clone());
+    }
+    let value = create()?;
+    *guard = Some(value.clone());
+    Ok(value)
 }
 
 #[cfg(target_os = "macos")]
@@ -233,6 +246,18 @@ mod tests {
 
     fn err() -> Step {
         Some(Err("device lost".into()))
+    }
+
+    #[test]
+    fn cached_retries_after_an_error_and_keeps_a_success() {
+        let slot = Mutex::new(None);
+        assert_eq!(
+            cached(&slot, || Err::<u32, _>("boom".into())),
+            Err("boom".into())
+        );
+        assert_eq!(cached(&slot, || Ok(7)), Ok(7));
+        // Cached now: the creator is not run again.
+        assert_eq!(cached(&slot, || Err("not called".into())), Ok(7));
     }
 
     #[test]

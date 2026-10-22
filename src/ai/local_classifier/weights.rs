@@ -211,6 +211,7 @@ impl WeightsManager {
         let final_dir = self.install_dir();
         let parent = final_dir.parent().expect("install dir has a parent");
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        sweep_stale_staging(parent, STALE_STAGING);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -250,6 +251,35 @@ impl WeightsManager {
 
 const CANCELLED: &str = "cancelled";
 
+/// A staging directory older than this belongs to a crashed install.
+const STALE_STAGING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Removes `.{HF_REVISION}.*.staging` directories in `parent` last modified
+/// more than `older_than` ago (left behind by an install that died). Best
+/// effort: errors are ignored.
+fn sweep_stale_staging(parent: &Path, older_than: std::time::Duration) {
+    let prefix = format!(".{HF_REVISION}.");
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(&prefix) && name.ends_with(".staging")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > older_than);
+        if stale {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +294,31 @@ mod tests {
             let file = fs::File::create(blobs.join(f.sha256)).unwrap();
             file.set_len(f.size).unwrap();
         }
+    }
+
+    #[test]
+    fn stale_staging_dirs_are_swept_and_fresh_ones_kept() {
+        let dir = tempdir();
+        let old = dir.path().join(format!(".{HF_REVISION}.1-a.staging"));
+        let fresh = dir.path().join(format!(".{HF_REVISION}.2-b.staging"));
+        let other = dir.path().join(".othersha.3-c.staging");
+        for d in [&old, &fresh, &other] {
+            fs::create_dir(d).unwrap();
+            fs::write(d.join("f"), b"x").unwrap();
+        }
+        let two_hours = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        fs::File::open(&old)
+            .unwrap()
+            .set_modified(two_hours)
+            .unwrap();
+        fs::File::open(&other)
+            .unwrap()
+            .set_modified(two_hours)
+            .unwrap();
+        sweep_stale_staging(dir.path(), STALE_STAGING);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(other.exists(), "other revisions are not ours to sweep");
     }
 
     #[test]

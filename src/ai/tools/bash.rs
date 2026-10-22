@@ -152,7 +152,8 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
 /// Without a classifier the engine is pure and fast, so it runs inline. With
 /// one, the model may block (a GPU call, a lock), so the whole classification
 /// runs on a blocking thread under [`ApprovalSetup::timeout`]; on a timeout or
-/// a panicked thread the verdict is the engine's with no model at all. The
+/// a panicked thread only cached model outcomes apply and no new model call
+/// is made. The
 /// slow thread is detached, never awaited past the timeout, and the in-flight
 /// guard keeps later commands off the model until it finishes.
 ///
@@ -200,8 +201,9 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
             }
         }
     } else {
-        // Another model call is in flight (or none is installed): an expired
-        // deadline keeps cached outcomes in play but starts no new call.
+        // Another model call is in flight, none is installed, or auto-approve
+        // is off (the guard is only taken when it is on): an expired deadline
+        // keeps cached outcomes in play but starts no new call.
         run(command, Some(Instant::now()))
     };
     match verdict {
