@@ -92,6 +92,9 @@ pub struct DenyPaths {
 }
 
 impl DenyPaths {
+    /// Builds the policy from path-component deny patterns (a trailing `*`
+    /// makes a prefix pattern, e.g. `".env*"`); they are lower-cased and split
+    /// once here so each `verify` call only compares.
     pub fn new(patterns: &[String]) -> Self {
         DenyPaths {
             lowered: lowered(patterns),

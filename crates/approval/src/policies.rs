@@ -352,12 +352,14 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
             &[],
             false,
         ),
-        "xmllint" => flags(
-            "",
-            &[],
-            &["-o", "-output", "--output", "-shell", "--shell"],
-            false,
-        ),
+        "xmllint" => {
+            flags(
+                "",
+                &[],
+                &["-o", "-output", "--output", "-shell", "--shell"],
+                false,
+            ) && xmllint_offline(seg)
+        }
         "date" => date_safe(seg),
         // `arch -x86_64 cmd` runs cmd
         "arch" => argv.len() == 1,
@@ -378,7 +380,8 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
         // `hash -p PATH NAME` remaps a later command
         "hash" => flags("pd", &[], &[], false),
         "command" => command_lookup(seg),
-        "tldr" => flags("uc", &["update", "clear-cache"], &[], false),
+        // Divergence from da: `tldr` is not read-only here. On a cache miss
+        // it downloads pages from the network.
         // I4: `ffprobe`, `mediainfo` and `identify` are not approved (they
         // follow URLs/delegates named by attacker-controlled files).
         // second operand is the output file
@@ -773,6 +776,24 @@ fn command_lookup(seg: &Segment) -> bool {
         Some(cluster) => cluster.chars().all(|c| "pvV".contains(c)) && cluster.contains(['v', 'V']),
         None => false,
     }
+}
+
+/// Divergence from da: `xmllint` options that make it fetch a DTD or
+/// XInclude target (possibly a URL named by the file) defer unless `--nonet`
+/// is also given. `--nonet` is matched exactly: an abbreviation could be
+/// `--noent`, which does not stop network access.
+fn xmllint_offline(seg: &Segment) -> bool {
+    const FETCHING: &[&str] = &[
+        "valid",
+        "loaddtd",
+        "dtdvalid",
+        "xinclude",
+        "dtdattr",
+        "postvalid",
+    ];
+    let args = || seg.argv.iter().skip(1);
+    let fetches = args().any(|t| FETCHING.iter().any(|f| long_is(t, f)));
+    !fetches || args().any(|t| t == "--nonet")
 }
 
 /// `env` with no command: prints the environment.
