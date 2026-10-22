@@ -416,3 +416,8 @@ mytool 'x;. evil.sh'
 mytool 'x&&. evil.sh'
 mytool 'x|. evil.sh'
 mytool $'x\n. evil.sh'
+mytool 'x;\. evil.sh'
+mytool "x;'.' evil.sh"
+mytool 'x;"." evil.sh'
+mytool 'x;.${IFS}evil.sh'
+mytool 'x;.$IFS evil.sh'

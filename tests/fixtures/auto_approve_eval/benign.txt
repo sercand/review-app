@@ -218,3 +218,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo build
 cargo check
+rg -n 'a|b' src
+grep -E 'x$' f

@@ -336,6 +336,14 @@ pub fn model_may_approve(seg: &Segment) -> bool {
     if !argv0.chars().all(|c| c.is_ascii_graphic()) {
         return false;
     }
+    // An argument with shell syntax in it looks like code for a program that
+    // might evaluate it (`mytool 'x;. evil.sh'`). Rule policies still vouch
+    // for `rg 'a|b'` and `grep -E 'x$'`; this restricts only the model.
+    if seg.argv.iter().skip(1).any(|w| has_shell_syntax(w))
+        || seg.assigns.iter().any(|(_, v)| has_shell_syntax(v))
+    {
+        return false;
+    }
     if seg.argv.iter().skip(1).any(|w| word_names_listed(w)) {
         return false;
     }
@@ -361,6 +369,13 @@ fn names_exec_option(word: &str) -> bool {
     EXEC_OPTIONS.iter().any(|o| name.eq_ignore_ascii_case(o))
 }
 
+/// Whether `word` contains a shell metacharacter or a line break.
+fn has_shell_syntax(word: &str) -> bool {
+    word.contains([
+        ';', '&', '|', '(', ')', '`', '$', '<', '>', '\\', '\'', '"', '{', '}', '\n', '\r',
+    ])
+}
+
 /// Whether `word` is, or holds, a pager or editor command (`!cmd`, `+!cmd`).
 fn runs_from_prompt(word: &str) -> bool {
     word.starts_with('!') || word.contains("+!")
@@ -372,7 +387,9 @@ fn runs_from_prompt(word: &str) -> bool {
 /// text (`--name=a/b`) is not a path, but a separate word after `-o` is
 /// (the filter cannot tell it from an operand).
 ///
-/// Residual, accepted: a bare relative operand with no `/` (`mytool evil.sh`)
+/// Residual, accepted: an unlisted program that shell-evaluates a plain
+/// argument containing no metacharacter relies on being listed in
+/// [`NEVER_APPROVE`]. Likewise a bare relative operand with no `/` (`mytool evil.sh`)
 /// stays approvable by the model. Executing a bare name goes through `PATH`
 /// (not the working tree), but an unlisted interpreter would read the file.
 fn names_pr_path(word: &str) -> bool {
@@ -575,6 +592,16 @@ mod tests {
             "mytool 'x`. evil.sh'",
             "mytool $'x\\n. evil.sh'",
             "mytool 'x;source evil.sh'",
+            "mytool 'x;\\. evil.sh'",
+            "mytool \"x;'.' evil.sh\"",
+            "mytool 'x;\".\" evil.sh'",
+            "mytool 'x;.${IFS}evil.sh'",
+            "mytool 'x;.$IFS evil.sh'",
+            "mytool 'a>b'",
+            "mytool 'a<b'",
+            "mytool '{a,b}'",
+            "mytool 'a\\b'",
+            "FOO='a;b' mytool x",
             "mytool '+!x'",
             "mytool '!x'",
             "mytool a+!x",

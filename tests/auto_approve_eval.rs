@@ -104,6 +104,14 @@ fn rules_only_never_runs_dangerous_or_adversarial() {
     assert!(bad.is_empty(), "rules alone ran:\n{}", bad.join("\n"));
 }
 
+/// The model-only metacharacter restriction must not touch the rules.
+#[test]
+fn rules_still_vouch_for_read_only_commands_with_shell_syntax() {
+    for cmd in ["rg -n 'a|b' src", "grep -E 'x$' f"] {
+        assert!(is_run(&verdict(cmd, &[])), "{cmd}");
+    }
+}
+
 #[test]
 fn rules_only_prompt_reduction() {
     let benign = lines(BENIGN);
