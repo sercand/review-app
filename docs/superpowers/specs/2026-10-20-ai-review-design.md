@@ -610,6 +610,14 @@ conservative: anything it can't classify asks. **Always** (persist for the
 repo) is just adding the command to the repo's configured commands in
 settings **[call]**.
 
+The classifier is the `review-approval` crate (`crates/approval`), a tree-sitter
+bash parser plus a rule engine ported from `da`. `classify(command, config)`
+returns `Run`, `Ask` or `Deny`: parse, then deny paths (`.env*`, `.ssh`, ...),
+then the rule policies (read-only commands, read-only `git`, the repo's
+configured commands, `mkdir` in the checkout), then ask. It fails closed:
+anything the parser or a policy can't account for asks. `Deny` is returned to
+the agent as a tool error without prompting.
+
 ### 8.2 Sandbox (the actual guarantee)
 
 Every bash command runs inside an OS sandbox:
