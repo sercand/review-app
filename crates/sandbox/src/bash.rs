@@ -272,16 +272,16 @@ impl Drop for InFlight<'_> {
 
 impl BashSession {
     /// Starts `bash --noprofile --norc` on a new PTY in `cwd`, with the host env
-    /// minus the scrubbed vars (see [`Launch::host`]) plus `PS1= PS2= TERM=dumb PAGER=cat GIT_PAGER=cat`,
-    /// and sends the setup line.
+    /// minus the scrubbed vars (see [`Launch::host`]) plus
+    /// `PS1= PS2= TERM=dumb PAGER=cat GIT_PAGER=cat`, and sends the setup line.
     pub fn start(cwd: &Path) -> std::io::Result<BashSession> {
         Self::start_with(cwd, &Launch::host())
     }
 
     /// Starts the shell described by `launch` on a new PTY in `cwd`: the child
     /// begins from an empty environment plus `launch.env`, gets `launch.args`
-    /// followed by `--noprofile --norc` and `PS1= PS2= TERM=dumb PAGER=cat GIT_PAGER=cat`, and the setup
-    /// line is sent.
+    /// followed by `--noprofile --norc` and
+    /// `PS1= PS2= TERM=dumb PAGER=cat GIT_PAGER=cat`, and the setup line is sent.
     pub fn start_with(cwd: &Path, launch: &Launch) -> std::io::Result<BashSession> {
         // Before the shell exists, so a failure here leaks nothing.
         let cmd_dir = command_dir()?;

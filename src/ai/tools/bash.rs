@@ -30,8 +30,8 @@ impl Tool for Bash {
         definition(
             "bash",
             "Run a bash command and return its combined output and exit code. It runs from the \
-             checkout root; pass paths to the command instead of using 'cd' (it is not needed). Use it for builds, \
-             tests, inspecting files and running tools.",
+             checkout root; pass paths to the command rather than 'cd'-ing; a leading 'cd' is fine but \
+             rarely needed. Use it for builds, tests, inspecting files and running tools.",
             json!({
                 "type": "object",
                 "properties": {
@@ -39,7 +39,8 @@ impl Tool for Bash {
                         "type": "string",
                         "description": "The bash command to run in the persistent shell (pipes, \
                             redirection and globbing work); it runs from the checkout root: pass \
-                            paths to the command instead of using 'cd'. Environment and shell \
+                            paths to the command rather than 'cd'-ing (a leading 'cd' is fine but \
+                            rarely needed). Environment and shell \
                             variables persist across calls. Combined stdout+stderr is returned; \
                             large output is truncated."
                     },

@@ -148,8 +148,7 @@ async fn bash_tool_reports_exit_code() {
 
     // Shell state persists across calls until a restart.
     // (A bare assignment and `set | grep`, not `export` and `echo $QA_X`: the
-    // engine asks about `export` and never vouches for a repo-allowed command
-    // with a run-time expansion in it.)
+    // engine treats `export` as an unsupported declaration command and asks.)
     bash(&cx, json!({"command": "QA_X=1"})).await;
     let out = bash(&cx, json!({"command": "set | grep QA_X"})).await;
     assert!(text(&out).contains("QA_X=1"), "{}", text(&out));
@@ -1343,6 +1342,25 @@ async fn bash_denies_secret_paths_without_prompting() {
     std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
     let interaction = Arc::new(ScriptedInteraction::new());
     let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was blocked: "),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("TOKEN=1"));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_deny_beats_repo_allowed_entry() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = interaction_ctx(&host, interaction.clone());
+    cx.allow_segments(["cat".to_string()]);
 
     let out = bash(&cx, json!({"command": "cat .env"})).await;
     assert!(out.is_error);

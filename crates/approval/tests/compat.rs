@@ -191,6 +191,9 @@ fn allowed_beats_leading_assignment() {
 
 #[test]
 fn intentional_changes() {
+    // Declaration commands are unsupported constructs: they ask even when the
+    // repo allows them.
+    asks("export FOO=1", &["export".to_string()]);
     // Structural: `cd` and bare non-risky assignments are harmless.
     runs("cd src", &[]);
     runs("FOO=bar", &[]);
