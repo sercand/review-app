@@ -560,6 +560,10 @@ impl ReviewApp {
             // arrives with the local-repos UI, which consumes it there.
             #[cfg(unix)]
             Event::AiFolderProbed { .. } => {}
+            // The keychain op's answer: the Settings AI tab matches it by
+            // token and shows the outcome once its dialog exists (Task 5).
+            #[cfg(unix)]
+            Event::AiKeyOpDone { .. } => {}
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -981,8 +985,14 @@ impl ReviewApp {
                     }
                 }
                 SettingsAction::TestProvider { provider, model } => {
-                    self.worker
-                        .send(Command::AiTestProvider { provider, model });
+                    // The Settings window has no key field yet (the AI tab
+                    // dialog that supplies one arrives with Task 5), so this
+                    // falls back to the keychain.
+                    self.worker.send(Command::AiTestProvider {
+                        provider,
+                        model,
+                        key: None,
+                    });
                 }
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }

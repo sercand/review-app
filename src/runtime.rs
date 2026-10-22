@@ -52,6 +52,46 @@ use crate::model::thread::{ReviewThread, ThreadComment};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionId(pub u64);
 
+/// One keychain change for a configured LLM provider.
+///
+/// Keys live only in the OS keychain under `llm:<name>`; a [`KeyOp`] carries a
+/// key only when the user typed a new one, and the reply never echoes it.
+#[cfg(unix)]
+#[derive(Debug)]
+pub enum KeyOp {
+    /// Store (or replace) the key for `name`.
+    Store {
+        /// The provider the key belongs to.
+        name: String,
+        /// The key as typed, in this command only.
+        key: String,
+    },
+    /// Copy the key for `from` to `to`, leaving `from` in place.
+    ///
+    /// The app sends [`KeyOp::Remove`] for `from` only after the settings
+    /// write that names `to` succeeds, and [`KeyOp::Undo`] for `to` if it
+    /// fails, so the keychain never holds a name the settings file lost.
+    Move {
+        /// The provider name the key is stored under now.
+        from: String,
+        /// The provider name to copy it to.
+        to: String,
+        /// A key the user just typed; wins over the stored one.
+        key: Option<String>,
+    },
+    /// Remove the key for `name`. Removing an absent key succeeds.
+    Remove {
+        /// The provider name to clear.
+        name: String,
+    },
+    /// Delete the key a [`KeyOp::Move`] copied to `name`, after the settings
+    /// write it was made for failed.
+    Undo {
+        /// The provider name the failed rename copied to.
+        name: String,
+    },
+}
+
 /// A unit of work handed from the UI to the worker.
 ///
 /// `AiStart` carries the loaded snapshot inputs; later tasks match them as
@@ -337,6 +377,23 @@ pub enum Command {
         provider: crate::persist::settings::ProviderSettings,
         /// The model to probe with.
         model: crate::persist::settings::ModelSettings,
+        /// A key the user just typed; `None` reads the keychain instead.
+        ///
+        /// A typed key wins, so a not-yet-saved provider still tests.
+        key: Option<String>,
+    },
+    /// Change one LLM provider's keychain entry (spec §10).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiKeyOpDone`], keyed by
+    /// `token` so an answer for a dialog the user has left can be dropped.
+    /// The keychain is blocking I/O, so the executor runs the op on the
+    /// blocking pool — never on the UI thread.
+    #[cfg(unix)]
+    AiKeyOp {
+        /// The requesting dialog's token, echoed by the reply.
+        token: u64,
+        /// The change to make.
+        op: KeyOp,
     },
     /// Probe what repository a local folder is a clone of (spec §4 step 2).
     ///
@@ -752,6 +809,18 @@ pub enum Event {
         path: PathBuf,
         /// The repository, or why the folder names none.
         result: Result<RemoteRepo, String>,
+    },
+    /// The result of a [`Command::AiKeyOp`]: `Ok` once the keychain reflects
+    /// the op, `Err` a display-safe message.
+    ///
+    /// The key itself is never part of the event — only whether the change
+    /// landed.
+    #[cfg(unix)]
+    AiKeyOpDone {
+        /// The token of the [`Command::AiKeyOp`] that asked.
+        token: u64,
+        /// The outcome, safe to show.
+        result: Result<(), String>,
     },
     /// A PR's full AI state, replayed on attach and after a run starts
     /// (spec §10.3).
@@ -1600,21 +1669,24 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 Err(error) => events.send(Event::MergeFailed { session, error }),
             }
         }
-        Command::AiTestProvider { provider, model } => {
+        Command::AiTestProvider {
+            provider,
+            model,
+            key,
+        } => {
             // Not PR-scoped, so no SessionId: the event names the provider.
             // Reads only, and the client applies its own retry policy.
             let name = provider.name.clone();
             #[cfg(unix)]
             {
-                let result = match crate::auth::store::llm_key(&*ctx.store, &name) {
-                    Ok(Some(key)) => {
+                let result = match provider_key(ctx.store.clone(), &name, key).await {
+                    Ok(key) => {
                         match crate::ai::llm::build_client(&provider, SecretString::from(key)) {
                             Ok(client) => crate::ai::llm::test_connection(&client, &model).await,
                             Err(error) => Err(error.to_string()),
                         }
                     }
-                    Ok(None) => Err(format!("no API key stored for {name}")),
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err(error),
                 };
                 events.send(Event::AiProviderTested {
                     provider: name,
@@ -1625,12 +1697,26 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             // command still answers so the Settings UI never hangs.
             #[cfg(not(unix))]
             {
-                let _ = (provider, model);
+                let _ = (provider, model, key);
                 events.send(Event::AiProviderTested {
                     provider: name,
                     result: Err("AI review is not available on this platform".to_owned()),
                 });
             }
+        }
+        #[cfg(unix)]
+        Command::AiKeyOp { token, op } => {
+            // Not PR-scoped: no SessionId, the token names the request. The
+            // keychain blocks (it may prompt), so the op runs on the blocking
+            // pool and never occupies an async worker thread.
+            let store = ctx.store.clone();
+            let result = match tokio::task::spawn_blocking(move || run_key_op(&*store, op)).await {
+                Ok(result) => result,
+                // The blocking pool lost the task (it panicked): the dialog
+                // still needs an answer.
+                Err(error) => Err(format!("the keychain change failed: {error}")),
+            };
+            events.send(Event::AiKeyOpDone { token, result });
         }
         #[cfg(unix)]
         Command::AiProbeFolder { token, path } => {
@@ -1907,6 +1993,44 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
 /// GitHub's own context width for the patches it sends.
 const LOCAL_DIFF_CONTEXT: usize = 3;
 
+/// The key to dial `name` with: the one the user just typed when present, else
+/// the keychain's. Blocking (the keychain may prompt), so it runs on the
+/// blocking pool; the error is safe to show and never contains a key.
+#[cfg(unix)]
+async fn provider_key(
+    store: Arc<dyn TokenStore>,
+    name: &str,
+    typed: Option<String>,
+) -> Result<String, String> {
+    if let Some(key) = typed {
+        return Ok(key);
+    }
+    let provider = name.to_owned();
+    match tokio::task::spawn_blocking(move || crate::auth::store::llm_key(&*store, &provider)).await
+    {
+        Ok(Ok(Some(key))) => Ok(key),
+        Ok(Ok(None)) => Err(format!("no API key stored for {name}")),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(format!("the keychain read failed: {error}")),
+    }
+}
+
+/// Apply one [`KeyOp`] to the keychain. Blocking — [`Command::AiKeyOp`] calls
+/// it on `spawn_blocking` — and the error is safe to show.
+#[cfg(unix)]
+fn run_key_op(store: &dyn TokenStore, op: KeyOp) -> Result<(), String> {
+    use crate::auth::store::{clear_llm_key, copy_llm_key, set_llm_key};
+
+    let result = match op {
+        KeyOp::Store { name, key } => set_llm_key(store, &name, &key),
+        // A rename is a non-destructive copy: `Remove` follows a successful
+        // settings write, `Undo` deletes the copy when that write failed.
+        KeyOp::Move { from, to, key } => copy_llm_key(store, &from, &to, key.as_deref()),
+        KeyOp::Remove { name } | KeyOp::Undo { name } => clear_llm_key(store, &name),
+    };
+    result.map_err(|error| error.to_string())
+}
+
 /// What repository `path` is a clone of, or the reason it names none (safe to
 /// show). Blocking — [`crate::ai::checkout::read_origin_repo`] runs `git` as a
 /// child process — so [`Command::AiProbeFolder`] calls it on
@@ -2116,6 +2240,140 @@ mod tests {
         assert!(
             reason.contains("does not exist"),
             "the reason should say why: {reason}"
+        );
+    }
+
+    /// Send one [`Command::AiKeyOp`] through the real executor and return its
+    /// answer, checking the request token is echoed.
+    #[cfg(unix)]
+    async fn apply_key_op(
+        store: &Arc<crate::auth::store::MemoryStore>,
+        token: u64,
+        op: KeyOp,
+    ) -> Result<(), String> {
+        let ctx = Arc::new(ExecCtx::new(store.clone()));
+        let (tx, rx) = event_channel();
+        execute(ctx, Command::AiKeyOp { token, op }, tx).await;
+        let Some(Event::AiKeyOpDone {
+            token: answered,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the key op's answer");
+        };
+        assert_eq!(
+            answered, token,
+            "the token is echoed for the consumer to match"
+        );
+        result
+    }
+
+    /// A rename copies the key to the new name and leaves the old entry in
+    /// place: the app removes it only after the settings write succeeds.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_copies_without_deleting_the_old_key() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+
+        apply_key_op(
+            &store,
+            11,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-work"),
+            "the old entry stays until the settings write succeeds"
+        );
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap().as_deref(),
+            Some("sk-work")
+        );
+    }
+
+    /// A typed key wins over whatever the old name holds, so renaming and
+    /// re-keying in one dialog stores the typed key under the new name.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_with_supplied_key_stores_that_key() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-old").unwrap();
+
+        apply_key_op(
+            &store,
+            12,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: Some("sk-typed".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap().as_deref(),
+            Some("sk-typed"),
+            "the supplied key is the one stored under the new name"
+        );
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-old"),
+            "a supplied key does not disturb the old entry"
+        );
+    }
+
+    /// Undo deletes the copied entry only; the old name keeps working.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn undo_removes_only_the_new_entry() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+        apply_key_op(
+            &store,
+            13,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        apply_key_op(
+            &store,
+            14,
+            KeyOp::Undo {
+                name: "work-renamed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap(),
+            None,
+            "the copied entry is gone"
+        );
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-work"),
+            "the old entry is untouched"
         );
     }
 
