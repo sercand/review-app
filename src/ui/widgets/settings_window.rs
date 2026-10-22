@@ -94,12 +94,21 @@ pub struct AiVm {
 /// (mapped to rule policies in `ai::approval_setup`, which is unix-only, so
 /// they are plain strings here).
 pub const AUTO_APPROVE_CAPABILITIES: [(&str, &str); 6] = [
-    ("git:add", "git add of files inside the checkout"),
-    ("git:commit", "git commit on the current branch"),
-    ("git:restore-staged", "git restore --staged (unstage only)"),
-    ("git:tag", "creating local git tags"),
-    ("cargo:local", "cargo build, check, test and clippy"),
-    ("help-bypass", "--help and --version on any command"),
+    ("git:add", "stage files with git add (any path)"),
+    (
+        "git:commit",
+        "git commit (not --amend, --no-verify or --no-gpg-sign)",
+    ),
+    ("git:restore-staged", "unstage with git restore --staged"),
+    ("git:tag", "create, list and delete local tags"),
+    (
+        "cargo:local",
+        "cargo build/test/run/fmt/update and other local subcommands (runs project code)",
+    ),
+    (
+        "help-bypass",
+        "run any binary with only --help, -h, --version, -V, help or version",
+    ),
 ];
 
 /// The Settings window's working copy of `[ai.auto_approve]`.
@@ -144,7 +153,7 @@ impl AutoApproveVm {
             enabled: s.enabled,
             local_classifier: s.local_classifier,
             classifier_available: false,
-            timeout_ms: s.classifier_timeout_ms.to_string(),
+            timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
             deny_paths_text: s.deny_paths.join("\n"),
             capabilities,
         }
@@ -161,7 +170,8 @@ impl AutoApproveVm {
     }
 
     /// Reject what [`Self::write_to`] cannot store: a timeout that is not
-    /// 50..=5000 ms, and deny patterns that are not one path component.
+    /// 50..=5000 ms, and deny patterns containing whitespace (`/` is fine:
+    /// `Library/Keychains` is a built-in).
     pub fn validate(&self) -> Result<(), String> {
         match self.timeout_ms.trim().parse::<u64>() {
             Ok(ms) if (50..=5000).contains(&ms) => {}
@@ -170,11 +180,6 @@ impl AutoApproveVm {
         for pattern in self.deny_paths() {
             if pattern.chars().any(char::is_whitespace) {
                 return Err(format!("deny pattern \"{pattern}\" contains whitespace"));
-            }
-            if pattern.contains('/') {
-                return Err(format!(
-                    "deny pattern \"{pattern}\" must be a single path component (no /)"
-                ));
             }
         }
         Ok(())
@@ -214,6 +219,16 @@ impl AiVm {
     /// keychain entry and the model's routing, so they must be non-empty and
     /// unique.
     fn validate(&self) -> Result<(), String> {
+        self.validate_providers()?;
+        // The auto-approve section is only rendered (and applied) on Unix.
+        if cfg!(unix) {
+            self.auto_approve.validate()?;
+        }
+        Ok(())
+    }
+
+    /// The provider rows' own errors, shown under Providers.
+    fn validate_providers(&self) -> Result<(), String> {
         for (index, provider) in self.providers.iter().enumerate() {
             let name = &provider.settings.name;
             if name.trim().is_empty() {
@@ -233,7 +248,6 @@ impl AiVm {
                 ));
             }
         }
-        self.auto_approve.validate()?;
         Ok(())
     }
 }
@@ -357,7 +371,10 @@ impl SettingsVm {
                 .any(|provider| provider.name == model.provider);
         s.ai.models.default = configured.then_some(model);
         s.ai.repos = self.ai.repos;
-        self.ai.auto_approve.write_to(&mut s.ai.auto_approve);
+        // Elsewhere the section is not rendered: leave the table as loaded.
+        if cfg!(unix) {
+            self.ai.auto_approve.write_to(&mut s.ai.auto_approve);
+        }
         Ok(host_changed)
     }
 }
@@ -629,7 +646,7 @@ pub fn render(
                 let save = if valid {
                     save
                 } else {
-                    save.on_hover_text("fix the AI providers before saving")
+                    save.on_hover_text("fix the AI settings before saving")
                 };
                 if save.clicked() {
                     // Apply comes first (the app stops on a rejected apply,
@@ -712,7 +729,7 @@ fn ai_section(
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ai_providers(ui, ai);
-            if let Err(error) = ai.validate() {
+            if let Err(error) = ai.validate_providers() {
                 ui.label(RichText::new(error).size(12.0).color(p.bad));
             }
             ui.add_space(6.0);
@@ -988,11 +1005,20 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
         &mut vm.enabled,
         "Run commands the rules prove read-only without asking",
     );
-    ui.add_enabled_ui(vm.classifier_available, |ui| {
-        ui.checkbox(
-            &mut vm.local_classifier,
-            "Also ask the local classifier (experimental)",
-        );
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(vm.classifier_available, |ui| {
+            ui.checkbox(
+                &mut vm.local_classifier,
+                "Also ask the local classifier (experimental)",
+            );
+        });
+        if !vm.classifier_available {
+            ui.label(
+                RichText::new("not available in this build")
+                    .size(12.0)
+                    .color(p.faint),
+            );
+        }
     });
     ui.label(
         RichText::new(
@@ -1001,22 +1027,18 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
         .size(12.0)
         .color(p.muted),
     );
-    if !vm.classifier_available {
-        ui.label(
-            RichText::new("not available in this build")
-                .size(12.0)
-                .color(p.faint),
-        );
-    }
     setting_row(ui, "Classifier timeout (ms)", |ui| {
         ui.add(egui::TextEdit::singleline(&mut vm.timeout_ms).desired_width(80.0));
     });
     text_area(
         ui,
-        "Never let the agent touch (one pattern per line, `*` at the end matches a prefix)",
+        "Never let the agent touch (one pattern per line, * at the end matches a prefix, * at the start a suffix, case-insensitive)",
         &mut vm.deny_paths_text,
-        "single path components, no / (for example: secrets, .env*)",
+        "path components, may contain / (for example: secrets, .env*, Library/Keychains)",
     );
+    if let Err(error) = vm.validate() {
+        ui.label(RichText::new(error).size(12.0).color(p.bad));
+    }
     for (name, on) in &mut vm.capabilities {
         let description = AUTO_APPROVE_CAPABILITIES
             .iter()
@@ -1592,7 +1614,7 @@ mod tests {
             };
             assert!(vm.validate().is_err(), "timeout {bad:?}");
         }
-        for bad in ["a b", "a/b", "Library/Keychains"] {
+        for bad in ["a b", "a\tb"] {
             let vm = AutoApproveVm {
                 deny_paths_text: format!("fine\n{bad}"),
                 ..ok.clone()
@@ -1647,5 +1669,43 @@ mod tests {
         vm.ai.auto_approve.classifier_available = true;
         vm.apply(&mut settings).unwrap();
         assert!(settings.ai.auto_approve.local_classifier);
+    }
+
+    #[test]
+    fn stored_out_of_range_timeout_and_slash_pattern_do_not_block_save() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.classifier_timeout_ms = 0;
+        settings.ai.auto_approve.deny_paths = vec!["Library/Keychains".into()];
+        let vm = settings_vm(&settings, &|_| false);
+        assert_eq!(vm.ai.auto_approve.timeout_ms, "50");
+        assert!(vm.ai.validate().is_ok());
+        vm.apply(&mut settings).unwrap();
+        assert_eq!(settings.ai.auto_approve.classifier_timeout_ms, 50);
+        assert_eq!(settings.ai.auto_approve.deny_paths, ["Library/Keychains"]);
+        settings.ai.auto_approve.classifier_timeout_ms = 10_000;
+        let vm = settings_vm(&settings, &|_| false);
+        assert_eq!(vm.ai.auto_approve.timeout_ms, "5000");
+    }
+
+    #[test]
+    fn crlf_deny_paths_are_split_cleanly() {
+        let mut settings = Settings::default();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.auto_approve.deny_paths_text = "a\r\nb\r\n".into();
+        assert!(vm.ai.validate().is_ok());
+        vm.apply(&mut settings).unwrap();
+        assert_eq!(settings.ai.auto_approve.deny_paths, ["a", "b"]);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn auto_approve_passes_through_verbatim_off_unix() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.classifier_timeout_ms = 0;
+        let before = settings.ai.auto_approve.clone();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.auto_approve.timeout_ms = "junk".into();
+        vm.apply(&mut settings).unwrap();
+        assert_eq!(settings.ai.auto_approve, before);
     }
 }

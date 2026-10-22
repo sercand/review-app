@@ -793,7 +793,7 @@ extra_deny_read = []
 enabled = true                  # rules auto-run commands proven read-only
 local_classifier = false        # model stage; off until the classifier is evaluated
 classifier_timeout_ms = 500     # clamped to 50..=5000; on timeout the command asks
-deny_paths = []                 # extra path-component deny patterns, `*` suffix = prefix
+deny_paths = []                 # extra deny patterns: path components or `a/b`; trailing `*` = prefix, leading `*` = suffix; case-insensitive
 capabilities = []               # opt-in: git:add git:commit git:restore-staged git:tag cargo:local help-bypass
 ```
 
