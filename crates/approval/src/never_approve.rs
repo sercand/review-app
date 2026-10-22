@@ -222,6 +222,75 @@ pub const NEVER_APPROVE: &[&str] = &[
     "unzip",
     "trash",
     "sort",
+    // Interpreters, runners and wrappers that execute PR files or an operand.
+    "tclsh",
+    "m4",
+    "ts-node",
+    "tsx",
+    "pwsh",
+    "powershell",
+    "julia",
+    "ed",
+    "meson",
+    "sbt",
+    "mix",
+    "dotnet",
+    "cmd",
+    "wsl",
+    "numactl",
+    "perf",
+    "setarch",
+    "faketime",
+    "ssh-agent",
+    "dbus-run-session",
+    // Disk, power, firewall and system-settings tools.
+    "diskutil",
+    "iptables",
+    "ip6tables",
+    "nft",
+    "ufw",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "security",
+    "defaults",
+    "sysctl",
+    "csrutil",
+    "spctl",
+    "tccutil",
+    "networksetup",
+    "scutil",
+    "pmset",
+    "hdiutil",
+    "tmutil",
+    "dscl",
+    "sysadminctl",
+    "visudo",
+    "passwd",
+    "useradd",
+    "userdel",
+    "usermod",
+    "parted",
+    "mke2fs",
+    "mkswap",
+];
+
+/// Options that name a program to run (matched on the word before any `=`).
+const EXEC_OPTIONS: &[&str] = &[
+    "--pre",
+    "--hostname-bin",
+    "--compress-program",
+    "--use-compress-program",
+    "--to-command",
+    "--checkpoint-action",
+    "--upload-pack",
+    "--receive-pack",
+    "--exec-path",
+    "--rsh",
+    "--pager",
+    "--editor",
+    "--unzip-command",
 ];
 
 /// Directories whose binaries are the system's, not the PR's.
@@ -235,9 +304,11 @@ const SYSTEM_BIN_DIRS: &[&str] = &[
 ];
 
 /// Whether a model's "safe" may approve `seg`: it has a literal command word
-/// that is a bare name or an absolute system path (a relative path is PR
-/// code) whose basename is not in [`NEVER_APPROVE`], no later word names a
-/// listed binary (wrappers, `awk 'BEGIN{system("curl …")}'`), it writes
+/// that is a bare ASCII name or an absolute system path (a relative path is
+/// PR code) whose basename is not in [`NEVER_APPROVE`], no later word names a
+/// listed binary (wrappers, `awk 'BEGIN{system("curl …")}'`), no later word
+/// is a working-tree path (`./x`, `dir/x`: PR code handed to a program the
+/// table does not know) or an option naming a program to run, it writes
 /// nowhere but `/dev/null` or an fd, and it sets no environment variable that
 /// changes what runs.
 pub fn model_may_approve(seg: &Segment) -> bool {
@@ -251,16 +322,56 @@ pub fn model_may_approve(seg: &Segment) -> bool {
         return false;
     }
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
-    if listed(base) {
+    if listed(base) || base.to_ascii_lowercase().starts_with("mkfs.") {
+        return false;
+    }
+    // Command names are ASCII: anything else is a look-alike or a name no
+    // trusted binary has.
+    if !argv0.chars().all(|c| c.is_ascii_graphic()) {
         return false;
     }
     if seg.argv.iter().skip(1).any(|w| word_names_listed(w)) {
+        return false;
+    }
+    if seg
+        .argv
+        .iter()
+        .skip(1)
+        .any(|w| names_exec_option(w) || names_pr_path(w))
+    {
         return false;
     }
     if !seg.redirects.iter().all(redirect_ok) {
         return false;
     }
     !seg.assigns.iter().any(|(n, v)| is_risky_env(n, v))
+}
+
+/// Whether `word` is an option that names a program to run.
+fn names_exec_option(word: &str) -> bool {
+    let name = word.split('=').next().unwrap_or(word);
+    EXEC_OPTIONS.iter().any(|o| name.eq_ignore_ascii_case(o))
+}
+
+/// Whether `word` points into the working tree, where a PR's own code lives:
+/// `./x`, `../x` or `dir/x`, either as the word itself or as the value of
+/// `--opt=value`. Absolute paths and `~` paths are not covered; an option's own
+/// text (`--name=a/b`) is not a path, but a separate word after `-o` is
+/// (the filter cannot tell it from an operand).
+fn names_pr_path(word: &str) -> bool {
+    let value = match word.strip_prefix('-') {
+        Some(_) => match word.split_once('=') {
+            Some((_, v)) => v,
+            None => return false,
+        },
+        None => word,
+    };
+    if value.starts_with(['/', '~']) {
+        return false;
+    }
+    value.starts_with("./")
+        || value.starts_with("../")
+        || (!word.starts_with('-') && value.contains('/'))
 }
 
 /// `path` is `dir` plus one file name: no `..`, no nesting.
@@ -282,6 +393,7 @@ fn word_names_listed(word: &str) -> bool {
 /// `node-18`, `ruby_3`) and the GNU-coreutils `g` prefix (`gtimeout`).
 fn listed(base: &str) -> bool {
     let lower = base.to_ascii_lowercase();
+    let lower = lower.strip_suffix(".exe").unwrap_or(&lower).to_string();
     let unversioned = lower
         .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
         .trim_end_matches(['-', '_']);
@@ -360,6 +472,67 @@ mod tests {
             "node-18 x.js",
             "ruby_3 x.rb",
             "sort -o f f",
+            // Interpreters, runners and wrappers an earlier table missed.
+            "numactl ./x",
+            "perf stat ./evil",
+            "setarch x86_64 ./evil",
+            "faketime 2020-01-01 scripts/evil",
+            "ssh-agent ./evil",
+            "dbus-run-session ./evil",
+            "tclsh evil.tcl",
+            "m4 evil.m4",
+            "ts-node x.ts",
+            "tsx x.ts",
+            "pwsh x.ps1",
+            "powershell x.ps1",
+            "julia x.jl",
+            "ed -s f",
+            "meson setup b",
+            "sbt run",
+            "mix run",
+            "dotnet run",
+            "cmd /c evil",
+            "wsl ls",
+            // `.exe` is not a different program.
+            "CURL.EXE x",
+            "curl.exe x",
+            "Python.EXE x.py",
+            "pwsh.exe x.ps1",
+            "env CURL.EXE x",
+            "ls cmd.exe",
+            // Disk, power, firewall and system-settings tools.
+            "mkfs.ext4 /dev/sda1",
+            "mkfs.xfs /dev/sdb",
+            "diskutil eraseDisk JHFS+ X /dev/disk2",
+            "iptables -F",
+            "ufw disable",
+            "shutdown -h now",
+            "reboot",
+            "halt",
+            "security dump-keychain",
+            "defaults write x y -bool true",
+            // PR code passed as an operand of an unlisted program.
+            "mytool ./evil.sh",
+            "mytool ../evil",
+            "mytool scripts/evil.sh",
+            "mytool a.txt src/x.rs",
+            "mytool -o a/b",
+            "mytool --config=./evil.toml",
+            "mytool --config=../evil.toml",
+            // Options that name a program to run.
+            "rg --pre ./evil pattern",
+            "rg --pre=evil pattern",
+            "rg --hostname-bin=./evil x",
+            "mytool --compress-program=x f",
+            "mytool --to-command=x f",
+            "mytool --checkpoint-action=exec=x f",
+            "mytool --use-compress-program x f",
+            "mytool --upload-pack=x f",
+            // A command name that is not plain ASCII is not a program we know.
+            "ls\u{3000}-la",
+            "c\u{430}t README.md",
+            "\u{ff52}\u{ff4d} -rf /",
+            "rm\u{200c} -rf /",
         ] {
             assert!(!may(cmd), "{cmd}");
         }
@@ -372,6 +545,11 @@ mod tests {
             "/usr/bin/mytool x",
             "mytool a.txt . ..",
             "mytool --name=a/b",
+            "mytool /abs/path/file",
+            "mytool a.txt",
+            "mytool ~/x",
+            "mytool --preview x",
+            "mytool --pre-commit-hint",
         ] {
             assert!(may(cmd), "{cmd}");
         }
