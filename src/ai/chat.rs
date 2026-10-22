@@ -309,6 +309,7 @@ mod tests {
             assigned: Arc::new(Vec::new()),
             spawner: None,
             prepare: None,
+            approval: Default::default(),
         };
         ChatSetup {
             llm: llm as Arc<dyn Llm>,

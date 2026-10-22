@@ -2046,6 +2046,7 @@ dependencies = [
  "pulldown-cmark",
  "raw-window-handle",
  "reqwest",
+ "review-approval",
  "review-llm",
  "review-sandbox",
  "rfd",

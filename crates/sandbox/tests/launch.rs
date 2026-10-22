@@ -30,3 +30,27 @@ async fn start_with_uses_exactly_the_given_environment() {
         .unwrap();
     assert_eq!(out.output.trim(), "42\nunset");
 }
+
+/// A pager the engine may force (`git -p log`) must never block the PTY.
+#[tokio::test]
+async fn shell_disables_pagers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = BTreeMap::new();
+    env.insert("PATH".into(), std::env::var_os("PATH").unwrap());
+    // Even a launch that asks for a real pager is overridden.
+    env.insert("PAGER".into(), "less".into());
+    let host = LocalHost::with_launch(
+        dir.path(),
+        Launch {
+            program: "bash".into(),
+            args: vec![],
+            env,
+        },
+    )
+    .unwrap();
+    let out = host
+        .exec("echo $PAGER; echo $GIT_PAGER; echo $TERM", false, T)
+        .await
+        .unwrap();
+    assert_eq!(out.output.trim(), "cat\ncat\ndumb");
+}

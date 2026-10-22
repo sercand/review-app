@@ -1,11 +1,12 @@
 //! `bash`: one command in the sandbox's persistent shell, gated by the
-//! classifier (spec §8.1): commands proven read-only or explicitly allowed run
-//! silently, everything else waits for the user's approval, and a denied
-//! command never reaches the shell.
+//! approval engine (`review_approval`, spec §8.1): commands it can prove safe
+//! or the repo explicitly allows run silently, commands touching secret paths
+//! are blocked without asking, everything else waits for the user's approval,
+//! and a refused command never reaches the shell.
 
 use std::time::Duration;
 
-use review_sandbox::Verdict;
+use review_approval::{ApprovalConfig, Verdict, classify};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -29,7 +30,7 @@ impl Tool for Bash {
         definition(
             "bash",
             "Run a bash command and return its combined output and exit code. It runs from the \
-             checkout root; pass paths to the command instead of using 'cd'. Use it for builds, \
+             checkout root; pass paths to the command instead of using 'cd' (it is not needed). Use it for builds, \
              tests, inspecting files and running tools.",
             json!({
                 "type": "object",
@@ -93,7 +94,7 @@ impl Tool for Bash {
     }
 }
 
-/// Asks the user about `command` when the classifier requires it.
+/// Asks the user about `command` when the approval engine requires it.
 ///
 /// Returns `None` when the command may run (silently, approved once, or the
 /// exact line was approved earlier in this review) and `Some(error)` when it
@@ -102,16 +103,36 @@ impl Tool for Bash {
 /// "For this review" memory is the exact line, whitespace-normalized and
 /// otherwise verbatim: approving `touch a` never grants `touch a b`, and
 /// approving a line with a wrapper in it never grants that wrapper. It is
-/// checked before [`review_sandbox::classify`], so the approved line runs even
-/// if the classifier would ask again.
+/// checked before [`classify`], so the approved line runs even if the engine
+/// would ask again. A command the engine denies (secret paths) never reaches
+/// the user: it is blocked outright.
 async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     let line = normalized_line(command);
     if cx.for_review_contains(&line) {
         return None;
     }
-    let reason = match review_sandbox::classify(command, &cx.allowed_snapshot()) {
-        Verdict::Run => return None,
+    let allowed = cx.allowed_snapshot();
+    let deny_paths = cx.approval.effective_deny_paths();
+    let verdict = classify(
+        command,
+        &ApprovalConfig {
+            allowed: &allowed,
+            deny_paths: &deny_paths,
+            cwd: Some(&cx.repo_root),
+            extra: &[],
+        },
+    );
+    let reason = match verdict {
+        Verdict::Run { source } => {
+            tracing::debug!(source, command, "bash command auto-approved");
+            return None;
+        }
         Verdict::Ask { reason } => reason,
+        Verdict::Deny { reason } => {
+            return Some(ToolOutput::error(format!(
+                "the command was blocked: {reason}"
+            )));
+        }
     };
     match cx
         .interaction

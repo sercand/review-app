@@ -226,6 +226,7 @@ mod tests {
             assigned: Arc::new(Vec::new()),
             spawner: None,
             prepare: None,
+            approval: Default::default(),
         };
         Ctx { _dir: dir, cx }
     }

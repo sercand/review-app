@@ -751,6 +751,7 @@ pub fn start_pipeline(
             assigned: Arc::new(Vec::new()),
             spawner: None,
             prepare: None,
+            approval: Default::default(),
         },
         llm: inputs.llm.clone(),
         ctl: ctl.unregistered_ctl(),

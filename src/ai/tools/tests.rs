@@ -79,6 +79,7 @@ fn ctx_with(
         assigned: Arc::new(Vec::new()),
         spawner: None,
         prepare: None,
+        approval: Default::default(),
     }
 }
 
@@ -123,7 +124,7 @@ async fn bash_tool_reports_exit_code() {
     let cx = ctx_allowing(
         Arc::new(host.clone()),
         host.root().path().to_path_buf(),
-        &["echo", "export", "exit"],
+        &["echo", "exit"],
     );
 
     let out = bash(&cx, json!({"command": "echo hi"})).await;
@@ -146,11 +147,14 @@ async fn bash_tool_reports_exit_code() {
     assert!(!text(&out).is_empty());
 
     // Shell state persists across calls until a restart.
-    bash(&cx, json!({"command": "export QA_X=1"})).await;
-    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\""})).await;
-    assert_eq!(text(&out).trim_end(), "x=1");
-    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\"", "restart": true})).await;
-    assert_eq!(text(&out).trim_end(), "x=");
+    // (A bare assignment and `set | grep`, not `export` and `echo $QA_X`: the
+    // engine asks about `export` and never vouches for a repo-allowed command
+    // with a run-time expansion in it.)
+    bash(&cx, json!({"command": "QA_X=1"})).await;
+    let out = bash(&cx, json!({"command": "set | grep QA_X"})).await;
+    assert!(text(&out).contains("QA_X=1"), "{}", text(&out));
+    let out = bash(&cx, json!({"command": "set | grep QA_X", "restart": true})).await;
+    assert!(!text(&out).contains("QA_X=1"), "{}", text(&out));
 
     // Bad input is a tool error, not a panic.
     let out = bash(&cx, json!({"command": 5})).await;
@@ -326,7 +330,7 @@ async fn for_review_never_grants_a_path_qualified_wrapper() {
 
     // No decision is queued: the scripted user denies. A path-qualified
     // wrapper is not a prefix grant either.
-    let out = bash(&cx, json!({"command": "/usr/bin/env sh -c true"})).await;
+    let out = bash(&cx, json!({"command": "/usr/bin/env sh -c 'touch zz'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -345,13 +349,14 @@ async fn for_review_never_grants_a_bare_wrapper() {
     assert!(cx.allowed_snapshot().is_empty());
 
     // A bare `sh` entry would let this run silently. No decision is queued, so
-    // the scripted user denies it: nothing runs and the call is recorded.
-    let out = bash(&cx, json!({"command": "sh -c true"})).await;
+    // the scripted user denies it: nothing runs and the call is recorded. (The
+    // inner `touch` is not vouched for; `sh -c true` would now run silently.)
+    let out = bash(&cx, json!({"command": "sh -c 'touch zz'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     let calls = interaction.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(
-        matches!(&calls[1], InteractionCall::Approve { command, .. } if command == "sh -c true"),
+        matches!(&calls[1], InteractionCall::Approve { command, .. } if command == "sh -c 'touch zz'"),
         "{calls:?}"
     );
 }
@@ -362,13 +367,13 @@ async fn for_review_preserves_whitespace_inside_quotes() {
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
     let cx = interaction_ctx(&host, interaction.clone());
 
-    let out = bash(&cx, json!({"command": "sh -c 'echo  hi'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch  hi'"})).await;
     assert!(!out.is_error, "{:?}", out.parts);
-    assert_eq!(remembered(&cx), ["sh -c 'echo  hi'"]);
+    assert_eq!(remembered(&cx), ["sh -c 'touch  hi'"]);
 
     // No decision is queued: the scripted user denies. Spaces inside the quotes
     // are command text, so this is a different line.
-    let out = bash(&cx, json!({"command": "sh -c 'echo hi'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch hi'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -379,13 +384,13 @@ async fn for_review_preserves_newlines_inside_quotes() {
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
     let cx = interaction_ctx(&host, interaction.clone());
 
-    let out = bash(&cx, json!({"command": "sh -c 'echo a'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch a'"})).await;
     assert!(!out.is_error, "{:?}", out.parts);
-    assert_eq!(remembered(&cx), ["sh -c 'echo a'"]);
+    assert_eq!(remembered(&cx), ["sh -c 'touch a'"]);
 
     // A newline inside the quotes separates two commands inside `sh -c`; it is
     // not formatting. No decision is queued, so this asks and is denied.
-    let out = bash(&cx, json!({"command": "sh -c 'echo\na'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch\na'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -1286,4 +1291,78 @@ fn registry_has_no_write_or_merge_tools() {
     ] {
         assert!(!is_forbidden_tool_name(ok), "{ok} should be allowed");
     }
+}
+
+/// A temp repo (`git init`, one commit) so `git status` has something to say.
+fn git_host() -> (tempfile::TempDir, LocalHost) {
+    let (dir, host) = host();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    (dir, host)
+}
+
+#[tokio::test]
+async fn bash_runs_cd_and_read_only_without_asking() {
+    let (_dir, host) = git_host();
+    // `NoInteraction` denies everything the engine would ask about.
+    let cx = host_ctx(&host);
+
+    let out = bash(&cx, json!({"command": "cd . && ls"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    let out = bash(&cx, json!({"command": "git status"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(
+        text(&out).contains("branch") || text(&out).contains("On "),
+        "{}",
+        text(&out)
+    );
+}
+
+#[tokio::test]
+async fn bash_denies_secret_paths_without_prompting() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was blocked: "),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("TOKEN=1"));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_still_asks_for_unknown_commands() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch asked"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("asked").exists());
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
 }

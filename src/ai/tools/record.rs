@@ -463,6 +463,7 @@ mod tests {
             ),
             spawner: None,
             prepare: None,
+            approval: Default::default(),
         };
         Ctx { _dir: dir, cx, run }
     }

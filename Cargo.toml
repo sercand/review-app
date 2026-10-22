@@ -50,6 +50,7 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 globset = "0.4"
 ignore = "0.4"
+review-approval = { path = "crates/approval" }
 review-llm = { path = "crates/llm" }
 review-sandbox = { path = "crates/sandbox" }
 rfd = "0.17.2"
