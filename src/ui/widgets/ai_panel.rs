@@ -715,9 +715,11 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         .show(ui, add);
 }
 
-/// A mono command line inside a card. Long paths and flags are unbreakable
-/// words: truncate to the available width and show the full command on
-/// hover, so the card never forces the right pane wider than the splitter.
+/// A mono command line inside a card. Commands contain spaces, so word
+/// wrapping keeps the whole command visible at any pane width (the min width
+/// is the longest single token): the approval decision must not hide the
+/// command tail — where the risk lives (`&& rm -rf …`) — behind a transient
+/// tooltip the way the noisy tool-call lines may.
 fn mono_line(ui: &mut egui::Ui, text: &str) {
     let p = theme::palette_of(ui);
     Frame::new()
@@ -725,12 +727,16 @@ fn mono_line(ui: &mut egui::Ui, text: &str) {
         .corner_radius(4.0)
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            tool_line(ui, text, p.text);
+            ui.add(
+                egui::Label::new(RichText::new(text).monospace().size(11.5).color(p.text))
+                    .wrap_mode(egui::TextWrapMode::Wrap),
+            );
         });
 }
 
-/// One monospace line (a tool call, a command) that truncates instead of
-/// widening the pane; the full text lives in the hover tooltip.
+/// One monospace tool-call line that truncates instead of widening the
+/// pane; the full text lives in the hover tooltip. (Approval commands use
+/// [`mono_line`] instead: they must stay fully visible.)
 fn tool_line(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.add(egui::Label::new(RichText::new(text).monospace().color(color).size(11.5)).truncate())
         .on_hover_text(text);
@@ -1099,9 +1105,13 @@ mod tests {
     /// own response rect back as the next frame's size). A 400+ char tool
     /// JSON with unbreakable path tokens and a long approval command must
     /// therefore neither widen the pane past its splitter width nor leave
-    /// content outside the visible clip rect.
+    /// content outside the visible clip rect — and the approval command must
+    /// stay FULLY visible (wrapped, not truncated: the command tail is where
+    /// the risk lives), its tail present in the label rather than behind a
+    /// tooltip.
     #[test]
     fn long_tool_and_approval_lines_fit_a_narrow_right_pane() {
+        use egui_kittest::kittest::Queryable;
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -1184,6 +1194,24 @@ mod tests {
         assert!(
             content.min.x >= clip.min.x - 1.0 && content.max.x <= clip.max.x + 1.0,
             "tab content outside the visible pane: content {content:?} vs clip {clip:?}"
+        );
+        // The approval command must be fully visible, not truncated: its
+        // tail — where the risk lives — is laid out in the card, not hidden
+        // behind a tooltip. A truncated galley ends in "…" and its label
+        // would not contain the command's last token.
+        // The approval command must be fully laid out, not truncated. The
+        // Label node always carries the full string, so check the laid-out
+        // text runs instead: joined they must contain the command's last
+        // token (wrapping only breaks at spaces/hyphens, which the token's
+        // characters survive contiguously), while a truncated galley ends
+        // in "…" and loses it.
+        let laid_out: String = harness
+            .query_all_by(|n| n.role() == egui::accesskit::Role::TextRun)
+            .filter_map(|n| n.value())
+            .collect();
+        assert!(
+            laid_out.contains("src/lib/data-tools/push-notification-default-links.ts"),
+            "the approval command was not laid out in full: {laid_out:?}"
         );
     }
 
