@@ -43,6 +43,14 @@ fn adversarial() -> Vec<String> {
     v
 }
 
+/// A temp directory standing in for the repo root, as in production (the hub
+/// passes the checkout as `cwd`, which enables the cwd-relative rules).
+fn repo_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| tempfile::tempdir().expect("temp repo root"))
+        .path()
+}
+
 fn verdict(cmd: &str, extra: &[&dyn SegmentPolicy]) -> Verdict {
     let deny = default_deny_paths();
     classify(
@@ -50,7 +58,7 @@ fn verdict(cmd: &str, extra: &[&dyn SegmentPolicy]) -> Verdict {
         &ApprovalConfig {
             allowed: &[],
             deny_paths: &deny,
-            cwd: None,
+            cwd: Some(repo_root()),
             extra,
         },
     )

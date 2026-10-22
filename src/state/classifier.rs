@@ -35,7 +35,7 @@ impl ClassifierState {
         }
         match self {
             ClassifierState::Off => "Off".to_owned(),
-            ClassifierState::NotInstalled => "Model not downloaded (≈133 MB)".to_owned(),
+            ClassifierState::NotInstalled => "Model not downloaded (≈135 MB)".to_owned(),
             ClassifierState::Downloading { done, total } if *total > 0 => {
                 format!(
                     "Downloading… {} %",
@@ -75,7 +75,7 @@ mod tests {
     fn state_text_table() {
         let rows = [
             (Off, "Off"),
-            (NotInstalled, "Model not downloaded (≈133 MB)"),
+            (NotInstalled, "Model not downloaded (≈135 MB)"),
             (Downloading { done: 0, total: 0 }, "Downloading…"),
             (
                 Downloading {

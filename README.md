@@ -150,10 +150,15 @@ commands mean such as `alias` or `trap`, and tools that load and run the
 repo's own config or plugins such as `eslint`, `tsc`, `terraform`), and if it
 is missing, loading or failing, you are asked exactly as without it. A tool
 that is not on the list may still be approved by the model; that part is
-advisory. Command text never leaves your
-machine.
+advisory. Command text never leaves your machine.
 
-It is **off by default**: the rules alone already auto-run about 91 % of
+Rules, not the model, keep repo secrets out of reach: searches that recurse
+or look at hidden, ignored or untracked files ask, and the sandbox cannot read
+repo-local `.env*` files (on Linux only those that exist when the review
+starts). `.git/config` is only protected by a text match, because git has to
+read it, so treat a remote URL that embeds a token as visible to the agent.
+
+It is **off by default**: the rules alone already auto-run about 89 % of
 benign commands in our evaluation set, and the model adds one more (see
 `docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
 

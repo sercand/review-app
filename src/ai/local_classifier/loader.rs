@@ -45,7 +45,13 @@ pub trait Engine: Send + Sync {
     /// Cheap check that a GPU backend exists, run before any download.
     fn gpu_available(&self) -> bool;
     /// Opens the backend and the model. Blocking; call from a job thread.
-    fn load(&self, dir: &Path) -> Result<Arc<dyn CommandClassifier>, LoadError>;
+    /// `on_trip` is called (from any thread) if the classifier disables
+    /// itself after repeated failures.
+    fn load(
+        &self,
+        dir: &Path,
+        on_trip: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<Arc<dyn CommandClassifier>, LoadError>;
 }
 
 struct ShisoEngine;
@@ -54,9 +60,15 @@ impl Engine for ShisoEngine {
     fn gpu_available(&self) -> bool {
         shiso::gpu_available()
     }
-    fn load(&self, dir: &Path) -> Result<Arc<dyn CommandClassifier>, LoadError> {
+    fn load(
+        &self,
+        dir: &Path,
+        on_trip: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<Arc<dyn CommandClassifier>, LoadError> {
         let backend = shiso::open_backend().map_err(LoadError::Unavailable)?;
-        let classifier = shiso::load_with_backend(backend, dir).map_err(LoadError::Failed)?;
+        let classifier = shiso::load_with_backend(backend, dir)
+            .map_err(LoadError::Failed)?
+            .with_on_trip(on_trip);
         Ok(Arc::new(classifier))
     }
 }
@@ -69,6 +81,9 @@ struct Inner {
     classifier: Option<Arc<dyn CommandClassifier>>,
     /// A job thread is running; at most one at a time.
     job_running: bool,
+    /// Bumped by every job; a trip report from an older job's classifier is
+    /// ignored.
+    generation: u64,
     /// What the running job last reported, even while disabled; shown again
     /// if the setting is switched back on before the job notices.
     phase: ClassifierState,
@@ -103,6 +118,7 @@ impl Loader {
                 state: ClassifierState::Off,
                 classifier: None,
                 job_running: false,
+                generation: 0,
                 phase: ClassifierState::Loading,
             }),
             source,
@@ -168,6 +184,7 @@ impl Loader {
             return;
         }
         inner.job_running = true;
+        inner.generation += 1;
         inner.phase = ClassifierState::Loading;
         drop(inner);
         let this = self.clone();
@@ -239,11 +256,33 @@ impl Loader {
         if !self.progress(ClassifierState::Loading) {
             return None;
         }
-        Some(match shared.engine.load(&dir) {
+        let generation = self.lock().generation;
+        let weak = Arc::downgrade(&self.0);
+        let on_trip = Box::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                Loader(shared).tripped(generation);
+            }
+        });
+        Some(match shared.engine.load(&dir, on_trip) {
             Ok(c) => Outcome::Ready(c),
             Err(LoadError::Unavailable(m)) => Outcome::State(ClassifierState::Unavailable(m)),
             Err(LoadError::Failed(m)) => Outcome::State(ClassifierState::Failed(m)),
         })
+    }
+
+    /// The classifier of job `generation` disabled itself after repeated
+    /// errors: stop handing it out and say so.
+    fn tripped(&self, generation: u64) {
+        let mut inner = self.lock();
+        if inner.generation != generation || inner.classifier.is_none() {
+            return;
+        }
+        let dropped = inner.classifier.take();
+        let state = ClassifierState::Unavailable("disabled after repeated errors".into());
+        inner.state = state.clone();
+        drop(inner);
+        (self.0.on_state)(state);
+        drop(dropped);
     }
 
     /// Ends the job and records the outcome. A cancelled job (`None`) or a
@@ -347,6 +386,8 @@ mod tests {
         load_error: Mutex<Option<LoadError>>,
         loads: AtomicUsize,
         delay: Duration,
+        /// The trip callback of the latest load.
+        trip: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
 
     impl FakeEngine {
@@ -356,6 +397,7 @@ mod tests {
                 load_error: Mutex::new(None),
                 loads: AtomicUsize::new(0),
                 delay: Duration::ZERO,
+                trip: Mutex::new(None),
             }
         }
     }
@@ -364,7 +406,12 @@ mod tests {
         fn gpu_available(&self) -> bool {
             self.gpu
         }
-        fn load(&self, _: &Path) -> Result<Arc<dyn CommandClassifier>, LoadError> {
+        fn load(
+            &self,
+            _: &Path,
+            on_trip: Box<dyn Fn() + Send + Sync>,
+        ) -> Result<Arc<dyn CommandClassifier>, LoadError> {
+            *self.trip.lock().unwrap() = Some(on_trip);
             self.loads.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
             match self.load_error.lock().unwrap().take() {
@@ -470,6 +517,47 @@ mod tests {
         let seen = r.until(is_ready);
         assert!(seen.contains(&Loading));
         assert!(r.loader.classifier().is_some());
+    }
+
+    /// M1: when the classifier trips its breaker, Settings stops showing Ready.
+    #[test]
+    fn a_tripped_classifier_is_reported_unavailable_and_not_handed_out() {
+        let source = FakeSource::default();
+        *source.installed.lock().unwrap() = Some(PathBuf::from("/fake/model"));
+        let r = rig(source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(|s| *s == Ready);
+        assert!(r.loader.classifier().is_some());
+        let trip = r.engine.trip.lock().unwrap().take().unwrap();
+        trip();
+        let seen = r.until(|s| matches!(s, Unavailable(_)));
+        assert_eq!(
+            seen.last(),
+            Some(&Unavailable("disabled after repeated errors".into()))
+        );
+        assert!(r.loader.classifier().is_none());
+        // A second report changes nothing.
+        trip();
+        assert!(r.states.try_recv().is_err());
+    }
+
+    /// A trip from a classifier of an earlier enable must not knock out the
+    /// current one.
+    #[test]
+    fn a_stale_trip_is_ignored() {
+        let source = FakeSource::default();
+        *source.installed.lock().unwrap() = Some(PathBuf::from("/fake/model"));
+        let r = rig(source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(|s| *s == Ready);
+        let stale = r.engine.trip.lock().unwrap().take().unwrap();
+        r.loader.set_enabled(false);
+        r.until(|s| *s == Off);
+        r.loader.set_enabled(true);
+        r.until(|s| *s == Ready);
+        stale();
+        assert!(r.loader.classifier().is_some());
+        assert!(r.states.try_recv().is_err());
     }
 
     #[test]

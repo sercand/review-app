@@ -55,6 +55,9 @@ pub struct ShisoClassifier {
     /// classifier answers `Unavailable` for the rest of the session: only a
     /// new `ShisoClassifier` (a reload) clears it.
     failures: AtomicU32,
+    /// Called once when the breaker trips, so whoever holds the classifier
+    /// can stop reporting it as ready.
+    on_trip: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// Clears the busy flag however the call ends.
@@ -72,11 +75,22 @@ impl ShisoClassifier {
             source,
             busy: AtomicBool::new(false),
             failures: AtomicU32::new(0),
+            on_trip: None,
         }
     }
 
+    /// Calls `f` once when the failure breaker trips.
+    pub fn with_on_trip(mut self, f: Box<dyn Fn() + Send + Sync>) -> ShisoClassifier {
+        self.on_trip = Some(f);
+        self
+    }
+
     fn record_failure(&self) -> ModelOutcome {
-        self.failures.fetch_add(1, Ordering::AcqRel);
+        if self.failures.fetch_add(1, Ordering::AcqRel) + 1 == MAX_FAILURES
+            && let Some(f) = &self.on_trip
+        {
+            f();
+        }
         ModelOutcome::Unavailable
     }
 }
@@ -92,6 +106,11 @@ impl CommandClassifier for ShisoClassifier {
         let _guard = BusyGuard(&self.busy);
         // Command text is never logged above debug.
         match catch_unwind(AssertUnwindSafe(|| self.source.logits(segment))) {
+            // A NaN/inf result is a broken device, not an answer.
+            Ok(Ok(logits)) if logits.iter().any(|l| !l.is_finite()) => {
+                tracing::warn!("local classifier returned non-finite logits");
+                self.record_failure()
+            }
             Ok(Ok(logits)) => {
                 self.failures.store(0, Ordering::Release);
                 calibrate(logits)
@@ -289,6 +308,40 @@ mod tests {
         }
         assert_eq!(c.classify("ls"), ModelOutcome::Unavailable);
         assert_eq!(c.failures.load(Ordering::Acquire), 3);
+    }
+
+    /// M1: the trip is announced exactly once, when the third failure lands.
+    #[test]
+    fn tripping_the_breaker_notifies_once() {
+        let trips = Arc::new(AtomicU32::new(0));
+        let seen = trips.clone();
+        let c = Script::classifier(vec![err(), err(), err()]).with_on_trip(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        for n in 1..=5 {
+            assert_eq!(c.classify("ls"), ModelOutcome::Unavailable);
+            assert_eq!(trips.load(Ordering::SeqCst), u32::from(n >= 3), "call {n}");
+        }
+    }
+
+    /// M1: a NaN/inf result is a failure; it must not reset the counter.
+    #[test]
+    fn non_finite_logits_count_as_failures() {
+        let trips = Arc::new(AtomicU32::new(0));
+        let seen = trips.clone();
+        let c = Script::classifier(vec![
+            err(),
+            Some(Ok([f32::NAN, 0.0, 0.0])),
+            Some(Ok([0.0, f32::INFINITY, 0.0])),
+        ])
+        .with_on_trip(Box::new(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        for _ in 0..3 {
+            assert_eq!(c.classify("ls"), ModelOutcome::Unavailable);
+        }
+        assert_eq!(c.failures.load(Ordering::Acquire), 3);
+        assert_eq!(trips.load(Ordering::SeqCst), 1);
     }
 
     #[test]
