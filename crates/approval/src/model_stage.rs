@@ -82,12 +82,15 @@ impl SegmentPolicy for ModelPolicy<'_> {
             Some(o) => o,
             None => {
                 match catch_unwind(AssertUnwindSafe(|| self.classifier.classify(&key))) {
+                    // Unavailable (still loading, transient timeout) is not
+                    // cached, so the next call retries.
                     Ok(o) => {
-                        self.cache.put(key, o);
+                        if o != ModelOutcome::Unavailable {
+                            self.cache.put(key, o);
+                        }
                         o
                     }
-                    // A panic counts as unavailable and is not cached: the
-                    // next call may work.
+                    // A panic counts as unavailable and is not cached either.
                     Err(_) => ModelOutcome::Unavailable,
                 }
             }

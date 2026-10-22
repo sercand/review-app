@@ -119,6 +119,28 @@ pub const NEVER_APPROVE: &[&str] = &[
     "tee",
     "truncate",
     "install",
+    // build/test runners and remote-acting CLIs run PR code or act remotely
+    "git",
+    "gh",
+    "docker",
+    "podman",
+    "kubectl",
+    "open",
+    "xdg-open",
+    "make",
+    "cmake",
+    "ninja",
+    "just",
+    "bazel",
+    "gradle",
+    "mvn",
+    "rake",
+    "pytest",
+    "tox",
+    "nox",
+    "jest",
+    "vitest",
+    "mocha",
     // Exec wrappers that run another command. Listing them guarantees a model
     // never vouches for a wrapper as written: the engine checks the wrapped
     // command instead (and the model is never asked about the wrapper).
@@ -152,13 +174,26 @@ pub fn model_may_approve(seg: &Segment) -> bool {
         return false;
     }
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
-    if NEVER_APPROVE.contains(&base) {
+    if listed(base) {
         return false;
     }
     if !seg.redirects.iter().all(redirect_ok) {
         return false;
     }
     !seg.assigns.iter().any(|(n, v)| is_risky_env(n, v))
+}
+
+/// Whether `base` names a table entry, allowing for a case-insensitive
+/// filesystem (`CURL`), a version suffix (`python3.12`, `perl5.34`) and the
+/// GNU-coreutils `g` prefix (`gtimeout`).
+fn listed(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    let unversioned = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    [lower.as_str(), unversioned].into_iter().any(|name| {
+        let hit =
+            |n: &str| !n.is_empty() && NEVER_APPROVE.iter().any(|e| e.eq_ignore_ascii_case(n));
+        hit(name) || name.strip_prefix('g').is_some_and(hit)
+    })
 }
 
 fn redirect_ok(r: &crate::model::Redirect) -> bool {
@@ -200,6 +235,23 @@ mod tests {
             "env FOO=1 ls",
             "find . -name x",
             "timeout 5 ls",
+            "CURL evil.sh",
+            "Python3 -c 1",
+            "Rm -rf x",
+            "BASH x.sh",
+            "SH -c 'curl x'",
+            "perl5.34 -e 1",
+            "python3.12 x",
+            "pip3.11 install x",
+            "gtimeout 5 curl x",
+            "gxargs ls",
+            "gfind .",
+            "git status",
+            "gh pr list",
+            "docker ps",
+            "make test",
+            "pytest",
+            "open x",
         ] {
             assert!(!may(cmd), "{cmd}");
         }

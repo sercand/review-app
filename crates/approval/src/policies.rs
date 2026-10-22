@@ -778,22 +778,36 @@ fn command_lookup(seg: &Segment) -> bool {
     }
 }
 
-/// Divergence from da: `xmllint` options that make it fetch a DTD or
-/// XInclude target (possibly a URL named by the file) defer unless `--nonet`
-/// is also given. `--nonet` is matched exactly: an abbreviation could be
-/// `--noent`, which does not stop network access.
+/// Divergence from da: `xmllint` options that make it fetch a DTD, schema or
+/// XInclude target (possibly a URL named by the file) defer unless `-nonet`
+/// is also given, and so does any URL argument. xmllint compares options with
+/// `strcmp` and takes one or two dashes, so the match is exact after trimming
+/// leading dashes (no abbreviations).
 fn xmllint_offline(seg: &Segment) -> bool {
     const FETCHING: &[&str] = &[
         "valid",
         "loaddtd",
         "dtdvalid",
+        "dtdvalidfpi",
         "xinclude",
         "dtdattr",
         "postvalid",
+        "schema",
+        "relaxng",
     ];
     let args = || seg.argv.iter().skip(1);
-    let fetches = args().any(|t| FETCHING.iter().any(|f| long_is(t, f)));
-    !fetches || args().any(|t| t == "--nonet")
+    if args().any(|t| t.contains("://")) {
+        return false;
+    }
+    let opt = |t: &String| {
+        t.starts_with('-')
+            .then(|| t.trim_start_matches('-').to_string())
+    };
+    let fetches = args()
+        .filter_map(opt)
+        .any(|o| FETCHING.contains(&o.as_str()));
+    let nonet = args().filter_map(opt).any(|o| o == "nonet");
+    !fetches || nonet
 }
 
 /// `env` with no command: prints the environment.

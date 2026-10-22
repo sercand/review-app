@@ -90,8 +90,10 @@ fn unavailable_asks_same_as_no_model() {
 fn dangerous_becomes_ask_with_warning() {
     match run("mytool --wipe", ModelOutcome::Dangerous) {
         Verdict::Ask { reason } => {
-            assert!(reason.contains("flagged"), "{reason}");
-            assert!(reason.contains("mytool --wipe"), "{reason}");
+            assert_eq!(
+                reason,
+                "the local classifier flagged this command as dangerous: mytool --wipe"
+            );
         }
         v => panic!("{v:?}"),
     }
@@ -153,12 +155,12 @@ fn dangerous_is_cached_too() {
 }
 
 #[test]
-fn unavailable_is_cached() {
+fn unavailable_is_not_cached() {
     let fake = FakeClassifier::new(ModelOutcome::Unavailable);
     let cache = DecisionCache::new();
     run_with("mytool", &fake, &cache);
     run_with("mytool", &fake, &cache);
-    assert_eq!(fake.calls(), 1);
+    assert_eq!(fake.calls(), 2);
 }
 
 struct PanicsOnce {
@@ -197,6 +199,39 @@ fn cache_clears_when_full() {
     cache.put("new".into(), ModelOutcome::Dangerous);
     assert_eq!(cache.get("new"), Some(ModelOutcome::Dangerous));
     assert_eq!(cache.get("k0"), None);
+}
+
+fn run_deny_paths(cmd: &str, outcome: ModelOutcome) -> Verdict {
+    let fake = FakeClassifier::new(outcome);
+    let cache = DecisionCache::new();
+    let policy = ModelPolicy {
+        classifier: &fake,
+        cache: &cache,
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    let deny = review_approval::default_deny_paths();
+    classify(
+        cmd,
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &deny,
+            cwd: None,
+            extra: &extra,
+        },
+    )
+}
+
+#[test]
+fn withhold_beats_model_safe() {
+    assert!(is_ask(&run_deny_paths("mytool .e*", ModelOutcome::Safe)));
+}
+
+#[test]
+fn hard_deny_beats_model_dangerous() {
+    match run_deny_paths("mytool; cat .env", ModelOutcome::Dangerous) {
+        Verdict::Deny { reason } => assert!(reason.contains(".env"), "{reason}"),
+        v => panic!("{v:?}"),
+    }
 }
 
 #[test]
