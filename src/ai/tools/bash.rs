@@ -6,7 +6,8 @@
 
 use std::time::Duration;
 
-use review_approval::{ApprovalConfig, Verdict, classify};
+use review_approval::model_stage::ModelPolicy;
+use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -112,17 +113,7 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     if cx.for_review_contains(&line) {
         return None;
     }
-    let allowed = cx.allowed_snapshot();
-    let deny_paths = cx.approval.effective_deny_paths();
-    let verdict = classify(
-        command,
-        &ApprovalConfig {
-            allowed: &allowed,
-            deny_paths: &deny_paths,
-            cwd: Some(&cx.repo_root),
-            extra: &[],
-        },
-    );
+    let verdict = decide(command, cx).await;
     let reason = match verdict {
         Verdict::Run { source } => {
             tracing::debug!(source, command, "bash command auto-approved");
@@ -154,6 +145,103 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
             Some(ToolOutput::error(text))
         }
     }
+}
+
+/// The engine's verdict for `command` under the run's [`ApprovalSetup`].
+///
+/// Without a classifier the engine is pure and fast, so it runs inline. With
+/// one, the model may block (a GPU call, a lock), so the whole classification
+/// runs on a blocking thread under [`ApprovalSetup::timeout`]; on a timeout or
+/// a panicked thread the verdict is the engine's with no model at all. The
+/// slow thread is detached, never awaited past the timeout.
+///
+/// With auto-approve off, no rule policy or model is consulted: a `Deny`
+/// (secret paths) still applies, and anything that would have run asks.
+///
+/// [`ApprovalSetup`]: crate::ai::approval_setup::ApprovalSetup
+/// [`ApprovalSetup::timeout`]: crate::ai::approval_setup::ApprovalSetup::timeout
+async fn decide(command: &str, cx: &ToolCx) -> Verdict {
+    let setup = cx.approval.clone();
+    let allowed = cx.allowed_snapshot();
+    let deny_paths = setup.effective_deny_paths();
+    let repo_root = cx.repo_root.clone();
+    let run = move |command: &str, with_model: bool| {
+        classify_with(
+            command,
+            &setup,
+            &allowed,
+            &deny_paths,
+            &repo_root,
+            with_model,
+        )
+    };
+    let verdict = if cx.approval.enabled && cx.approval.classifier.is_some() {
+        let owned = command.to_string();
+        let timeout = cx.approval.timeout;
+        let blocking = {
+            let run = run.clone();
+            tokio::task::spawn_blocking(move || run(&owned, true))
+        };
+        match tokio::time::timeout(timeout, blocking).await {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "command classifier thread failed; asking");
+                run(command, false)
+            }
+            Err(_) => {
+                tracing::warn!(?timeout, "command classifier timed out; asking");
+                run(command, false)
+            }
+        }
+    } else {
+        run(command, false)
+    };
+    match verdict {
+        Verdict::Run { .. } if !cx.approval.enabled => Verdict::Ask {
+            reason: "auto-approve is off".to_string(),
+        },
+        other => other,
+    }
+}
+
+/// One synchronous `classify` run: rule policies, the opt-in capabilities and
+/// (when asked, and a classifier is installed) the model last.
+fn classify_with(
+    command: &str,
+    setup: &crate::ai::approval_setup::ApprovalSetup,
+    allowed: &[String],
+    deny_paths: &[String],
+    repo_root: &std::path::Path,
+    with_model: bool,
+) -> Verdict {
+    // With auto-approve off nothing may vouch for the command; only the deny
+    // list and the repo's own allowed lines (which `Run` is mapped away from
+    // by the caller) are left.
+    let mut extra: Vec<&dyn SegmentPolicy> = Vec::new();
+    if setup.enabled {
+        for policy in &setup.capabilities {
+            extra.push(*policy);
+        }
+    }
+    let model = match (&setup.classifier, with_model && setup.enabled) {
+        (Some(classifier), true) => Some(ModelPolicy {
+            classifier: classifier.as_ref(),
+            cache: &setup.cache,
+        }),
+        _ => None,
+    };
+    if let Some(model) = &model {
+        extra.push(model);
+    }
+    classify(
+        command,
+        &ApprovalConfig {
+            allowed,
+            deny_paths,
+            cwd: Some(repo_root),
+            extra: &extra,
+        },
+    )
 }
 
 /// The line "for this review" remembers.

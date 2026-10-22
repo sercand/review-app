@@ -1386,3 +1386,256 @@ async fn bash_still_asks_for_unknown_commands() {
     assert!(dir.path().join("asked").exists());
     assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
 }
+
+// ---- the optional classifier stage ----
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use review_approval::model_stage::{CommandClassifier, ModelOutcome};
+
+use crate::ai::approval_setup::ApprovalSetup;
+use crate::persist::settings::AutoApproveSettings;
+
+/// Answers every segment with one outcome and counts the calls.
+struct FixedClassifier {
+    outcome: ModelOutcome,
+    calls: AtomicUsize,
+}
+
+impl FixedClassifier {
+    fn new(outcome: ModelOutcome) -> Arc<FixedClassifier> {
+        Arc::new(FixedClassifier {
+            outcome,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl CommandClassifier for FixedClassifier {
+    fn classify(&self, _segment: &str) -> ModelOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.outcome
+    }
+}
+
+/// Sleeps until `release` is set (or 3 s pass), like a hung model. The test
+/// sets `release` at the end so the runtime's shutdown does not wait on it.
+struct SlowClassifier {
+    release: Arc<AtomicBool>,
+}
+
+impl CommandClassifier for SlowClassifier {
+    fn classify(&self, _segment: &str) -> ModelOutcome {
+        for _ in 0..300 {
+            if self.release.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ModelOutcome::Safe
+    }
+}
+
+struct PanicClassifier;
+
+impl CommandClassifier for PanicClassifier {
+    fn classify(&self, _segment: &str) -> ModelOutcome {
+        panic!("classifier blew up");
+    }
+}
+
+/// `interaction_ctx` with an approval setup built from `settings`.
+fn classifier_ctx(
+    host: &LocalHost,
+    interaction: Arc<ScriptedInteraction>,
+    settings: &AutoApproveSettings,
+    classifier: Option<Arc<dyn CommandClassifier>>,
+) -> ToolCx {
+    let mut cx = interaction_ctx(host, interaction);
+    cx.approval = Arc::new(ApprovalSetup::from_settings(settings, classifier));
+    cx
+}
+
+fn model_on() -> AutoApproveSettings {
+    AutoApproveSettings {
+        local_classifier: true,
+        ..AutoApproveSettings::default()
+    }
+}
+
+/// Writes an executable `./tool.sh` that prints `done`. It is no rule's
+/// binary, is path-qualified (so no rule can match it) and is not in the
+/// never-approve table, which makes it exactly what only the model may vouch
+/// for.
+fn write_tool(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("tool.sh");
+    std::fs::write(&path, "#!/bin/sh\necho done\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn bash_model_safe_runs_unknown_command() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+
+    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(text(&out).trim_end(), "done");
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    // The same segment again is a cache hit: the model is not asked twice.
+    bash(&cx, json!({"command": "./tool.sh"})).await;
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn bash_model_off_by_default() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    // A classifier is supplied but `local_classifier` stays off.
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &AutoApproveSettings::default(),
+        Some(classifier.clone()),
+    );
+
+    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bash_classifier_timeout_falls_back_to_ask() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let release = Arc::new(AtomicBool::new(false));
+    let settings = AutoApproveSettings {
+        classifier_timeout_ms: 100,
+        ..model_on()
+    };
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(Arc::new(SlowClassifier {
+            release: release.clone(),
+        })),
+    );
+
+    let started = std::time::Instant::now();
+    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+}
+
+#[tokio::test]
+async fn bash_classifier_panic_falls_back_to_ask() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(Arc::new(PanicClassifier)),
+    );
+
+    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_auto_approve_disabled_asks_for_everything_except_denies() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let settings = AutoApproveSettings {
+        enabled: false,
+        ..AutoApproveSettings::default()
+    };
+    let cx = classifier_ctx(&host, interaction.clone(), &settings, None);
+
+    // Read-only `ls` would run silently; with auto-approve off it asks.
+    let out = bash(&cx, json!({"command": "ls"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    match interaction.calls().as_slice() {
+        [InteractionCall::Approve { reason, .. }] => assert_eq!(reason, "auto-approve is off"),
+        other => panic!("{other:?}"),
+    }
+
+    // A secret path is still blocked without asking.
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was blocked: "),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("TOKEN=1"));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_dangerous_flag_reaches_dialog_reason() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction =
+        Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny { reason: None }));
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(FixedClassifier::new(ModelOutcome::Dangerous)),
+    );
+
+    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    assert!(out.is_error);
+    match interaction.calls().as_slice() {
+        [InteractionCall::Approve { reason, .. }] => {
+            assert!(reason.contains("flagged"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bash_capability_vouches_before_the_model() {
+    let (dir, host) = host();
+    // `git commit` is not read-only; only the opt-in capability vouches.
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let settings = AutoApproveSettings {
+        capabilities: vec!["git:add".into()],
+        ..AutoApproveSettings::default()
+    };
+    let cx = classifier_ctx(&host, interaction.clone(), &settings, None);
+    std::fs::write(dir.path().join("f"), "x").unwrap();
+
+    let out = bash(&cx, json!({"command": "git add f"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}

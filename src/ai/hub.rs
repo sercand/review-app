@@ -946,6 +946,8 @@ impl AiHub {
             interaction: interaction.clone() as Arc<dyn Interaction>,
             mode,
             bash_disabled: bash_disabled.clone(),
+            // No classifier is installed yet; bash approval is rules-only.
+            classifier: None,
         });
         if let Err(error) = self.store.checkout_set_state(rec.id, CheckoutState::Active) {
             tracing::warn!(%error, "ai hub: marking the checkout active failed");
