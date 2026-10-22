@@ -60,6 +60,20 @@ pub enum CheckoutError {
         /// The `host/owner/name` the PR belongs to.
         wanted: String,
     },
+    /// The folder's repository has no remote, so the repository it is a clone
+    /// of cannot be learned.
+    #[error("this folder has no git remote, so the repository it belongs to is unknown")]
+    NoRemote,
+    /// The folder's repository has several remotes and no `origin` to choose
+    /// between them.
+    #[error(
+        "this folder has several remotes ({}), so the repository it belongs to is ambiguous",
+        .0.join(", ")
+    )]
+    AmbiguousRemote(Vec<String>),
+    /// A remote URL that is not a repository URL this app understands.
+    #[error("the remote URL `{0}` is not a repository URL this app understands")]
+    UnparseableRemote(String),
     /// A `git` invocation failed.
     #[error("`git {args}` failed: {stderr}")]
     Git {
@@ -240,6 +254,101 @@ pub fn find_remote(
         }
     }
     Err(CheckoutError::NoMatchingRemote { wanted })
+}
+
+/// The repository a local folder is a clone of, as [`read_origin_repo`] names
+/// it: lowercase `host`, `owner` and `name`, the shape of a settings
+/// `host/owner/name` key (spec §4 step 2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRepo {
+    /// The host, e.g. `github.com`.
+    pub host: String,
+    /// The repository's owner or organization.
+    pub owner: String,
+    /// The repository name.
+    pub name: String,
+}
+
+impl RemoteRepo {
+    /// The `host/owner/name` key the settings store entry under.
+    pub fn key(&self) -> String {
+        format!("{}/{}/{}", self.host, self.owner, self.name)
+    }
+}
+
+/// Parse one remote URL into a [`RemoteRepo`]. The raw `url` is kept in
+/// [`CheckoutError::UnparseableRemote`], because that is what the user has to
+/// look at and fix.
+fn parse_remote(url: &str) -> Result<RemoteRepo, CheckoutError> {
+    let unparseable = || CheckoutError::UnparseableRemote(url.to_string());
+    let (host, slug) = split_remote_url(url).ok_or_else(unparseable)?;
+    // A repository is exactly `owner/name`: a deeper path is another kind of
+    // URL (a browse link, a GitLab subgroup), not a GitHub remote.
+    let (owner, name) = slug.split_once('/').ok_or_else(unparseable)?;
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(unparseable());
+    }
+    Ok(RemoteRepo {
+        host,
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// The repository a local folder is a clone of (spec §4 step 2): its `origin`
+/// remote, or its only remote when it has no `origin`.
+///
+/// Reads the **raw** configured URLs for the same reason as [`find_remote`]:
+/// `insteadOf` rewrites would hide the host this app has to match. Whether a
+/// remote is a fork or a mirror has no say here — the remote decides the
+/// repository, so a fork's clone names the fork.
+///
+/// Fails with [`CheckoutError::NotARepo`] when `folder` is not a git
+/// repository, [`CheckoutError::NoRemote`] when it has no remote at all,
+/// [`CheckoutError::AmbiguousRemote`] when it has several remotes and none is
+/// named `origin` (the names are sorted for display), and
+/// [`CheckoutError::UnparseableRemote`] when the chosen remote's URL is not a
+/// repository URL.
+pub fn read_origin_repo(folder: &Path) -> Result<RemoteRepo, CheckoutError> {
+    git(folder, &["rev-parse", "--git-dir"])
+        .map_err(|_| CheckoutError::NotARepo(folder.to_path_buf()))?;
+    let raw = match git(folder, &["config", "--get-regexp", "^remote\\..*\\.url$"]) {
+        Ok(raw) => raw,
+        // A repository with no remotes makes `--get-regexp` exit non-zero.
+        Err(CheckoutError::Git { .. }) => return Err(CheckoutError::NoRemote),
+        Err(e) => return Err(e),
+    };
+
+    // The first URL of each remote is its fetch URL (git ignores any later
+    // ones for fetching), so a duplicate key keeps the first.
+    let mut remotes: Vec<(String, String)> = Vec::new();
+    for line in raw.lines() {
+        let Some((key, url)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some(name) = key
+            .strip_prefix("remote.")
+            .and_then(|k| k.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        if !remotes.iter().any(|(known, _)| known == name) {
+            remotes.push((name.to_string(), url.trim().to_string()));
+        }
+    }
+
+    let url = if let Some((_, url)) = remotes.iter().find(|(name, _)| name == "origin") {
+        url.clone()
+    } else if remotes.is_empty() {
+        return Err(CheckoutError::NoRemote);
+    } else if let [(_, only)] = remotes.as_slice() {
+        only.clone()
+    } else {
+        let mut names: Vec<String> = remotes.into_iter().map(|(name, _)| name).collect();
+        names.sort();
+        return Err(CheckoutError::AmbiguousRemote(names));
+    };
+    parse_remote(&url)
 }
 
 /// The confirmed plan for checking out one PR (spec §4 step 2 dialog).
@@ -914,6 +1023,108 @@ mod tests {
             ),
             "a fork URL must not match"
         );
+    }
+
+    /// A fresh git repository with no remotes, plus its temp dir.
+    fn empty_repo() -> (TempDir, PathBuf) {
+        let dir = tempdir();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create the repo dir");
+        gitx(&repo, &["init", "-b", "main"]);
+        (dir, repo)
+    }
+
+    /// The https, ssh, scp and `.git`/no-`.git` forms all name the same
+    /// repository (spec §4 step 2).
+    #[test]
+    fn origin_https_ssh_scp_and_dot_git_forms_parse() {
+        let (_dir, clone) = empty_repo();
+        for url in [
+            "https://github.com/acme/widgets.git",
+            "https://github.com/acme/widgets",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+        ] {
+            gitx(&clone, &["config", "remote.origin.url", url]);
+            let remote = read_origin_repo(&clone).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(
+                remote,
+                RemoteRepo {
+                    host: "github.com".to_string(),
+                    owner: "acme".to_string(),
+                    name: "widgets".to_string(),
+                },
+                "should parse {url}"
+            );
+            assert_eq!(remote.key(), "github.com/acme/widgets", "{url}");
+        }
+    }
+
+    /// Without an `origin`, the only remote is the answer.
+    #[test]
+    fn no_origin_single_remote_is_used() {
+        let (_dir, clone) = empty_repo();
+        gitx(
+            &clone,
+            &[
+                "config",
+                "remote.upstream.url",
+                "git@gitlab.example.com:Team/App.git",
+            ],
+        );
+        assert_eq!(
+            read_origin_repo(&clone).unwrap().key(),
+            "gitlab.example.com/team/app"
+        );
+    }
+
+    /// Without an `origin`, several remotes leave the repository unknown and
+    /// the error names them.
+    #[test]
+    fn no_origin_two_remotes_is_ambiguous() {
+        let (_dir, clone) = empty_repo();
+        gitx(
+            &clone,
+            &[
+                "config",
+                "remote.upstream.url",
+                "https://github.com/acme/app.git",
+            ],
+        );
+        gitx(
+            &clone,
+            &["config", "remote.fork.url", "https://github.com/me/app.git"],
+        );
+        match read_origin_repo(&clone) {
+            Err(CheckoutError::AmbiguousRemote(names)) => {
+                assert_eq!(names, vec!["fork".to_string(), "upstream".to_string()])
+            }
+            other => panic!("expected AmbiguousRemote, got {other:?}"),
+        }
+    }
+
+    /// A repository with no remotes at all has no repository to name.
+    #[test]
+    fn no_remote_errors() {
+        let (_dir, clone) = empty_repo();
+        assert!(matches!(
+            read_origin_repo(&clone),
+            Err(CheckoutError::NoRemote)
+        ));
+    }
+
+    /// A remote that is not a repository URL keeps its raw URL in the error.
+    #[test]
+    fn garbage_url_is_unparseable() {
+        let (_dir, clone) = empty_repo();
+        gitx(
+            &clone,
+            &["config", "remote.origin.url", "./some/local/path"],
+        );
+        match read_origin_repo(&clone) {
+            Err(CheckoutError::UnparseableRemote(url)) => assert_eq!(url, "./some/local/path"),
+            other => panic!("expected UnparseableRemote, got {other:?}"),
+        }
     }
 
     #[test]

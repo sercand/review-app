@@ -17,6 +17,7 @@ pub mod llm;
 pub mod model;
 pub mod pipeline;
 pub mod prompts;
+pub mod repo_link;
 pub mod review;
 pub mod snapshot;
 pub mod stages;

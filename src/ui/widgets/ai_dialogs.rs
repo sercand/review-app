@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Frame, Margin, RichText};
 
-use crate::ai::checkout::{CheckoutPlan, PrTarget, find_remote};
+use crate::ai::checkout::{CheckoutPlan, PrTarget, RemoteRepo, find_remote};
+use crate::ai::repo_link::link_repo;
 use crate::ai::store::{CheckoutRecord, OriginalRef, PrKey};
-use crate::persist::settings::{AiSettings, RepoAiSettings};
+use crate::persist::settings::AiSettings;
 use crate::ui::components::{Btn, BtnKind};
 use crate::ui::{fonts, icons, theme};
 
@@ -91,27 +92,17 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-/// Save `path` as the checkout folder for `key` (spec §4 step 2), updating
-/// the repo's row in place when one exists: a re-pick moves the folder
-/// without losing the commands the user configured or accepted from the
-/// scout. A new repo gets a fresh row with no commands.
+/// Save `path` as the checkout folder for `key` (spec §4 step 2): a re-pick
+/// moves the folder without losing the commands the user configured or
+/// accepted from the scout, and a new repo gets a fresh row with no commands.
+/// The link itself is [`link_repo`]'s; this adapts the PR key to it.
 pub fn save_folder(ai: &mut AiSettings, key: &PrKey, path: PathBuf) {
-    let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo).to_lowercase();
-    match ai
-        .repos
-        .iter_mut()
-        .find(|repo| repo.repo.to_lowercase() == repo_key)
-    {
-        Some(repo) => {
-            repo.repo = repo_key;
-            repo.path = path;
-        }
-        None => ai.repos.push(RepoAiSettings {
-            repo: repo_key,
-            path,
-            ..Default::default()
-        }),
-    }
+    let repo = RemoteRepo {
+        host: key.host.clone(),
+        owner: key.owner.clone(),
+        name: key.repo.clone(),
+    };
+    link_repo(ai, &repo, path);
 }
 
 /// Window-level context the dialogs display but do not own.
