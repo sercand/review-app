@@ -1598,7 +1598,7 @@ async fn bash_busy_classifier_is_not_stacked() {
     let release = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let settings = AutoApproveSettings {
-        classifier_timeout_ms: 100,
+        classifier_timeout_ms: 2000,
         ..model_on()
     };
     let cx = classifier_ctx(
@@ -1626,8 +1626,34 @@ async fn bash_busy_classifier_is_not_stacked() {
     release.store(true, Ordering::SeqCst);
     assert!(c.is_error);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(elapsed < Duration::from_millis(90), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
     assert_eq!(interaction.calls().len(), 3);
+}
+
+/// A cached Safe outcome still approves while another model call is in
+/// flight, and the classifier is not called again.
+#[tokio::test]
+async fn bash_busy_classifier_still_uses_cached_outcome() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    // Another model call is now in flight.
+    let _busy = cx.approval.try_begin_model().expect("slot free");
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
 }
 
 #[tokio::test]

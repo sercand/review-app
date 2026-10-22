@@ -192,15 +192,17 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
             Ok(Ok(verdict)) => verdict,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "command classifier thread failed; asking");
-                run(command, None)
+                run(command, Some(Instant::now()))
             }
             Err(_) => {
                 tracing::warn!(?timeout, "command classifier timed out; asking");
-                run(command, None)
+                run(command, Some(Instant::now()))
             }
         }
     } else {
-        run(command, None)
+        // Another model call is in flight (or none is installed): an expired
+        // deadline keeps cached outcomes in play but starts no new call.
+        run(command, Some(Instant::now()))
     };
     match verdict {
         Verdict::Run { .. } if !cx.approval.enabled => Verdict::Ask {

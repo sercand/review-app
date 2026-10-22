@@ -1031,7 +1031,7 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
     });
     ui.label(
         RichText::new(
-            "Advisory only. A \"safe\" answer never runs network, interpreter, install, delete or wrapper commands, programs given by a relative path (PR code), or a command that names one of those binaries; they still ask. The sandbox remains the security boundary.",
+            "Advisory only. A \"safe\" answer never approves a listed network, interpreter, install, delete or wrapper program, a program given by a relative path (PR code), or a command naming one; those still ask. Unlisted programs can be approved. The sandbox remains the security boundary.",
         )
         .size(12.0)
         .color(p.muted),
