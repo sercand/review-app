@@ -56,9 +56,9 @@ pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> 
                 .ok_or(Bail::Syntax)?;
             Ok((inner.to_string(), false))
         }
-        // Decoded rather than kept raw, on purpose: a raw `$'\x2d\x72'` would look
-        // like an innocuous word while bash runs it as `-r`. So `$'...'` is decoded (so `$'\x2d\x72'` is seen as `-r`). A decoded NUL
-        // would make bash truncate the word, so it is treated as dynamic.
+        // `$'...'` is decoded, not kept raw, so `$'\x2d\x72'` is seen as the flag
+        // `-r` bash will run. A decoded NUL makes bash truncate the word, so it
+        // is treated as dynamic.
         "ansi_c_string" => {
             let t = text(node, src)?;
             let inner = t
@@ -98,8 +98,11 @@ pub(super) fn check_expansion(node: Node, src: &str) -> Result<(), Bail> {
         stack.extend(n.children(&mut cursor));
     }
     let t = text(node, src)?;
-    if t.contains("$((") {
+    if t.contains("$((") || t.contains("$[") {
         return Err(Bail::Arithmetic);
+    }
+    if t.contains("<(") || t.contains(">(") {
+        return Err(Bail::ProcessSubstitution);
     }
     if t.contains('`') || t.contains("$(") {
         return Err(Bail::CommandSubstitution);

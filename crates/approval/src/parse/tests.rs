@@ -200,3 +200,20 @@ fn unsupported_kind_names_come_from_the_grammar() {
         Err(Bail::Unsupported("redirected_statement"))
     );
 }
+
+#[test]
+fn process_substitution_and_legacy_arithmetic_in_expansions_bail() {
+    assert_eq!(
+        parse("echo ${A:-<(touch pwned)}"),
+        Err(Bail::ProcessSubstitution)
+    );
+    assert_eq!(
+        parse("echo ${A:->(touch pwned)}"),
+        Err(Bail::ProcessSubstitution)
+    );
+    assert_eq!(
+        parse("echo \"${A:-<(touch pwned)}\""),
+        Err(Bail::ProcessSubstitution)
+    );
+    assert_eq!(parse("echo ${A:-$[1+2]}"), Err(Bail::Arithmetic));
+}
