@@ -1629,6 +1629,8 @@ mod tests {
         assert!(vm.validate().is_ok());
     }
 
+    // C1: write_to/validate of auto_approve are unix-only; these assert that.
+    #[cfg(unix)]
     #[test]
     fn apply_writes_settings() {
         let mut settings = Settings::default();
@@ -1647,6 +1649,8 @@ mod tests {
         assert_eq!(aa.capabilities, vec!["git:commit", "help-bypass"]);
     }
 
+    // C1: write_to/validate of auto_approve are unix-only; these assert that.
+    #[cfg(unix)]
     #[test]
     fn invalid_auto_approve_blocks_apply_without_writing() {
         let mut settings = Settings::default();
@@ -1658,6 +1662,8 @@ mod tests {
         assert_eq!(settings, before);
     }
 
+    // C1: write_to/validate of auto_approve are unix-only; these assert that.
+    #[cfg(unix)]
     #[test]
     fn classifier_checkbox_forced_off_when_unavailable() {
         let mut settings = Settings::default();
@@ -1671,6 +1677,8 @@ mod tests {
         assert!(settings.ai.auto_approve.local_classifier);
     }
 
+    // C1: write_to/validate of auto_approve are unix-only; these assert that.
+    #[cfg(unix)]
     #[test]
     fn stored_out_of_range_timeout_and_slash_pattern_do_not_block_save() {
         let mut settings = Settings::default();
@@ -1687,6 +1695,8 @@ mod tests {
         assert_eq!(vm.ai.auto_approve.timeout_ms, "5000");
     }
 
+    // C1: write_to/validate of auto_approve are unix-only; these assert that.
+    #[cfg(unix)]
     #[test]
     fn crlf_deny_paths_are_split_cleanly() {
         let mut settings = Settings::default();
