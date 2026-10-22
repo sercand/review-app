@@ -32,6 +32,21 @@ command
 never widen what the sandbox permits. Stages 1–3 are deterministic; 4 is advisory and fails closed
 (error, timeout, model missing, no GPU → fall through to the next stage, never to `Run`).
 
+## Implementation plans (execute in this order; each is self-contained for a fresh session)
+
+| Plan | Covers | Repo / working dir | Depends on |
+|------|--------|--------------------|------------|
+| `2026-10-22-auto-approve-1-rules-engine.md` | M2: tree-sitter front end, da's engine + rule policies, deny paths, wire `bash` | reviewer | - |
+| `2026-10-22-auto-approve-2-model-stage.md` | M3: classifier trait, never-approve table, cache, timeouts, settings | reviewer | plan 1 |
+| `2026-10-22-auto-approve-3-shiso-classifier.md` | M0 + M1: weights recovery, HF publish, `distilbert_cls` family, registry recipe | **shiso-llm** | none (parallel to 1-2) |
+| `2026-10-22-auto-approve-4-classifier-integration.md` | M4 + M5: link shiso, download, loader, UI, evaluation, promotion | reviewer | plans 2 and 3 |
+
+**Changes from this document found while planning (the plans win):** shiso needs **no new kernels** (all ops exist on both
+backends) and **no facade crate** (the family lives in `shiso-models`; the reviewer links `shiso-models`/`shiso-hub` and opens the
+Metal/CUDA backend itself); the registry needs a new `Task::Classification`; the engine is `da`'s own (ported onto a tree-sitter front end
+rather than re-written); a model "dangerous" verdict becomes an *ask with a warning*, not a hard deny; shiso's CUDA kernels only exist when
+the consumer builds with `SHISO_CUDA_COMPILE=1`.
+
 ## Findings that shape the plan
 
 1. **da's parser is hand-written (`src/shparse`, ~1.0k lines), not tree-sitter.** The request says
