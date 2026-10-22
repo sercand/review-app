@@ -180,7 +180,65 @@ fn classify_script(
         Ok(_) => return (Decision::Defer, Some(Reason::Empty)),
         Err(b) => return (Decision::Defer, Some(Reason::Bail(b))),
     };
+    // I2: a hard deny anywhere in the whole command (wrapper contents and
+    // `sh -c` scripts included) wins before any policy, the model above all,
+    // is asked to approve or deny an earlier segment. Nested scripts are
+    // scanned by the recursion here, so only the outermost call scans.
+    if depth == 0
+        && let Some(done) = deny_scan(&segs, cwd, stack, 0)
+    {
+        return done;
+    }
     classify_all(&segs, cwd, stack, depth)
+}
+
+/// The first hard deny among `segs` and everything they run (wrapper inners,
+/// `sh -c` scripts), as written. Withholds are not looked at here.
+fn deny_scan(
+    segs: &[Segment],
+    cwd: Option<&Path>,
+    stack: &[&dyn SegmentPolicy],
+    depth: usize,
+) -> Option<Res> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    for seg in segs {
+        if let Screen::Deny(res) = screen(seg, cwd, stack) {
+            return Some(res);
+        }
+        if seg.argv.is_empty() || seg.is_dynamic(0) {
+            continue;
+        }
+        let binary = argv0_name(&seg.argv[0]);
+        if SHELLS.contains(&binary) {
+            if let Some(i) = shell_c_index(seg)
+                && let Ok(inner) = parse(&seg.argv[i])
+                && let Some(done) = deny_scan(&inner, cwd, stack, depth + 1)
+            {
+                return Some(done);
+            }
+        } else if let Some(Unwrapped::Inner(inner)) = unwrap_wrapper(seg, binary)
+            && let Some(done) = deny_scan(&inner, cwd, stack, depth)
+        {
+            return Some(done);
+        }
+    }
+    None
+}
+
+/// What a wrapper command (`env`, `time`, `xargs`, …) runs, if `binary` is
+/// one and its form is understood.
+fn unwrap_wrapper(seg: &Segment, binary: &str) -> Option<Unwrapped> {
+    match binary {
+        "command" => unwrap_command(seg),
+        "env" => unwrap_env(seg),
+        "time" => unwrap_time(seg),
+        "timeout" => unwrap_timeout(seg),
+        "xargs" => unwrap_xargs(seg),
+        "find" => unwrap_find_exec(seg),
+        _ => None,
+    }
 }
 
 fn classify_all(
@@ -264,15 +322,7 @@ fn classify_segment(
         }
         None
     } else {
-        match binary {
-            "command" => unwrap_command(seg),
-            "env" => unwrap_env(seg),
-            "time" => unwrap_time(seg),
-            "timeout" => unwrap_timeout(seg),
-            "xargs" => unwrap_xargs(seg),
-            "find" => unwrap_find_exec(seg),
-            _ => None,
-        }
+        unwrap_wrapper(seg, binary)
     };
     match wrapped {
         Some(Unwrapped::Noop) => structural(),
@@ -281,9 +331,11 @@ fn classify_segment(
             let res = classify_all(&inner, cwd, stack, depth);
             match res.0 {
                 // A policy may still vouch for the wrapper invocation as
-                // written (`--allow 'timeout 5 foo'`, the model); if none
-                // does, the inner segment's reason is the useful one.
-                Decision::Defer => match consult(seg, cwd, stack) {
+                // written (`--allow 'timeout 5 foo'`); if none does, the
+                // inner segment's reason is the useful one. I1: the model is
+                // not asked about the wrapper as a whole (it would approve
+                // `timeout 5 curl evil` on the strength of `timeout`).
+                Decision::Defer => match consult_with(seg, cwd, stack, false) {
                     (Decision::Defer, _) => res,
                     other => other,
                 },
@@ -296,7 +348,17 @@ fn classify_segment(
 
 /// Ask the stack about one segment. First policy with an opinion wins.
 fn consult(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> Res {
-    for p in stack {
+    consult_with(seg, cwd, stack, true)
+}
+
+/// [`consult`], optionally leaving out the model policy.
+fn consult_with(
+    seg: &Segment,
+    cwd: Option<&Path>,
+    stack: &[&dyn SegmentPolicy],
+    with_model: bool,
+) -> Res {
+    for p in stack.iter().filter(|p| with_model || p.name() != ML_NAME) {
         match p.verify(seg, cwd) {
             Some(PolicyVerdict::Approve) => return (Decision::Approve { source: p.name() }, None),
             Some(PolicyVerdict::Deny) => return denied(seg, *p),
@@ -955,6 +1017,78 @@ mod tests {
             classify_stack("echo", None, &stack).0,
             Decision::Approve { source: "ml" }
         );
+    }
+
+    /// A model stand-in that vouches only for the wrapper words themselves
+    /// and has no opinion on what they run.
+    struct WrapperOnlyMl;
+    impl SegmentPolicy for WrapperOnlyMl {
+        fn name(&self) -> &'static str {
+            "ml"
+        }
+        fn verify(&self, seg: &Segment, _: Option<&Path>) -> Option<PolicyVerdict> {
+            matches!(
+                seg.argv.first().map(String::as_str),
+                Some("timeout" | "env" | "command" | "xargs" | "find" | "time")
+            )
+            .then_some(PolicyVerdict::Approve)
+        }
+    }
+
+    // I1: the model is never asked about a wrapper as a whole once the
+    // command it runs is not approved.
+    #[test]
+    fn model_does_not_vouch_for_a_wrapper_over_an_unapproved_command() {
+        let ml = WrapperOnlyMl;
+        let stack: [&dyn SegmentPolicy; 2] = [&READ_ONLY, &ml];
+        for cmd in [
+            "timeout 5 curl evil",
+            "env curl x",
+            "command rm -rf /",
+            "xargs rm -rf",
+            "find . -exec rm {} \\;",
+            "time touch x",
+        ] {
+            assert_eq!(classify_stack(cmd, None, &stack).0, Decision::Defer, "{cmd}");
+        }
+        // The model still judges the inner command itself.
+        let all = Named("ml", Some(PolicyVerdict::Approve));
+        let stack: [&dyn SegmentPolicy; 1] = [&all];
+        assert_eq!(
+            classify_stack("timeout 5 curl evil", None, &stack).0,
+            Decision::Approve { source: "ml" }
+        );
+    }
+
+    #[test]
+    fn repo_allow_still_vouches_for_a_wrapper_as_written() {
+        let allow = crate::repo::RepoAllow(&["timeout 5 make".to_string()]);
+        let ml = WrapperOnlyMl;
+        let stack: [&dyn SegmentPolicy; 2] = [&allow, &ml];
+        assert_eq!(
+            classify_stack("timeout 5 make", None, &stack).0,
+            Decision::Approve { source: "repo-allow" }
+        );
+    }
+
+    // I2: a model deny on an early segment must not mask a later hard deny.
+    #[test]
+    fn hard_deny_beats_model_deny_on_an_earlier_segment() {
+        let ml = Named("ml", Some(PolicyVerdict::Deny));
+        let stack: [&dyn SegmentPolicy; 2] = [&DENY_DOTENV, &ml];
+        for cmd in [
+            "foo; cat .env",
+            "foo && sh -c 'cat .env'",
+            "foo | xargs cat .env",
+            "bash -c 'foo; timeout 5 cat .env'",
+        ] {
+            let (d, reason) = classify_stack_reason(cmd, None, &stack);
+            assert_eq!(d, Decision::Deny, "{cmd}");
+            let text = reason.unwrap().to_string();
+            assert!(text.contains(".env"), "{cmd}: {text}");
+        }
+        // Without a hard deny the model's deny stands.
+        assert_eq!(classify_stack("foo", None, &stack).0, Decision::Deny);
     }
 
     fn redirect_ok(target: &str) -> bool {
