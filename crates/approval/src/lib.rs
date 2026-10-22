@@ -6,6 +6,7 @@
 
 pub mod engine;
 pub mod model;
+pub mod never_approve;
 pub mod parse;
 pub mod policies;
 pub mod policy;

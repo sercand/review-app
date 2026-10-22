@@ -753,7 +753,7 @@ pub(crate) fn is_env_assignment(s: &str) -> bool {
 ///
 /// This is a list of known offenders, not a proof: an arbitrary tool may
 /// honour a variable that is not here.
-fn is_risky_env(name: &str, value: &str) -> bool {
+pub(crate) fn is_risky_env(name: &str, value: &str) -> bool {
     const EXACT: &[&str] = &[
         "PATH",
         "TMPDIR",
