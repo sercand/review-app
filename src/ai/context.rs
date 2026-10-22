@@ -411,6 +411,24 @@ mod tests {
     }
 
     #[test]
+    fn context_parses_this_repos_review_md() {
+        // This repo ships its own `.github/REVIEW.md` (spec §17 call 11);
+        // it must stay parseable by the checks grammar above.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/REVIEW.md");
+        let markdown = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let checks = parse_checks(&markdown);
+        assert!(
+            checks.len() >= 8,
+            "expected ≥ 8 checks, got {}: {:?}",
+            checks.len(),
+            checks.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+        let globs: Vec<&str> = checks.iter().filter_map(|c| c.glob.as_deref()).collect();
+        assert_eq!(globs, ["src/ai/**", "src/diff/**"]);
+    }
+
+    #[test]
     fn only_a_level_two_heading_closes_the_checks_section() {
         let checks = parse_checks("## Checks\n- A\n### Bugs\n- B\n## Other\n- C\n");
         let texts: Vec<&str> = checks.iter().map(|c| c.text.as_str()).collect();
