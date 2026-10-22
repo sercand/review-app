@@ -612,7 +612,10 @@ settings **[call]**.
 
 The classifier is the `review-approval` crate (`crates/approval`), a tree-sitter
 bash parser plus a rule engine ported from `da`. `classify(command, config)`
-returns `Run`, `Ask` or `Deny`: parse, then deny paths (`.env*`, `.ssh`, ...),
+returns `Run`, `Ask` or `Deny`: parse, then deny paths (`.env*`, `.ssh`, ...;
+a text match on the command's words that stops naive reads, not a guarantee:
+recursive greps, PR symlinks and run-time splices get past it, so the OS
+deny-read list in §8.2 is what actually protects credentials),
 then the rule policies (read-only commands, read-only `git`, the repo's
 configured commands, `mkdir` in the checkout), then ask. It fails closed:
 anything the parser or a policy can't account for asks. `Deny` is returned to
@@ -634,7 +637,7 @@ Profile:
 | Network | **allowed** |
 | Write | the repo working tree **except `.git/`**; a per-run temp dir (exported as `TMPDIR`); package/build caches: `~/.cargo/registry`, `~/.cargo/git`, `~/.npm`, `~/.cache`, `~/Library/Caches`, `~/go/pkg/mod`, `~/.gradle`, plus a user-editable list in settings |
 | Read | everything except the denied paths below |
-| Read denied | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`, `~/.docker/config.json`, keychain databases, the app's own config dir, plus a user-editable list |
+| Read denied | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`, `~/.npmrc`, `~/.pypirc`, `~/.kube`, `~/.gnupg`, `~/.docker`, keychain databases, the app's own config dir, plus a user-editable list |
 
 ### 8.3 Clean environment
 
@@ -646,7 +649,9 @@ the user can extend, with:
 - `GH_CONFIG_DIR` pointing at an empty temp dir
 - `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`
 - `GIT_CONFIG_GLOBAL` pointing at a generated config that copies `user.name`
-  and `user.email` but sets `credential.helper=` (empty)
+  and `user.email` but sets `credential.helper=` (empty) and
+  `safe.bareRepository=explicit` (a PR can commit a bare-repo layout as plain
+  files; git must not discover it from `cd DIR && git status`)
 
 ### 8.4 Why this holds
 

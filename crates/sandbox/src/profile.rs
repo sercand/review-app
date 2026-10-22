@@ -61,7 +61,14 @@ pub fn default_deny_read(home: &Path, app_config: &Path) -> Vec<PathBuf> {
         ".git-credentials",
         ".netrc",
         ".aws",
-        ".docker/config.json",
+        // The approval engine's text-level DenyPaths list (`.npmrc`,
+        // `.pypirc`, `.kube`, `.gnupg`, `.docker`) is only a convenience; this
+        // OS-level list is the guarantee, so it must cover the same homes.
+        ".npmrc",
+        ".pypirc",
+        ".kube",
+        ".gnupg",
+        ".docker",
         "Library/Keychains",
     ]
     .iter()
@@ -425,7 +432,11 @@ mod tests {
                 Path::new("/h/.git-credentials"),
                 Path::new("/h/.netrc"),
                 Path::new("/h/.aws"),
-                Path::new("/h/.docker/config.json"),
+                Path::new("/h/.npmrc"),
+                Path::new("/h/.pypirc"),
+                Path::new("/h/.kube"),
+                Path::new("/h/.gnupg"),
+                Path::new("/h/.docker"),
                 Path::new("/h/Library/Keychains"),
                 Path::new("/app/config"),
             ]
