@@ -13,6 +13,9 @@ license = "MIT"
 # Test doubles for the AI pipeline (`ai::testing`), for integration tests that
 # drive the worker. Unit tests compile them unconditionally.
 ai-testing = []
+# Local ONNX-free DistilBERT command classifier on the shiso inference stack
+# (Metal on macOS, CUDA on Linux). Off by default: pulls a large git dependency.
+local-classifier = ["dep:shiso-models", "dep:shiso-core", "dep:shiso-hub", "dep:shiso-metal", "dep:shiso-cuda"]
 
 [[test]]
 name = "ai_pipeline"
@@ -58,6 +61,13 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
 tokio-util = "0.7"
 url = "2.5"
+shiso-core = { git = "https://github.com/sercand/shiso-llm", rev = "bd08f1b5a704e35788d817a6489adda44981caa6", optional = true }
+shiso-hub = { git = "https://github.com/sercand/shiso-llm", rev = "bd08f1b5a704e35788d817a6489adda44981caa6", optional = true }
+shiso-metal = { git = "https://github.com/sercand/shiso-llm", rev = "bd08f1b5a704e35788d817a6489adda44981caa6", optional = true }
+shiso-models = { git = "https://github.com/sercand/shiso-llm", rev = "bd08f1b5a704e35788d817a6489adda44981caa6", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+shiso-cuda = { git = "https://github.com/sercand/shiso-llm", rev = "bd08f1b5a704e35788d817a6489adda44981caa6", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.21"
