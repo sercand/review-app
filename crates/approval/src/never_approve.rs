@@ -465,7 +465,7 @@ fn listed(base: &str) -> bool {
 
 fn redirect_ok(r: &crate::model::Redirect) -> bool {
     match r.op {
-        RedirOp::In | RedirOp::InDup => true,
+        RedirOp::In | RedirOp::InDup => !names_pr_path(&r.target) && !has_shell_syntax(&r.target),
         RedirOp::OutDup => {
             r.target == "-"
                 || r.target == "/dev/null"
@@ -528,6 +528,10 @@ mod tests {
             "/usr/bin/sub/tool",
             "ls curl",
             "mytool --to-command=curl",
+            // Input redirects hand a file to the program too.
+            "mytool < ./evil.sh",
+            "mytool < scripts/evil.sh",
+            "mytool < 'a;b'",
             "node-18 x.js",
             "ruby_3 x.rb",
             "sort -o f f",

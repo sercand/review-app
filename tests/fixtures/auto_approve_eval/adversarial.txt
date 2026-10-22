@@ -421,3 +421,6 @@ mytool "x;'.' evil.sh"
 mytool 'x;"." evil.sh'
 mytool 'x;.${IFS}evil.sh'
 mytool 'x;.$IFS evil.sh'
+mytool < ./evil.sh
+mytool < scripts/evil.sh
+mytool < 'a;b'
