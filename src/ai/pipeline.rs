@@ -557,24 +557,24 @@ impl Ctl {
     }
 
     /// Apply a reviewer's outcome. A cancelled group that the user asked to
-    /// rerun goes back to `Pending`; one the user skipped stays `Skipped`.
+    /// rerun goes back to `Pending` with a fresh cancel token (the old one
+    /// is spent); one the user skipped stays `Skipped` whatever the stop.
     fn apply_group_stop(&self, idx: usize, stop: GroupStopKind) {
         let mut state = self.state();
         let slot = &mut state.groups[idx];
         slot.agent = None;
+        let rerun = std::mem::take(&mut slot.rerun);
+        if slot.state == GroupState::Skipped {
+            return;
+        }
         slot.state = match stop {
             GroupStopKind::Done => GroupState::Done,
             GroupStopKind::Failed => GroupState::Failed,
-            GroupStopKind::Cancelled => {
-                if slot.rerun {
-                    slot.rerun = false;
-                    GroupState::Pending
-                } else if slot.state == GroupState::Running {
-                    GroupState::Failed
-                } else {
-                    slot.state
-                }
+            GroupStopKind::Cancelled if rerun => {
+                slot.cancel = self.cancel.child_token();
+                GroupState::Pending
             }
+            GroupStopKind::Cancelled => GroupState::Failed,
         };
     }
 
@@ -1278,8 +1278,19 @@ async fn review_pass(base: &StageInputs, ctl: &Arc<Ctl>, brief: &Brief) -> bool 
                 });
                 let (ctl, rtx, tally, brief, permit) =
                     (ctl.clone(), rtx.clone(), tally, brief.clone(), permit);
+                // A panicking reviewer must not strand the run waiting on its
+                // result, so the task is joined and a join error is a failure.
+                let task = tokio::spawn({
+                    let agent = agent.clone();
+                    async move { run_reviewer(&inputs, &agent, &brief, &group).await }
+                });
                 tokio::spawn(async move {
-                    let outcome = run_reviewer(&inputs, &agent, &brief, &group).await;
+                    let outcome = match task.await {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            Err(StageError::Failed(format!("reviewer panicked: {error}")))
+                        }
+                    };
                     let over = agent_finished(&ctl, &tally, &agent, stop_of(&outcome));
                     let stop = match &outcome {
                         Ok(_) => GroupStopKind::Done,
@@ -1618,8 +1629,8 @@ impl Spawner for PipelineSpawner {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentControl, Ctl, Finding, Group, GroupState, PipelineControl, cut_words, finding_counts,
-        risk_rank, schedule_order, verifier_batches,
+        AgentControl, Ctl, Finding, Group, GroupState, GroupStopKind, PipelineControl, cut_words,
+        finding_counts, risk_rank, schedule_order, verifier_batches,
     };
     use crate::ai::review::{Evidence, FindingAnchor, FindingState, Severity};
     use crate::ai::stages::scout::Risk;
@@ -1840,7 +1851,30 @@ mod tests {
     }
 
     #[test]
-    fn rerun_while_running_sets_the_flag_and_cancels_the_reviewer() {
+    fn a_skipped_group_stays_skipped_whatever_the_stop() {
+        for stop in [
+            GroupStopKind::Done,
+            GroupStopKind::Failed,
+            GroupStopKind::Cancelled,
+        ] {
+            let (control, ctl) = control_with(&[group("g1", Risk::High, false)]);
+            ctl.state().groups[0].state = GroupState::Running;
+            control.skip_group("g1").unwrap();
+            ctl.apply_group_stop(0, stop);
+            assert_eq!(ctl.state().groups[0].state, GroupState::Skipped);
+        }
+    }
+
+    #[test]
+    fn a_plain_cancel_without_a_rerun_fails_the_group() {
+        let (_control, ctl) = control_with(&[group("g1", Risk::High, false)]);
+        ctl.state().groups[0].state = GroupState::Running;
+        ctl.apply_group_stop(0, GroupStopKind::Cancelled);
+        assert_eq!(ctl.state().groups[0].state, GroupState::Failed);
+    }
+
+    #[test]
+    fn rerun_cancels_the_reviewer_and_restarts_it_with_a_fresh_token() {
         let (control, ctl) = control_with(&[
             group("g1", Risk::High, false),
             group("g2", Risk::Medium, false),
@@ -1861,6 +1895,16 @@ mod tests {
         );
         assert!(!state.groups[1].rerun);
         assert!(!state.groups[1].cancel.is_cancelled());
+        drop(state);
+
+        ctl.apply_group_stop(0, GroupStopKind::Cancelled);
+        let state = ctl.state();
+        assert_eq!(state.groups[0].state, GroupState::Pending);
+        assert!(!state.groups[0].rerun, "the flag is consumed");
+        assert!(
+            !state.groups[0].cancel.is_cancelled(),
+            "the restarted reviewer must not start cancelled"
+        );
     }
 
     #[test]

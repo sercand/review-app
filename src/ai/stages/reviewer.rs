@@ -157,7 +157,12 @@ pub async fn run_reviewer(
     // Running out of reminders, finish nudges or turns is a normal
     // completion here (spec §5.3/§5.4): the gaps get recorded as skipped and
     // the stage still succeeds. Only a model failure or a cancel fails it.
-    let skipped = if matches!(outcome.stop, AgentStop::Failed(_)) {
+    //
+    // A cancel records nothing: a rerun (or a skip) cancels this agent, and
+    // "not checked" entries would count as coverage for the restarted
+    // reviewer (`RunState::missing` counts any entry) and so switch the
+    // enforcement off. The group state already says the group did not finish.
+    let skipped = if matches!(outcome.stop, AgentStop::Failed(_) | AgentStop::Cancelled) {
         Vec::new()
     } else {
         record_skips(&cx.run, &assigned)

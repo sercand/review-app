@@ -1392,3 +1392,109 @@ async fn prior_check_skipped_when_no_open_findings() {
         "no prior-check agent"
     );
 }
+
+/// Waits until `g1`'s reviewer is parked in its first `read_file`.
+async fn wait_for_reviewer_read(rx: &mut mpsc::UnboundedReceiver<PipelineEvent>) {
+    drain_until(rx, |e| {
+        matches!(
+            e,
+            PipelineEvent::ToolCall { name, agent, .. }
+                if name == "read_file" && agent.role == AgentRole::Reviewer
+        )
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn rerun_group_restarts_the_reviewer_with_coverage_enforced() {
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_one_group()));
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            // First attempt: parked in a tool when the rerun lands.
+            ScriptStep::ToolCalls(vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]),
+            // Rerun: tries to finish with one check recorded; coverage must
+            // push back instead of accepting.
+            ScriptStep::ToolCalls(check_calls("src/a.rs", &["intent"])),
+            ScriptStep::Text("finished".into()),
+            full_review_step(),
+            ScriptStep::Text("all checked".into()),
+        ],
+    );
+    scripts.insert("verifier".into(), vec![verdicts_step(&[1])]);
+    scripts.insert("assembler".into(), vec![draft_step("comment", "one risk")]);
+
+    let mut s = start(scripts);
+    wait_for_reviewer_read(&mut s.rx).await;
+    s.control.rerun_group("g1").expect("g1 is running");
+
+    let status = s.handle.await.expect("the orchestrator joins");
+    assert_eq!(status, RunStatus::Completed);
+    let groups = s.control.status().groups;
+    assert_eq!(groups, vec![("g1".to_string(), GroupState::Done)]);
+
+    // The rerun did not start cancelled: it was pushed back by the coverage
+    // reminder and kept going until every pair was recorded.
+    let requests = s.llm.requests_for("reviewer");
+    assert_eq!(requests.len(), 5, "{}", requests.len());
+    assert!(
+        request_text(&requests[3]).contains("You haven't recorded these checks yet"),
+        "the rerun's early finish is refused"
+    );
+    let coverage = s.store.coverage_list(s.session).expect("coverage rows");
+    assert!(
+        coverage.iter().all(|c| c.note != "not checked"),
+        "a rerun leaves no 'not checked' gaps behind: {coverage:?}"
+    );
+}
+
+#[tokio::test]
+async fn skipped_group_stays_skipped_and_the_run_ends() {
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_two_plain_groups()));
+    scripts.insert(
+        "reviewer".into(),
+        vec![
+            ScriptStep::ToolCalls(vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]),
+            asset_review_step(),
+            ScriptStep::Text("asset checked".into()),
+        ],
+    );
+    scripts.insert("verifier".into(), vec![verdicts_step(&[1])]);
+    scripts.insert("assembler".into(), vec![draft_step("approve", "a nit")]);
+
+    let mut s = start(scripts);
+    wait_for_reviewer_read(&mut s.rx).await;
+    s.control.skip_group("g1").expect("g1 is running");
+
+    let status = s.handle.await.expect("the orchestrator joins");
+    assert_eq!(status, RunStatus::Completed);
+    let groups = s.control.status().groups;
+    assert!(
+        groups.contains(&("g1".to_string(), GroupState::Skipped)),
+        "{groups:?}"
+    );
+    assert!(
+        groups.contains(&("g2".to_string(), GroupState::Done)),
+        "{groups:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_panicking_reviewer_fails_its_group_and_the_run_still_ends() {
+    let mut scripts: BTreeMap<String, Vec<ScriptStep>> = BTreeMap::new();
+    scripts.insert("scout".into(), scout_step(brief_one_group()));
+    // An empty script: the first model call panics ("script exhausted").
+    scripts.insert("reviewer".into(), Vec::new());
+    scripts.insert("assembler".into(), vec![draft_step("comment", "nothing")]);
+
+    let s = start(scripts);
+    let status = tokio::time::timeout(Duration::from_secs(30), s.handle)
+        .await
+        .expect("a reviewer panic must not hang the run")
+        .expect("the orchestrator joins");
+    assert_eq!(status, RunStatus::Completed);
+    let groups = s.control.status().groups;
+    assert_eq!(groups, vec![("g1".to_string(), GroupState::Failed)]);
+}
