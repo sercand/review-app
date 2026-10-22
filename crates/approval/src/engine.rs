@@ -28,7 +28,7 @@ use crate::policy::{PolicyVerdict, SegmentPolicy};
 pub const STRUCTURAL: &str = "structural";
 
 /// Name of the model policy, which `deny_or_defer` never consults.
-const ML_NAME: &str = "ml";
+pub(crate) const ML_NAME: &str = "ml";
 
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "ksh", "csh", "tcsh", "fish", "dash"];
 
@@ -52,8 +52,9 @@ pub enum Decision {
     /// `cd src && ls` reports `"read-only"`; it is `"structural"` only when
     /// every segment was structural.
     Approve { source: &'static str },
-    /// At least one segment was actively denied by a policy.
-    Deny,
+    /// At least one segment was actively denied by a policy; `source` is the
+    /// policy's name (`"ml"` for the model stage, whose deny is only advice).
+    Deny { source: &'static str },
     /// No policy spoke up for at least one segment, or the parser bailed.
     Defer,
 }
@@ -141,7 +142,7 @@ impl Fold {
                 }
                 None
             }
-            Decision::Deny => Some((Decision::Deny, reason)),
+            Decision::Deny { source } => Some((Decision::Deny { source }, reason)),
             Decision::Defer => {
                 if !self.deferred {
                     self.deferred = true;
@@ -388,7 +389,7 @@ fn denied(seg: &Segment, p: &dyn SegmentPolicy) -> Res {
         },
         None => Reason::Segment(segment_text(seg)),
     };
-    (Decision::Deny, Some(reason))
+    (Decision::Deny { source: p.name() }, Some(reason))
 }
 
 /// What the non-model policies' deny and withhold verdicts say about a
@@ -894,7 +895,9 @@ mod tests {
         ] {
             assert_eq!(
                 run(cmd, &[&DENY_DOTENV, &READ_ONLY]).0,
-                Decision::Deny,
+                Decision::Deny {
+                    source: "test-deny-dotenv"
+                },
                 "{cmd}"
             );
         }
@@ -999,6 +1002,8 @@ mod tests {
         }
     }
 
+    const ML_DENY: Decision = Decision::Deny { source: "ml" };
+
     #[test]
     fn deny_or_defer_skips_ml_by_name() {
         let ml = Named("ml", Some(PolicyVerdict::Deny));
@@ -1007,9 +1012,12 @@ mod tests {
         // structurally refused (file redirect): ml is not consulted
         assert_eq!(classify_stack("echo > f", None, &stack).0, Decision::Defer);
         // but it is consulted for an ordinary segment
-        assert_eq!(classify_stack("echo", None, &stack).0, Decision::Deny);
+        assert_eq!(classify_stack("echo", None, &stack).0, ML_DENY);
         let stack: [&dyn SegmentPolicy; 2] = [&ml, &other];
-        assert_eq!(classify_stack("echo > f", None, &stack).0, Decision::Deny);
+        assert_eq!(
+            classify_stack("echo > f", None, &stack).0,
+            Decision::Deny { source: "rule" }
+        );
         let approve = Named("ml", Some(PolicyVerdict::Approve));
         let stack: [&dyn SegmentPolicy; 1] = [&approve];
         assert_eq!(classify_stack("echo > f", None, &stack).0, Decision::Defer);
@@ -1089,12 +1097,18 @@ mod tests {
             "bash -c 'foo; timeout 5 cat .env'",
         ] {
             let (d, reason) = classify_stack_reason(cmd, None, &stack);
-            assert_eq!(d, Decision::Deny, "{cmd}");
+            assert_eq!(
+                d,
+                Decision::Deny {
+                    source: "test-deny-dotenv"
+                },
+                "{cmd}"
+            );
             let text = reason.unwrap().to_string();
             assert!(text.contains(".env"), "{cmd}: {text}");
         }
         // Without a hard deny the model's deny stands.
-        assert_eq!(classify_stack("foo", None, &stack).0, Decision::Deny);
+        assert_eq!(classify_stack("foo", None, &stack).0, ML_DENY);
     }
 
     fn redirect_ok(target: &str) -> bool {

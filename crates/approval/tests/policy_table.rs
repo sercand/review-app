@@ -26,7 +26,7 @@ fn classify(cmd: &str, cwd: Option<&Path>, stack: &[&Policy]) -> Outcome {
     match classify_stack(cmd, cwd, &dynamic).0 {
         Decision::Approve { .. } => Approve,
         Decision::Defer => Defer,
-        Decision::Deny => Deny,
+        Decision::Deny { .. } => Deny,
     }
 }
 
