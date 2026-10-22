@@ -357,7 +357,76 @@ fn bail_table() {
 
 #[test]
 fn depth_is_capped() {
-    let deep = format!("{}a", "a && ".repeat(100));
-    assert_eq!(parse(&deep), Err(Bail::Unsupported("depth")));
-    assert!(parse(&format!("{}a", "a && ".repeat(10))).is_ok());
+    // A chain of N `&&` nests N lists; commands sit at depth N, the cap is 64.
+    assert!(parse(&format!("{}a", "a && ".repeat(63))).is_ok());
+    assert!(parse(&format!("{}a", "a && ".repeat(64))).is_ok());
+    assert_eq!(
+        parse(&format!("{}a", "a && ".repeat(65))),
+        Err(Bail::Unsupported("depth"))
+    );
+}
+
+#[test]
+fn redirect_on_last_command_of_list_or_pipeline() {
+    let segs = parse("a && b > f").unwrap();
+    assert_eq!(segs.len(), 2);
+    assert!(segs[0].redirects.is_empty());
+    assert_eq!(segs[1].redirects.len(), 1);
+    assert_eq!(segs[1].redirects[0].target, "f");
+    assert_eq!(segs[0].follows, Separator::And);
+
+    let segs = parse("a | b 2>/dev/null").unwrap();
+    assert!(segs[0].redirects.is_empty());
+    assert_eq!(segs[1].redirects.len(), 1);
+    assert_eq!(segs[1].redirects[0].fd, Some(2));
+    assert_eq!(segs[0].follows, Separator::Pipe);
+
+    // Trailing words after the target are args of the last command.
+    let segs = parse("a | b > f x").unwrap();
+    assert_eq!(segs[0].argv, strs(&["a"]));
+    assert_eq!(segs[1].argv, strs(&["b", "x"]));
+
+    for src in [
+        "git log | head -5 2>/dev/null",
+        "a | b 2>&1 | c",
+        "a && b | c > f",
+        "! a | b > f",
+    ] {
+        assert!(parse(src).is_ok(), "{src}");
+    }
+    let segs = parse("a | b 2>&1 | c").unwrap();
+    assert!(segs[0].redirects.is_empty() && segs[2].redirects.is_empty());
+    assert_eq!(segs[1].redirects.len(), 1);
+    let segs = parse("a && b | c > f").unwrap();
+    assert_eq!(
+        segs.iter().map(|s| s.redirects.len()).collect::<Vec<_>>(),
+        vec![0, 0, 1]
+    );
+}
+
+#[test]
+fn literal_redirect_target_with_dollar_bails() {
+    assert_eq!(
+        parse("echo > '$TMPDIR'/x"),
+        Err(Bail::Unsupported("redirect_target"))
+    );
+    assert_eq!(
+        parse("echo > \"a\\$b\""),
+        Err(Bail::Unsupported("redirect_target"))
+    );
+    let segs = parse("echo > $TMPDIR/x").unwrap();
+    assert_eq!(segs[0].redirects[0].target, "$TMPDIR/x");
+}
+
+#[test]
+fn fixed_target_redirect_takes_following_words_as_args() {
+    let segs = parse("cat >&- x").unwrap();
+    assert_eq!(segs[0].argv, strs(&["cat", "x"]));
+    assert_eq!(segs[0].redirects[0].op, RedirOp::OutDup);
+    assert_eq!(segs[0].redirects[0].target, "-");
+    let segs = parse("cat <&- x").unwrap();
+    assert_eq!(segs[0].argv, strs(&["cat", "x"]));
+    // tree-sitter reports a syntax error for two words after either form.
+    assert_eq!(parse("cat >&- x y"), Err(Bail::Syntax));
+    assert_eq!(parse("cat <&- x y"), Err(Bail::Syntax));
 }

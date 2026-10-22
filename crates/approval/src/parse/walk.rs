@@ -180,17 +180,17 @@ fn redirected(node: Node, src: &str, depth: usize, out: &mut Vec<Segment>) -> Re
     if body.is_none() {
         out.push(empty_segment());
     }
-    // Redirects belong to exactly one command; a body that expanded to several
-    // segments (never produced by this grammar today) is not understood.
-    match out.get_mut(start..) {
-        Some([seg]) => {
-            seg.redirects.extend(redirects);
-            for (v, d) in trailing {
-                seg.argv.push(v);
-                seg.dynamic.push(d);
-            }
-        }
-        _ => return Err(Bail::Unsupported("redirected_statement")),
+    // When the last command of a list or pipeline has a redirect, tree-sitter
+    // wraps the whole list as the body. Bash binds the redirect to the last
+    // simple command, so that is where it (and any trailing words) goes.
+    if out.len() <= start {
+        return Err(Bail::Unsupported("redirected_statement"));
+    }
+    let seg = out.last_mut().ok_or(Bail::Syntax)?;
+    seg.redirects.extend(redirects);
+    for (v, d) in trailing {
+        seg.argv.push(v);
+        seg.dynamic.push(d);
     }
     Ok(())
 }
@@ -228,9 +228,16 @@ fn redirect(node: Node, src: &str) -> Result<(Redirect, TrailingWords), Bail> {
         } else if child.kind() == "file_descriptor" {
             fd = Some(text(child, src)?.parse::<u32>().map_err(|_| Bail::Syntax)?);
         } else if is_word_kind(child.kind()) {
-            if target.is_none() {
+            let fixed_target = op.is_some_and(|(_, fixed)| fixed.is_some());
+            if target.is_none() && !fixed_target {
+                let (value, dynamic) = word_value(child, src)?;
                 // A dynamic target keeps its source text; the engine rejects it.
-                target = Some(word_value(child, src)?.0);
+                // A literal one must not look like an expansion (`'$TMPDIR'/x`),
+                // or it would be indistinguishable from the dynamic spelling.
+                if !dynamic && value.contains(['$', '`']) {
+                    return Err(Bail::Unsupported("redirect_target"));
+                }
+                target = Some(value);
             } else {
                 // A word glued to the previous one by `\<newline>` would need
                 // joining; anything else is a separate argument.
