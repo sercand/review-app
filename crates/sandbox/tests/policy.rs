@@ -42,8 +42,15 @@ fn run(program: &str, args: &[&str], cwd: &Path) -> anyhow::Result<()> {
 /// `LocalHost` whose shell runs under `sandboxed_launch`. `Ok(None)` (after
 /// printing `skipping: …`) when this machine can't sandbox.
 fn sandboxed() -> anyhow::Result<Option<Sand>> {
+    sandboxed_in("repo", &[])
+}
+
+/// Like [`sandboxed`], with the repo directory named `repo_name` and `files`
+/// (repo-relative path, contents) written before the shell starts: bubblewrap
+/// hides `.env*` files that exist at launch.
+fn sandboxed_in(repo_name: &str, files: &[(&str, &str)]) -> anyhow::Result<Option<Sand>> {
     let root = tempfile::tempdir()?;
-    let repo = root.path().join("repo");
+    let repo = root.path().join(repo_name);
     std::fs::create_dir_all(&repo)?;
     run("git", &["init", "-q", "."], &repo)?;
     run(
@@ -61,6 +68,12 @@ fn sandboxed() -> anyhow::Result<Option<Sand>> {
         ],
         &repo,
     )?;
+    for (f, body) in files {
+        if let Some(dir) = repo.join(f).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(repo.join(f), body)?;
+    }
     let tmp = root.path().join("tmp");
     std::fs::create_dir_all(&tmp)?;
     let secret = root.path().join("secret");
@@ -174,6 +187,55 @@ async fn cannot_read_denied_paths() -> anyhow::Result<()> {
         "secret leaked: {}",
         out.output
     );
+    Ok(())
+}
+
+/// Final review I3(a): repo-local `.env*` files are unreadable at any depth;
+/// similarly named files and ordinary repo files stay readable. The repo name
+/// holds regex and string metacharacters.
+#[tokio::test]
+async fn cannot_read_repo_local_env_files() -> anyhow::Result<()> {
+    let Some(s) = sandboxed_in(
+        "my.repo+(1) \"q\"",
+        &[
+            (".env", "hunter2"),
+            (".env.local", "hunter2"),
+            ("sub/.env", "hunter2"),
+            ("sub/deep/.envrc", "hunter2"),
+            ("environment.txt", "visible"),
+            ("sub/dotenv", "visible"),
+            ("README", "visible"),
+        ],
+    )?
+    else {
+        return Ok(());
+    };
+    for f in [".env", ".env.local", "sub/.env", "sub/deep/.envrc"] {
+        let out = s.host.exec(&format!("cat '{f}'"), false, T).await?;
+        assert_ne!(out.exit_code, 0, "cat {f} succeeded: {}", out.output);
+        assert!(
+            !out.output.contains("hunter2"),
+            "{f} leaked: {}",
+            out.output
+        );
+    }
+    for f in ["environment.txt", "sub/dotenv", "README"] {
+        let out = s.host.exec(&format!("cat '{f}'"), false, T).await?;
+        assert_eq!(out.exit_code, 0, "cat {f}: {}", out.output);
+        assert!(out.output.contains("visible"), "{f}: {}", out.output);
+    }
+    // The recursive search that motivated the rule.
+    let out = s.host.exec("grep -r hunter2 . ; true", false, T).await?;
+    assert!(!out.output.contains("hunter2:"), "{}", out.output);
+    assert!(!out.output.contains(":hunter2"), "{}", out.output);
+    // macOS only (Seatbelt matches by name): a file created later is covered too.
+    if cfg!(target_os = "macos") {
+        let out = s
+            .host
+            .exec("echo hunter2 > .env.new; cat .env.new", false, T)
+            .await?;
+        assert_ne!(out.exit_code, 0, "{}", out.output);
+    }
     Ok(())
 }
 

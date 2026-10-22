@@ -98,6 +98,63 @@ fn sbpl_path(path: &Path) -> String {
     sbpl_str(&path.display().to_string())
 }
 
+/// `s` with every regex metacharacter backslash-escaped (POSIX ERE).
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.^$*+?()[]{}|".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// How deep (directories below the repo root) the Linux walk for `.env*`
+/// files goes.
+const MAX_ENV_DEPTH: usize = 8;
+/// How many directory entries the Linux walk looks at before giving up.
+const MAX_ENV_ENTRIES: usize = 50_000;
+/// Directories the Linux walk does not enter.
+const ENV_WALK_SKIP: &[&str] = &[".git", "node_modules", "target"];
+
+/// The regular files named `.env*` under `repo`, sorted: a bounded walk that
+/// skips `.git`, `node_modules` and `target`, does not follow symlinks and
+/// stops at [`MAX_ENV_DEPTH`] levels or [`MAX_ENV_ENTRIES`] entries. The
+/// bubblewrap profile hides exactly these, so a file created after launch is
+/// not covered there (Seatbelt matches by name and covers it).
+fn repo_env_files(repo: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut seen = 0usize;
+    let mut stack = vec![(repo.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_ENV_ENTRIES {
+                found.sort();
+                return found;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_dir() {
+                if depth < MAX_ENV_DEPTH && !ENV_WALK_SKIP.contains(&name.as_ref()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if kind.is_file() && name.starts_with(".env") {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// The policy paths that exist, canonicalized (missing entries skipped).
 fn existing_canonical(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths
@@ -113,8 +170,9 @@ fn existing_canonical(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// profile allows everything by default, denies all file writes, then allows
 /// exactly: the repo except `.git/`, the tmp dir, each writable path, and the
 /// `/dev` entries a shell needs; finally it denies reads of each `deny_read`
-/// path (`subpath` for directories, `literal` for files). Network is not
-/// restricted.
+/// path (`subpath` for directories, `literal` for files) and of every file
+/// named `.env*` anywhere under the repo (a regex rule on the canonical repo
+/// root). Network is not restricted.
 pub fn seatbelt_profile(policy: &SandboxPolicy) -> std::io::Result<String> {
     let repo = std::fs::canonicalize(&policy.repo)?;
     let tmp = std::fs::canonicalize(&policy.tmp)?;
@@ -143,6 +201,14 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> std::io::Result<String> {
         let op = if d.is_dir() { "subpath" } else { "literal" };
         p.push_str(&format!("(deny file-read* ({op} {}))\n", sbpl_path(&d)));
     }
+    // Repo-local secrets: `.env*` files at any depth, including ones created
+    // later. In an SBPL `#"..."` regex literal a backslash is not an escape
+    // and a quote cannot be written, so the repo root is only regex-escaped,
+    // with `"` matched by `.` (over-matching a path no real repo has).
+    let root = regex_escape(&repo.display().to_string()).replace('"', ".");
+    p.push_str(&format!(
+        "(deny file-read* (regex #\"^{root}/(.*/)?\\.env[^/]*$\"))\n"
+    ));
     Ok(p)
 }
 
@@ -153,7 +219,9 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> std::io::Result<String> {
 /// optional paths are skipped. The root is bound read-only; the repo, tmp dir
 /// and writable paths bind read-write; `.git/` is re-bound read-only over the
 /// repo (when it exists); denied directories get a `--tmpfs` and denied files
-/// are replaced by `/dev/null`. Network stays shared (no `--unshare-net`).
+/// are replaced by `/dev/null`, as is each `.env*` file found in a bounded
+/// walk of the repo (files created later are not covered). Network stays
+/// shared (no `--unshare-net`).
 pub fn bwrap_args(policy: &SandboxPolicy) -> std::io::Result<Vec<OsString>> {
     let repo = std::fs::canonicalize(&policy.repo)?;
     let tmp = std::fs::canonicalize(&policy.tmp)?;
@@ -186,6 +254,12 @@ pub fn bwrap_args(policy: &SandboxPolicy) -> std::io::Result<Vec<OsString>> {
             push(&mut args, "--ro-bind", Path::new("/dev/null"));
             args.push(d.as_os_str().to_os_string());
         }
+    }
+    // Repo-local secrets: hide each `.env*` file that exists now (see
+    // `repo_env_files`; files created later are not covered here).
+    for f in repo_env_files(&repo) {
+        push(&mut args, "--ro-bind", Path::new("/dev/null"));
+        args.push(f.as_os_str().to_os_string());
     }
     args.push("--die-with-parent".into());
     push(&mut args, "--chdir", &repo);
@@ -405,6 +479,114 @@ mod tests {
             "(deny file-read* (literal \"{}\"))",
             canon(&netrc)
         )));
+    }
+
+    #[test]
+    fn seatbelt_denies_reading_repo_local_env_files_at_any_depth() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("r.e+po (\"x\")"); // regex and string metacharacters
+        std::fs::create_dir_all(&repo).unwrap();
+        let tmp = t.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let p = seatbelt_profile(&SandboxPolicy {
+            repo: repo.clone(),
+            tmp,
+            write_paths: vec![],
+            deny_read: vec![],
+        })
+        .unwrap();
+        // Regex metacharacters backslash-escaped once (an SBPL regex literal
+        // has no string escapes); the quote becomes `.`.
+        let want = canon(&repo)
+            .chars()
+            .map(|c| match c {
+                '.' | '+' | '(' | ')' => format!("\\{c}"),
+                '"' => ".".to_string(),
+                c => c.to_string(),
+            })
+            .collect::<String>();
+        let rule = format!("(deny file-read* (regex #\"^{want}/(.*/)?\\.env[^/]*$\"))");
+        assert!(p.contains(&rule), "{rule}\nnot in\n{p}");
+    }
+
+    #[test]
+    fn bwrap_hides_existing_env_files_but_skips_git_and_vendor_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        for d in ["sub/deep", ".git", "node_modules/x", "target/debug"] {
+            std::fs::create_dir_all(repo.join(d)).unwrap();
+        }
+        for f in [
+            ".env",
+            ".env.local",
+            ".envrc",
+            "sub/.env",
+            "sub/deep/.env.production",
+            ".git/.env",
+            "node_modules/x/.env",
+            "target/debug/.env",
+            "environment.txt",
+            "sub/dotenv",
+        ] {
+            std::fs::write(repo.join(f), b"K=1").unwrap();
+        }
+        std::os::unix::fs::symlink("/nonexistent", repo.join("sub/.env.link")).unwrap();
+        let tmp = t.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args: Vec<String> = bwrap_args(&SandboxPolicy {
+            repo: repo.clone(),
+            tmp,
+            write_paths: vec![],
+            deny_read: vec![],
+        })
+        .unwrap()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        let repo = canon(&repo);
+        let hidden: Vec<&str> = args
+            .windows(3)
+            .filter(|w| w[0] == "--ro-bind" && w[1] == "/dev/null")
+            .map(|w| w[2].as_str())
+            .collect();
+        let mut want: Vec<String> = [
+            ".env",
+            ".env.local",
+            ".envrc",
+            "sub/.env",
+            "sub/deep/.env.production",
+        ]
+        .iter()
+        .map(|f| format!("{repo}/{f}"))
+        .collect();
+        want.sort();
+        assert_eq!(hidden, want, "{args:?}");
+        // After the repo bind, so the overlay is not itself overlaid.
+        let l = seq(&args, &["--bind", &repo, &repo]);
+        let o = seq(&args, &["--ro-bind", "/dev/null", &format!("{repo}/.env")]);
+        assert!(l < o);
+    }
+
+    #[test]
+    fn bwrap_env_walk_is_bounded_in_depth() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let mut deep = repo.clone();
+        for i in 0..(MAX_ENV_DEPTH + 3) {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join(".env"), b"K=1").unwrap();
+        let tmp = t.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let args = bwrap_args(&SandboxPolicy {
+            repo,
+            tmp,
+            write_paths: vec![],
+            deny_read: vec![],
+        })
+        .unwrap();
+        assert!(!args.iter().any(|a| a.to_string_lossy().ends_with("/.env")));
     }
 
     #[test]
