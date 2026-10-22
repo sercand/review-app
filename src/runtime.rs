@@ -331,6 +331,12 @@ pub enum Command {
         /// The model to probe with.
         model: crate::persist::settings::ModelSettings,
     },
+    /// Switch the local command classifier on or off. On starts the weights
+    /// download if they are absent, then the GPU load; progress arrives as
+    /// [`Event::ClassifierState`]. App-global, so no `SessionId`.
+    ClassifierSetEnabled(bool),
+    /// Fetch the classifier weights again after a failure (the Retry button).
+    ClassifierDownload,
     /// Attach to a PR's AI review: rebinds any live run to `session` and
     /// answers with [`Event::AiSnapshot`] (spec §10.2). Unix-only with
     /// [`crate::ai`].
@@ -724,6 +730,13 @@ pub enum Event {
         /// The model that served the probe, or why the probe failed.
         result: Result<String, String>,
     },
+    /// The local classifier moved to a new state.
+    ///
+    /// App-global, like [`Event::AiProviderTested`]: the classifier belongs to
+    /// the process, not to an open PR, so this carries no [`SessionId`] and the
+    /// stale-event rule never drops it (leaving a PR must not hide the
+    /// download progress or a failure from Settings).
+    ClassifierState(crate::state::classifier::ClassifierState),
     /// A PR's full AI state, replayed on attach and after a run starts
     /// (spec §10.3).
     #[cfg(unix)]
@@ -1603,6 +1616,21 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 });
             }
         }
+        #[cfg(unix)]
+        Command::ClassifierSetEnabled(enabled) => {
+            // Switching off can free a GPU model, which is slow: keep it off
+            // the async worker.
+            let ctx = ctx.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                ctx.ai.classifier_set_enabled(enabled, &events);
+            })
+            .await;
+        }
+        #[cfg(unix)]
+        Command::ClassifierDownload => ctx.ai.classifier_download(&events),
+        // No AI (and no classifier) off Unix; the Settings window says so.
+        #[cfg(not(unix))]
+        Command::ClassifierSetEnabled(_) | Command::ClassifierDownload => {}
         #[cfg(unix)]
         Command::AiAttach { session, key } => {
             ctx.ai.attach(session, key, &events);

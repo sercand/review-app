@@ -226,6 +226,8 @@ pub struct ReviewApp {
     palette: PaletteState,
     help_open: bool,
     settings_window: SettingsWindowState,
+    /// Whether the once-per-start classifier enable went out (first frame).
+    classifier_startup_done: bool,
     settings_writer: DebouncedWriter,
     applied_theme: Option<egui::Theme>,
     settings: Settings,
@@ -293,6 +295,12 @@ pub struct ReviewApp {
 #[cfg(unix)]
 fn quit_close_needs_intercept(close_requested: bool, self_triggered: bool) -> bool {
     close_requested && !self_triggered
+}
+
+/// True exactly once, on the first call, and only when the classifier setting
+/// is on: the app then sends `ClassifierSetEnabled(true)`.
+fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
+    !std::mem::replace(done, true) && setting_on
 }
 
 impl ReviewApp {
@@ -371,6 +379,7 @@ impl ReviewApp {
             palette: PaletteState::default(),
             help_open: false,
             settings_window: SettingsWindowState::default(),
+            classifier_startup_done: false,
             settings_writer: DebouncedWriter::default(),
             applied_theme: None,
             settings,
@@ -556,6 +565,8 @@ impl ReviewApp {
                     .test_results
                     .insert(provider, result);
             }
+            // App-global (no SessionId, never stale): Settings shows it.
+            Event::ClassifierState(state) => self.settings_window.set_classifier_state(state),
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -909,6 +920,7 @@ impl ReviewApp {
                         .iter()
                         .map(|provider| provider.name.clone())
                         .collect();
+                    let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
                     let host_changed = match vm.apply(&mut self.settings) {
                         Ok(host_changed) => host_changed,
                         Err(error) => {
@@ -923,6 +935,11 @@ impl ReviewApp {
                         }
                     };
                     self.save_settings(now);
+                    let classifier_on = self.settings.ai.auto_approve.local_classifier;
+                    if classifier_on != classifier_was_on {
+                        self.worker
+                            .send(Command::ClassifierSetEnabled(classifier_on));
+                    }
                     let new_names: Vec<String> = self
                         .settings
                         .ai
@@ -979,6 +996,9 @@ impl ReviewApp {
                 SettingsAction::TestProvider { provider, model } => {
                     self.worker
                         .send(Command::AiTestProvider { provider, model });
+                }
+                SettingsAction::ClassifierDownload => {
+                    self.worker.send(Command::ClassifierDownload);
                 }
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }
@@ -2777,6 +2797,14 @@ impl eframe::App for ReviewApp {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
+        // The first frame is up: only now start the classifier download/load
+        // (never in `new`), and only if the user switched it on.
+        if classifier_startup_due(
+            &mut self.classifier_startup_done,
+            self.settings.ai.auto_approve.local_classifier,
+        ) {
+            self.worker.send(Command::ClassifierSetEnabled(true));
+        }
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
@@ -2973,6 +3001,27 @@ mod tests {
         assert!(
             !quit_close_needs_intercept(false, false),
             "no close, nothing to intercept"
+        );
+    }
+
+    #[test]
+    fn classifier_startup_fires_once_and_only_when_on() {
+        let mut done = false;
+        assert!(classifier_startup_due(&mut done, true));
+        assert!(!classifier_startup_due(&mut done, true), "only once");
+        let mut done = false;
+        assert!(!classifier_startup_due(&mut done, false));
+        assert!(done, "the first frame is spent even when off");
+    }
+
+    #[test]
+    fn classifier_event_updates_the_settings_window_vm() {
+        use crate::state::classifier::ClassifierState;
+        let mut window = SettingsWindowState::default();
+        window.set_classifier_state(ClassifierState::Failed("offline".into()));
+        assert_eq!(
+            window.vm.ai.auto_approve.classifier_state,
+            ClassifierState::Failed("offline".into())
         );
     }
 

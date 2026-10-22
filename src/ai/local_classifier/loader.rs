@@ -10,25 +10,7 @@ use review_approval::model_stage::CommandClassifier;
 use super::shiso;
 use super::weights::WeightsManager;
 
-/// Lifecycle of the local classifier.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ClassifierState {
-    /// The setting is off.
-    Off,
-    /// On, but the weights are not on disk.
-    NotInstalled,
-    Downloading {
-        done: u64,
-        total: u64,
-    },
-    /// Creating the backend and uploading the weights.
-    Loading,
-    Ready,
-    /// No GPU, a backend error, or disabled after repeated failures.
-    Unavailable(String),
-    /// A download or load error; retryable.
-    Failed(String),
-}
+pub use crate::state::classifier::ClassifierState;
 
 /// Where the weights come from; a fake in tests.
 pub trait WeightsSource: Send + Sync {

@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -58,6 +58,60 @@ use review_sandbox::{
     EnvInput, Launch, LocalHost, SandboxOps, SandboxPolicy, SandboxUnavailable, agent_env,
     default_deny_read, default_write_paths, sandboxed_launch,
 };
+
+/// Where the hub gets the local command classifier from, and how it is
+/// switched. The real one is the shiso-backed loader (feature
+/// `local-classifier`); builds without it use [`NoClassifier`]. A trait so the
+/// hub is testable without a GPU.
+pub trait ClassifierProvider: Send + Sync {
+    /// The classifier, only while it is ready.
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>>;
+    /// Switch the classifier on (download if needed, then load) or off.
+    fn set_enabled(&self, _enabled: bool) {}
+    /// Fetch the weights again after a failure.
+    fn download(&self) {}
+}
+
+/// The provider of builds without the local classifier.
+pub struct NoClassifier;
+
+impl ClassifierProvider for NoClassifier {
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        None
+    }
+}
+
+#[cfg(feature = "local-classifier")]
+impl ClassifierProvider for crate::ai::local_classifier::Loader {
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        crate::ai::local_classifier::Loader::classifier(self)
+    }
+    fn set_enabled(&self, enabled: bool) {
+        crate::ai::local_classifier::Loader::set_enabled(self, enabled);
+    }
+    fn download(&self) {
+        crate::ai::local_classifier::Loader::download(self);
+    }
+}
+
+/// The real provider: the loader reporting through `events`, weights under
+/// `<data_dir>/models`.
+#[cfg(feature = "local-classifier")]
+fn default_classifier_provider(
+    data_dir: &Path,
+    events: &EventSender,
+) -> Arc<dyn ClassifierProvider> {
+    let events = events.clone();
+    Arc::new(crate::ai::local_classifier::Loader::new(
+        crate::ai::local_classifier::WeightsManager::new(data_dir),
+        Arc::new(move |state| events.send(Event::ClassifierState(state))),
+    ))
+}
+
+#[cfg(not(feature = "local-classifier"))]
+fn default_classifier_provider(_: &Path, _: &EventSender) -> Arc<dyn ClassifierProvider> {
+    Arc::new(NoClassifier)
+}
 
 /// How the hub starts the sandboxed shell; a test seam (spec §8.2).
 pub type SandboxLauncher = Arc<
@@ -335,6 +389,11 @@ pub struct AiHub {
     unrestored: Mutex<Option<Vec<CheckoutRecord>>>,
     /// Sequence for agent temp dir names.
     tmp_seq: AtomicU64,
+    /// Where the classifier weights live (`<data_dir>/models`).
+    data_dir: PathBuf,
+    /// The local classifier, created on the first classifier command because
+    /// its state callback needs the worker's [`EventSender`].
+    classifier: OnceLock<Arc<dyn ClassifierProvider>>,
 }
 
 impl AiHub {
@@ -360,7 +419,9 @@ impl AiHub {
                 Arc::new(Store::open_in_memory().expect("an in-memory AI store always opens"))
             }
         };
-        AiHub::new(store, tokens)
+        let mut hub = AiHub::new(store, tokens);
+        hub.data_dir = config_root.to_path_buf();
+        hub
     }
 
     /// A hub with injected seams, for tests.
@@ -393,7 +454,50 @@ impl AiHub {
             llms,
             unrestored: Mutex::new(Some(unrestored)),
             tmp_seq: AtomicU64::new(0),
+            data_dir: config_root(),
+            classifier: OnceLock::new(),
         }
+    }
+
+    /// A hub whose classifier is `provider`, for tests.
+    pub fn with_classifier(self, provider: Arc<dyn ClassifierProvider>) -> AiHub {
+        let _ = self.classifier.set(provider);
+        self
+    }
+
+    fn classifier_provider(&self, events: &EventSender) -> &Arc<dyn ClassifierProvider> {
+        self.classifier
+            .get_or_init(|| default_classifier_provider(&self.data_dir, events))
+    }
+
+    /// Switch the local classifier on or off ([`Command::ClassifierSetEnabled`]).
+    ///
+    /// [`Command::ClassifierSetEnabled`]: crate::runtime::Command::ClassifierSetEnabled
+    pub fn classifier_set_enabled(&self, enabled: bool, events: &EventSender) {
+        // Never create the loader just to switch it off.
+        if enabled || self.classifier.get().is_some() {
+            self.classifier_provider(events).set_enabled(enabled);
+        }
+    }
+
+    /// Retry the classifier download ([`Command::ClassifierDownload`]).
+    ///
+    /// [`Command::ClassifierDownload`]: crate::runtime::Command::ClassifierDownload
+    pub fn classifier_download(&self, events: &EventSender) {
+        self.classifier_provider(events).download();
+    }
+
+    /// The classifier a run starting now may use: only while the setting is
+    /// on and the model is ready. Not ready means rules-only approval; the
+    /// next run after the load finishes picks it up.
+    fn run_classifier(
+        &self,
+        settings: &AiSettings,
+    ) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        if !settings.auto_approve.local_classifier {
+            return None;
+        }
+        self.classifier.get()?.classifier()
     }
 
     /// Replace the AI settings every later run reads (the app calls this at
@@ -933,6 +1037,7 @@ impl AiHub {
             repo_settings.prepare.clone(),
         );
         let elide_threshold = f64::from(settings.context_threshold);
+        let classifier = self.run_classifier(&settings);
         let (control, mut rx, pipeline) = start_pipeline(PipelineInputs {
             store: self.store.clone(),
             session_id: ai_session_id,
@@ -946,8 +1051,7 @@ impl AiHub {
             interaction: interaction.clone() as Arc<dyn Interaction>,
             mode,
             bash_disabled: bash_disabled.clone(),
-            // No classifier is installed yet; bash approval is rules-only.
-            classifier: None,
+            classifier,
         });
         if let Err(error) = self.store.checkout_set_state(rec.id, CheckoutState::Active) {
             tracing::warn!(%error, "ai hub: marking the checkout active failed");
@@ -1622,6 +1726,96 @@ fn default_llm_factory(
 
 #[cfg(test)]
 mod tests {
+
+    /// A provider the test flips between ready and not.
+    #[derive(Default)]
+    struct FakeProvider {
+        ready: AtomicBool,
+        enabled_calls: Mutex<Vec<bool>>,
+    }
+
+    struct SafeClassifier;
+    impl review_approval::model_stage::CommandClassifier for SafeClassifier {
+        fn classify(&self, _: &str) -> review_approval::model_stage::ModelOutcome {
+            review_approval::model_stage::ModelOutcome::Safe
+        }
+    }
+
+    impl ClassifierProvider for FakeProvider {
+        fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+            self.ready
+                .load(Ordering::SeqCst)
+                .then(|| Arc::new(SafeClassifier) as Arc<_>)
+        }
+        fn set_enabled(&self, enabled: bool) {
+            self.enabled_calls.lock().unwrap().push(enabled);
+            self.ready.store(enabled, Ordering::SeqCst);
+        }
+    }
+
+    fn hub_with(provider: Arc<FakeProvider>) -> AiHub {
+        AiHub::new(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MemoryStore::default()),
+        )
+        .with_classifier(provider)
+    }
+
+    fn settings_with_classifier(on: bool) -> AiSettings {
+        let mut s = AiSettings::default();
+        s.auto_approve.local_classifier = on;
+        s
+    }
+
+    #[test]
+    fn run_gets_the_classifier_only_when_ready_and_the_setting_is_on() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(provider.clone());
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_none(),
+            "not ready"
+        );
+        provider.ready.store(true, Ordering::SeqCst);
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_some()
+        );
+        assert!(
+            hub.run_classifier(&settings_with_classifier(false))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_hub_without_a_provider_has_no_classifier() {
+        let hub = AiHub::new(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MemoryStore::default()),
+        );
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn toggle_off_clears_provider() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(provider.clone());
+        let (events, _rx) = event_channel();
+        hub.classifier_set_enabled(true, &events);
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_some()
+        );
+        hub.classifier_set_enabled(false, &events);
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_none()
+        );
+        assert_eq!(*provider.enabled_calls.lock().unwrap(), [true, false]);
+    }
     use super::*;
     use crate::ai::checkout::RestoreOutcome;
     use crate::ai::events::{StageKind, StageStatus};

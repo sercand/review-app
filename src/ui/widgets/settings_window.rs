@@ -20,6 +20,7 @@ use crate::model::diff::DiffMode;
 use crate::persist::settings::{
     AutoApproveSettings, ModelSettings, ProviderSettings, RepoAiSettings, Settings,
 };
+use crate::state::classifier::{self, ClassifierState};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::thread_view::avatar;
 use crate::ui::{fonts, icons, theme};
@@ -122,6 +123,9 @@ pub struct AutoApproveVm {
     /// while `false` the checkbox is disabled and apply leaves the stored
     /// `local_classifier` as it is.
     pub classifier_available: bool,
+    /// Where the classifier is on its way to ready; drives the status line and
+    /// the Download / Retry button. Filled by the caller.
+    pub classifier_state: ClassifierState,
     /// The classifier timeout in milliseconds, as typed.
     pub timeout_ms: String,
     /// The extra deny patterns, one per line.
@@ -153,10 +157,22 @@ impl AutoApproveVm {
             enabled: s.enabled,
             local_classifier: s.local_classifier,
             classifier_available: false,
+            classifier_state: ClassifierState::Off,
             timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
             deny_paths_text: s.deny_paths.join("\n"),
             capabilities,
         }
+    }
+
+    /// Show `state`: the checkbox is editable unless this build has no
+    /// classifier or the device is unusable.
+    pub fn set_classifier_state(&mut self, state: ClassifierState) {
+        self.set_classifier_state_for(state, classifier::COMPILED);
+    }
+
+    fn set_classifier_state_for(&mut self, state: ClassifierState, compiled: bool) {
+        self.classifier_available = state.available(compiled);
+        self.classifier_state = state;
     }
 
     /// The deny patterns: trimmed, empty lines dropped.
@@ -424,6 +440,8 @@ pub struct SettingsWindowState {
     pub vm: SettingsVm,
     /// The repo text areas' buffers, one per `vm.ai.repos` entry, in order.
     pub drafts: Vec<RepoDraft>,
+    /// The classifier's latest state, re-applied to every fresh VM.
+    pub classifier_state: ClassifierState,
 }
 
 impl SettingsWindowState {
@@ -431,8 +449,17 @@ impl SettingsWindowState {
     /// the keychain for the AI section's "stored" marks.
     pub fn open_with(&mut self, settings: &Settings, has_key: &dyn Fn(&str) -> bool) {
         self.vm = settings_vm(settings, has_key);
+        let state = self.classifier_state.clone();
+        self.vm.ai.auto_approve.set_classifier_state(state);
         self.drafts = self.vm.ai.repos.iter().map(RepoDraft::for_repo).collect();
         self.open = true;
+    }
+
+    /// The classifier moved to `state`. Kept here, not only in the VM, because
+    /// `open_with` rebuilds the VM from the settings and the state outlives it.
+    pub fn set_classifier_state(&mut self, state: ClassifierState) {
+        self.vm.ai.auto_approve.set_classifier_state(state.clone());
+        self.classifier_state = state;
     }
 
     /// Dismiss the window, discarding unapplied edits.
@@ -461,6 +488,8 @@ pub enum SettingsAction {
         /// The model to probe with.
         model: ModelSettings,
     },
+    /// Fetch the classifier weights again (the Retry button).
+    ClassifierDownload,
     /// Sign out through the app's existing sign-out flow.
     SignOut,
 }
@@ -738,7 +767,7 @@ fn ai_section(
             ui.add_space(6.0);
             ai_model(ui, ai, actions);
             ui.add_space(6.0);
-            ai_auto_approve(ui, &mut ai.auto_approve);
+            ai_auto_approve(ui, &mut ai.auto_approve, actions);
             ui.add_space(6.0);
             ai_repos(ui, ai, drafts);
             // The text areas are authoritative for the lists they edit;
@@ -1009,7 +1038,7 @@ const AUTO_APPROVE_HINT: &str = "Off: every command asks, including the repo's a
 /// The auto-approve section: rule-based approval, the optional classifier,
 /// extra deny patterns and the opt-in capabilities.
 #[cfg(unix)]
-fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
+fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<SettingsAction>) {
     let p = theme::palette_of(ui);
     ui.label(RichText::new("Auto-approve bash commands").font(fonts::semibold(13.0)));
     ui.checkbox(&mut vm.enabled, AUTO_APPROVE_LABEL);
@@ -1021,17 +1050,29 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
                 "Also ask the local classifier (experimental)",
             );
         });
-        if !vm.classifier_available {
-            ui.label(
-                RichText::new("not available in this build")
-                    .size(12.0)
-                    .color(p.faint),
-            );
+        ui.label(
+            RichText::new(vm.classifier_state.text(classifier::COMPILED))
+                .size(12.0)
+                .color(p.faint),
+        );
+        if vm.classifier_state.can_download(classifier::COMPILED)
+            && Btn::new(
+                BtnKind::Default,
+                if matches!(vm.classifier_state, ClassifierState::Failed(_)) {
+                    "Retry"
+                } else {
+                    "Download"
+                },
+            )
+            .show(ui)
+            .clicked()
+        {
+            actions.push(SettingsAction::ClassifierDownload);
         }
     });
     ui.label(
         RichText::new(
-            "Advisory only. A \"safe\" answer never approves a listed network, interpreter, install, delete or wrapper program, a program given by a relative path (PR code), or a command naming one; those still ask. Unlisted programs can be approved. The sandbox remains the security boundary.",
+            "Advisory only. A \"safe\" answer never approves a listed network, interpreter, install, delete or wrapper program, a program outside the system bin directories (PR code), or a command naming one; those still ask. Unlisted programs can be approved. The sandbox remains the security boundary.",
         )
         .size(12.0)
         .color(p.muted),
@@ -1692,6 +1733,32 @@ mod tests {
         vm.ai.auto_approve.classifier_available = true;
         vm.apply(&mut settings).unwrap();
         assert!(settings.ai.auto_approve.local_classifier);
+    }
+
+    #[test]
+    fn classifier_state_survives_reopening_and_gates_the_checkbox() {
+        let dir = tempdir();
+        let settings = Settings::load_or_default(dir.path());
+        let mut state = SettingsWindowState::default();
+        state.set_classifier_state(ClassifierState::Downloading { done: 1, total: 2 });
+        state.open_with(&settings, &|_| false);
+        let aa = &state.vm.ai.auto_approve;
+        assert_eq!(
+            aa.classifier_state,
+            ClassifierState::Downloading { done: 1, total: 2 }
+        );
+        assert_eq!(aa.classifier_available, classifier::COMPILED);
+    }
+
+    #[test]
+    fn unavailable_or_uncompiled_classifier_is_not_editable() {
+        let mut aa = AutoApproveVm::default();
+        aa.set_classifier_state_for(ClassifierState::Failed("offline".into()), true);
+        assert!(aa.classifier_available, "editable while Failed");
+        aa.set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        assert!(!aa.classifier_available);
+        aa.set_classifier_state_for(ClassifierState::Off, false);
+        assert!(!aa.classifier_available);
     }
 
     // M4: a hand-set `local_classifier = true` survives saving while the
