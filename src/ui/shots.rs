@@ -994,6 +994,36 @@ fn shots() {
                 false,
                 true,
             );
+            // The Local repos tab (AI settings Task 9): collapsed, one
+            // expanded, empty, and a missing folder.
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-{t}"),
+                false,
+                false,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-expanded-{t}"),
+                true,
+                false,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-empty-{t}"),
+                false,
+                true,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-missing-{t}"),
+                false,
+                false,
+                true,
+            );
         }
 
         let settings = Settings::default();
@@ -1339,4 +1369,91 @@ fn ai_shot_keys() -> std::collections::BTreeMap<String, bool> {
     ]
     .into_iter()
     .collect()
+}
+
+/// The Local repos tab (AI settings Task 9) in its four shapes: rows
+/// collapsed, one row expanded over its PRs, nothing linked, and a linked
+/// folder that has gone missing (its PRs still listed).
+#[cfg(unix)]
+fn local_repos_shot(dark: bool, name: &str, expanded: bool, empty: bool, missing_first: bool) {
+    use crate::persist::settings::{AiSettings, RepoAiSettings};
+    use crate::state::local_repos::{ListTab, LocalReposState, RepoPrs};
+    use crate::ui::widgets::local_repos;
+
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let gone = std::path::PathBuf::from("/Users/sercand/Developer/acme/infra");
+    let ai = if empty {
+        AiSettings::default()
+    } else {
+        AiSettings {
+            repos: vec![
+                RepoAiSettings {
+                    repo: "github.com/acme/widgets".to_string(),
+                    path: if missing_first {
+                        gone.clone()
+                    } else {
+                        manifest.clone()
+                    },
+                    ..Default::default()
+                },
+                RepoAiSettings {
+                    repo: "github.com/acme/api".to_string(),
+                    path: manifest,
+                    ..Default::default()
+                },
+                RepoAiSettings {
+                    repo: "github.com/acme/infra".to_string(),
+                    path: gone,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    };
+    let mut state = LocalReposState::default();
+    if !empty {
+        let pr = |number: u64, title: &str| {
+            let mut s = pr_summary(number, title, 0);
+            s.repo = crate::model::RepoRef::new("acme", "widgets");
+            s
+        };
+        state.repos.insert(
+            "github.com/acme/widgets".to_string(),
+            RepoPrs::Loaded {
+                total: 3,
+                items: vec![
+                    pr(412, "Fix flaky retry in uploader"),
+                    pr(409, "Add CSV export"),
+                    pr(401, "Bump deps"),
+                ],
+            },
+        );
+        state.repos.insert(
+            "github.com/acme/api".to_string(),
+            RepoPrs::Loaded {
+                total: 7,
+                items: Vec::new(),
+            },
+        );
+        if expanded {
+            state.expanded.insert("github.com/acme/widgets".to_string());
+        }
+    }
+    let blocked = |_: &str| None;
+    let h = harness(dark, move |ui| {
+        pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+        egui::CentralPanel::default().show(ui, |ui| {
+            pr_list::render_tabs(ui, ListTab::Local, &mut Vec::new(), &mut Vec::new());
+            local_repos::render(
+                ui,
+                &ai,
+                "github.com",
+                &state,
+                &blocked,
+                "2026-10-20T00:00:00Z",
+                &mut Vec::new(),
+            );
+        });
+    });
+    save(h, name);
 }

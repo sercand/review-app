@@ -15,6 +15,8 @@ pub mod file_header;
 pub mod file_tree;
 pub mod filter_bar;
 pub mod image_diff;
+#[cfg(unix)]
+pub mod local_repos;
 pub mod markdown;
 pub mod merge_panel;
 pub mod metadata_panel;

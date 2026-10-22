@@ -36,6 +36,8 @@ use crate::runtime::{
     Command, Event, EventReceiver, ExecCtx, SessionId, Worker, event_channel, execute, spawn_worker,
 };
 use crate::state::composer::{self, ComposerAction};
+#[cfg(unix)]
+use crate::state::local_repos::{ListTab, LocalReposMsg, LocalReposState};
 use crate::state::pr_detail::{PrSession, start_submit, viewer_is_author};
 use crate::state::pr_list::{PrListMsg, PrListState, load_more, reduce};
 use crate::ui::command::{self, KeyPress, next_index};
@@ -46,6 +48,8 @@ use crate::ui::theme;
 use crate::ui::widgets::command_palette::{self, PaletteState};
 use crate::ui::widgets::diff_view::{DiffAction, DiffMode, DiffViewState};
 use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFooterAction};
+#[cfg(unix)]
+use crate::ui::widgets::local_repos::{self, LocalPicker, LocalReposAction};
 use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::review_panel::ReviewAction;
 #[cfg(unix)]
@@ -195,6 +199,30 @@ fn repo_has_commands(repo: Option<&RepoAiSettings>) -> bool {
     repo.is_some_and(|repo| !repo.commands.is_empty() || !repo.prepare.is_empty())
 }
 
+/// Why the Local repos tab must disable Change folder / Unlink for
+/// `repo_key` (AI settings Task 9, reusing Task 7's `change_blocked`): a
+/// live run only concerns the open PR's repository, so for any other row
+/// only the app-wide unrestored check applies.
+#[cfg(unix)]
+fn local_change_blocked(
+    session: Option<&PrSession>,
+    unrestored: &[crate::ai::store::CheckoutRecord],
+    repo_key: &str,
+) -> Option<String> {
+    use crate::state::ai_review::change_blocked;
+    let holds_repo = session.is_some_and(|session| {
+        format!(
+            "{}/{}/{}",
+            session.host, session.repo.owner, session.repo.name
+        )
+        .eq_ignore_ascii_case(repo_key)
+    });
+    match session {
+        Some(session) if holds_repo => change_blocked(&session.ai, unrestored, repo_key),
+        _ => change_blocked(&Default::default(), unrestored, repo_key),
+    }
+}
+
 /// The error an event carries, if it carries one. Every such event toasts
 /// it, so this is where the app notices a write-blocking failure.
 fn event_error(event: &Event) -> Option<&GhError> {
@@ -255,6 +283,18 @@ enum AiKeyOpKind {
     },
 }
 
+/// What an in-flight folder probe is for. The PR AI tab's pick (AI settings
+/// Task 7) is accepted only while its PR is still open; a Local repos pick
+/// (Task 9) answers an Add or Change intent instead, which no PR owns.
+#[cfg(unix)]
+#[derive(Debug)]
+enum FolderProbeTarget {
+    /// The ✦ AI tab's Local checkout row for this PR.
+    Pr(crate::ai::store::PrKey),
+    /// The Local repos tab's "+ Add local repo…" or "Change folder".
+    Local(LocalPicker),
+}
+
 /// The root app: owns settings, the worker bridge, and every piece of UI state.
 pub struct ReviewApp {
     screen: ScreenKind,
@@ -265,6 +305,13 @@ pub struct ReviewApp {
     login_form: LoginForm,
     pr_list: PrListState,
     pr_list_form: PrListForm,
+    /// Which PR-list tab the screen shows (AI settings Task 9); persisted
+    /// in [`Settings::layout`]. Unix-only: Windows has no Local tab.
+    #[cfg(unix)]
+    pr_list_tab: ListTab,
+    /// The Local repos tab's loading state (AI settings Task 9).
+    #[cfg(unix)]
+    local_repos: LocalReposState,
     pr_detail: PrDetailState,
     highlight_cache: HighlightCache,
     session: Option<PrSession>,
@@ -310,13 +357,13 @@ pub struct ReviewApp {
     /// `None` shows none.
     #[cfg(unix)]
     ai_repo_dialog: Option<crate::ui::widgets::ai_repo_dialog::RepoCommandsDialog>,
-    /// The in-flight OS folder picker: the PR it was opened for and its
-    /// answer, polled once per frame (AI settings Task 7); `None` when no
-    /// picker is open. The PR key lets a late answer for a PR the user has
-    /// left be dropped instead of linking the wrong repository.
+    /// The in-flight OS folder picker: what the pick was for and its answer,
+    /// polled once per frame (AI settings Task 7, widened to Local repos
+    /// picks by Task 9); `None` when no picker is open. A PR pick whose PR
+    /// the user has left is dropped instead of linking the wrong repository.
     #[cfg(unix)]
     folder_picker: Option<(
-        crate::ai::store::PrKey,
+        FolderProbeTarget,
         std::sync::mpsc::Receiver<Option<PathBuf>>,
     )>,
     /// The token the next folder probe carries (AI settings Task 7): the
@@ -324,10 +371,10 @@ pub struct ReviewApp {
     /// back by token, like the keychain probes above.
     #[cfg(unix)]
     next_ai_probe_token: u64,
-    /// Folder probes still awaiting their verdict, by token, with the repo
-    /// key the pick was for. A reply whose token is gone is stale.
+    /// Folder probes still awaiting their verdict, by token, with what the
+    /// pick was for. A reply whose token is gone is stale.
     #[cfg(unix)]
-    ai_folder_probes: BTreeMap<u64, crate::ai::store::PrKey>,
+    ai_folder_probes: BTreeMap<u64, FolderProbeTarget>,
     /// The last folder-probe verdict the Local checkout row must show:
     /// (repo key, message). Row-scoped, never a toast (AI settings Task 7).
     #[cfg(unix)]
@@ -474,6 +521,10 @@ impl ReviewApp {
             login_form: LoginForm::for_settings(&settings),
             pr_list,
             pr_list_form: PrListForm::default(),
+            #[cfg(unix)]
+            pr_list_tab: settings.layout.pr_list_tab.for_platform(),
+            #[cfg(unix)]
+            local_repos: LocalReposState::default(),
             pr_detail: PrDetailState::default(),
             highlight_cache: HighlightCache::new(2048, Box::new(SyntectHighlighter::new(true))),
             session: None,
@@ -531,6 +582,12 @@ impl ReviewApp {
         // until the replies land.
         #[cfg(unix)]
         app.probe_key_presence();
+        // A saved Local tab opens on fresh counts, like the tab switch does
+        // (AI settings Task 9).
+        #[cfg(unix)]
+        if app.pr_list_tab == ListTab::Local && restored.is_some() {
+            app.refresh_local_repos();
+        }
         app
     }
 
@@ -825,9 +882,35 @@ impl ReviewApp {
             | Event::AiApprovalRequest { .. }
             | Event::AiChat { .. }
             | Event::AiRestoreNeedsDecision { .. }
-            | Event::AiRestored { .. }
-            // The Local tab's screen state arrives with Task 9's rendering.
-            | Event::RepoPrsLoaded { .. } => {}
+            | Event::AiRestored { .. } => {}
+            // The Local tab's repo search answered (AI settings Task 9):
+            // folded into the tab's reducer, which drops a reply whose
+            // generation the last refresh superseded. A failure stays on the
+            // row — no toast — but a 401 ends the session like anywhere else.
+            #[cfg(unix)]
+            Event::RepoPrsLoaded {
+                generation,
+                repo,
+                result,
+            } => {
+                let unauthorized = matches!(&result, Err(GhError::Unauthorized));
+                let msg = match result {
+                    Ok(page) => LocalReposMsg::Loaded {
+                        generation,
+                        repo,
+                        page,
+                    },
+                    Err(error) => LocalReposMsg::Failed {
+                        generation,
+                        repo,
+                        error,
+                    },
+                };
+                self.apply_local_repos(msg);
+                if unauthorized {
+                    self.on_unauthorized(now);
+                }
+            }
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -841,9 +924,14 @@ impl ReviewApp {
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
-        // first search.
+        // first search, and the Local tab's counts when that tab is the open
+        // one (AI settings Task 9).
         if self.screen == ScreenKind::PrList && previous != ScreenKind::PrList {
             self.apply_pr_list(PrListMsg::Refresh, now);
+            #[cfg(unix)]
+            if self.pr_list_tab == ListTab::Local {
+                self.refresh_local_repos();
+            }
         }
     }
 
@@ -896,6 +984,93 @@ impl ReviewApp {
         self.pr_list.recent_constraints = self.settings.recent_constraints.clone();
         self.pr_list.group_by_repo = self.settings.group_by_repo;
         self.pr_list_form = PrListForm::default();
+        // The Local tab's rows belong to the old account's host too.
+        #[cfg(unix)]
+        {
+            self.local_repos = LocalReposState::default();
+        }
+    }
+
+    /// Fold one Local-repos message into the tab's state and send whatever
+    /// commands it produced (AI settings Task 9). The reducer enforces the
+    /// four-search cap and drops stale-generation replies.
+    #[cfg(unix)]
+    fn apply_local_repos(&mut self, msg: LocalReposMsg) {
+        for command in crate::state::local_repos::reduce(&mut self.local_repos, msg) {
+            self.worker.send(command);
+        }
+    }
+
+    /// Restart the Local tab's searches for exactly the repositories linked
+    /// on the signed-in host (opening the tab, refreshing, or changing a
+    /// link).
+    #[cfg(unix)]
+    fn refresh_local_repos(&mut self) {
+        let keys = crate::ai::repo_link::linked_repos(&self.settings.ai, &self.settings.host)
+            .into_iter()
+            .map(|entry| entry.repo.clone())
+            .collect();
+        self.apply_local_repos(LocalReposMsg::Refresh(keys));
+    }
+
+    /// Open the OS folder picker for a Local repos Add/Change intent. Like
+    /// the PR row's picker (Task 7), `rfd` blocks its calling thread, so the
+    /// pick runs on a plain thread and `poll_folder_picker` reads the answer.
+    #[cfg(unix)]
+    fn open_local_picker(&mut self, picker: LocalPicker) {
+        if self.folder_picker.is_some() {
+            return; // one picker at a time
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.folder_picker = Some((FolderProbeTarget::Local(picker), receiver));
+        std::thread::spawn(move || {
+            let _ = sender.send(rfd::FileDialog::new().pick_folder());
+        });
+    }
+
+    /// Apply one Local repos tab action (AI settings Task 9).
+    #[cfg(unix)]
+    fn apply_local_repos_action(&mut self, action: LocalReposAction, now: Instant) {
+        use crate::ai::repo_link::unlink_repo;
+        match action {
+            LocalReposAction::Toggle(key) => self.apply_local_repos(LocalReposMsg::Toggle(key)),
+            LocalReposAction::OpenPr { repo, number } => {
+                if let Some(repo) = local_repos::repo_ref_from_key(&repo) {
+                    self.open_pr(repo, number);
+                }
+            }
+            LocalReposAction::AddRepo => self.open_local_picker(LocalPicker::Add),
+            LocalReposAction::ChangeFolder(key) => {
+                // The menu disables the item with the reason; this is the
+                // stale-frame backstop.
+                if local_change_blocked(
+                    self.session.as_ref(),
+                    &self.ai_unrestored,
+                    &key.to_lowercase(),
+                )
+                .is_some()
+                {
+                    return;
+                }
+                self.open_local_picker(LocalPicker::Change(key));
+            }
+            LocalReposAction::Unlink(key) => {
+                if local_change_blocked(
+                    self.session.as_ref(),
+                    &self.ai_unrestored,
+                    &key.to_lowercase(),
+                )
+                .is_some()
+                {
+                    return;
+                }
+                // Unlinking clears only the path: the repo's commands,
+                // prepare commands and extra paths stay for a relink.
+                unlink_repo(&mut self.settings.ai, &key);
+                self.save_settings(now);
+                self.refresh_local_repos();
+            }
+        }
     }
 
     /// Write any debounced session change before the session is dropped or
@@ -1330,11 +1505,14 @@ impl ReviewApp {
         }
     }
 
-    /// Fold one folder probe's verdict in (AI settings Task 7). A token this
-    /// app no longer tracks is a stale reply and is dropped. A folder that is
-    /// a clone of the repository the pick was for links; anything else leaves
-    /// the settings alone and lands in that repo's Local checkout row —
-    /// never a toast, so the complaint stays beside the folder it names.
+    /// Fold one folder probe's verdict in (AI settings Task 7, widened to
+    /// Local repos picks by Task 9). A token this app no longer tracks is a
+    /// stale reply and is dropped. A PR pick that is a clone of the
+    /// repository the pick was for links; anything else leaves the settings
+    /// alone and lands in that repo's Local checkout row — never a toast, so
+    /// the complaint stays beside the folder it names. A Local repos pick
+    /// folds through [`local_repos::apply_folder_answer`]: a clean link
+    /// saves, anything else toasts the reason.
     #[cfg(unix)]
     fn on_ai_folder_probed(
         &mut self,
@@ -1345,24 +1523,48 @@ impl ReviewApp {
     ) {
         use crate::ai::repo_link::link_repo;
 
-        let Some(key) = self.ai_folder_probes.remove(&token) else {
+        let Some(target) = self.ai_folder_probes.remove(&token) else {
             tracing::debug!(token, "dropping a stale folder-probe reply");
             return;
         };
-        let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
-        match result {
-            Ok(remote) if remote.key().eq_ignore_ascii_case(&repo_key) => {
-                link_repo(&mut self.settings.ai, &remote, path);
-                self.ai_row_error = None;
-                self.save_settings(now);
+        match target {
+            // The PR row's verdict lands in that repo's Local checkout row,
+            // never a toast (Task 7).
+            FolderProbeTarget::Pr(key) => {
+                let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
+                match result {
+                    Ok(remote) if remote.key().eq_ignore_ascii_case(&repo_key) => {
+                        link_repo(&mut self.settings.ai, &remote, path);
+                        self.ai_row_error = None;
+                        self.save_settings(now);
+                    }
+                    Ok(remote) => {
+                        self.ai_row_error = Some((
+                            repo_key.clone(),
+                            format!("that folder is a clone of {}, not {repo_key}", remote.key()),
+                        ))
+                    }
+                    Err(reason) => self.ai_row_error = Some((repo_key, reason)),
+                }
             }
-            Ok(remote) => {
-                self.ai_row_error = Some((
-                    repo_key.clone(),
-                    format!("that folder is a clone of {}, not {repo_key}", remote.key()),
-                ))
+            // The Local tab's verdict (Task 9): a clean link saves and
+            // reloads the counts; anything else toasts the reason and
+            // changes nothing.
+            FolderProbeTarget::Local(picker) => {
+                match local_repos::apply_folder_answer(
+                    &mut self.settings.ai,
+                    &self.settings.host,
+                    &picker,
+                    path,
+                    result,
+                ) {
+                    Some(message) => self.toasts.push(message, now),
+                    None => {
+                        self.save_settings(now);
+                        self.refresh_local_repos();
+                    }
+                }
             }
-            Err(reason) => self.ai_row_error = Some((repo_key, reason)),
         }
     }
 
@@ -1660,9 +1862,31 @@ impl ReviewApp {
     fn render_pr_list(&mut self, ui: &mut egui::Ui, now: Instant) {
         let mut msgs = Vec::new();
         let mut actions = Vec::new();
+        #[cfg(unix)]
+        let mut local_actions = Vec::new();
         let wall = crate::ui::widgets::pr_row::now_iso();
         pr_list::render_title_bar(ui, &mut msgs, &mut actions);
         egui::CentralPanel::default().show(ui, |ui| {
+            // The tab strip is unix-only; on Windows the screen is the All
+            // PRs list unchanged (AI settings Task 9).
+            #[cfg(unix)]
+            {
+                pr_list::render_tabs(ui, self.pr_list_tab, &mut actions, &mut local_actions);
+                if self.pr_list_tab == ListTab::Local {
+                    local_repos::render(
+                        ui,
+                        &self.settings.ai,
+                        &self.settings.host,
+                        &self.local_repos,
+                        &|key| {
+                            local_change_blocked(self.session.as_ref(), &self.ai_unrestored, key)
+                        },
+                        &wall,
+                        &mut local_actions,
+                    );
+                    return;
+                }
+            }
             pr_list::render(
                 ui,
                 &mut self.pr_list,
@@ -1673,8 +1897,15 @@ impl ReviewApp {
             );
         });
 
+        #[cfg(unix)]
+        let refresh_requested = msgs.iter().any(|msg| matches!(msg, PrListMsg::Refresh));
         for msg in msgs {
             self.apply_pr_list(msg, now);
+        }
+        // The title bar's refresh reloads whichever tab is open (Task 9).
+        #[cfg(unix)]
+        if refresh_requested && self.pr_list_tab == ListTab::Local {
+            self.refresh_local_repos();
         }
         for action in actions {
             match action {
@@ -1687,7 +1918,21 @@ impl ReviewApp {
                 PrListAction::Settings => self.open_settings(),
                 PrListAction::Palette => self.palette.open_now(),
                 PrListAction::ToggleTheme => self.toggle_theme(ui.ctx(), now),
+                // The tab choice is a durable preference, like the scopes.
+                #[cfg(unix)]
+                PrListAction::SetTab(tab) => {
+                    self.pr_list_tab = tab;
+                    self.settings.layout.pr_list_tab = tab;
+                    self.save_settings(now);
+                    if tab == ListTab::Local {
+                        self.refresh_local_repos();
+                    }
+                }
             }
+        }
+        #[cfg(unix)]
+        for action in local_actions {
+            self.apply_local_repos_action(action, now);
         }
     }
 
@@ -2454,7 +2699,7 @@ impl ReviewApp {
                 // thread must not call it; the answer arrives over the
                 // channel `poll_folder_picker` reads, tied to this PR.
                 let (sender, receiver) = std::sync::mpsc::channel();
-                self.folder_picker = Some((key, receiver));
+                self.folder_picker = Some((FolderProbeTarget::Pr(key), receiver));
                 std::thread::spawn(move || {
                     let _ = sender.send(rfd::FileDialog::new().pick_folder());
                 });
@@ -2484,11 +2729,11 @@ impl ReviewApp {
     }
 
     /// Collect the OS folder picker's answer once per frame (AI settings
-    /// Task 7). The picker runs on a plain thread because `rfd` blocks; a
-    /// cancelled picker and an answer for a PR the user has left are both
-    /// dropped, and an accepted answer goes to the worker for the clone
-    /// check — the verdict arrives as `Event::AiFolderProbed`, matched back
-    /// by token.
+    /// Task 7, widened to Local repos picks by Task 9). The picker runs on a
+    /// plain thread because `rfd` blocks; a cancelled picker, and a PR pick
+    /// for a PR the user has left, are both dropped, and an accepted answer
+    /// goes to the worker for the clone check — the verdict arrives as
+    /// `Event::AiFolderProbed`, matched back by token.
     #[cfg(unix)]
     fn poll_folder_picker(&mut self) {
         use std::sync::mpsc::TryRecvError;
@@ -2505,13 +2750,24 @@ impl ReviewApp {
         let Some((stored, _)) = self.folder_picker.take() else {
             return;
         };
-        let open = self.session.as_ref().map(crate::state::pr_detail::pr_key);
-        let Some((key, path)) = picker_answer(&stored, open.as_ref(), answer) else {
-            return;
+        // A PR pick stands or falls with its PR (Task 7); a Local repos pick
+        // answers its Add/Change intent directly (Task 9).
+        let (target, path) = match stored {
+            FolderProbeTarget::Pr(stored) => {
+                let open = self.session.as_ref().map(crate::state::pr_detail::pr_key);
+                match picker_answer(&stored, open.as_ref(), answer) {
+                    Some((key, path)) => (FolderProbeTarget::Pr(key), path),
+                    None => return,
+                }
+            }
+            FolderProbeTarget::Local(picker) => match answer {
+                Some(path) => (FolderProbeTarget::Local(picker), path),
+                None => return,
+            },
         };
         let token = self.next_ai_probe_token;
         self.next_ai_probe_token += 1;
-        self.ai_folder_probes.insert(token, key);
+        self.ai_folder_probes.insert(token, target);
         self.worker.send(Command::AiProbeFolder { token, path });
     }
 
