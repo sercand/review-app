@@ -1,5 +1,5 @@
 use super::parse;
-use crate::model::{Bail, Separator};
+use crate::model::{Bail, RedirOp, Separator};
 
 fn argv(src: &str) -> Vec<Vec<String>> {
     parse(src)
@@ -125,10 +125,7 @@ fn syntax_errors_and_unsupported_kinds_bail() {
     assert_eq!(parse("ls;;"), Err(Bail::Syntax));
     assert_eq!(parse("echo a\0b"), Err(Bail::Syntax));
     assert_eq!(parse("ls &"), Err(Bail::Background));
-    assert!(matches!(
-        parse("if x; then y; fi"),
-        Err(Bail::Unsupported("if_statement"))
-    ));
+    assert_eq!(parse("if x; then y; fi"), Err(Bail::CompoundCommand));
 }
 
 #[test]
@@ -191,13 +188,10 @@ fn continuation_cannot_assemble_brace_expansion() {
 
 #[test]
 fn unsupported_kind_names_come_from_the_grammar() {
+    assert_eq!(parse("[[ -f x ]]"), Err(Bail::Unsupported("test_command")));
     assert_eq!(
-        parse("for i in a; do b; done"),
-        Err(Bail::Unsupported("for_statement"))
-    );
-    assert_eq!(
-        parse("echo hi > f"),
-        Err(Bail::Unsupported("redirected_statement"))
+        parse("declare -a x"),
+        Err(Bail::Unsupported("declaration_command"))
     );
 }
 
@@ -216,4 +210,154 @@ fn process_substitution_and_legacy_arithmetic_in_expansions_bail() {
         Err(Bail::ProcessSubstitution)
     );
     assert_eq!(parse("echo ${A:-$[1+2]}"), Err(Bail::Arithmetic));
+}
+
+fn follows(src: &str) -> Vec<Separator> {
+    parse(src).unwrap().iter().map(|s| s.follows).collect()
+}
+
+fn redirs(src: &str) -> Vec<(Option<u32>, RedirOp, String)> {
+    let segs = parse(src).unwrap_or_else(|b| panic!("{src:?} bailed: {b:?}"));
+    segs.into_iter()
+        .flat_map(|s| s.redirects)
+        .map(|r| (r.fd, r.op, r.target))
+        .collect()
+}
+
+#[test]
+fn list_and_pipeline_segments() {
+    assert_eq!(
+        follows("a && b | c; d"),
+        vec![
+            Separator::And,
+            Separator::Pipe,
+            Separator::Semi,
+            Separator::End
+        ]
+    );
+    assert_eq!(
+        follows("a || b |& c"),
+        vec![Separator::Or, Separator::PipeBoth, Separator::End]
+    );
+    assert_eq!(
+        follows("a &&\nb |\nc"),
+        vec![Separator::And, Separator::Pipe, Separator::End]
+    );
+    assert_eq!(
+        argv("! ls | a && ! b"),
+        vec![strs(&["ls"]), strs(&["a"]), strs(&["b"])]
+    );
+}
+
+#[test]
+fn newline_splits_and_trailing_separators_ok() {
+    assert_eq!(parse("ls\nrm x\n").unwrap().len(), 2);
+    assert_eq!(parse("ls;").unwrap().len(), 1);
+    assert_eq!(parse("").unwrap(), vec![]);
+    assert_eq!(parse("  ").unwrap(), vec![]);
+}
+
+#[test]
+fn crlf_and_line_continuation() {
+    assert_eq!(argv("ls\r\nrm x"), vec![strs(&["ls"]), strs(&["rm", "x"])]);
+    assert_eq!(argv("ls \\\n-la"), vec![strs(&["ls", "-la"])]);
+}
+
+#[test]
+fn redirect_forms() {
+    use RedirOp::*;
+    let r = |fd, op, t: &str| (fd, op, t.to_string());
+    assert_eq!(redirs("cat x > o"), vec![r(None, OutTrunc, "o")]);
+    assert_eq!(redirs("cat x 2>&1"), vec![r(Some(2), OutDup, "1")]);
+    assert_eq!(redirs("cat &> f"), vec![r(None, OutAll, "f")]);
+    assert_eq!(redirs("cat &>> f"), vec![r(None, OutAllAppend, "f")]);
+    assert_eq!(redirs("cat >> f"), vec![r(None, OutAppend, "f")]);
+    assert_eq!(redirs("cat < f"), vec![r(None, In, "f")]);
+    assert_eq!(redirs("cat >| f"), vec![r(None, OutClobber, "f")]);
+    assert_eq!(redirs("cat <&0"), vec![r(None, InDup, "0")]);
+    assert_eq!(redirs("cat >&-"), vec![r(None, OutDup, "-")]);
+    assert_eq!(
+        redirs("cat 2> /dev/null"),
+        vec![r(Some(2), OutTrunc, "/dev/null")]
+    );
+    assert_eq!(
+        redirs("cat x > 2> /dev/null"),
+        vec![r(None, OutTrunc, "2"), r(None, OutTrunc, "/dev/null")]
+    );
+    assert_eq!(redirs("> f cmd"), vec![r(None, OutTrunc, "f")]);
+    assert_eq!(redirs("cat x > o | b"), vec![r(None, OutTrunc, "o")]);
+    // A dynamic target keeps its source text.
+    assert_eq!(redirs("echo > $F"), vec![r(None, OutTrunc, "$F")]);
+    // Redirects attach to their own command, words after a redirect still count.
+    let segs = parse("cat > o x $Y").unwrap();
+    assert_eq!(segs[0].argv, strs(&["cat", "x", "$Y"]));
+    assert_eq!(segs[0].dynamic, vec![false, false, true]);
+    assert_eq!(segs[0].redirects[0].target, "o");
+    assert_eq!(
+        argv("cat a > o x > p y"),
+        vec![strs(&["cat", "a", "x", "y"])]
+    );
+    let segs = parse("> f").unwrap();
+    assert!(segs[0].argv.is_empty());
+    assert_eq!(segs[0].redirects.len(), 1);
+}
+
+#[test]
+fn redirect_target_bails_like_any_word() {
+    assert_eq!(parse("echo > $(x)"), Err(Bail::CommandSubstitution));
+    assert_eq!(parse("echo > <(x)"), Err(Bail::ProcessSubstitution));
+}
+
+#[test]
+fn continuation_rules_survive_redirects() {
+    assert_eq!(argv("echo a\\\nb > f"), vec![strs(&["echo", "ab"])]);
+    assert_eq!(
+        parse("echo {a\\\n,b} > f"),
+        Err(Bail::Unsupported("line_continuation"))
+    );
+    assert_eq!(
+        parse("echo > f\\\ng"),
+        Err(Bail::Unsupported("line_continuation"))
+    );
+}
+
+#[test]
+fn bail_table() {
+    let cases: &[(&str, Bail)] = &[
+        ("$(x)", Bail::CommandSubstitution),
+        ("`x`", Bail::CommandSubstitution),
+        ("\"$(x)\"", Bail::CommandSubstitution),
+        ("<(x)", Bail::ProcessSubstitution),
+        ("cat <<EOF\nx\nEOF", Bail::Heredoc),
+        ("cat <<-EOF\nx\nEOF", Bail::Heredoc),
+        ("cat <<<x", Bail::HereString),
+        ("echo $((1+1))", Bail::Arithmetic),
+        ("(a)", Bail::Subshell),
+        ("a && (b)", Bail::Subshell),
+        ("{ a; }", Bail::BraceGroup),
+        ("if a; then b; fi", Bail::CompoundCommand),
+        ("for i in a; do b; done", Bail::CompoundCommand),
+        ("while a; do b; done", Bail::CompoundCommand),
+        ("until a; do b; done", Bail::CompoundCommand),
+        ("case a in b) c;; esac", Bail::CompoundCommand),
+        ("f() { a; }", Bail::FunctionDef),
+        ("A=(1 2)", Bail::ArrayLiteral),
+        ("a &", Bail::Background),
+        ("a & b", Bail::Background),
+        ("a && b &", Bail::Background),
+        ("a | b &", Bail::Background),
+        ("echo 'x", Bail::Syntax),
+        ("ls;;", Bail::Syntax),
+        ("[[ -f x ]]", Bail::Unsupported("test_command")),
+    ];
+    for (src, want) in cases {
+        assert_eq!(parse(src).as_ref(), Err(want), "{src:?}");
+    }
+}
+
+#[test]
+fn depth_is_capped() {
+    let deep = format!("{}a", "a && ".repeat(100));
+    assert_eq!(parse(&deep), Err(Bail::Unsupported("depth")));
+    assert!(parse(&format!("{}a", "a && ".repeat(10))).is_ok());
 }
