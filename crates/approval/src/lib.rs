@@ -51,7 +51,11 @@ pub struct ApprovalConfig<'a> {
 /// deny anywhere in the command (wrapper contents and redirects included)
 /// denies the whole command. Anything not vouched for asks.
 pub fn classify(command: &str, cfg: &ApprovalConfig<'_>) -> Verdict {
-    if command.trim().is_empty() {
+    // ASCII whitespace only: bash treats U+00A0 and friends as a command name.
+    if command
+        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .is_empty()
+    {
         return Verdict::Run { source: "empty" };
     }
     let deny = DenyPaths(cfg.deny_paths);
@@ -82,7 +86,7 @@ fn describe(reason: Option<&Reason>, why: &str) -> String {
         Some(Reason::Bail(b)) => bail_text(b),
         Some(Reason::Segment(text)) if !text.is_empty() => format!("{text}: {why}"),
         Some(Reason::Empty) | None | Some(Reason::Segment(_)) => why.to_string(),
-        Some(r @ Reason::TooDeep) => r.to_string(),
+        Some(r @ (Reason::TooDeep | Reason::Denied { .. })) => r.to_string(),
     }
 }
 

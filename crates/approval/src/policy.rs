@@ -16,6 +16,11 @@ pub enum PolicyVerdict {
     Approve,
     /// This policy actively rejects the segment.
     Deny,
+    /// This policy cannot rule the segment out (a glob that might expand to a
+    /// protected path) and so no policy may approve it: the engine defers,
+    /// whatever the rest of the stack says. Not a deny; a literal deny
+    /// anywhere in the command still wins.
+    Withhold,
 }
 
 /// One rule in the stack. First policy with an opinion wins.
@@ -25,6 +30,11 @@ pub trait SegmentPolicy: Send + Sync {
     /// Inspect one segment: `Some(Approve)` vouches, `Some(Deny)` rejects,
     /// `None` abstains and lets later policies speak.
     fn verify(&self, seg: &Segment, cwd: Option<&Path>) -> Option<PolicyVerdict>;
+    /// For a segment this policy denied: what matched, for the reason text
+    /// (e.g. `protected path ".env"`).
+    fn explain_deny(&self, _seg: &Segment) -> Option<String> {
+        None
+    }
 }
 
 /// A policy made of a name and a plain function; each capability is one

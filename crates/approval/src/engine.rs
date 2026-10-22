@@ -67,6 +67,9 @@ pub enum Reason {
     Empty,
     /// `sh -c` nesting beyond the supported depth.
     TooDeep,
+    /// A segment denied by a policy that said what matched: the segment's
+    /// words and the policy's explanation.
+    Denied { text: String, detail: String },
     /// The first segment that was denied or not vouched for: its words
     /// joined by single spaces (or its assignments, when it has no words).
     Segment(String),
@@ -79,6 +82,7 @@ impl fmt::Display for Reason {
             Reason::Empty => f.write_str("empty command"),
             Reason::TooDeep => f.write_str("shell invocations nested too deeply"),
             Reason::Segment(text) => f.write_str(text),
+            Reason::Denied { text, detail } => write!(f, "{text}: {detail}"),
         }
     }
 }
@@ -224,8 +228,10 @@ fn classify_segment(
     // Deny rules see the segment as written first, so a wrapper's own
     // redirects and arguments (`xargs cat < .env`) are checked even though
     // the wrapped command is classified without them.
-    if is_denied(seg, cwd, stack) {
-        return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
+    match screen(seg, cwd, stack) {
+        Screen::Deny(res) => return res,
+        Screen::Withhold => return defer(seg),
+        Screen::Clear => {}
     }
     if !seg.redirects.iter().all(is_redirect_safe)
         || seg
@@ -293,9 +299,8 @@ fn consult(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> R
     for p in stack {
         match p.verify(seg, cwd) {
             Some(PolicyVerdict::Approve) => return (Decision::Approve { source: p.name() }, None),
-            Some(PolicyVerdict::Deny) => {
-                return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
-            }
+            Some(PolicyVerdict::Deny) => return denied(seg, *p),
+            Some(PolicyVerdict::Withhold) => return defer(seg),
             None => {}
         }
     }
@@ -306,18 +311,46 @@ fn consult(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> R
 /// explicit deny rule still denies, everything else defers. The model is
 /// not asked — it has nothing to add to a segment that cannot be approved.
 fn deny_or_defer(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> Res {
-    if is_denied(seg, cwd, stack) {
-        return (Decision::Deny, Some(Reason::Segment(segment_text(seg))));
+    match screen(seg, cwd, stack) {
+        Screen::Deny(res) => res,
+        Screen::Withhold | Screen::Clear => defer(seg),
     }
-    defer(seg)
 }
 
-/// Whether any non-model policy in the stack denies this segment.
-fn is_denied(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> bool {
-    stack
-        .iter()
-        .filter(|p| p.name() != ML_NAME)
-        .any(|p| p.verify(seg, cwd) == Some(PolicyVerdict::Deny))
+/// The deny result for `seg`, naming what matched when the policy can say.
+fn denied(seg: &Segment, p: &dyn SegmentPolicy) -> Res {
+    let reason = match p.explain_deny(seg) {
+        Some(detail) => Reason::Denied {
+            text: segment_text(seg),
+            detail,
+        },
+        None => Reason::Segment(segment_text(seg)),
+    };
+    (Decision::Deny, Some(reason))
+}
+
+/// What the non-model policies' deny and withhold verdicts say about a
+/// segment as written. A deny anywhere beats a withhold.
+enum Screen {
+    Deny(Res),
+    Withhold,
+    Clear,
+}
+
+fn screen(seg: &Segment, cwd: Option<&Path>, stack: &[&dyn SegmentPolicy]) -> Screen {
+    let mut withhold = false;
+    for p in stack.iter().filter(|p| p.name() != ML_NAME) {
+        match p.verify(seg, cwd) {
+            Some(PolicyVerdict::Deny) => return Screen::Deny(denied(seg, *p)),
+            Some(PolicyVerdict::Withhold) => withhold = true,
+            Some(PolicyVerdict::Approve) | None => {}
+        }
+    }
+    if withhold {
+        Screen::Withhold
+    } else {
+        Screen::Clear
+    }
 }
 
 /// What a wrapper invocation boils down to.

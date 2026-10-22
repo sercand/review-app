@@ -60,12 +60,24 @@ impl SegmentPolicy for RepoAllow<'_> {
 }
 
 /// Denies any segment that mentions a protected path in an argument, a
-/// redirect target or an assignment value. It checks the source text of
-/// run-time-expanded words too: they are never proven safe, but only a
-/// literal component can make them a deny.
+/// redirect target or an assignment value, and withholds approval from a
+/// segment whose glob or brace words could expand to one. It checks the
+/// source text of run-time-expanded words too: they are never proven safe,
+/// but only a literal component can make them a deny. Matching ignores ASCII
+/// case (macOS volumes are case-insensitive by default).
 // Adapted from amenocturne/da (MIT), src/main.rs (`custom_deny_verify`)
 #[derive(Debug, Clone, Copy)]
 pub struct DenyPaths<'a>(pub &'a [String]);
+
+impl DenyPaths<'_> {
+    fn words<'s>(seg: &'s Segment) -> impl Iterator<Item = &'s str> {
+        seg.argv
+            .iter()
+            .map(String::as_str)
+            .chain(seg.redirects.iter().map(|r| r.target.as_str()))
+            .chain(seg.assigns.iter().map(|(_, v)| v.as_str()))
+    }
+}
 
 impl SegmentPolicy for DenyPaths<'_> {
     fn name(&self) -> &'static str {
@@ -73,16 +85,24 @@ impl SegmentPolicy for DenyPaths<'_> {
     }
 
     fn verify(&self, seg: &Segment, _cwd: Option<&Path>) -> Option<PolicyVerdict> {
-        let hit = |t: &str| token_matches_deny(t, self.0);
-        (seg.argv.iter().any(|a| hit(a))
-            || seg.redirects.iter().any(|r| hit(&r.target))
-            || seg.assigns.iter().any(|(_, v)| hit(v)))
-        .then_some(PolicyVerdict::Deny)
+        if Self::words(seg).any(|w| token_matches_deny(w, self.0)) {
+            Some(PolicyVerdict::Deny)
+        } else if Self::words(seg).any(|w| could_match_deny(w, self.0)) {
+            Some(PolicyVerdict::Withhold)
+        } else {
+            None
+        }
+    }
+
+    fn explain_deny(&self, seg: &Segment) -> Option<String> {
+        Self::words(seg)
+            .find(|w| token_matches_deny(w, self.0))
+            .map(|w| format!("protected path \"{w}\""))
     }
 }
 
 fn components(s: &str) -> Vec<&str> {
-    s.split(['/', '~', '='])
+    s.split(['/', '~', '=', ':'])
         .filter(|c| !c.is_empty() && *c != ".")
         .collect()
 }
@@ -97,16 +117,155 @@ fn component_matches(pattern: &str, component: &str) -> bool {
     }
 }
 
+fn lowered(patterns: &[String]) -> Vec<Vec<String>> {
+    patterns
+        .iter()
+        .map(|p| {
+            components(p)
+                .into_iter()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 // Adapted from amenocturne/da (MIT), src/main.rs (`token_matches_deny`)
-fn token_matches_deny(token: &str, patterns: &[String]) -> bool {
-    let tokens = components(token);
-    patterns.iter().any(|pattern| {
-        let pat = components(pattern);
-        !pat.is_empty()
-            && tokens
-                .windows(pat.len())
-                .any(|w| w.iter().zip(&pat).all(|(c, p)| component_matches(p, c)))
+/// Whether some path component of `token` literally matches a deny pattern.
+pub(crate) fn token_matches_deny(token: &str, patterns: &[String]) -> bool {
+    let token = token.to_ascii_lowercase();
+    let tokens = components(&token);
+    lowered(patterns).iter().any(|pat| {
+        tokens
+            .windows(pat.len())
+            .any(|w| w.iter().zip(pat).all(|(c, p)| component_matches(p, c)))
     })
+}
+
+/// Whether `token`, once brace-expanded, has a glob component that could
+/// match a deny pattern. Over-approximate on purpose: a quoted `*` looks the
+/// same as a bare one here.
+pub(crate) fn could_match_deny(token: &str, patterns: &[String]) -> bool {
+    let token = token.to_ascii_lowercase();
+    let Some(variants) = expand_braces(&token) else {
+        return true;
+    };
+    let pats = lowered(patterns);
+    variants.iter().any(|v| {
+        let tokens = components(v);
+        let braced = v != &token;
+        pats.iter().any(|pat| {
+            tokens.windows(pat.len()).any(|w| {
+                w.iter()
+                    .zip(pat)
+                    .all(|(c, p)| (braced && component_matches(p, c)) || glob_could_match(c, p))
+            })
+        })
+    })
+}
+
+fn glob_start(c: &str) -> Option<usize> {
+    c.char_indices()
+        .find(|&(i, ch)| match ch {
+            '*' | '?' => true,
+            '[' => c[i + 1..].contains(']'),
+            _ => false,
+        })
+        .map(|(i, _)| i)
+}
+
+fn glob_end(c: &str) -> usize {
+    c.char_indices()
+        .rev()
+        .find(|&(i, ch)| match ch {
+            '*' | '?' | ']' => ch != ']' || c[..i].contains('['),
+            _ => false,
+        })
+        .map_or(0, |(i, _)| i + 1)
+}
+
+/// Can the glob `comp` match a name that `pattern` (a deny component:
+/// exact, `prefix*` or `*suffix`) matches? A component with no glob
+/// characters is compared literally, which `token_matches_deny` already did.
+fn glob_could_match(comp: &str, pattern: &str) -> bool {
+    let Some(start) = glob_start(comp) else {
+        return false;
+    };
+    let (cpre, csuf) = (&comp[..start], &comp[glob_end(comp)..]);
+    let (ppre, psuf) = if let Some(p) = pattern.strip_suffix('*') {
+        (p, "")
+    } else if let Some(p) = pattern.strip_prefix('*') {
+        ("", p)
+    } else {
+        (pattern, pattern)
+    };
+    // Without dotglob, a leading metachar never matches a leading dot.
+    if cpre.is_empty() && ppre.starts_with('.') {
+        return false;
+    }
+    // `*.rs` against `id_rsa*`: only by an unrealistic `id_rsa.rs`; treating
+    // a bare extension glob as a match would ask for every `ls *.rs`.
+    if cpre.is_empty() && csuf.starts_with('.') && csuf.len() > 1 && psuf.is_empty() {
+        return false;
+    }
+    (cpre.starts_with(ppre) || ppre.starts_with(cpre))
+        && (csuf.ends_with(psuf) || psuf.ends_with(csuf))
+}
+
+const MAX_BRACE_VARIANTS: usize = 256;
+
+/// Bash brace expansion. `None` when the result is unknown or too large
+/// (sequences like `{1..3}`, more than 256 words); a brace without a
+/// top-level comma is literal, as in bash.
+pub(crate) fn expand_braces(word: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    expand_into(word, &mut out)?;
+    Some(out)
+}
+
+fn expand_into(word: &str, out: &mut Vec<String>) -> Option<()> {
+    let bytes = word.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = word[from..].find('{') {
+        let open = from + rel;
+        let mut depth = 0usize;
+        let mut commas = Vec::new();
+        let mut close = None;
+        for (i, &b) in bytes.iter().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                b',' if depth == 1 => commas.push(i),
+                _ => {}
+            }
+        }
+        let Some(close) = close else { break };
+        if commas.is_empty() {
+            if word[open + 1..close].contains("..") {
+                return None;
+            }
+            from = open + 1;
+            continue;
+        }
+        let (pre, post) = (&word[..open], &word[close + 1..]);
+        let mut start = open + 1;
+        for end in commas.into_iter().chain([close]) {
+            expand_into(&format!("{pre}{}{post}", &word[start..end]), out)?;
+            start = end + 1;
+        }
+        return Some(());
+    }
+    if out.len() >= MAX_BRACE_VARIANTS {
+        return None;
+    }
+    out.push(word.to_string());
+    Some(())
 }
 
 #[cfg(test)]
@@ -249,6 +408,109 @@ mod tests {
         }
         assert_eq!(run("", &[]), Verdict::Run { source: "empty" });
         assert_eq!(run("  \n ", &[]), Verdict::Run { source: "empty" });
+    }
+
+    #[test]
+    fn globs_and_braces_that_could_hit_a_deny_pattern_ask() {
+        for cmd in [
+            "cat .e*",
+            "cat .en[v]",
+            "cat .en?",
+            "cat .{env,x}",
+            "cat .*",
+            "cat id*",
+            "cat *",
+            "cat ~/.s*/config",
+            "cat {1..3}",
+            "cat *rsa",
+            "cat x/.ssh?",
+        ] {
+            assert!(is_ask(&run(cmd, &[])), "{cmd}");
+        }
+        // Even a repo allow entry cannot approve them.
+        assert!(is_ask(&run("cat .e*", &["cat"])));
+        assert!(is_ask(&run("cat *", &["cat"])));
+        // A literal deny elsewhere in the command still wins.
+        assert!(is_deny(&run("cat .e* && cat .env", &[])));
+        assert!(is_deny(&run("cat .e* > .env", &[])));
+        for cmd in [
+            "ls *.rs",
+            "rg foo src/*.rs",
+            "cat src/{a,b}.rs",
+            "ls src/?.x",
+            "cat [abc].txt",
+            "[ -f x ]",
+            "awk '{print $1}' f",
+            "sed -n '/x/{p;q}' f",
+        ] {
+            assert!(!is_ask(&run(cmd, &[])) || cmd.starts_with('['), "{cmd}");
+        }
+        assert!(is_run(&run("ls *.rs", &[]), "read-only"));
+        assert!(is_run(&run("rg foo src/*.rs", &[]), "read-only"));
+        assert!(is_run(&run("cat src/{a,b}.rs", &[]), "read-only"));
+    }
+
+    #[test]
+    fn deny_ignores_ascii_case() {
+        assert!(is_deny(&run("cat .ENV", &[])));
+        assert!(is_deny(&run("cat x.PEM", &[])));
+        assert!(is_deny(&run("cat ~/.SSH/ID_RSA", &[])));
+        assert!(is_deny(&run("cat ~/library/keychains/x", &[])));
+    }
+
+    #[test]
+    fn unicode_whitespace_is_not_empty() {
+        for cmd in ["\u{a0}", "\u{3000}", "\u{85}", "\u{2028}"] {
+            assert!(is_ask(&run(cmd, &[])), "{cmd:?}");
+        }
+        assert_eq!(run("\t \r\n", &[]), Verdict::Run { source: "empty" });
+    }
+
+    #[test]
+    fn colon_separates_components() {
+        assert!(is_deny(&run("git show HEAD:.env", &[])));
+        assert!(is_deny(&run("git show HEAD:config/.ssh/x", &[])));
+    }
+
+    #[test]
+    fn deny_reason_names_the_path() {
+        match run("cat < .env", &[]) {
+            Verdict::Deny { reason } => assert_eq!(reason, "cat: protected path \".env\""),
+            other => panic!("{other:?}"),
+        }
+        match run("ls && cat ~/.ssh/id_rsa", &[]) {
+            Verdict::Deny { reason } => {
+                assert!(
+                    reason.contains("protected path \"~/.ssh/id_rsa\""),
+                    "{reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn brace_expansion() {
+        let ex = |w: &str| super::expand_braces(w);
+        assert_eq!(ex("a"), Some(vec!["a".into()]));
+        assert_eq!(ex("{a,b}c"), Some(vec!["ac".into(), "bc".into()]));
+        assert_eq!(
+            ex("{a,b{c,d}}"),
+            Some(vec!["a".into(), "bc".into(), "bd".into()])
+        );
+        assert_eq!(ex("{a}"), Some(vec!["{a}".into()]));
+        assert_eq!(ex("{a,b"), Some(vec!["{a,b".into()]));
+        assert_eq!(ex("{1..3}"), None);
+        assert_eq!(ex("{a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}{o,p}{q,r}"), None);
+    }
+
+    #[test]
+    fn glob_compatibility() {
+        let pats = default_deny_paths();
+        let could = |t: &str| super::could_match_deny(t, &pats);
+        assert!(could(".e*") && could("id_*") && could("*") && could("*.p?m"));
+        assert!(!could("*.rs") && !could("?.x") && !could("src/*.rs") && !could("plain"));
+        assert!(could("foo*") && !could("[abc].txt"));
     }
 
     #[test]
