@@ -220,6 +220,50 @@ pub struct AiSettings {
     pub models: AiModels,
     /// The per-repository settings.
     pub repos: Vec<RepoAiSettings>,
+    /// How the bash tool decides what runs without asking.
+    pub auto_approve: AutoApproveSettings,
+}
+
+/// The `[ai.auto_approve]` table: the bash approval engine's knobs.
+///
+/// `capabilities` names opt-in rule policies (the mapping to the engine's
+/// policies lives in `ai::approval_setup`, which is unix-only). Never put a
+/// secret here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoApproveSettings {
+    /// Rule-based auto-approval; denied secret paths apply either way.
+    pub enabled: bool,
+    /// Consult the local command classifier for commands the rules cannot
+    /// vouch for. Off until the classifier is evaluated.
+    pub local_classifier: bool,
+    /// How long the classifier may take before the command asks instead;
+    /// clamped by [`AutoApproveSettings::timeout`].
+    pub classifier_timeout_ms: u64,
+    /// Path-component deny patterns on top of the built-in ones.
+    pub deny_paths: Vec<String>,
+    /// Opt-in rule policies: `git:add`, `git:commit`, `git:restore-staged`,
+    /// `git:tag`, `cargo:local`, `help-bypass`.
+    pub capabilities: Vec<String>,
+}
+
+impl Default for AutoApproveSettings {
+    fn default() -> AutoApproveSettings {
+        AutoApproveSettings {
+            enabled: true,
+            local_classifier: false,
+            classifier_timeout_ms: 500,
+            deny_paths: Vec::new(),
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+impl AutoApproveSettings {
+    /// The classifier timeout, clamped to 50 ms ..= 5 s.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.classifier_timeout_ms.clamp(50, 5000))
+    }
 }
 
 impl Default for AiSettings {
@@ -232,6 +276,7 @@ impl Default for AiSettings {
             providers: Vec::new(),
             models: AiModels::default(),
             repos: Vec::new(),
+            auto_approve: AutoApproveSettings::default(),
         }
     }
 }
@@ -364,6 +409,67 @@ impl Settings {
 mod tests {
     use super::*;
     use crate::test_support::tempdir;
+
+    #[test]
+    fn old_settings_toml_loads_with_auto_approve_defaults() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[ai]\nmax_parallel_reviewers = 3\n",
+        )
+        .unwrap();
+        let s = Settings::load_or_default(dir.path());
+        assert_eq!(s.ai.max_parallel_reviewers, 3);
+        assert!(s.ai.auto_approve.enabled);
+        assert!(!s.ai.auto_approve.local_classifier);
+        assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 500);
+        assert!(s.ai.auto_approve.deny_paths.is_empty());
+        assert!(s.ai.auto_approve.capabilities.is_empty());
+    }
+
+    #[test]
+    fn auto_approve_round_trip_preserves_values() {
+        let dir = tempdir();
+        let mut s = Settings::default();
+        s.ai.auto_approve = AutoApproveSettings {
+            enabled: false,
+            local_classifier: true,
+            classifier_timeout_ms: 1234,
+            deny_paths: vec!["secrets".into()],
+            capabilities: vec!["git:add".into(), "cargo:local".into()],
+        };
+        s.save(dir.path()).unwrap();
+        let back = Settings::load_or_default(dir.path());
+        assert_eq!(back.ai.auto_approve, s.ai.auto_approve);
+    }
+
+    #[test]
+    fn timeout_clamps() {
+        let at = |ms| AutoApproveSettings {
+            classifier_timeout_ms: ms,
+            ..AutoApproveSettings::default()
+        };
+        assert_eq!(at(0).timeout(), std::time::Duration::from_millis(50));
+        assert_eq!(at(99_999).timeout(), std::time::Duration::from_millis(5000));
+        assert_eq!(at(700).timeout(), std::time::Duration::from_millis(700));
+    }
+
+    #[test]
+    fn serialized_default_omits_nothing_secret() {
+        let raw = toml::to_string(&Settings::default()).unwrap();
+        assert!(raw.contains("[ai.auto_approve]"), "{raw}");
+        // `run_token_budget` is a number, not a secret; look at key names
+        // that would hold one.
+        for secret in ["api_key", "apikey", "secret", "password", "token ="] {
+            assert!(!raw.to_lowercase().contains(secret), "{secret}: {raw}");
+        }
+        let table = raw.split("[ai.auto_approve]").nth(1).unwrap();
+        let table = table.split("\n[").next().unwrap();
+        assert!(
+            !table.contains("key") && !table.contains("token"),
+            "{table}"
+        );
+    }
 
     #[test]
     fn code_font_size_is_clamped_to_the_offered_sizes() {
