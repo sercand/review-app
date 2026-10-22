@@ -363,9 +363,29 @@ fn unwrap_env(seg: &Segment) -> Option<Unwrapped> {
             return None;
         }
         match argv[i].as_str() {
-            "-" | "-i" | "--ignore-environment" => i += 1,
-            "-u" | "-C" | "--unset" | "--chdir" => i += 2,
-            t if t.starts_with("--unset=") || t.starts_with("--chdir=") => i += 1,
+            // An emptied environment unsets `$TMPDIR`/`$PATH` too, which
+            // changes what the `$TMPDIR` redirect carve-out points at.
+            "-" | "-i" | "--ignore-environment" => return Some(Unwrapped::Defer),
+            "-C" | "--chdir" => i += 2,
+            "-u" | "--unset" => {
+                if unset_is_risky(seg, i + 1) {
+                    return Some(Unwrapped::Defer);
+                }
+                i += 2;
+            }
+            t if t.starts_with("--chdir=") => i += 1,
+            t if t.starts_with("--unset=") => {
+                if is_risky_env(&t["--unset=".len()..], "") {
+                    return Some(Unwrapped::Defer);
+                }
+                i += 1;
+            }
+            t if t.starts_with("-u") && !t.starts_with("--") => {
+                if is_risky_env(&t[2..], "") {
+                    return Some(Unwrapped::Defer);
+                }
+                i += 1;
+            }
             // `-S` splits a string into a command line; anything else is
             // not understood.
             _ => return None,
@@ -384,6 +404,15 @@ fn unwrap_env(seg: &Segment) -> Option<Unwrapped> {
         return None;
     }
     Some(Unwrapped::Inner(vec![tail_segment(seg, i)]))
+}
+
+/// Whether the `env -u NAME` operand at `argv[at]` is missing, dynamic or a
+/// variable the engine treats as risky (unsetting it changes behaviour).
+fn unset_is_risky(seg: &Segment, at: usize) -> bool {
+    match seg.argv.get(at) {
+        Some(name) => seg.is_dynamic(at) || is_risky_env(name, ""),
+        None => true,
+    }
 }
 
 /// `time [-p] cmd…`. Other flags (`-o FILE` writes a report) are not
@@ -928,6 +957,65 @@ mod tests {
                 Decision::Defer,
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn env_cannot_unset_or_clear_risky_vars() {
+        let all = Named("any", Some(PolicyVerdict::Approve));
+        let stack: [&dyn SegmentPolicy; 1] = [&all];
+        for cmd in [
+            "env -u TMPDIR sh -c 'echo > $TMPDIR/etc/x'",
+            "env --unset=TMPDIR sh -c 'echo > $TMPDIR/x'",
+            "env --unset TMPDIR sh -c 'echo > $TMPDIR/x'",
+            "env -uTMPDIR sh -c 'echo > $TMPDIR/x'",
+            "env -i sh -c 'echo > $TMPDIR/x'",
+            "env - sh -c 'echo > $TMPDIR/x'",
+            "env --ignore-environment ls",
+            "env -u PATH ls",
+            "env -u $V ls",
+            "env -u",
+        ] {
+            assert_ne!(
+                classify_stack(cmd, None, &stack).0,
+                Decision::Approve { source: "any" },
+                "{cmd}"
+            );
+        }
+        assert!(matches!(
+            classify_stack("env -u FOO ls", None, &stack).0,
+            Decision::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn builtins_cannot_redefine_tmpdir_or_path() {
+        for cmd in [
+            "unset TMPDIR; echo > $TMPDIR/x",
+            "unset -v TMPDIR; echo > $TMPDIR/x",
+            "unset PATH; ls",
+            "export TMPDIR=/etc; echo > $TMPDIR/x",
+            "export TMPDIR; echo > $TMPDIR/x",
+            "declare TMPDIR=/etc; echo > $TMPDIR/x",
+            "declare -x PATH=/x; ls",
+            "typeset TMPDIR=/etc; echo > $TMPDIR/x",
+            "readonly TMPDIR=/etc; echo > $TMPDIR/x",
+            "local TMPDIR=/etc; echo > $TMPDIR/x",
+            "read TMPDIR; echo > $TMPDIR/x",
+            "read -r PATH; ls",
+            "getopts a TMPDIR; echo > $TMPDIR/x",
+            "mapfile TMPDIR; echo > $TMPDIR/x",
+            "readarray TMPDIR; echo > $TMPDIR/x",
+            "printf -v TMPDIR /etc; echo > $TMPDIR/x",
+            "eval 'TMPDIR=/etc'; echo > $TMPDIR/x",
+            "source x; echo > $TMPDIR/x",
+            "alias ls=rm; ls",
+            "command unset TMPDIR; echo > $TMPDIR/x",
+            "builtin unset TMPDIR; echo > $TMPDIR/x",
+            "env sh -c 'unset TMPDIR; echo > $TMPDIR/x'",
+            "bash -c 'read TMPDIR; echo > $TMPDIR/x'",
+        ] {
+            assert_eq!(run(cmd, ALL_BUILTIN).0, Decision::Defer, "{cmd}");
         }
     }
 
