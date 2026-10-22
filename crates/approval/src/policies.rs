@@ -1046,6 +1046,9 @@ const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "reflog",
     "shortlog",
     "config",
+    "grep",
+    "cat-file",
+    "merge-base",
 ];
 const GIT_COMMIT_DANGEROUS: &[&str] = &["--amend", "--no-verify", "--no-gpg-sign"];
 
@@ -1072,6 +1075,11 @@ fn git_read_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
     let ok = match sub {
         "branch" => git_branch_lists(args),
         "config" => git_config_reads(args),
+        // `-O<cmd>` / `--open-files-in-pager=<cmd>` runs a command.
+        "grep" => !args.iter().any(|t| {
+            long_is(t, "open-files-in-pager") && t.len() > 3
+                || t.starts_with('-') && !t.starts_with("--") && t.contains('O')
+        }),
         "reflog" => !matches!(
             args.iter()
                 .find(|t| !t.starts_with('-'))
@@ -1690,6 +1698,18 @@ mod tests {
         assert!(approves("git branch", p));
         assert!(approves("git blame foo.rs", p));
         assert!(approves("git rev-parse HEAD", p));
+    }
+
+    #[test]
+    fn git_grep_cat_file_merge_base_read_but_pager_opt_asks() {
+        let p: &[&Policy] = &[&GIT_READ];
+        assert!(approves("git grep -n foo src", p));
+        assert!(approves("git cat-file -p abc123", p));
+        assert!(approves("git merge-base main HEAD", p));
+        assert!(defers("git grep -Osh foo", p));
+        assert!(defers("git grep -nO foo", p));
+        assert!(defers("git grep --open-files-in-pager=sh foo", p));
+        assert!(defers("git grep --open foo", p));
     }
 
     #[test]

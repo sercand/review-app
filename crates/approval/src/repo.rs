@@ -47,14 +47,23 @@ impl SegmentPolicy for RepoAllow<'_> {
         if seg.argv.is_empty() || seg.has_dynamic() {
             return None;
         }
+        // An entry matches the command words, or the line with its leading
+        // `NAME=value` words (`FOO=1 cargo test`), as written in REVIEW.md.
+        let with_assigns: Vec<String> = seg
+            .assigns
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .chain(seg.argv.iter().cloned())
+            .collect();
+        let matches = |entry: &str, line: &[String]| {
+            let mut words = entry.split_whitespace().peekable();
+            words.peek().is_some()
+                && line.len() >= entry.split_whitespace().count()
+                && words.zip(line).all(|(w, a)| w == a)
+        };
         self.0
             .iter()
-            .any(|entry| {
-                let mut words = entry.split_whitespace().peekable();
-                words.peek().is_some()
-                    && seg.argv.len() >= entry.split_whitespace().count()
-                    && words.zip(&seg.argv).all(|(w, a)| w == a)
-            })
+            .any(|e| matches(e, &seg.argv) || matches(e, &with_assigns))
             .then_some(PolicyVerdict::Approve)
     }
 }
@@ -322,6 +331,20 @@ mod tests {
         assert!(is_ask(&run("cargo", &["cargo test"])));
         assert!(is_ask(&run("cargo test", &["", "  "])));
         assert!(is_ask(&run("cargo \"test x\"", &["cargo test x"])));
+    }
+
+    #[test]
+    fn allow_entry_may_include_leading_assignment() {
+        let e = &["FOO=1 cargo test"];
+        assert!(is_run(&run("FOO=1 cargo test --locked", e), "repo-allow"));
+        assert!(is_ask(&run("FOO=2 cargo test", e)));
+        assert!(is_ask(&run("cargo test", e)));
+        assert!(is_ask(&run("FOO=1 cargo test $(evil)", e)));
+        // An entry without the assignment still matches the command words.
+        assert!(is_run(
+            &run("FOO=1 cargo test", &["cargo test"]),
+            "repo-allow"
+        ));
     }
 
     #[test]
