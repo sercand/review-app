@@ -153,3 +153,5 @@ License. The license files are in `assets/`.
 ## License
 
 [MIT](LICENSE)
+
+Small README touch to exercise the in-app AI review (smoke test).
