@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use review_approval::model_stage::{CommandClassifier, ModelOutcome};
 use shiso_core::Backend;
-use shiso_models::distilbert_cls::{Classifier, ClassifierDesc};
+use shiso_models::distilbert_cls::{Classifier, ClassifierDesc, ClassifyError};
 
 use super::calibrate::calibrate;
 
@@ -19,12 +19,31 @@ const MAX_FAILURES: u32 = 3;
 
 /// Where logits come from; a fake in tests.
 trait LogitSource: Send + Sync {
-    fn logits(&self, text: &str) -> Result<[f32; 3], String>;
+    fn logits(&self, text: &str) -> Result<[f32; 3], SourceError>;
+}
+
+/// A failed logits call. `kind` is a fixed label that is safe to log at any
+/// level; `detail` may echo the command text (a tokenizer error can), so it
+/// is only ever logged at debug.
+#[derive(Debug)]
+struct SourceError {
+    kind: &'static str,
+    detail: String,
 }
 
 impl LogitSource for Classifier {
-    fn logits(&self, text: &str) -> Result<[f32; 3], String> {
-        Classifier::logits(self, text).map_err(|e| e.to_string())
+    fn logits(&self, text: &str) -> Result<[f32; 3], SourceError> {
+        Classifier::logits(self, text).map_err(|e| SourceError {
+            kind: match &e {
+                ClassifyError::BadConfig(_) => "bad config",
+                ClassifyError::MissingTensor(_) => "missing tensor",
+                ClassifyError::BadTensor { .. } => "bad tensor",
+                ClassifyError::Tokenizer(_) => "tokenizer",
+                ClassifyError::Device(_) => "device",
+                ClassifyError::Io(_) => "io",
+            },
+            detail: e.to_string(),
+        })
     }
 }
 
@@ -32,7 +51,9 @@ pub struct ShisoClassifier {
     source: Box<dyn LogitSource>,
     /// Set while a call is running; a second caller does not queue behind it.
     busy: AtomicBool,
-    /// Consecutive failed calls; a success resets it.
+    /// Consecutive failed calls; a success resets it. At `MAX_FAILURES` the
+    /// classifier answers `Unavailable` for the rest of the session: only a
+    /// new `ShisoClassifier` (a reload) clears it.
     failures: AtomicU32,
 }
 
@@ -76,7 +97,8 @@ impl CommandClassifier for ShisoClassifier {
                 calibrate(logits)
             }
             Ok(Err(e)) => {
-                tracing::warn!("local classifier call failed: {e}");
+                tracing::warn!("local classifier call failed: {}", e.kind);
+                tracing::debug!("local classifier error detail: {}", e.detail);
                 self.record_failure()
             }
             Err(_) => {
@@ -123,10 +145,41 @@ fn create_backend() -> Result<Arc<dyn Backend>, String> {
     Err("no usable GPU".into())
 }
 
+/// Whether this build has a GPU backend that can run on this machine. Cheap
+/// (no device is created), so callers can check before fetching weights.
+pub fn gpu_available() -> bool {
+    catch_unwind(probe_gpu).unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn probe_gpu() -> bool {
+    shiso_metal::metal_available()
+}
+
+#[cfg(all(target_os = "linux", feature = "local-classifier-cuda"))]
+fn probe_gpu() -> bool {
+    shiso_cuda::cuda_available()
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", feature = "local-classifier-cuda")
+)))]
+fn probe_gpu() -> bool {
+    false
+}
+
 /// Opens the backend and the model in `model_dir`. Blocking (device setup and
 /// weight upload); call it from a dedicated thread.
 pub fn load(model_dir: &Path) -> Result<ShisoClassifier, String> {
-    let backend = open_backend()?;
+    load_with_backend(open_backend()?, model_dir)
+}
+
+/// [`load`] on an already opened backend (one per process).
+pub fn load_with_backend(
+    backend: Arc<dyn Backend>,
+    model_dir: &Path,
+) -> Result<ShisoClassifier, String> {
     let classifier = catch_unwind(AssertUnwindSafe(|| {
         Classifier::open(&ClassifierDesc {
             dir: model_dir,
@@ -160,9 +213,13 @@ mod tests {
     }
 
     impl LogitSource for Script {
-        fn logits(&self, _: &str) -> Result<[f32; 3], String> {
+        fn logits(&self, _: &str) -> Result<[f32; 3], SourceError> {
             let step = self.0.lock().unwrap().pop().expect("script exhausted");
             step.unwrap_or_else(|| panic!("device exploded"))
+                .map_err(|detail| SourceError {
+                    kind: "device",
+                    detail,
+                })
         }
     }
 
@@ -180,6 +237,10 @@ mod tests {
         }
     }
 
+    // Two tests below script a panic inside `classify`; the default panic hook
+    // prints it to stderr. That noise is accepted: swapping the process-wide
+    // hook would race with every other test running in parallel and could
+    // swallow a real failure's message.
     #[test]
     fn classify_maps_errors_to_unavailable() {
         let c = Script::classifier(vec![err(), None, Some(Ok(SAFE))]);
@@ -189,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn three_failures_disable_until_success() {
+    fn three_failures_disable_for_session() {
         // Only three steps: a fourth call must not reach the source.
         let c = Script::classifier(vec![err(), err(), None]);
         for _ in 0..3 {
@@ -231,7 +292,7 @@ mod tests {
             release: Mutex<mpsc::Receiver<()>>,
         }
         impl LogitSource for Gate {
-            fn logits(&self, _: &str) -> Result<[f32; 3], String> {
+            fn logits(&self, _: &str) -> Result<[f32; 3], SourceError> {
                 self.entered.send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
                 Ok(SAFE)
