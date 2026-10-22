@@ -788,12 +788,23 @@ commands = ["cargo test", "cargo clippy", "cargo fmt --check"]
 prepare = ["cargo fetch"]       # run outside the sandbox as the user (§8.5)
 extra_write_paths = []
 extra_deny_read = []
+
+[ai.auto_approve]               # bash approval engine (§8.1)
+enabled = true                  # rules auto-run commands proven read-only
+local_classifier = false        # model stage; off until the classifier is evaluated
+classifier_timeout_ms = 500     # clamped to 50..=5000; on timeout the command asks
+deny_paths = []                 # extra path-component deny patterns, `*` suffix = prefix
+capabilities = []               # opt-in: git:add git:commit git:restore-staged git:tag cargo:local help-bypass
 ```
 
 API keys: keychain service `gh-review-desktop`, account `llm:<provider name>`.
 
 **Settings → AI** page: providers (add/edit/remove, "Test connection" makes
-one tiny request), model selection, per-repo folders and commands.
+one tiny request), model selection, per-repo folders and commands, and the
+"Auto-approve bash commands" section (the `[ai.auto_approve]` keys above). The
+classifier checkbox is disabled while no classifier is available; the model
+never approves a command in the never-approve table and any failure falls back
+to the rule engine's verdict.
 
 ## 11. Storage (SQLite)
 
