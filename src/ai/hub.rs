@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -187,6 +187,9 @@ pub struct RunHandle {
     /// The orchestrator's handle, awaited by [`AiHub::finish`] so the agents
     /// are gone before the working tree is restored.
     pipeline: Option<JoinHandle<RunStatus>>,
+    /// The agents' sandbox (their PTY shell dies with its last owner), so a
+    /// finish can wait for the shell to be gone before moving the tree.
+    sandbox: Option<Weak<dyn SandboxOps>>,
     /// The run's agent-owned temp dir, removed when the run closes.
     tmp_dir: Option<PathBuf>,
 }
@@ -220,9 +223,56 @@ impl RunHandle {
             starting: true,
             finishing: false,
             pipeline: None,
+            sandbox: None,
             tmp_dir: None,
         }
     }
+}
+
+/// Releases [`AiHub::start`]'s placeholder when the start ends by any route
+/// (return, panic, cancelled future). A no-op once the real handle replaced
+/// the placeholder.
+struct StartSlot<'a> {
+    hub: &'a AiHub,
+    key: &'a PrKey,
+}
+
+impl Drop for StartSlot<'_> {
+    fn drop(&mut self) {
+        self.hub.release_starting(self.key);
+    }
+}
+
+/// How long a finish waits for the pipeline to wind down after cancelling.
+const PIPELINE_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a finish waits for the agent shell to die once the pipeline task
+/// is gone.
+const SANDBOX_RELEASE: Duration = Duration::from_secs(10);
+
+/// Stop the pipeline task: wait up to `grace` for it to end by itself, then
+/// abort it and wait for the abort to land, so no agent is still running
+/// when the caller moves the working tree. Returns whether it had to abort.
+async fn halt_pipeline<T>(mut pipeline: JoinHandle<T>, grace: Duration) -> bool {
+    if tokio::time::timeout(grace, &mut pipeline).await.is_ok() {
+        return false;
+    }
+    pipeline.abort();
+    let _ = pipeline.await;
+    true
+}
+
+/// Wait up to `max` for every owner of the sandbox to drop it - the agent
+/// shell is killed when its last owner goes. True when it is gone.
+async fn sandbox_released(sandbox: &Weak<dyn SandboxOps>, max: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    while sandbox.strong_count() > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
 }
 
 /// One run's part of the window-close decision (spec §7.3, Task 8): what
@@ -597,7 +647,16 @@ impl AiHub {
         let replacing = {
             let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
             match runs.get(&key) {
-                Some(run) if run.live.load(Ordering::SeqCst) => {
+                // A finish restoring this PR's checkout owns the slot until
+                // it is done: replacing the entry would start a pipeline on
+                // a tree that is being reset under it.
+                Some(run) if run.finishing => {
+                    events.send(Event::Toast(
+                        "the previous AI review is still being restored".to_owned(),
+                    ));
+                    return;
+                }
+                Some(run) if run.live.load(Ordering::SeqCst) || run.starting => {
                     events.send(Event::Toast(
                         "an AI review is already running for this PR".to_owned(),
                     ));
@@ -613,17 +672,31 @@ impl AiHub {
                 }
             }
         };
+        // From here every exit - an early return, a panic, a dropped
+        // future - releases the placeholder; the real handle, once
+        // inserted, stays.
+        let _slot = StartSlot {
+            hub: self,
+            key: &key,
+        };
         if let Some(old) = replacing {
             close_run_handle(old);
         }
 
-        // Undo a checkout this start made when a later step fails; every
-        // failure path also releases the placeholder.
+        // An attach can rebind the run's session at any await point, so
+        // every event reads the cell at the moment it is sent.
+        let current = || *session_cell.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Undo a checkout this start made when a later step fails. The
+        // placeholder is held until the restore is done (the guard above
+        // releases it on return), so a Start in between cannot race it.
         let abort = |rec: CheckoutRecord, events: EventSender, message: String| {
-            self.release_starting(&key);
             let store = self.store.clone();
             async move {
-                events.send(Event::AiCheckoutFailed { session, message });
+                events.send(Event::AiCheckoutFailed {
+                    session: current(),
+                    message,
+                });
                 let outcome = tokio::task::spawn_blocking(move || restore(&rec, true, &store))
                     .await
                     .map_err(|_| "the undo was cancelled".to_string())
@@ -658,9 +731,8 @@ impl AiHub {
                 match planned {
                     Ok(plan) => plan,
                     Err(error) => {
-                        self.release_starting(&key);
                         events.send(Event::AiCheckoutFailed {
-                            session,
+                            session: current(),
                             message: error.to_string(),
                         });
                         return;
@@ -675,17 +747,15 @@ impl AiHub {
             match tokio::task::spawn_blocking(move || execute_checkout(&plan, &pr, &store)).await {
                 Ok(Ok(rec)) => rec,
                 Ok(Err(error)) => {
-                    self.release_starting(&key);
                     events.send(Event::AiCheckoutFailed {
-                        session,
+                        session: current(),
                         message: error.to_string(),
                     });
                     return;
                 }
                 Err(_) => {
-                    self.release_starting(&key);
                     events.send(Event::AiCheckoutFailed {
-                        session,
+                        session: current(),
                         message: "the checkout was cancelled".to_owned(),
                     });
                     return;
@@ -720,7 +790,7 @@ impl AiHub {
                 }
             }
             events.send(Event::AiPrepareOutput {
-                session,
+                session: current(),
                 outputs: outputs.clone(),
             });
             if let Some(failed) = outputs.iter().find(|o| o.status != 0) {
@@ -806,6 +876,7 @@ impl AiHub {
             }
         };
         let sandbox: Arc<dyn SandboxOps> = Arc::new(sandbox);
+        let sandbox_weak = Arc::downgrade(&sandbox);
 
         // 4. The frozen PR (spec §4 step 2).
         let repo = RepoRef::new(&pr.owner, &pr.name);
@@ -821,7 +892,7 @@ impl AiHub {
             Ok(snapshot) => Arc::new(snapshot),
             Err(error) => {
                 events.send(Event::Failed {
-                    session: Some(session),
+                    session: Some(current()),
                     error,
                 });
                 abort(
@@ -928,12 +999,14 @@ impl AiHub {
                 starting: false,
                 finishing: false,
                 pipeline: Some(pipeline),
+                sandbox: Some(sandbox_weak),
                 tmp_dir: Some(tmp_dir),
             },
         );
 
         let forward_events = events.clone();
         let forward_store = self.store.clone();
+        let forward_session = session_cell.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 // The run is over once the orchestrator reports its end:
@@ -943,7 +1016,7 @@ impl AiHub {
                 if matches!(event, PipelineEvent::RunEnded { .. }) {
                     live.store(false, Ordering::SeqCst);
                 }
-                let session = *session_cell.lock().unwrap_or_else(|e| e.into_inner());
+                let session = *forward_session.lock().unwrap_or_else(|e| e.into_inner());
                 // The pipeline events carry only finding ids; the UI's
                 // rows come from the store (spec §10.3).
                 let refresh = pipeline_changes_findings(&event);
@@ -971,7 +1044,10 @@ impl AiHub {
         {
             let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
             match self.snapshot_data(&key, runs.get(&key)) {
-                Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
+                Ok(snapshot) => events.send(Event::AiSnapshot {
+                    session: current(),
+                    snapshot,
+                }),
                 Err(error) => events.send(Event::Toast(format!(
                     "could not load the AI review state: {error}"
                 ))),
@@ -1138,6 +1214,7 @@ impl AiHub {
                         // put back awaits a decision, not a restore.
                         finishing: false,
                         pipeline: run.pipeline.take(),
+                        sandbox: run.sandbox.clone(),
                         tmp_dir: run.tmp_dir.clone(),
                     }))
                 }
@@ -1161,8 +1238,29 @@ impl AiHub {
             control.cancel();
         }
         run.interaction.cancel_all();
-        if let Some(pipeline) = run.pipeline.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(30), pipeline).await;
+        if let Some(pipeline) = run.pipeline.take()
+            && halt_pipeline(pipeline, PIPELINE_GRACE).await
+        {
+            // The pipeline ignored the cancel and was aborted. Its tools
+            // and the chat may still own the agent shell, which keeps
+            // running until its last owner drops: stop the chat too and wait
+            // for the shell to die, or refuse to touch the tree.
+            if let Some(chat) = run.chat_task.take() {
+                chat.abort();
+            }
+            run.chat_setup = None;
+            run.chat = None;
+            if let Some(sandbox) = run.sandbox.as_ref()
+                && !sandbox_released(sandbox, SANDBOX_RELEASE).await
+            {
+                events.send(Event::Toast(
+                    "the AI agents did not stop; the checkout was left as it is - \
+                     try finishing again in a moment"
+                        .to_owned(),
+                ));
+                self.put_back(key, run);
+                return;
+            }
         }
 
         let store = self.store.clone();
@@ -1274,18 +1372,29 @@ impl AiHub {
 
     /// Put a run back after a restore that needs a decision: the control and
     /// pipeline are already gone, but the checkout and parked prompts stay.
+    ///
+    /// Only the entry `run` was taken from is replaced: a slot another run
+    /// has since claimed is never overwritten (its checkout and agents are
+    /// not ours to evict).
     fn put_back(&self, key: &PrKey, run: RunHandle) {
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), run);
+        let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        if runs.get(key).is_none_or(|current| owns(&run, current)) {
+            runs.insert(key.clone(), run);
+        } else {
+            drop(runs);
+            close_run_handle(run);
+        }
     }
 
+    /// Remove `run`'s own entry (never one a newer run installed) and tear
+    /// the run down.
     fn close_run(&self, key: &PrKey, run: RunHandle) {
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
+        {
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            if runs.get(key).is_some_and(|current| owns(&run, current)) {
+                runs.remove(key);
+            }
+        }
         self.plans
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1341,10 +1450,21 @@ impl AiHub {
             let rec = store
                 .checkout_get(id)?
                 .ok_or_else(|| anyhow::anyhow!("no checkout record #{id}"))?;
-            restore(&rec, true, &store).map(|outcome| (rec, outcome))
+            // A failed record with no stash is not review output alone: it
+            // can come from a failed `git stash push`, where the tree holds
+            // the user's own work. Never discard there without the user
+            // looking at it (`restore` itself refuses finished records).
+            let discard = !(rec.state == CheckoutState::Failed && rec.stash_sha.is_none());
+            restore(&rec, discard, &store).map(|outcome| (rec, outcome))
         })
         .await;
         match result {
+            Ok(Err(CheckoutError::NeedsDecision(changes))) => events.send(Event::Toast(format!(
+                "the checkout has {} uncommitted change(s) and no stash was recorded, so they \
+                 may be your own work: nothing was discarded. Commit, stash or discard them \
+                 yourself, then restore again",
+                changes.len()
+            ))),
             Ok(Ok((rec, RestoreOutcome::Restored))) => events.send(Event::Toast(format!(
                 "restored {} to {}",
                 rec.repo_path.display(),
@@ -1363,6 +1483,12 @@ impl AiHub {
             Err(_) => events.send(Event::Toast("the restore was cancelled".to_owned())),
         }
     }
+}
+
+/// Whether `taken` is the handle that `slot` was split from: the run's `live`
+/// flag is created once per run and shared by the clones `finish` makes.
+fn owns(taken: &RunHandle, slot: &RunHandle) -> bool {
+    Arc::ptr_eq(&taken.live, &slot.live)
 }
 
 /// Tear down a run's leftovers: resolve anything parked, drop the chat agent,
@@ -2392,6 +2518,161 @@ mod tests {
             fx.store.checkouts_unrestored().expect("list").is_empty(),
             "the holding record is restored"
         );
+    }
+
+    // --- checkout safety ---
+
+    /// A stored record on the fixture's repo, for the recovery tests.
+    fn stored_record(
+        fx: &HubFixture,
+        state: CheckoutState,
+        stash_sha: Option<String>,
+    ) -> CheckoutRecord {
+        let mut rec = CheckoutRecord {
+            id: 0,
+            repo_path: canonical(fx),
+            repo: "acme/app".to_owned(),
+            pr_number: 7,
+            original: OriginalRef::Branch("main".to_owned()),
+            stash_sha,
+            head_sha: fx.pr.head_sha.clone(),
+            state,
+        };
+        rec.id = fx.store.checkout_begin(&rec).expect("record");
+        rec
+    }
+
+    /// A stale or double-clicked recovery dialog must not reset the tree
+    /// for a record that was already restored or replaced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_restore_ignores_finished_records() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        for state in [CheckoutState::Restored, CheckoutState::Superseded] {
+            let rec = stored_record(&fx, state, None);
+            std::fs::write(fx.clone.join("a.txt"), "typed since\n").expect("edit");
+            std::fs::write(fx.clone.join("mine.txt"), "mine\n").expect("new");
+            fx.hub.recover_restore(rec.id, &fx.tx).await;
+            wait_for(&fx.events, |e| matches!(e, Event::Toast(_)));
+            assert_eq!(
+                std::fs::read_to_string(fx.clone.join("a.txt")).unwrap(),
+                "typed since\n",
+                "{state:?} must not be reset"
+            );
+            assert!(fx.clone.join("mine.txt").exists(), "{state:?}");
+            std::fs::remove_file(fx.clone.join("mine.txt")).unwrap();
+            gitx(&fx.clone, &["checkout", "a.txt"]);
+        }
+    }
+
+    /// A failed record with no stash may sit on the user's own work (a
+    /// failed `git stash push`): recovery must not discard it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_restore_keeps_unstashed_work_of_a_failed_record() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        let rec = stored_record(&fx, CheckoutState::Failed, None);
+        std::fs::write(fx.clone.join("a.txt"), "precious\n").expect("edit");
+        std::fs::write(fx.clone.join("mine.txt"), "mine\n").expect("new");
+        fx.hub.recover_restore(rec.id, &fx.tx).await;
+        match wait_for(&fx.events, |e| matches!(e, Event::Toast(_))) {
+            Event::Toast(text) => assert!(text.contains("nothing was discarded"), "{text}"),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            std::fs::read_to_string(fx.clone.join("a.txt")).unwrap(),
+            "precious\n"
+        );
+        assert!(fx.clone.join("mine.txt").exists());
+        let held = fx.store.checkout_get(rec.id).unwrap().unwrap();
+        assert_eq!(held.state, CheckoutState::Failed, "still recoverable");
+    }
+
+    /// A Start for a PR whose finish is restoring the tree must not replace
+    /// the entry, and a handle can only remove or re-install its own slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_waits_out_a_finish_and_handles_only_touch_their_own_slot() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+        let live = {
+            let mut runs = fx.hub.runs.lock().unwrap();
+            let run = runs.get_mut(&fx.key).expect("the finished run stays");
+            run.finishing = true;
+            run.live.clone()
+        };
+
+        fx.hub
+            .start(
+                fx.client.clone(),
+                SessionId(1),
+                fx.key.clone(),
+                fx.pr.clone(),
+                snapshot_inputs(&fx.pr.head_sha),
+                RunMode::Full,
+                &fx.tx,
+            )
+            .await;
+        match wait_for(&fx.events, |e| matches!(e, Event::Toast(_))) {
+            Event::Toast(text) => assert!(text.contains("being restored"), "{text}"),
+            _ => unreachable!(),
+        }
+        {
+            let runs = fx.hub.runs.lock().unwrap();
+            let run = runs.get(&fx.key).expect("the entry is untouched");
+            assert!(Arc::ptr_eq(&run.live, &live), "the old run still owns it");
+        }
+
+        // A foreign handle can neither evict the entry nor overwrite it.
+        let foreign = RunHandle::starting(Arc::new(Mutex::new(SessionId(9))), &fx.tx);
+        fx.hub.close_run(&fx.key, foreign);
+        let foreign = RunHandle::starting(Arc::new(Mutex::new(SessionId(9))), &fx.tx);
+        fx.hub.put_back(&fx.key, foreign);
+        let runs = fx.hub.runs.lock().unwrap();
+        let run = runs.get(&fx.key).expect("still there");
+        assert!(Arc::ptr_eq(&run.live, &live));
+    }
+
+    /// A pipeline that ignores the cancel is aborted (not detached), and a
+    /// pipeline that stops by itself is left alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn halt_pipeline_aborts_a_stuck_task_and_waits_for_it() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Flag(dropped.clone());
+        let stuck = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        assert!(halt_pipeline(stuck, Duration::from_millis(50)).await);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the task is gone by the time halt returns"
+        );
+
+        let quick = tokio::spawn(async {});
+        assert!(!halt_pipeline(quick, Duration::from_secs(5)).await);
+    }
+
+    /// The agent shell lives while any owner holds the sandbox; the restore
+    /// must wait for the last owner, and give up if one never lets go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sandbox_release_waits_for_the_last_owner() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let host: Arc<dyn SandboxOps> = Arc::new(LocalHost::new(dir.path()).expect("host"));
+        let weak = Arc::downgrade(&host);
+        assert!(!sandbox_released(&weak, Duration::from_millis(60)).await);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            drop(host);
+        });
+        assert!(sandbox_released(&weak, Duration::from_secs(5)).await);
+        release.await.unwrap();
     }
 
     // --- the lifecycle (Task 8) ---

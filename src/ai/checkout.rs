@@ -96,6 +96,25 @@ pub enum CheckoutError {
     /// Nothing was stashed, recorded or touched — confirm again.
     #[error("the repository changed since the checkout was confirmed; confirm again")]
     PlanStale,
+    /// A checkout attempt failed (`cause`) and the working tree held changes
+    /// that were not part of the attempt - almost certainly the user's own
+    /// edits, made while the app was fetching. They were left untouched and
+    /// the record was marked `Failed`.
+    #[error(
+        "{cause}; the working tree has {} uncommitted change(s) made meanwhile, which were left untouched. \
+         The checkout is marked failed: restore it from the recovery dialog once those changes are dealt with",
+        .changes.len()
+    )]
+    LeftChanges {
+        /// Why the checkout attempt failed.
+        cause: String,
+        /// `git status --porcelain` lines of the changes that were kept.
+        changes: Vec<String>,
+    },
+    /// The record was already restored, or replaced by a newer one, so
+    /// restoring it again would reset the tree and re-apply its stash.
+    #[error("this checkout was already restored or replaced; nothing was changed")]
+    AlreadyFinished,
     /// The SQLite checkout record could not be written.
     #[error("could not record the checkout: {0}")]
     Store(#[from] anyhow::Error),
@@ -453,6 +472,11 @@ pub fn execute_checkout(
     };
     // Record BEFORE anything is stashed so a crash can be undone (§7.3).
     rec.id = store.checkout_begin(&rec).map_err(CheckoutError::Store)?;
+    // The tree is clean once we stashed (or it was clean), so at an abort
+    // any change is one the user made during the network-bound fetch. Only
+    // a re-review (`skip_stash`) legitimately holds the review's own output,
+    // which an abort may throw away as it always did.
+    let discard_ok = plan.skip_stash;
     if let Some(old) = &superseded {
         // Move the lock over only after the new row exists; if the
         // supersede write fails, back out the new row and report.
@@ -474,8 +498,10 @@ pub fn execute_checkout(
             // The push failed, so no stash protects the user's work: a
             // restore here would `reset --hard` + `clean -fd` with
             // `stash_sha == None` and destroy it. Leave the tree exactly as
-            // it is and mark the record Failed (best-effort) for §7.3.
-            let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+            // it is. Nothing was changed, so there is nothing to recover:
+            // close the record (best-effort) rather than leave a `Failed`
+            // row whose recovery would discard the user's own work (§7.3).
+            let _ = store.checkout_set_state(rec.id, CheckoutState::Restored);
             return Err(e);
         }
         // Track the stash by commit SHA, never `stash@{0}` (§7.1 step 4).
@@ -501,36 +527,30 @@ pub fn execute_checkout(
             .checkout_set_stash(rec.id, &sha)
             .map_err(CheckoutError::Store)
         {
-            abort_failed_checkout(&rec, store);
-            return Err(e);
+            return Err(abort_failed_checkout(&rec, store, discard_ok, e));
         }
         rec.stash_sha = Some(sha);
     }
 
     let fetch_ref = format!("pull/{}/head", pr.number);
     if let Err(e) = git(repo.as_path(), &["fetch", &plan.remote, &fetch_ref]) {
-        abort_failed_checkout(&rec, store);
-        return Err(e);
+        return Err(abort_failed_checkout(&rec, store, discard_ok, e));
     }
     if let Err(e) = git(repo.as_path(), &["checkout", "--detach", &pr.head_sha]) {
-        abort_failed_checkout(&rec, store);
-        return Err(e);
+        return Err(abort_failed_checkout(&rec, store, discard_ok, e));
     }
 
     // §7.1 step 7: verify HEAD, aborting (with restore) on mismatch.
     let head = match git(repo.as_path(), &["rev-parse", "HEAD"]) {
         Ok(head) => head.trim().to_string(),
-        Err(e) => {
-            abort_failed_checkout(&rec, store);
-            return Err(e);
-        }
+        Err(e) => return Err(abort_failed_checkout(&rec, store, discard_ok, e)),
     };
     if head != pr.head_sha {
-        abort_failed_checkout(&rec, store);
-        return Err(CheckoutError::HeadMismatch {
+        let mismatch = CheckoutError::HeadMismatch {
             expected: pr.head_sha.clone(),
             actual: head,
-        });
+        };
+        return Err(abort_failed_checkout(&rec, store, discard_ok, mismatch));
     }
 
     store
@@ -540,12 +560,32 @@ pub fn execute_checkout(
     Ok(rec)
 }
 
-/// Undo a failed checkout attempt: restore unconditionally (discarding
-/// whatever the attempt produced); if even that fails, mark the record
-/// `Failed` so crash recovery (§7.3) can pick it up.
-fn abort_failed_checkout(rec: &CheckoutRecord, store: &Store) {
-    if restore(rec, true, store).is_err() {
-        let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+/// Undo a failed checkout attempt and return the error to report. A restore
+/// that needs no discard is always safe; `discard_ok` (a re-review whose
+/// tree holds only the review's own output) allows throwing changes away.
+/// Otherwise changes found now were made by the user while we were fetching:
+/// they are left untouched, the record is marked `Failed` and the error
+/// becomes [`CheckoutError::LeftChanges`]. If the restore fails for another
+/// reason the record is likewise marked `Failed` for crash recovery (§7.3).
+fn abort_failed_checkout(
+    rec: &CheckoutRecord,
+    store: &Store,
+    discard_ok: bool,
+    cause: CheckoutError,
+) -> CheckoutError {
+    match restore(rec, discard_ok, store) {
+        Ok(_) => cause,
+        Err(CheckoutError::NeedsDecision(changes)) => {
+            let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+            CheckoutError::LeftChanges {
+                cause: cause.to_string(),
+                changes,
+            }
+        }
+        Err(_) => {
+            let _ = store.checkout_set_state(rec.id, CheckoutState::Failed);
+            cause
+        }
     }
 }
 
@@ -592,6 +632,18 @@ pub fn restore(
 ) -> Result<RestoreOutcome, CheckoutError> {
     let repo = rec.repo_path.as_path();
 
+    // The caller's copy may be stale (a double-clicked dialog, a second
+    // recovery of the same row): a finished row must never reset the tree
+    // or re-apply its stash again.
+    if let Some(current) = store.checkout_get(rec.id).map_err(CheckoutError::Store)?
+        && matches!(
+            current.state,
+            CheckoutState::Restored | CheckoutState::Superseded
+        )
+    {
+        return Err(CheckoutError::AlreadyFinished);
+    }
+
     // §7.3 step 1: changes made during the review need a decision.
     let preview = restore_preview(rec)?;
     if !preview.is_empty() && !discard {
@@ -608,7 +660,9 @@ pub fn restore(
         // Back to the exact original ref; branch names may contain slashes.
         match &rec.original {
             OriginalRef::Branch(name) => {
-                git(repo, &["checkout", name])?;
+                // `switch` has no file/branch ambiguity and `--end-of-options`
+                // keeps an odd branch name from being read as a flag.
+                git(repo, &["switch", "--end-of-options", name])?;
             }
             OriginalRef::Detached(sha) => {
                 git(repo, &["checkout", "--detach", sha])?;
@@ -622,7 +676,12 @@ pub fn restore(
                     stash_sha: sha.clone(),
                 });
             }
-            drop_our_stash(repo, sha)?;
+            // The stash is applied, so the work is back: a failed drop only
+            // leaves a stray entry. Failing here would mark the row `Failed`
+            // and a retry would apply the stash a second time.
+            if let Err(error) = drop_our_stash(repo, sha) {
+                tracing::warn!(%error, stash = %sha, "could not drop the applied stash");
+            }
         }
         Ok(RestoreOutcome::Restored)
     })();
@@ -1155,8 +1214,9 @@ mod tests {
             "no stash was created"
         );
 
-        // The single record is Failed and still holds the tree; recovery
-        // (§7.3) can see it, even though no stash was created.
+        // Nothing was changed, so the record is closed: a recoverable
+        // `Failed` row with no stash would offer to discard the user's own
+        // work, and the repo is not held by anything.
         let conn = rusqlite::Connection::open(&db).unwrap();
         let states: Vec<String> = conn
             .prepare("SELECT state FROM ai_checkout")
@@ -1165,16 +1225,136 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(states, vec!["failed".to_string()]);
-        let held = store
-            .checkout_holding(&rec_path(&clone))
-            .unwrap()
-            .expect("a failed row still holds the tree");
+        assert_eq!(states, vec!["restored".to_string()]);
+        assert!(store.checkout_holding(&rec_path(&clone)).unwrap().is_none());
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+    }
+
+    /// Bug (a): the user edits a clean tree while `git fetch` is running and
+    /// the fetch then fails; the abort must not `reset --hard` those edits.
+    #[test]
+    fn edits_made_during_a_failing_fetch_survive_the_abort() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let db = dir.path().join("ai.sqlite");
+        let store = Store::open(&db).unwrap();
+        let (_origin_dir, clone, pr) = fixture();
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        assert!(!plan.dirty);
+
+        // A local upload-pack that edits the work tree (the user typing
+        // while the network call runs) and then fails the fetch.
+        let script = dir.path().join("upload-pack.sh");
+        write_file(
+            &script,
+            &format!(
+                "#!/bin/sh\necho 'typed mid-fetch' > '{}'\necho 'new' > '{}'\nexit 1\n",
+                clone.join("a.txt").display(),
+                clone.join("new.txt").display()
+            ),
+        );
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gitx(
+            &clone,
+            &[
+                "config",
+                "remote.origin.uploadpack",
+                &script.display().to_string(),
+            ],
+        );
+
+        let err = execute_checkout(&plan, &pr, &store).expect_err("the fetch must fail");
+        match &err {
+            CheckoutError::LeftChanges { changes, .. } => assert_eq!(changes.len(), 2, "{err:?}"),
+            other => panic!("expected LeftChanges, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "typed mid-fetch\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("new.txt")).unwrap(),
+            "new\n"
+        );
+        // Still a recovery target, so the lock is not silently dropped.
+        let held = store.checkout_holding(&rec_path(&clone)).unwrap().unwrap();
         assert_eq!(held.state, CheckoutState::Failed);
-        let unrestored = store.checkouts_unrestored().unwrap();
-        assert_eq!(unrestored.len(), 1);
-        assert_eq!(unrestored[0].state, CheckoutState::Failed);
-        assert_eq!(unrestored[0].pr_number, pr.number);
+    }
+
+    /// Bug (b): a stale copy of a finished record must not reset the tree.
+    #[test]
+    fn restoring_a_finished_record_again_changes_nothing() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        let rec = execute_checkout(&plan, &pr, &store).unwrap();
+        restore(&rec, false, &store).unwrap();
+
+        write_file(&clone.join("a.txt"), "typed after the restore\n");
+        write_file(&clone.join("mine.txt"), "mine\n");
+        // `rec` is still the stale `Active` copy a double-clicked dialog has.
+        let err = restore(&rec, true, &store).expect_err("a restored row is final");
+        assert!(matches!(err, CheckoutError::AlreadyFinished), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "typed after the restore\n"
+        );
+        assert!(clone.join("mine.txt").exists());
+
+        // A superseded row is final too.
+        let id = store.checkout_begin(&rec).unwrap();
+        store
+            .checkout_set_state(id, CheckoutState::Superseded)
+            .unwrap();
+        let stale = CheckoutRecord { id, ..rec };
+        assert!(matches!(
+            restore(&stale, true, &store),
+            Err(CheckoutError::AlreadyFinished)
+        ));
+        assert!(clone.join("mine.txt").exists());
+    }
+
+    /// Bug (c): a failed `stash drop` after a successful apply is a warning,
+    /// not a failure that would make a retry apply the stash twice.
+    #[test]
+    fn failed_stash_drop_still_marks_the_record_restored() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        write_file(&clone.join("a.txt"), "mine\n");
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        let rec = execute_checkout(&plan, &pr, &store).unwrap();
+
+        // `stash apply` does not touch refs/stash; `stash drop` must.
+        let lock = clone.join(".git").join("refs").join("stash.lock");
+        std::fs::File::create(&lock).unwrap();
+        let outcome = restore(&rec, false, &store).expect("a failed drop is only a warning");
+        std::fs::remove_file(&lock).unwrap();
+
+        assert_eq!(outcome, RestoreOutcome::Restored);
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "mine\n"
+        );
+        assert!(store.checkouts_unrestored().unwrap().is_empty());
+        assert!(matches!(
+            restore(&rec, false, &store),
+            Err(CheckoutError::AlreadyFinished)
+        ));
+    }
+
+    /// A branch named like a flag must not be parsed as one on restore.
+    #[test]
+    fn restore_switches_to_a_branch_that_looks_like_a_path() {
+        let (_dir, clone, pr) = fixture();
+        let store = Store::open_in_memory().unwrap();
+        // `a.txt` is both a file and (now) a branch: plain `git checkout
+        // a.txt` would restore the file instead of switching.
+        gitx(&clone, &["branch", "a.txt"]);
+        gitx(&clone, &["checkout", "a.txt"]);
+        let plan = plan_checkout(&clone, &pr, &store).unwrap();
+        let rec = execute_checkout(&plan, &pr, &store).unwrap();
+        restore(&rec, false, &store).unwrap();
+        assert_eq!(gitx(&clone, &["symbolic-ref", "--short", "HEAD"]), "a.txt");
     }
 
     #[test]
