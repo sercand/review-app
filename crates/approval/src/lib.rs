@@ -32,6 +32,9 @@ pub enum Verdict {
     Deny { reason: String },
 }
 
+/// Longest command (in bytes) that is parsed; longer ones ask.
+pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
+
 /// Per-call configuration for [`classify`].
 pub struct ApprovalConfig<'a> {
     /// Repo-configured commands: exact line or whole-word prefix, as today.
@@ -50,7 +53,16 @@ pub struct ApprovalConfig<'a> {
 /// MKDIR_CWD, ..cfg.extra]`; the first policy with an opinion wins, and a
 /// deny anywhere in the command (wrapper contents and redirects included)
 /// denies the whole command. Anything not vouched for asks.
+///
+/// A command longer than [`MAX_COMMAND_BYTES`] (64 KiB) asks with reason
+/// "command too long" before any parsing, which bounds parse time on
+/// adversarial input.
 pub fn classify(command: &str, cfg: &ApprovalConfig<'_>) -> Verdict {
+    if command.len() > MAX_COMMAND_BYTES {
+        return Verdict::Ask {
+            reason: "command too long".into(),
+        };
+    }
     // ASCII whitespace only: bash treats U+00A0 and friends as a command name.
     if command
         .trim_matches(|c: char| c.is_ascii_whitespace())

@@ -63,7 +63,12 @@ impl SegmentPolicy for RepoAllow<'_> {
         };
         self.0
             .iter()
-            .any(|e| matches(e, &seg.argv) || matches(e, &with_assigns))
+            .any(|e| {
+                matches(e, &seg.argv)
+                    // An entry of assignments only must not vouch for any command.
+                    || (e.split_whitespace().count() > seg.assigns.len()
+                        && matches(e, &with_assigns))
+            })
             .then_some(PolicyVerdict::Approve)
     }
 }
@@ -338,6 +343,8 @@ mod tests {
         let e = &["FOO=1 cargo test"];
         assert!(is_run(&run("FOO=1 cargo test --locked", e), "repo-allow"));
         assert!(is_ask(&run("FOO=2 cargo test", e)));
+        assert!(is_ask(&run("FOO=1 rm -rf x", &["FOO=1"])));
+        assert!(is_ask(&run("FOO=1 BAR=2 rm x", &["FOO=1 BAR=2"])));
         assert!(is_ask(&run("cargo test", e)));
         assert!(is_ask(&run("FOO=1 cargo test $(evil)", e)));
         // An entry without the assignment still matches the command words.

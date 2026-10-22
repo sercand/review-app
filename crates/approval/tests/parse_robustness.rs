@@ -15,13 +15,15 @@ fn run(command: &str) -> Verdict {
     )
 }
 
-/// True when `s` has a `$(` outside single quotes and not backslash-escaped.
+/// True when `s` has a `$(` outside single quotes and not backslash-escaped
+/// (inside double quotes it still counts).
 fn contains_unquoted_cmd_sub(s: &str) -> bool {
     let c: Vec<char> = s.chars().collect();
-    let (mut i, mut single) = (0, false);
+    let (mut i, mut single, mut double) = (0, false, false);
     while i < c.len() {
         match c[i] {
-            '\'' => single = !single,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
             '\\' if !single => i += 1,
             '$' if !single && c.get(i + 1) == Some(&'(') => return true,
             _ => {}
@@ -29,6 +31,14 @@ fn contains_unquoted_cmd_sub(s: &str) -> bool {
         i += 1;
     }
     false
+}
+
+#[test]
+fn reference_check_tracks_both_quote_kinds() {
+    assert!(contains_unquoted_cmd_sub("\"'$(x)\""));
+    assert!(contains_unquoted_cmd_sub("echo $(x)"));
+    assert!(!contains_unquoted_cmd_sub("echo '$(x)'"));
+    assert!(!contains_unquoted_cmd_sub("echo \\$(x)"));
 }
 
 struct XorShift(u64);
@@ -70,10 +80,18 @@ fn assert_ask_within_a_second(s: &str) {
 }
 
 #[test]
-fn very_long_command_is_fast_and_asks() {
-    // One 100k-character unknown word, and 20k segments ending in an unknown command.
+fn over_cap_commands_ask_fast() {
+    // 100k characters: rejected by the length cap before parsing.
     assert_ask_within_a_second(&format!("xx{}", "a".repeat(100_000)));
     assert_ask_within_a_second(&format!("{}rm x", "ls ; ".repeat(20_000)));
+    assert!(matches!(run(&format!("ls {}", "a".repeat(100_000))),
+        Verdict::Ask { reason } if reason == "command too long"));
+}
+
+#[test]
+fn long_commands_below_cap_are_fast_and_ask() {
+    assert_ask_within_a_second(&format!("xx{}", "a".repeat(60_000)));
+    assert_ask_within_a_second(&format!("{}rm x", "ls ; ".repeat(12_000)));
 }
 
 #[test]
@@ -84,7 +102,7 @@ fn deeply_nested_parens_are_fast_and_ask() {
 
 #[test]
 fn deeply_nested_braces_are_fast_and_ask() {
-    let s = format!("echo {}a{}", "{".repeat(60_000), "}".repeat(60_000));
+    let s = format!("echo {}a{}", "{".repeat(30_000), "}".repeat(30_000));
     assert_ask_within_a_second(&s);
 }
 

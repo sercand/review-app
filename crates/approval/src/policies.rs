@@ -1076,8 +1076,12 @@ fn git_read_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
         "branch" => git_branch_lists(args),
         "config" => git_config_reads(args),
         // `-O<cmd>` / `--open-files-in-pager=<cmd>` runs a command.
+        // `--textconv` / `--filters` run configured converter commands.
+        "cat-file" => !args
+            .iter()
+            .any(|t| long_is(t, "textconv") || long_is(t, "filters")),
         "grep" => !args.iter().any(|t| {
-            long_is(t, "open-files-in-pager") && t.len() > 3
+            long_is(t, "open-files-in-pager")
                 || t.starts_with('-') && !t.starts_with("--") && t.contains('O')
         }),
         "reflog" => !matches!(
@@ -1710,6 +1714,10 @@ mod tests {
         assert!(defers("git grep -nO foo", p));
         assert!(defers("git grep --open-files-in-pager=sh foo", p));
         assert!(defers("git grep --open foo", p));
+        assert!(defers("git grep --o foo", p));
+        assert!(defers("git cat-file --textconv HEAD:a", p));
+        assert!(defers("git cat-file --filters HEAD:a", p));
+        assert!(defers("git cat-file --text HEAD:a", p));
     }
 
     #[test]

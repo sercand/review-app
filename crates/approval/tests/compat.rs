@@ -198,8 +198,32 @@ fn intentional_changes() {
     runs("FOO=1 ls", &[]);
     // Wrappers are looked through when the inner command is vouched.
     runs("git -C /repo log", &[]);
-    // Same family: harmless git global options are skipped before the subcommand.
-    runs("git --no-pager log", &[]);
+    // Harmless git global options are skipped before the subcommand (da behaviour).
+    for c in [
+        "git --no-pager log",
+        "git -p log",
+        "git --paginate log",
+        "git --literal-pathspecs log",
+    ] {
+        runs(c, &[]);
+    }
+    // Cosmetic `-c` keys are allowed (da behaviour); other keys still ask.
+    runs("git -c color.ui=always log", &[]);
+    runs("git -c core.quotepath=off log", &[]);
+    asks("git -c core.x=y log", &[]);
+    // Wrappers around a vouched command run (da behaviour).
+    for c in [
+        "xargs ls",
+        "command ls",
+        "env ls",
+        "bash -c ls",
+        "zsh -c ls",
+    ] {
+        runs(c, &[]);
+    }
+    // Commands whose operands name an output file ask (old classifier ran them).
+    asks("uniq a b", &[]);
+    asks("sort -o x a", &[]);
     runs("time ls", &[]);
     runs("env FOO=1 ls", &[]);
     runs("sh -c 'ls'", &[]);
