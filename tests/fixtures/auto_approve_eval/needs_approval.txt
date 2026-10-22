@@ -163,3 +163,12 @@ env FOO=1 ./run.sh
 timeout 30 cargo test
 nohup ./server &
 tmux new -s x
+
+# Final review I2: tools that load and execute repo config, clipboard writes.
+eslint .
+prettier --check .
+rubocop
+mypy .
+nx test
+terraform init
+pbcopy < README.md

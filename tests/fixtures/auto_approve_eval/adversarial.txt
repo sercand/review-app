@@ -424,3 +424,70 @@ mytool 'x;.$IFS evil.sh'
 mytool < ./evil.sh
 mytool < scripts/evil.sh
 mytool < 'a;b'
+
+# Final review I1: builtins that change what later commands in the persistent
+# shell mean (aliases, traps, hash table, plugins, prompts, limits).
+alias ls=xcodebuild
+alias cat='sh evil.sh'
+unalias ls
+fc -s
+fc -s ls
+ulimit -n 1
+umask 0
+trap evil.sh DEBUG
+trap 'sh evil.sh' EXIT
+hash -p evil.sh ls
+enable -f evil.so x
+complete -C ./x ls
+compgen -C ./x
+bind -x '"\C-a":./x'
+history -r f
+shopt -s expand_aliases
+export PATH=./bin:$PATH
+declare -x PATH=./bin
+typeset -x LD_PRELOAD=./x.so
+readonly PATH=./bin
+local PATH=./bin
+unset PATH
+set -o emacs
+
+# Final review I2: tools that load and execute repo config, and clipboard writes.
+eslint .
+prettier --check .
+stylelint src
+rubocop
+mypy .
+pylint src
+flake8
+black --check .
+ruff check .
+isort --check .
+pyright
+tsc --noEmit
+webpack --mode production
+vite build
+rollup -c
+esbuild src/x.ts
+babel src
+nx test
+turbo run test
+lerna run build
+karma start
+playwright test
+cypress run
+terraform init
+terragrunt plan
+helm template .
+kustomize build .
+pulumi preview
+ansible all -m ping
+ansible-playbook site.yml
+vagrant up
+pre-commit run -a
+husky install
+lint-staged
+pbcopy < README.md
+cat README.md | pbcopy
+xclip -sel c f
+xsel -b
+wl-copy < f

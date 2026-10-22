@@ -144,9 +144,13 @@ AI review is Unix-only for now: the sandbox has no Windows backend.
 An optional on-device model that helps decide which shell commands the agent
 may run without asking. It only sees commands the built-in rules could not
 vouch for, and it is advisory: it can let a harmless command through, but it
-never approves anything on the never-approve list (network tools,
-interpreters, scripts from the PR and so on), and if it is missing, loading or
-failing, you are asked exactly as without it. Command text never leaves your
+never approves a program on the never-approve list (network tools,
+interpreters, scripts from the PR, shell builtins that change what later
+commands mean such as `alias` or `trap`, and tools that load and run the
+repo's own config or plugins such as `eslint`, `tsc`, `terraform`), and if it
+is missing, loading or failing, you are asked exactly as without it. A tool
+that is not on the list may still be approved by the model; that part is
+advisory. Command text never leaves your
 machine.
 
 It is **off by default**: the rules alone already auto-run about 91 % of

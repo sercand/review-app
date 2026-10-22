@@ -69,6 +69,21 @@ fn read_only_alone_approves_only_recognised_read_only_forms() {
             ("wc -l < Cargo.toml", Approve),
             ("set -euo pipefail", Approve),
             ("set -- a b", Defer),
+            // Final review I1: no rule vouches for the forms that rewrite
+            // what later commands in the persistent shell mean.
+            ("alias ls=xcodebuild", Defer),
+            ("unalias ls", Defer),
+            ("fc -s", Defer),
+            ("ulimit -n 1", Defer),
+            ("umask 0", Defer),
+            ("trap evil.sh DEBUG", Defer),
+            ("hash -p evil.sh ls", Defer),
+            ("enable -f evil.so x", Defer),
+            ("complete -C ./x ls", Defer),
+            ("bind -x '\"\\C-a\":./x'", Defer),
+            ("history -r f", Defer),
+            ("eslint .", Defer),
+            ("terraform init", Defer),
         ],
     );
 }
