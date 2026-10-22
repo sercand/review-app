@@ -281,9 +281,9 @@ pub struct ReviewApp {
     write_blocked_until: Option<SystemTime>,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
-    /// Whether the keychain holds an API key per provider name, probed once
-    /// at startup and kept current by the key ops below. The cache means the
-    /// Settings AI tab never reads the keychain in a frame.
+    /// Whether the keychain holds an API key per provider name, probed by the
+    /// worker at startup and kept current by the key ops below. The cache
+    /// means the Settings AI tab never reads the keychain in a frame.
     llm_keys: BTreeMap<String, bool>,
     /// The token the next non-PR-scoped keychain op carries.
     #[cfg(unix)]
@@ -291,6 +291,11 @@ pub struct ReviewApp {
     /// The keychain ops this app is still waiting for, by token.
     #[cfg(unix)]
     ai_key_ops: BTreeMap<u64, AiKeyOpKind>,
+    /// In-flight presence probes, by token, with the provider they asked
+    /// about. A reply whose token is gone (superseded by a key write, or the
+    /// row deleted) is stale and dropped.
+    #[cfg(unix)]
+    ai_key_probes: BTreeMap<u64, String>,
     exec: Arc<ExecCtx>,
     worker: Worker,
     events: EventReceiver,
@@ -375,20 +380,9 @@ impl ReviewApp {
         };
 
         // The AI tab's Key column reads this cache, never the keychain: a
-        // keychain read blocks, and no frame may block. The key ops keep the
-        // cache current after startup; a failed probe leaves the name
-        // unknown instead of claiming "no key".
-        #[cfg(unix)]
-        let llm_keys = {
-            let mut keys = BTreeMap::new();
-            for provider in &settings.ai.providers {
-                if let Ok(key) = crate::auth::store::llm_key(store.as_ref(), &provider.name) {
-                    keys.insert(provider.name.clone(), key.is_some());
-                }
-            }
-            keys
-        };
-        #[cfg(not(unix))]
+        // keychain read blocks, and no frame may block. The worker probes the
+        // configured providers once the app is up and replies late; the cache
+        // is kept current by those replies and by the key ops below.
         let llm_keys = BTreeMap::new();
 
         // The AI hub opens the persisted AI database beside the settings;
@@ -428,7 +422,7 @@ impl ReviewApp {
             }
         }
 
-        ReviewApp {
+        let mut app = ReviewApp {
             screen: initial_screen(restored.is_some()),
             auth_state: AuthState::Idle,
             login_started: None,
@@ -454,6 +448,8 @@ impl ReviewApp {
             next_ai_key_token: 1,
             #[cfg(unix)]
             ai_key_ops: BTreeMap::new(),
+            #[cfg(unix)]
+            ai_key_probes: BTreeMap::new(),
             exec,
             worker,
             events: receiver,
@@ -476,7 +472,13 @@ impl ReviewApp {
             quit_close_sent: false,
             #[cfg(unix)]
             ai_continue_since: None,
-        }
+        };
+        // The probes go to the worker after the app is built: the keychain
+        // read never runs on the GUI thread, and the Key column shows unknown
+        // until the replies land.
+        #[cfg(unix)]
+        app.probe_key_presence();
+        app
     }
 
     /// Apply one event to the app state.
@@ -644,6 +646,14 @@ impl ReviewApp {
             // reply for an op the app no longer tracks is dropped.
             #[cfg(unix)]
             Event::AiKeyOpDone { token, result } => self.on_ai_key_op_done(token, result, now),
+            // The presence probe's answer (spec §10): fills the Key column's
+            // cache; a superseded token is dropped like any stale reply.
+            #[cfg(unix)]
+            Event::AiKeyPresenceDone {
+                token,
+                name,
+                result,
+            } => self.on_ai_key_presence(token, name, result),
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -958,8 +968,8 @@ impl ReviewApp {
 
     /// Open the settings window on a fresh copy of the current settings.
     ///
-    /// The AI tab's "stored" marks come from [`Self::llm_keys`], the cache
-    /// probed once at startup: a frame never reads the keychain.
+    /// The AI tab's "stored" marks come from [`Self::llm_keys`], the cache the
+    /// worker probes at startup: a frame never reads the keychain.
     fn open_settings(&mut self) {
         self.settings_window.open_with(&self.settings);
     }
@@ -1057,6 +1067,13 @@ impl ReviewApp {
             return;
         }
 
+        // The identity changed, so any earlier probe of either name would be
+        // answering about a different row.
+        self.supersede_key_probes(&provider.name);
+        if let Some(from) = &original {
+            self.supersede_key_probes(from);
+        }
+
         if let Some(from) = original
             .as_deref()
             .filter(|from| *from != provider.name)
@@ -1108,6 +1125,11 @@ impl ReviewApp {
                     key,
                 },
             });
+        } else {
+            // A new row (or an edited one) with no typed key: ask the worker
+            // once, so a provider with no key settles to "no key" instead of
+            // staying unknown forever.
+            self.probe_key(&provider.name);
         }
     }
 
@@ -1123,6 +1145,9 @@ impl ReviewApp {
             );
             return;
         }
+        // The row is leaving, so a probe still in flight for it must not
+        // repopulate the cache when its reply lands.
+        self.supersede_key_probes(name);
         let mut candidate = self.settings.clone();
         candidate
             .ai
@@ -1151,6 +1176,72 @@ impl ReviewApp {
         let token = self.next_ai_key_token;
         self.next_ai_key_token = self.next_ai_key_token.wrapping_add(1);
         token
+    }
+
+    /// Ask the worker whether each configured provider has a key. Called once
+    /// at startup; the replies fill the cache late, so the Key column shows
+    /// unknown until they land.
+    #[cfg(unix)]
+    fn probe_key_presence(&mut self) {
+        let names: Vec<String> = self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .map(|provider| provider.name.clone())
+            .collect();
+        for name in names {
+            self.probe_key(&name);
+        }
+    }
+
+    /// Ask the worker whether `name` has a key. A keychain read may block or
+    /// prompt, so it never runs here on the GUI thread.
+    #[cfg(unix)]
+    fn probe_key(&mut self, name: &str) {
+        let token = self.ai_key_op_token();
+        self.ai_key_probes.insert(token, name.to_owned());
+        self.worker.send(Command::AiKeyPresence {
+            token,
+            name: name.to_owned(),
+        });
+    }
+
+    /// Drop in-flight probes for `name`: a key write or a delete is about to
+    /// answer the question, so an older probe's reply would be stale.
+    #[cfg(unix)]
+    fn supersede_key_probes(&mut self, name: &str) {
+        self.ai_key_probes.retain(|_, probed| probed != name);
+    }
+
+    /// Fold one presence probe's reply in. A token this app no longer tracks
+    /// is stale and dropped, and a row deleted while the probe ran must not
+    /// repopulate the cache.
+    #[cfg(unix)]
+    fn on_ai_key_presence(&mut self, token: u64, name: String, result: Result<bool, String>) {
+        let Some(probed) = self.ai_key_probes.remove(&token) else {
+            tracing::debug!(token, "dropping a stale keychain presence reply");
+            return;
+        };
+        debug_assert_eq!(probed, name, "the reply echoes the probed name");
+        if !self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .any(|provider| provider.name == name)
+        {
+            return;
+        }
+        match result {
+            Ok(present) => {
+                self.llm_keys.insert(name, present);
+            }
+            // Unknown stays unknown rather than claiming "no key".
+            Err(error) => {
+                tracing::debug!(%error, %name, "could not probe the LLM key presence");
+            }
+        }
     }
 
     /// Fold one keychain op's reply in. A token this app no longer tracks is
@@ -1256,12 +1347,20 @@ impl ReviewApp {
         });
 
         // The presence cache follows the key: a typed key means `to` has one;
-        // otherwise it inherits whatever `from` had (or stays unknown).
+        // otherwise it inherits whatever `from` had. With neither, ask the
+        // worker rather than leave a new name unknown forever.
         let old = self.llm_keys.remove(&from);
-        if key.is_some() {
-            self.llm_keys.insert(to, true);
+        let known = if key.is_some() {
+            self.llm_keys.insert(to.clone(), true);
+            true
         } else if let Some(present) = old {
-            self.llm_keys.insert(to, present);
+            self.llm_keys.insert(to.clone(), present);
+            true
+        } else {
+            false
+        };
+        if !known {
+            self.probe_key(&to);
         }
     }
 

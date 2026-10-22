@@ -558,13 +558,13 @@ fn render_dialog(
                 rule(ui);
 
                 field_label(ui, "Name");
-                Field::new(&mut dialog.name)
-                    .hint("name")
-                    .show(ui);
+                let name_edit = Field::new(&mut dialog.name).hint("name").show(ui);
                 field_label(ui, "API");
+                let api_before = dialog.api;
                 api_combo(ui, &mut dialog.api);
+                let api_changed = dialog.api != api_before;
                 field_label(ui, "Base URL (optional)");
-                Field::new(&mut dialog.base_url)
+                let base_url_edit = Field::new(&mut dialog.base_url)
                     .icon(icons::GLOBE)
                     .hint("vendor default")
                     .show(ui);
@@ -574,7 +574,7 @@ fn render_dialog(
                     .copied()
                     .unwrap_or(false);
                 field_label(ui, "API key");
-                Field::new(&mut dialog.key_input)
+                let key_edit = Field::new(&mut dialog.key_input)
                     .icon(icons::KEY_ROUND)
                     .password(true)
                     .hint(if stored {
@@ -583,6 +583,15 @@ fn render_dialog(
                         "stored in the keychain, never in settings"
                     })
                     .show(ui);
+                if name_edit.changed()
+                    || api_changed
+                    || base_url_edit.changed()
+                    || key_edit.changed()
+                {
+                    // The refusal (e.g. Delete blocked by a model) named the
+                    // values as they were; any edit makes that message stale.
+                    dialog.error = None;
+                }
 
                 // The latest Test result for the name the dialog would save.
                 match results.get(&dialog.name) {
@@ -659,6 +668,7 @@ fn render_dialog(
                                 save.on_hover_text("fix the provider before saving")
                             };
                             if save.clicked() {
+                                dialog.error = None;
                                 outcome = Some(AiTabAction::SaveProvider {
                                     original: dialog.original.clone(),
                                     provider: candidate.clone(),

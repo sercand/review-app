@@ -395,6 +395,19 @@ pub enum Command {
         /// The change to make.
         op: KeyOp,
     },
+    /// Ask whether a provider has a key in the keychain (spec §10).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiKeyPresenceDone`],
+    /// keyed by `token`. This is the worker-side probe the Settings AI tab's
+    /// Key column reads through a cache: a keychain read blocks, so it never
+    /// runs on the UI thread.
+    #[cfg(unix)]
+    AiKeyPresence {
+        /// The requesting probe's token, echoed by the reply.
+        token: u64,
+        /// The provider name to look up.
+        name: String,
+    },
     /// Probe what repository a local folder is a clone of (spec §4 step 2).
     ///
     /// Not PR-scoped: the result arrives as [`Event::AiFolderProbed`], keyed
@@ -821,6 +834,20 @@ pub enum Event {
         token: u64,
         /// The outcome, safe to show.
         result: Result<(), String>,
+    },
+    /// The result of a [`Command::AiKeyPresence`]: whether the keychain holds
+    /// a key for `name`.
+    ///
+    /// A keychain read may prompt or block, which is why it happens on the
+    /// worker; the reply carries no key material.
+    #[cfg(unix)]
+    AiKeyPresenceDone {
+        /// The token of the [`Command::AiKeyPresence`] that asked.
+        token: u64,
+        /// The provider that was probed.
+        name: String,
+        /// `true` when a key is stored, `Err` a display-safe reason.
+        result: Result<bool, String>,
     },
     /// A PR's full AI state, replayed on attach and after a run starts
     /// (spec §10.3).
@@ -1719,6 +1746,29 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             events.send(Event::AiKeyOpDone { token, result });
         }
         #[cfg(unix)]
+        Command::AiKeyPresence { token, name } => {
+            // Not PR-scoped: the token names the request. The keychain blocks
+            // (it may prompt), so the probe runs on the blocking pool like a
+            // key op, never on the worker's async threads.
+            let store = ctx.store.clone();
+            let probe = name.clone();
+            let result = match tokio::task::spawn_blocking(move || {
+                crate::auth::store::llm_key(&*store, &probe)
+                    .map(|key| key.is_some())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!("the keychain probe failed: {error}")),
+            };
+            events.send(Event::AiKeyPresenceDone {
+                token,
+                name,
+                result,
+            });
+        }
+        #[cfg(unix)]
         Command::AiProbeFolder { token, path } => {
             // Not PR-scoped: no SessionId, the token names the request. `git`
             // runs as a child process, so the probe goes to the blocking pool
@@ -2266,6 +2316,59 @@ mod tests {
             "the token is echoed for the consumer to match"
         );
         result
+    }
+
+    /// Send one [`Command::AiKeyPresence`] through the real executor and
+    /// return whether the keychain holds a key, checking the echoed token and
+    /// name.
+    #[cfg(unix)]
+    async fn apply_key_presence(
+        store: &Arc<crate::auth::store::MemoryStore>,
+        token: u64,
+        name: &str,
+    ) -> Result<bool, String> {
+        let ctx = Arc::new(ExecCtx::new(store.clone()));
+        let (tx, rx) = event_channel();
+        execute(
+            ctx,
+            Command::AiKeyPresence {
+                token,
+                name: name.to_owned(),
+            },
+            tx,
+        )
+        .await;
+        let Some(Event::AiKeyPresenceDone {
+            token: answered,
+            name: answered_name,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the presence probe's answer");
+        };
+        assert_eq!(answered, token, "the token is echoed for the consumer");
+        assert_eq!(answered_name, name, "the probed name is echoed");
+        result
+    }
+
+    /// The presence probe reports a stored key as present and an absent one
+    /// as `false` (not an error); it never returns the key itself.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presence_probe_reports_stored_and_absent_keys() {
+        use crate::auth::store::{MemoryStore, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+
+        assert!(
+            apply_key_presence(&store, 21, "work").await.unwrap(),
+            "a stored key is present"
+        );
+        assert!(
+            !apply_key_presence(&store, 22, "home").await.unwrap(),
+            "an absent key is absent, not a failure"
+        );
     }
 
     /// A rename copies the key to the new name and leaves the old entry in
