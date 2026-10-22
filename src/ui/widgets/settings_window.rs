@@ -189,12 +189,60 @@ impl SettingsWindowState {
     }
 }
 
+/// One of the two model roles the AI tab edits (spec §10). The roles are
+/// fixed — every AI feature asks for one of them — so the table always shows
+/// both rows.
+///
+/// Defined here, next to [`SettingsAction`], because the action carries it on
+/// every platform while the tab itself is Unix-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRole {
+    /// The model that runs reviews and chat.
+    Default,
+    /// The optional cheaper model for lookup helpers.
+    Lookup,
+}
+
+impl ModelRole {
+    /// The Role column's text (mockup `ai-settings-tab.html`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelRole::Default => "Review & chat",
+            ModelRole::Lookup => "Lookup helper",
+        }
+    }
+
+    /// This role's model in `ai`, if it is configured.
+    pub fn model(self, ai: &AiSettings) -> Option<&ModelSettings> {
+        match self {
+            ModelRole::Default => ai.models.default.as_ref(),
+            ModelRole::Lookup => ai.models.lookup.as_ref(),
+        }
+    }
+
+    /// Set (or, with `None`, clear) this role's model.
+    pub fn set_model(self, ai: &mut AiSettings, model: Option<ModelSettings>) {
+        match self {
+            ModelRole::Default => ai.models.default = model,
+            ModelRole::Lookup => ai.models.lookup = model,
+        }
+    }
+}
+
 /// What the window asked the app to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsAction {
     /// Persist these edited General/Appearance settings (the app saves; a host
     /// change ends the session). AI settings are untouched.
     Apply(SettingsVm),
+    /// Commit one AI model role (spec §10). `None` clears the role (only
+    /// meaningful for the optional lookup helper); no keychain is involved.
+    SaveModel {
+        /// The role being edited.
+        role: ModelRole,
+        /// The model to store, or `None` to clear the role.
+        model: Option<ModelSettings>,
+    },
     /// Commit one AI provider row (spec §10): a new row, an edit, or a rename.
     /// `original` is the row's name before the edit; `key` is a key typed in
     /// the dialog, never a stored one.
@@ -229,6 +277,7 @@ pub enum SettingsAction {
 impl From<AiTabAction> for SettingsAction {
     fn from(action: AiTabAction) -> SettingsAction {
         match action {
+            AiTabAction::SaveModel { role, model } => SettingsAction::SaveModel { role, model },
             AiTabAction::SaveProvider {
                 original,
                 provider,

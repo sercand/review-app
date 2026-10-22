@@ -21,10 +21,10 @@ use crate::state::pr_list::PrListState;
 use crate::test_support::{line_anchor, loaded, meta, pr_summary, repo};
 use crate::ui::screens::{login, pr_detail, pr_list};
 #[cfg(unix)]
-use crate::ui::widgets::settings_ai_tab::ProviderDialog;
-#[cfg(unix)]
-use crate::ui::widgets::settings_window::SettingsTab;
+use crate::ui::widgets::settings_ai_tab::{ModelDialog, ProviderDialog};
 use crate::ui::widgets::settings_window::{self, AccountInfo, SettingsWindowState};
+#[cfg(unix)]
+use crate::ui::widgets::settings_window::{ModelRole, SettingsTab};
 use crate::ui::{fonts, theme};
 
 const SIZE: [f32; 2] = [1440.0, 900.0];
@@ -965,6 +965,8 @@ fn shots() {
             let settings_for_shot = ai_settings.clone();
             let keys_for_shot = keys.clone();
             let scopes_for_dialog = scopes_ai.clone();
+            let scopes_for_models = scopes_ai.clone();
+            let scopes_for_model_dialog = scopes_ai.clone();
             let h = harness_sized(dark, SIZE, move |ui| {
                 pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -1032,6 +1034,83 @@ fn shots() {
                 );
             });
             save_after(h, &format!("settings-ai-provider-dialog-{t}"), 8);
+
+            // The Models table below the providers (spec §10, Task 6): two
+            // fixed roles, both filled like the approved mockup.
+            let mut models = SettingsWindowState::default();
+            models.open_with(&ai_settings);
+            models.tab = SettingsTab::Ai;
+            models
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut models,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_models,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-models-{t}"), 8);
+
+            // The model dialog over the Models table, editing the default role.
+            let mut model_dialog = SettingsWindowState::default();
+            model_dialog.open_with(&ai_settings);
+            model_dialog.tab = SettingsTab::Ai;
+            model_dialog.ai_tab.model_dialog =
+                Some(ModelDialog::new(ModelRole::Default, &ai_settings.ai));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut model_dialog,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_model_dialog,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-model-dialog-{t}"), 8);
         }
     }
 }

@@ -27,9 +27,9 @@ use crate::persist::config_root;
 use crate::persist::session::DebouncedWriter;
 #[cfg(unix)]
 use crate::persist::settings::ProviderSettings;
-#[cfg(unix)]
-use crate::persist::settings::RepoAiSettings;
 use crate::persist::settings::Settings;
+#[cfg(unix)]
+use crate::persist::settings::{ModelSettings, RepoAiSettings};
 #[cfg(unix)]
 use crate::runtime::KeyOp;
 use crate::runtime::{
@@ -50,6 +50,8 @@ use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::review_panel::ReviewAction;
 #[cfg(unix)]
 use crate::ui::widgets::settings_ai_tab;
+#[cfg(unix)]
+use crate::ui::widgets::settings_window::ModelRole;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::title_bar;
@@ -1011,6 +1013,10 @@ impl ReviewApp {
                 // Spec §10: AI rows are saved by their own dialogs, so this
                 // action carries one row and its typed key only.
                 #[cfg(unix)]
+                SettingsAction::SaveModel { role, model } => {
+                    self.save_model(role, model, now);
+                }
+                #[cfg(unix)]
                 SettingsAction::SaveProvider {
                     original,
                     provider,
@@ -1034,12 +1040,30 @@ impl ReviewApp {
                 }
                 // The AI tab is Unix-only, so these never arise elsewhere.
                 #[cfg(not(unix))]
-                SettingsAction::SaveProvider { .. }
+                SettingsAction::SaveModel { .. }
+                | SettingsAction::SaveProvider { .. }
                 | SettingsAction::DeleteProvider { .. }
                 | SettingsAction::TestProvider { .. } => {}
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }
         }
+    }
+
+    /// Commit one AI model role (spec §10). Nothing here touches the keychain:
+    /// a model names a provider the user already configured.
+    #[cfg(unix)]
+    fn save_model(&mut self, role: ModelRole, model: Option<ModelSettings>, now: Instant) {
+        if let Some(model) = &model
+            && let Err(error) = settings_ai_tab::validate_model(&self.settings.ai, model)
+        {
+            // The dialog keeps Save disabled on invalid input, so this is the
+            // defensive path.
+            self.toasts.push(format!("model not saved: {error}"), now);
+            return;
+        }
+        let mut candidate = self.settings.clone();
+        role.set_model(&mut candidate.ai, model);
+        self.try_save_settings(candidate, now);
     }
 
     /// Commit one AI provider row (spec §10).
