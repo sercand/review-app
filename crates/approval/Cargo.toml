@@ -1,0 +1,18 @@
+[package]
+name = "review-approval"
+description = "Pure bash command classifier: tree-sitter parse into segments, then a rule engine decides run, ask or deny."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+tree-sitter = "0.27.1"
+tree-sitter-bash = "0.25.1"
