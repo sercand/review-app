@@ -119,8 +119,8 @@ pub struct AutoApproveVm {
     /// Whether the local classifier is consulted.
     pub local_classifier: bool,
     /// Whether this build has a classifier at all. Filled by the caller;
-    /// while `false` the checkbox is disabled and apply never writes
-    /// `local_classifier = true`.
+    /// while `false` the checkbox is disabled and apply leaves the stored
+    /// `local_classifier` as it is.
     pub classifier_available: bool,
     /// The classifier timeout in milliseconds, as typed.
     pub timeout_ms: String,
@@ -185,11 +185,14 @@ impl AutoApproveVm {
         Ok(())
     }
 
-    /// Write the validated copy into `s`. The classifier flag is forced off
-    /// while no classifier is available.
+    /// Write the validated copy into `s`. The classifier flag is only written
+    /// while a classifier is available; otherwise the stored value stays.
     fn write_to(&self, s: &mut AutoApproveSettings) {
         s.enabled = self.enabled;
-        s.local_classifier = self.local_classifier && self.classifier_available;
+        // Not editable while unavailable: keep what is stored (M4).
+        if self.classifier_available {
+            s.local_classifier = self.local_classifier;
+        }
         s.classifier_timeout_ms = self
             .timeout_ms
             .trim()
@@ -995,16 +998,22 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
     });
 }
 
+/// M5: the checkbox also gates the repo's own allowed commands (`decide`
+/// turns every `Run` into an ask while it is off), so the copy says so.
+#[cfg(unix)]
+const AUTO_APPROVE_LABEL: &str =
+    "Run commands the rules prove read-only, or the repo allows, without asking";
+#[cfg(unix)]
+const AUTO_APPROVE_HINT: &str = "Off: every command asks, including the repo's allowed commands. Secret paths stay blocked either way.";
+
 /// The auto-approve section: rule-based approval, the optional classifier,
 /// extra deny patterns and the opt-in capabilities.
 #[cfg(unix)]
 fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
     let p = theme::palette_of(ui);
     ui.label(RichText::new("Auto-approve bash commands").font(fonts::semibold(13.0)));
-    ui.checkbox(
-        &mut vm.enabled,
-        "Run commands the rules prove read-only without asking",
-    );
+    ui.checkbox(&mut vm.enabled, AUTO_APPROVE_LABEL);
+    ui.label(RichText::new(AUTO_APPROVE_HINT).size(12.0).color(p.muted));
     ui.horizontal(|ui| {
         ui.add_enabled_ui(vm.classifier_available, |ui| {
             ui.checkbox(
@@ -1629,6 +1638,14 @@ mod tests {
         assert!(vm.validate().is_ok());
     }
 
+    // M5: the copy must say the repo's allowed commands are gated too.
+    #[cfg(unix)]
+    #[test]
+    fn auto_approve_copy_mentions_repo_allowed_commands() {
+        assert!(AUTO_APPROVE_LABEL.contains("repo allows"));
+        assert!(AUTO_APPROVE_HINT.contains("repo's allowed commands"));
+    }
+
     // C1: write_to/validate of auto_approve are unix-only; these assert that.
     #[cfg(unix)]
     #[test]
@@ -1673,6 +1690,19 @@ mod tests {
         vm.clone().apply(&mut settings).unwrap();
         assert!(!settings.ai.auto_approve.local_classifier);
         vm.ai.auto_approve.classifier_available = true;
+        vm.apply(&mut settings).unwrap();
+        assert!(settings.ai.auto_approve.local_classifier);
+    }
+
+    // M4: a hand-set `local_classifier = true` survives saving while the
+    // checkbox was not editable (no classifier available).
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_hand_set_local_classifier_while_unavailable() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.local_classifier = true;
+        let vm = settings_vm(&settings, &|_| false);
+        assert!(!vm.ai.auto_approve.classifier_available);
         vm.apply(&mut settings).unwrap();
         assert!(settings.ai.auto_approve.local_classifier);
     }
