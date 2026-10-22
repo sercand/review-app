@@ -96,10 +96,11 @@ On Linux and Windows, use `Ctrl` instead of `⌘`.
 
 On Unix, the app can run an AI review of an open PR. It checks the PR head
 out into the repo's local folder (stashing your uncommitted changes first),
-runs a pipeline of agents — scout, reviewers, verifier — against the checkout,
-and drafts findings as inline comments in the diff. Each draft is Keep / Edit
-/ Drop; keeping one moves it into your pending review like any other comment.
-Nothing is posted to GitHub unless you submit it yourself.
+runs a pipeline of agents — scout, reviewers, challengers, verifiers,
+assembler — against the checkout, and drafts findings as inline comments in
+the diff. Each draft is Keep / Edit / Drop; keeping one moves it into your
+pending review like any other comment. Nothing is posted to GitHub unless you
+submit it yourself.
 
 ### Setup
 
@@ -108,9 +109,8 @@ In **Settings → AI**:
 1. Add a provider (name, API type, base URL, API key) and pick a model. The
    key goes to the OS keychain, like the GitHub token.
 2. Per repository, set the local folder and the commands the agent may run
-   without asking (e.g. `cargo test`). The first time you review a repo, the
-   app proposes these from `Cargo.toml` / `package.json` / `Makefile` / CI
-   workflows and you confirm them.
+   without asking (e.g. `cargo test`). On your first review of a repo, the
+   scout agent proposes these and you confirm them.
 
 Other commands ask for approval in the AI tab, once or for the whole review.
 

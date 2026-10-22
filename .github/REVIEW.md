@@ -3,9 +3,9 @@
 GH Review (`gh-review-desktop`) is a native Rust + egui desktop app for
 reviewing GitHub pull requests: PR lists, fast diffs, inline comments and
 review submission, without a browser. The GUI thread never does I/O: the UI
-sends a `Command` to a background `Worker` (its own tokio runtime) and results
-come back as `Event`s that `ReviewApp` drains once per frame
-(`src/runtime.rs`).
+sends a `Command` to a background `Worker` (its own multi-thread tokio
+runtime) and results come back as `Event`s that `ReviewApp` drains once per
+frame (`src/runtime.rs`).
 
 ## Checks
 
