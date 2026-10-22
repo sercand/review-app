@@ -281,11 +281,34 @@ fn read_only_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
         return None;
     }
     let bin = argv0_name(&seg.argv[0]);
+    if bin == "printf" && !printf_assigns_nothing(seg) {
+        return None;
+    }
     if READ_ONLY_PURE.contains(&bin) || read_only_checked(bin, seg) {
         Some(Verdict::Approve)
     } else {
         None
     }
+}
+
+/// Deliberate divergence from da: `printf -v NAME` assigns a shell variable
+/// (`printf -v PATH /x; ls`, `printf -v TMPDIR /etc`), which would defeat the
+/// engine's environment checks. Abstain when any word before `--` is a `-v…`
+/// flag (including glued `-vX`), or when the first word (where bash looks for
+/// options) is only known at run time.
+fn printf_assigns_nothing(seg: &Segment) -> bool {
+    if seg.is_dynamic(1) {
+        return false;
+    }
+    for (i, w) in seg.argv.iter().enumerate().skip(1) {
+        if w == "--" && !seg.is_dynamic(i) {
+            break;
+        }
+        if w.starts_with("-v") {
+            return false;
+        }
+    }
+    true
 }
 
 /// Binaries on the read-only list that need their arguments inspected.
@@ -1823,5 +1846,17 @@ mod tests {
         assert!(approves("cargo --help", p));
         assert!(approves("cargo build --help", p));
         assert!(approves("terraform --help", p));
+    }
+
+    #[test]
+    fn printf_v_assignment_defers() {
+        let p: &[&Policy] = &[&READ_ONLY];
+        assert!(approves("printf '%s\\n' hi", p));
+        assert!(defers("printf -v PATH /x", p));
+        assert!(defers("printf -vPATH /x", p));
+        assert!(defers("printf -v TMPDIR /etc", p));
+        assert!(approves("printf -- -v x", p));
+        assert!(defers("printf $F x", p));
+        assert!(defers("printf -v PATH /x; ls", p));
     }
 }

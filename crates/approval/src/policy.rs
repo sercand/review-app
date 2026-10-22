@@ -1,3 +1,4 @@
+// Adapted from amenocturne/da (MIT), src/lib.rs
 //! The policy abstraction the engine consults per segment.
 //!
 //! Rule policies are plain `fn` values wrapped in [`Policy`]; policies that

@@ -568,20 +568,22 @@ pub(crate) fn argv0_name(s: &str) -> &str {
 }
 
 /// Prefixes under which a redirect target counts as "somewhere under
-/// `$TMPDIR`". The parser currently unquotes such words (`"$TMPDIR"/x`
-/// arrives as `$TMPDIR/x`); the quoted spellings are accepted too in case a
-/// target ever arrives with its source quoting. Nothing else is.
-const TMPDIR_PREFIXES: &[&str] = &["$TMPDIR/", "${TMPDIR}/", "\"$TMPDIR\"/", "\"${TMPDIR}\"/"];
+/// `$TMPDIR`". The parser unquotes such words (`"$TMPDIR"/x` arrives as
+/// `$TMPDIR/x`), so only the two unquoted spellings are needed.
+const TMPDIR_PREFIXES: &[&str] = &["$TMPDIR/", "${TMPDIR}/"];
 
 /// `$TMPDIR/…` in one of the [`TMPDIR_PREFIXES`] spellings, with a remainder
 /// that is a plain relative path: no further expansion, no quotes or
-/// backslashes, no `..` component.
+/// backslashes, no glob/brace/tilde metacharacters (bash glob-expands
+/// redirect targets, so `.[.]` would match `..`), no whitespace or control
+/// characters, no `..` component.
 fn is_tmpdir_target(target: &str) -> bool {
     let Some(rest) = TMPDIR_PREFIXES.iter().find_map(|p| target.strip_prefix(p)) else {
         return false;
     };
     !rest.is_empty()
-        && !rest.contains(['$', '`', '"', '\'', '\\'])
+        && !rest.contains(['$', '`', '"', '\'', '\\', '*', '?', '[', ']', '{', '}', '~'])
+        && !rest.chars().any(|c| c.is_whitespace() || c.is_control())
         && !rest.split('/').any(|c| c == "..")
 }
 
@@ -620,6 +622,7 @@ pub(crate) fn is_env_assignment(s: &str) -> bool {
 fn is_risky_env(name: &str, value: &str) -> bool {
     const EXACT: &[&str] = &[
         "PATH",
+        "TMPDIR",
         "IFS",
         "ENV",
         "BASH_ENV",
@@ -885,6 +888,18 @@ mod tests {
         assert!(!redirect_ok("$TMPDIR/../x"));
         assert!(!redirect_ok("$TMPDIR/a/../x"));
         assert!(!redirect_ok("$TMPDIR/.."));
+        for t in [
+            "$TMPDIR/.[.]/target/f",
+            "$TMPDIR/*",
+            "$TMPDIR/x?",
+            "$TMPDIR/[a]",
+            "$TMPDIR/{a,b}",
+            "$TMPDIR/~x",
+        ] {
+            assert!(!redirect_ok(t), "{t}");
+        }
+        assert!(!is_tmpdir_target("$TMPDIR/a\nb"));
+        assert!(!is_tmpdir_target("$TMPDIR/a\u{7}b"));
         assert!(!redirect_ok("$TMPDIR/$Y"));
         assert!(!redirect_ok("$TMPDIR/${Y}"));
         assert!(!redirect_ok("$TMPDIR"));
@@ -898,13 +913,27 @@ mod tests {
     }
 
     #[test]
-    fn tmpdir_helper_direct() {
-        for t in [
-            "$TMPDIR/x",
-            "${TMPDIR}/x",
-            "\"$TMPDIR\"/x",
-            "\"${TMPDIR}\"/x",
+    fn tmpdir_reassignment_is_risky() {
+        let all = Named("any", Some(PolicyVerdict::Approve));
+        let stack: [&dyn SegmentPolicy; 1] = [&all];
+        for cmd in [
+            "TMPDIR=$HOME/.ssh && echo k >> $TMPDIR/authorized_keys",
+            "TMPDIR=/etc sh -c 'echo > $TMPDIR/x'",
+            "env TMPDIR=/etc sh -c 'echo > $TMPDIR/x'",
+            "TMPDIR=/etc echo hi",
+            "TMPDIR=/etc",
         ] {
+            assert_eq!(
+                classify_stack(cmd, None, &stack).0,
+                Decision::Defer,
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn tmpdir_helper_direct() {
+        for t in ["$TMPDIR/x", "${TMPDIR}/x"] {
             assert!(is_tmpdir_target(t), "{t}");
         }
         for t in [
