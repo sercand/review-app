@@ -32,6 +32,13 @@ pub trait CommandClassifier: Send + Sync {
     /// (use `try_lock`, never queue behind another call), must never block
     /// indefinitely, and should return `Unavailable` instead of panicking.
     fn classify(&self, segment: &str) -> ModelOutcome;
+
+    /// `false` means the model must not influence decisions right now,
+    /// cached outcomes included (for example the user switched it off during
+    /// a run). Checked before the cache is read.
+    fn active(&self) -> bool {
+        true
+    }
 }
 
 /// Most entries held; the cache is emptied when a new key arrives at the cap.
@@ -81,7 +88,7 @@ impl SegmentPolicy for ModelPolicy<'_> {
     }
 
     fn verify(&self, seg: &Segment, _cwd: Option<&Path>) -> Option<PolicyVerdict> {
-        if seg.argv.is_empty() {
+        if seg.argv.is_empty() || !self.classifier.active() {
             return None;
         }
         let key = seg.argv.join(" ");

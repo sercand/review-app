@@ -361,3 +361,39 @@ fn overrun_stops_consulting_the_model_for_later_segments() {
     assert_eq!(slow.0.load(Ordering::SeqCst), 1);
     assert!(is_ask(&v), "{v:?}");
 }
+
+/// A classifier that can be switched off mid-run.
+struct Switchable {
+    inner: FakeClassifier,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl CommandClassifier for Switchable {
+    fn classify(&self, segment: &str) -> ModelOutcome {
+        self.inner.classify(segment)
+    }
+    fn active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn inactive_classifier_ignores_cached_outcomes_and_is_not_called() {
+    let model = Switchable {
+        inner: FakeClassifier::new(ModelOutcome::Safe),
+        active: std::sync::atomic::AtomicBool::new(true),
+    };
+    let cache = DecisionCache::new();
+    let cmd = "/usr/bin/pr -t file.txt";
+    assert!(matches!(run_with(cmd, &model, &cache), Verdict::Run { .. }));
+    assert_eq!(model.inner.calls(), 1);
+    // Cached Safe, but the model is switched off: the command asks, and
+    // there is no further call.
+    model.active.store(false, Ordering::SeqCst);
+    assert!(is_ask(&run_with(cmd, &model, &cache)));
+    assert_eq!(model.inner.calls(), 1);
+    // Back on: the cached outcome applies again.
+    model.active.store(true, Ordering::SeqCst);
+    assert!(matches!(run_with(cmd, &model, &cache), Verdict::Run { .. }));
+    assert_eq!(model.inner.calls(), 1);
+}

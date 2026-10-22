@@ -334,7 +334,13 @@ pub enum Command {
     /// Switch the local command classifier on or off. On starts the weights
     /// download if they are absent, then the GPU load; progress arrives as
     /// [`Event::ClassifierState`]. App-global, so no `SessionId`.
-    ClassifierSetEnabled(bool),
+    ClassifierSetEnabled {
+        enabled: bool,
+        /// Stamped by the UI in send order; the hub ignores a request older
+        /// than one it has seen, since the worker may run commands out of
+        /// order.
+        seq: u64,
+    },
     /// Fetch the classifier weights again after a failure (the Retry button).
     ClassifierDownload,
     /// Attach to a PR's AI review: rebinds any live run to `session` and
@@ -1617,11 +1623,12 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             }
         }
         #[cfg(unix)]
-        Command::ClassifierSetEnabled(enabled) => {
-            // Record the request now (in command order) and flip the live
-            // flag; the blocking task applies the newest request, so two
-            // commands that overtake each other still end on the last one.
-            ctx.ai.classifier_request(enabled);
+        Command::ClassifierSetEnabled { enabled, seq } => {
+            // Commands run as separate tasks and may overtake each other, so
+            // order comes from `seq` (stamped by the UI in send order): the
+            // hub drops a request older than one it has recorded, and the
+            // blocking task applies the newest recorded value.
+            ctx.ai.classifier_request(enabled, seq);
             // Switching off can free a GPU model, which is slow: keep it off
             // the async worker.
             let ctx = ctx.clone();
@@ -1634,7 +1641,7 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         Command::ClassifierDownload => ctx.ai.classifier_download(&events),
         // No AI (and no classifier) off Unix; the Settings window says so.
         #[cfg(not(unix))]
-        Command::ClassifierSetEnabled(_) | Command::ClassifierDownload => {}
+        Command::ClassifierSetEnabled { .. } | Command::ClassifierDownload => {}
         #[cfg(unix)]
         Command::AiAttach { session, key } => {
             ctx.ai.attach(session, key, &events);

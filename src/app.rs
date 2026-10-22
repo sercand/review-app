@@ -228,6 +228,8 @@ pub struct ReviewApp {
     settings_window: SettingsWindowState,
     /// Whether the once-per-start classifier enable went out (first frame).
     classifier_startup_done: bool,
+    /// Stamps `ClassifierSetEnabled` in send order (the worker may reorder).
+    classifier_seq: u64,
     settings_writer: DebouncedWriter,
     applied_theme: Option<egui::Theme>,
     settings: Settings,
@@ -390,6 +392,7 @@ impl ReviewApp {
             help_open: false,
             settings_window: SettingsWindowState::default(),
             classifier_startup_done: false,
+            classifier_seq: 0,
             settings_writer: DebouncedWriter::default(),
             applied_theme: None,
             settings,
@@ -879,6 +882,15 @@ impl ReviewApp {
         }
     }
 
+    /// Ask the worker to switch the classifier on or off, newest wins.
+    fn send_classifier_enabled(&mut self, enabled: bool) {
+        self.classifier_seq += 1;
+        self.worker.send(Command::ClassifierSetEnabled {
+            enabled,
+            seq: self.classifier_seq,
+        });
+    }
+
     /// Persist settings, reporting a failure as a toast.
     fn save_settings(&mut self, now: Instant) {
         if let Err(error) = self.settings.save(&self.config_dir) {
@@ -949,8 +961,7 @@ impl ReviewApp {
                     self.save_settings(now);
                     let classifier_on = self.settings.ai.auto_approve.local_classifier;
                     if classifier_on != classifier_was_on {
-                        self.worker
-                            .send(Command::ClassifierSetEnabled(classifier_on));
+                        self.send_classifier_enabled(classifier_on);
                     }
                     let new_names: Vec<String> = self
                         .settings
@@ -2815,7 +2826,7 @@ impl eframe::App for ReviewApp {
             &mut self.classifier_startup_done,
             self.settings.ai.auto_approve.local_classifier,
         ) {
-            self.worker.send(Command::ClassifierSetEnabled(true));
+            self.send_classifier_enabled(true);
         }
         for event in self.events.drain() {
             self.handle_event(event, now);
