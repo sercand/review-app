@@ -153,12 +153,11 @@ pub(crate) fn could_match_deny(token: &str, patterns: &[String]) -> bool {
     let pats = lowered(patterns);
     variants.iter().any(|v| {
         let tokens = components(v);
-        let braced = v != &token;
         pats.iter().any(|pat| {
             tokens.windows(pat.len()).any(|w| {
                 w.iter()
                     .zip(pat)
-                    .all(|(c, p)| (braced && component_matches(p, c)) || glob_could_match(c, p))
+                    .all(|(c, p)| component_matches(p, c) || glob_could_match(c, p))
             })
         })
     })
@@ -213,6 +212,8 @@ fn glob_could_match(comp: &str, pattern: &str) -> bool {
 }
 
 const MAX_BRACE_VARIANTS: usize = 256;
+const MAX_BRACE_WORD: usize = 4096;
+const MAX_BRACE_DEPTH: usize = 32;
 
 /// Bash brace expansion. `None` when the result is unknown or too large
 /// (sequences like `{1..3}`, more than 256 words); a brace without a
@@ -224,6 +225,9 @@ pub(crate) fn expand_braces(word: &str) -> Option<Vec<String>> {
 }
 
 fn expand_into(word: &str, out: &mut Vec<String>) -> Option<()> {
+    if word.len() > MAX_BRACE_WORD {
+        return None;
+    }
     let bytes = word.as_bytes();
     let mut from = 0;
     while let Some(rel) = word[from..].find('{') {
@@ -233,7 +237,12 @@ fn expand_into(word: &str, out: &mut Vec<String>) -> Option<()> {
         let mut close = None;
         for (i, &b) in bytes.iter().enumerate().skip(open) {
             match b {
-                b'{' => depth += 1,
+                b'{' => {
+                    depth += 1;
+                    if depth > MAX_BRACE_DEPTH {
+                        return None;
+                    }
+                }
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
@@ -511,6 +520,42 @@ mod tests {
         assert!(could(".e*") && could("id_*") && could("*") && could("*.p?m"));
         assert!(!could("*.rs") && !could("?.x") && !could("src/*.rs") && !could("plain"));
         assert!(could("foo*") && !could("[abc].txt"));
+    }
+
+    #[test]
+    fn multi_component_patterns_are_glob_checked() {
+        assert!(is_ask(&run("cat ~/Library/Keych*ns/x", &[])));
+        assert!(is_ask(&run("cat ~/Lib*/Keychains/x", &[])));
+        assert!(is_ask(&run(
+            "cat ~/Library/Keych*ns/login.keychain-db",
+            &["cat"]
+        )));
+        assert!(is_run(&run("cat ~/Library/Fonts/*.ttf", &[]), "read-only"));
+    }
+
+    #[test]
+    fn shell_options_that_enable_dotglob_do_not_run_silently() {
+        for cmd in [
+            "GLOBIGNORE=x; cat *.env",
+            "GLOBIGNORE=x; cat ~/*.aws/credentials",
+            "GLOBIGNORE=x cat *.env",
+            "env GLOBIGNORE=x cat *.env",
+            "shopt -s dotglob; cat *.env",
+            "BASHOPTS=dotglob cat *.env",
+        ] {
+            assert!(!matches!(run(cmd, &[]), Verdict::Run { .. }), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn pathological_braces_are_fast_and_could_match() {
+        let start = std::time::Instant::now();
+        let deep = format!("{}a,b{}", "{".repeat(60_000), "}".repeat(60_000));
+        assert_eq!(super::expand_braces(&deep), None);
+        let nested = format!("{}a,b{}", "{".repeat(40), "}".repeat(40));
+        assert_eq!(super::expand_braces(&nested), None);
+        assert!(is_ask(&run(&format!("cat {deep}"), &[])));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

@@ -695,6 +695,8 @@ fn is_risky_env(name: &str, value: &str) -> bool {
         "PATH",
         "TMPDIR",
         "IFS",
+        // A non-null GLOBIGNORE turns dotglob on, so `*.env` reaches `.env`.
+        "GLOBIGNORE",
         "ENV",
         "BASH_ENV",
         "SHELL",

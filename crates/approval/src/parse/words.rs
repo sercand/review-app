@@ -304,40 +304,34 @@ fn take_radix(c: &[char], radix: u32, max: usize) -> (u32, usize) {
 }
 
 /// Whether `t` (unquoted text) contains `{a,b}` or `{1..3}` style expansion.
-/// Escaped braces do not count.
+/// Escaped braces do not count. One pass with a stack of open braces, each
+/// remembering whether it has seen a top-level `,` or `..`.
 fn has_brace_expansion(t: &str) -> bool {
     let b: Vec<char> = t.chars().collect();
+    let mut open: Vec<bool> = Vec::new();
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            '\\' => i += 2,
-            '{' => {
-                let mut depth = 1;
-                let mut sep = false;
-                let mut j = i + 1;
-                while j < b.len() {
-                    match b[j] {
-                        '\\' => j += 1,
-                        '{' => depth += 1,
-                        '}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                        }
-                        ',' if depth == 1 => sep = true,
-                        '.' if depth == 1 && b.get(j + 1) == Some(&'.') => sep = true,
-                        _ => {}
-                    }
-                    j += 1;
-                }
-                if depth == 0 && sep {
+            '\\' => i += 1,
+            '{' => open.push(false),
+            '}' => {
+                if open.pop() == Some(true) {
                     return true;
                 }
-                i += 1;
             }
-            _ => i += 1,
+            ',' => {
+                if let Some(top) = open.last_mut() {
+                    *top = true;
+                }
+            }
+            '.' if b.get(i + 1) == Some(&'.') => {
+                if let Some(top) = open.last_mut() {
+                    *top = true;
+                }
+            }
+            _ => {}
         }
+        i += 1;
     }
     false
 }

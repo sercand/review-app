@@ -28,7 +28,9 @@ pub trait SegmentPolicy: Send + Sync {
     /// Stable id (e.g. `"git:read"`), reported as the approval's source.
     fn name(&self) -> &'static str;
     /// Inspect one segment: `Some(Approve)` vouches, `Some(Deny)` rejects,
-    /// `None` abstains and lets later policies speak.
+    /// `Some(Withhold)` stops every policy in the stack from approving it
+    /// (the engine checks it in its screen pass, before any policy is
+    /// consulted), `None` abstains and lets later policies speak.
     fn verify(&self, seg: &Segment, cwd: Option<&Path>) -> Option<PolicyVerdict>;
     /// For a segment this policy denied: what matched, for the reason text
     /// (e.g. `protected path ".env"`).
