@@ -805,7 +805,23 @@ fn env_print(seg: &Segment) -> bool {
 
 /// `set -e`, `set -euo pipefail`, `set +x`: shell option toggles only.
 /// `set -- …` rewrites the positional parameters and is not approved.
+/// Deliberate divergence from da: `set` is approved only for a known-safe
+/// option allowlist. `set -k` (`-o keyword`) makes bash treat later
+/// `NAME=value` arguments as environment assignments, which would bypass the
+/// risky-env screen (`set -k; git diff GIT_EXTERNAL_DIFF=evil`).
 fn set_safe(seg: &Segment) -> bool {
+    const SHORT: &str = "euxvfCnBao";
+    const NAMES: &[&str] = &[
+        "errexit",
+        "nounset",
+        "xtrace",
+        "verbose",
+        "noglob",
+        "noclobber",
+        "pipefail",
+        "allexport",
+        "braceexpand",
+    ];
     if seg.has_dynamic() {
         return false;
     }
@@ -816,18 +832,18 @@ fn set_safe(seg: &Segment) -> bool {
         let Some(letters) = t.strip_prefix('-').or_else(|| t.strip_prefix('+')) else {
             return false;
         };
-        if letters.is_empty() || !letters.chars().all(|c| c.is_ascii_alphabetic()) {
+        // `o` takes the following option name, so it must end the cluster.
+        let takes_name = letters.ends_with('o');
+        let body = letters.strip_suffix('o').unwrap_or(letters);
+        if letters.is_empty() || !body.chars().all(|c| SHORT.contains(c) && c != 'o') {
             return false;
         }
         i += 1;
-        if letters.contains('o') {
-            // `-o NAME`
-            if let Some(name) = argv.get(i)
-                && !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_lowercase())
-            {
-                i += 1;
-            }
+        if takes_name
+            && let Some(name) = argv.get(i)
+            && NAMES.contains(&name.as_str())
+        {
+            i += 1;
         }
     }
     true

@@ -225,7 +225,7 @@ pub(crate) fn expand_braces(word: &str) -> Option<Vec<String>> {
 }
 
 fn expand_into(word: &str, out: &mut Vec<String>) -> Option<()> {
-    if word.len() > MAX_BRACE_WORD {
+    if word.len() > MAX_BRACE_WORD && word.contains('{') {
         return None;
     }
     let bytes = word.as_bytes();
@@ -556,6 +556,43 @@ mod tests {
         assert_eq!(super::expand_braces(&nested), None);
         assert!(is_ask(&run(&format!("cat {deep}"), &[])));
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn set_keyword_cannot_smuggle_env_assignments() {
+        for cmd in [
+            "set -k; git diff GIT_EXTERNAL_DIFF=evil",
+            "set -k; man PAGER=evil ls",
+            "set -k\nls LD_PRELOAD=x",
+            "set -o keyword; ls",
+            "set -ek; ls",
+            "set -ko; ls",
+            "set +k; ls",
+            "set -h; ls",
+            "set -- a b",
+            "set -oe pipefail",
+        ] {
+            assert!(is_ask(&run(cmd, &[])), "{cmd}");
+        }
+        for cmd in [
+            "set -euo pipefail",
+            "set -x",
+            "set +e",
+            "set -o",
+            "set +o",
+            "set -o noclobber -x",
+            "set -B",
+            "set -a",
+        ] {
+            assert!(!is_ask(&run(cmd, &[])), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn long_words_without_braces_are_not_could_match() {
+        let long = "a".repeat(10_000);
+        assert!(is_run(&run(&format!("rg {long} src"), &[]), "read-only"));
+        assert_eq!(super::expand_braces(&long), Some(vec![long.clone()]));
     }
 
     #[test]
