@@ -657,6 +657,7 @@ impl ReviewApp {
             }
             #[cfg(unix)]
             Event::AiSnapshot { .. }
+            | Event::AiFindings { .. }
             | Event::AiCheckoutPlanned { .. }
             | Event::AiCheckoutHeld { .. }
             | Event::AiNotice { .. }
@@ -1198,6 +1199,13 @@ impl ReviewApp {
         };
         for command in commands {
             self.worker.send(command);
+        }
+        // Rebinds a live run to this session and replays the stored AI
+        // state (spec §10.2); without it findings and the AI tab stay empty.
+        #[cfg(unix)]
+        if let Some(session) = &self.session {
+            self.worker
+                .send(crate::state::pr_detail::ai_attach_command(session));
         }
         self.screen = ScreenKind::PrDetail;
     }

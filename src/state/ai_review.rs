@@ -11,7 +11,8 @@
 //! What the event surface does *not* carry, this state does not invent:
 //! [`PipelineEvent::FindingAdded`] and [`PipelineEvent::Coverage`] carry ids
 //! only, so the full [`Finding`] rows and coverage entries arrive with the
-//! next [`Event::AiSnapshot`] (on attach, and again when a run starts).
+//! next [`Event::AiSnapshot`] (on attach, and again when a run starts) or
+//! [`Event::AiFindings`] (as a live run adds and finalizes them).
 //! [`PipelineEvent::Approval`] is ignored on purpose: it announces the same
 //! approval as [`Event::AiApprovalRequest`] but in a different id space, and
 //! only the latter's id answers it.
@@ -214,6 +215,12 @@ impl AiReviewState {
     pub fn apply(&mut self, ev: &Event) {
         match ev {
             Event::AiSnapshot { snapshot, .. } => self.apply_snapshot(snapshot),
+            Event::AiFindings {
+                findings, coverage, ..
+            } => {
+                self.findings = findings.iter().map(|f| (f.id, f.clone())).collect();
+                self.coverage = coverage.clone();
+            }
             Event::AiCheckoutPlanned { plan, .. } => {
                 self.plan = Some(plan.clone());
                 if matches!(
@@ -613,8 +620,9 @@ impl AiReviewState {
                     self.timeline.push(TimelineEntry::Finding { id: *id });
                 }
             }
-            // The full finding and coverage rows arrive with the next
-            // snapshot; the card already exists from `FindingAdded`.
+            // The full finding and coverage rows arrive with the
+            // [`Event::AiFindings`] that follows; the card already exists
+            // from `FindingAdded`.
             PipelineEvent::FindingChanged { .. }
             | PipelineEvent::Coverage { .. }
             | PipelineEvent::BriefReady => {}
@@ -1582,6 +1590,30 @@ mod tests {
             st.suggestions, None,
             "an unparseable brief suggests nothing"
         );
+    }
+
+    #[test]
+    fn findings_event_replaces_rows_and_coverage() {
+        let mut st = AiReviewState::default();
+        st.apply(&pipeline(PipelineEvent::FindingAdded { id: 1 }));
+        assert!(st.findings.is_empty(), "the id event carries no row");
+        st.apply(&Event::AiFindings {
+            session: SESSION,
+            findings: vec![line_finding(1, Severity::Bug, FindingState::Draft, "a.rs")],
+            coverage: vec![coverage("a.rs", CheckResult::Ok)],
+        });
+        assert_eq!(st.findings.len(), 1);
+        assert_eq!(st.findings[&1].title, "finding 1");
+        assert_eq!(st.coverage.len(), 1);
+
+        // A later update is the whole truth, not a merge.
+        st.apply(&Event::AiFindings {
+            session: SESSION,
+            findings: vec![line_finding(2, Severity::Nit, FindingState::Draft, "b.rs")],
+            coverage: Vec::new(),
+        });
+        assert_eq!(st.findings.keys().copied().collect::<Vec<_>>(), vec![2]);
+        assert!(st.coverage.is_empty());
     }
 
     #[test]

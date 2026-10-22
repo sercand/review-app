@@ -933,6 +933,7 @@ impl AiHub {
         );
 
         let forward_events = events.clone();
+        let forward_store = self.store.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 // The run is over once the orchestrator reports its end:
@@ -943,7 +944,22 @@ impl AiHub {
                     live.store(false, Ordering::SeqCst);
                 }
                 let session = *session_cell.lock().unwrap_or_else(|e| e.into_inner());
+                // The pipeline events carry only finding ids; the UI's
+                // rows come from the store (spec §10.3).
+                let refresh = pipeline_changes_findings(&event);
                 forward_events.send(Event::AiPipeline { session, event });
+                if refresh {
+                    match findings_update(&forward_store, ai_session_id) {
+                        Ok((findings, coverage)) => forward_events.send(Event::AiFindings {
+                            session,
+                            findings,
+                            coverage,
+                        }),
+                        Err(error) => {
+                            tracing::warn!(%error, "ai hub: could not reload the findings");
+                        }
+                    }
+                }
             }
             live.store(false, Ordering::SeqCst);
             // Anything still parked (a question the user never answered)
@@ -1365,6 +1381,31 @@ fn close_run_handle(run: RunHandle) {
 }
 
 /// The display text for a recorded original ref.
+/// Whether a forwarded pipeline event changed rows the UI reads from the
+/// store: findings (added, or finalized when the run ends) and coverage.
+fn pipeline_changes_findings(event: &PipelineEvent) -> bool {
+    matches!(
+        event,
+        PipelineEvent::FindingAdded { .. }
+            | PipelineEvent::FindingChanged { .. }
+            | PipelineEvent::Coverage { .. }
+            | PipelineEvent::RunEnded { .. }
+    )
+}
+
+/// The session's current finding rows and the latest run's coverage.
+fn findings_update(
+    store: &Store,
+    session_id: i64,
+) -> anyhow::Result<(Vec<Finding>, Vec<CoverageEntry>)> {
+    let findings = store.finding_list(session_id)?;
+    let coverage = match store.latest_run(session_id)? {
+        Some(run) => store.coverage_list(run.id)?,
+        None => Vec::new(),
+    };
+    Ok((findings, coverage))
+}
+
 fn original_ref_text(original: &OriginalRef) -> String {
     match original {
         OriginalRef::Branch(name) => format!("branch {name}"),
@@ -1469,6 +1510,22 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn only_finding_and_coverage_events_refresh_the_rows() {
+        assert!(pipeline_changes_findings(&PipelineEvent::FindingAdded {
+            id: 1
+        }));
+        assert!(pipeline_changes_findings(&PipelineEvent::FindingChanged {
+            id: 1
+        }));
+        assert!(pipeline_changes_findings(&PipelineEvent::RunEnded {
+            run_id: 1,
+            status: crate::ai::events::RunStatus::Completed,
+            stop_reason: None,
+        }));
+        assert!(!pipeline_changes_findings(&PipelineEvent::BriefReady));
+    }
 
     // --- fixtures: the checkout.rs git repo, the ai_pipeline snapshot ---
 

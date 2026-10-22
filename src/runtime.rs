@@ -733,6 +733,18 @@ pub enum Event {
         /// The state to rebuild the AI tab from.
         snapshot: crate::ai::hub::AiSnapshotData,
     },
+    /// The session's full finding rows and the latest run's coverage, sent
+    /// after a live run adds or finalizes findings: the pipeline events
+    /// carry only ids (spec §10.3).
+    #[cfg(unix)]
+    AiFindings {
+        /// The session the run is bound to.
+        session: SessionId,
+        /// Every finding row, newest run included.
+        findings: Vec<crate::ai::review::Finding>,
+        /// Coverage of the latest run.
+        coverage: Vec<crate::ai::review::CoverageEntry>,
+    },
     /// A checkout plan is ready for the user to confirm (spec §4 step 2).
     #[cfg(unix)]
     AiCheckoutPlanned {

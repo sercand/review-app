@@ -755,6 +755,7 @@ impl PrSession {
             }
             #[cfg(unix)]
             Event::AiCheckoutPlanned { session, .. }
+            | Event::AiFindings { session, .. }
             | Event::AiCheckoutFailed { session, .. }
             | Event::AiCheckoutHeld { session, .. }
             | Event::AiNotice { session, .. }
@@ -1872,6 +1873,17 @@ pub fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
         owner: session.repo.owner.to_lowercase(),
         repo: session.repo.name.to_lowercase(),
         number: session.number,
+    }
+}
+
+/// The command that binds the AI review to a freshly opened `session`
+/// (spec §10.2): the hub rebinds a live run's events to this session id and
+/// answers with the stored snapshot.
+#[cfg(unix)]
+pub fn ai_attach_command(session: &PrSession) -> Command {
+    Command::AiAttach {
+        session: session.id,
+        key: pr_key(session),
     }
 }
 
@@ -4239,6 +4251,60 @@ mod tests {
             snapshot,
         });
         assert_eq!(s.pending.body, "my own summary");
+    }
+
+    /// A live run's findings reach `session.ai.findings` through
+    /// [`Event::AiFindings`], and a stale session's rows are dropped; the
+    /// draft prefill is untouched by them.
+    #[test]
+    #[cfg(unix)]
+    fn ai_findings_event_fills_session_findings() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let finding = ai_finding(
+            5,
+            FindingAnchor::Line(line_anchor("a.rs", 1)),
+            Severity::Bug,
+            FindingState::Draft,
+            "title",
+            "body",
+        );
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::FindingAdded { id: 5 },
+        });
+        assert!(s.ai.findings.is_empty(), "ids alone carry no row");
+        s.on_event(&Event::AiFindings {
+            session: SessionId(1),
+            findings: vec![finding.clone()],
+            coverage: Vec::new(),
+        });
+        assert_eq!(s.ai.findings.get(&5), Some(&finding));
+
+        s.on_event(&Event::AiFindings {
+            session: SessionId(99),
+            findings: Vec::new(),
+            coverage: Vec::new(),
+        });
+        assert_eq!(s.ai.findings.len(), 1, "a stale session is dropped");
+        assert!(s.pending.body.is_empty(), "no draft, no prefill");
+    }
+
+    /// Opening a PR must bind the AI review to the new session id.
+    #[test]
+    #[cfg(unix)]
+    fn ai_attach_command_targets_the_open_session() {
+        let (s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        match ai_attach_command(&s) {
+            Command::AiAttach { session, key } => {
+                assert_eq!(session, s.id);
+                assert_eq!(key, pr_key(&s));
+            }
+            other => panic!("expected AiAttach, got {other:?}"),
+        }
     }
 
     /// The verdict mapping the prefill uses, one-to-one with GitHub's events.
