@@ -17,7 +17,9 @@ use eframe::egui::{Popup, PopupCloseBehavior};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
-use crate::persist::settings::{ModelSettings, ProviderSettings, RepoAiSettings, Settings};
+use crate::persist::settings::{
+    AutoApproveSettings, ModelSettings, ProviderSettings, RepoAiSettings, Settings,
+};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::thread_view::avatar;
 use crate::ui::{fonts, icons, theme};
@@ -83,6 +85,119 @@ pub struct AiVm {
     pub repos: Vec<RepoAiSettings>,
     /// The latest "Test connection" outcome per provider name.
     pub test_results: BTreeMap<String, Result<String, String>>,
+    /// The `[ai.auto_approve]` table's editable copy.
+    pub auto_approve: AutoApproveVm,
+}
+
+/// The opt-in approval capabilities the window offers, with their one-line
+/// descriptions. The names are the `[ai.auto_approve].capabilities` values
+/// (mapped to rule policies in `ai::approval_setup`, which is unix-only, so
+/// they are plain strings here).
+pub const AUTO_APPROVE_CAPABILITIES: [(&str, &str); 6] = [
+    ("git:add", "git add of files inside the checkout"),
+    ("git:commit", "git commit on the current branch"),
+    ("git:restore-staged", "git restore --staged (unstage only)"),
+    ("git:tag", "creating local git tags"),
+    ("cargo:local", "cargo build, check, test and clippy"),
+    ("help-bypass", "--help and --version on any command"),
+];
+
+/// The Settings window's working copy of `[ai.auto_approve]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoApproveVm {
+    /// Rule-based auto-approval.
+    pub enabled: bool,
+    /// Whether the local classifier is consulted.
+    pub local_classifier: bool,
+    /// Whether this build has a classifier at all. Filled by the caller;
+    /// while `false` the checkbox is disabled and apply never writes
+    /// `local_classifier = true`.
+    pub classifier_available: bool,
+    /// The classifier timeout in milliseconds, as typed.
+    pub timeout_ms: String,
+    /// The extra deny patterns, one per line.
+    pub deny_paths_text: String,
+    /// Every capability with its on/off state. Names the window does not
+    /// know (from a newer settings file) are kept, so saving never drops them.
+    pub capabilities: Vec<(String, bool)>,
+}
+
+impl Default for AutoApproveVm {
+    fn default() -> Self {
+        AutoApproveVm::from_settings(&AutoApproveSettings::default())
+    }
+}
+
+impl AutoApproveVm {
+    /// The working copy of `s`; `classifier_available` starts `false`.
+    pub fn from_settings(s: &AutoApproveSettings) -> AutoApproveVm {
+        let mut capabilities: Vec<(String, bool)> = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .map(|(name, _)| ((*name).to_owned(), s.capabilities.iter().any(|c| c == name)))
+            .collect();
+        for unknown in &s.capabilities {
+            if !capabilities.iter().any(|(name, _)| name == unknown) {
+                capabilities.push((unknown.clone(), true));
+            }
+        }
+        AutoApproveVm {
+            enabled: s.enabled,
+            local_classifier: s.local_classifier,
+            classifier_available: false,
+            timeout_ms: s.classifier_timeout_ms.to_string(),
+            deny_paths_text: s.deny_paths.join("\n"),
+            capabilities,
+        }
+    }
+
+    /// The deny patterns: trimmed, empty lines dropped.
+    fn deny_paths(&self) -> Vec<String> {
+        self.deny_paths_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Reject what [`Self::write_to`] cannot store: a timeout that is not
+    /// 50..=5000 ms, and deny patterns that are not one path component.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.timeout_ms.trim().parse::<u64>() {
+            Ok(ms) if (50..=5000).contains(&ms) => {}
+            _ => return Err("classifier timeout must be 50 to 5000 ms".to_owned()),
+        }
+        for pattern in self.deny_paths() {
+            if pattern.chars().any(char::is_whitespace) {
+                return Err(format!("deny pattern \"{pattern}\" contains whitespace"));
+            }
+            if pattern.contains('/') {
+                return Err(format!(
+                    "deny pattern \"{pattern}\" must be a single path component (no /)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the validated copy into `s`. The classifier flag is forced off
+    /// while no classifier is available.
+    fn write_to(&self, s: &mut AutoApproveSettings) {
+        s.enabled = self.enabled;
+        s.local_classifier = self.local_classifier && self.classifier_available;
+        s.classifier_timeout_ms = self
+            .timeout_ms
+            .trim()
+            .parse()
+            .unwrap_or(s.classifier_timeout_ms);
+        s.deny_paths = self.deny_paths();
+        s.capabilities = self
+            .capabilities
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
 }
 
 impl AiVm {
@@ -118,6 +233,7 @@ impl AiVm {
                 ));
             }
         }
+        self.auto_approve.validate()?;
         Ok(())
     }
 }
@@ -194,6 +310,7 @@ pub fn settings_vm(s: &Settings, has_key: &dyn Fn(&str) -> bool) -> SettingsVm {
             default_model: s.ai.models.default.clone().unwrap_or_default(),
             repos: s.ai.repos.clone(),
             test_results: BTreeMap::new(),
+            auto_approve: AutoApproveVm::from_settings(&s.ai.auto_approve),
         },
     }
 }
@@ -240,6 +357,7 @@ impl SettingsVm {
                 .any(|provider| provider.name == model.provider);
         s.ai.models.default = configured.then_some(model);
         s.ai.repos = self.ai.repos;
+        self.ai.auto_approve.write_to(&mut s.ai.auto_approve);
         Ok(host_changed)
     }
 }
@@ -600,6 +718,8 @@ fn ai_section(
             ui.add_space(6.0);
             ai_model(ui, ai, actions);
             ui.add_space(6.0);
+            ai_auto_approve(ui, &mut ai.auto_approve);
+            ui.add_space(6.0);
             ai_repos(ui, ai, drafts);
             // The text areas are authoritative for the lists they edit;
             // applying reads them back through `ai.repos`.
@@ -856,6 +976,54 @@ fn ai_model(ui: &mut egui::Ui, ai: &mut AiVm, actions: &mut Vec<SettingsAction>)
             }
         }
     });
+}
+
+/// The auto-approve section: rule-based approval, the optional classifier,
+/// extra deny patterns and the opt-in capabilities.
+#[cfg(unix)]
+fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new("Auto-approve bash commands").font(fonts::semibold(13.0)));
+    ui.checkbox(
+        &mut vm.enabled,
+        "Run commands the rules prove read-only without asking",
+    );
+    ui.add_enabled_ui(vm.classifier_available, |ui| {
+        ui.checkbox(
+            &mut vm.local_classifier,
+            "Also ask the local classifier (experimental)",
+        );
+    });
+    ui.label(
+        RichText::new(
+            "Advisory only. It never approves network, interpreter, install or delete commands, and the sandbox remains the security boundary.",
+        )
+        .size(12.0)
+        .color(p.muted),
+    );
+    if !vm.classifier_available {
+        ui.label(
+            RichText::new("not available in this build")
+                .size(12.0)
+                .color(p.faint),
+        );
+    }
+    setting_row(ui, "Classifier timeout (ms)", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut vm.timeout_ms).desired_width(80.0));
+    });
+    text_area(
+        ui,
+        "Never let the agent touch (one pattern per line, `*` at the end matches a prefix)",
+        &mut vm.deny_paths_text,
+        "single path components, no / (for example: secrets, .env*)",
+    );
+    for (name, on) in &mut vm.capabilities {
+        let description = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .find(|(known, _)| known == name)
+            .map_or("", |(_, description)| *description);
+        ui.checkbox(on, format!("{name}  {description}"));
+    }
 }
 
 /// Whether "Test connection" may run: the provider exists, a model id is
@@ -1389,5 +1557,95 @@ mod tests {
             missing.ai.providers[0].key_input.is_empty(),
             "the probe never exposes the key itself"
         );
+    }
+
+    #[test]
+    fn vm_round_trips_settings() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve = AutoApproveSettings {
+            enabled: false,
+            local_classifier: false,
+            classifier_timeout_ms: 1234,
+            deny_paths: vec!["secrets".into(), ".env*".into()],
+            capabilities: vec![
+                "git:add".into(),
+                "cargo:local".into(),
+                "future:thing".into(),
+            ],
+        };
+        let before = settings.ai.auto_approve.clone();
+        let vm = settings_vm(&settings, &|_| false);
+        assert_eq!(vm.ai.auto_approve.timeout_ms, "1234");
+        assert_eq!(vm.ai.auto_approve.deny_paths_text, "secrets\n.env*");
+        vm.apply(&mut settings).unwrap();
+        assert_eq!(settings.ai.auto_approve, before);
+    }
+
+    #[test]
+    fn validate_rejects_bad_timeout_and_patterns() {
+        let ok = AutoApproveVm::default();
+        assert!(ok.validate().is_ok());
+        for bad in ["", "abc", "49", "5001", "-1"] {
+            let vm = AutoApproveVm {
+                timeout_ms: bad.into(),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "timeout {bad:?}");
+        }
+        for bad in ["a b", "a/b", "Library/Keychains"] {
+            let vm = AutoApproveVm {
+                deny_paths_text: format!("fine\n{bad}"),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "pattern {bad:?}");
+        }
+        let vm = AutoApproveVm {
+            timeout_ms: "50".into(),
+            deny_paths_text: "\n  secrets* \n\n".into(),
+            ..ok
+        };
+        assert!(vm.validate().is_ok());
+    }
+
+    #[test]
+    fn apply_writes_settings() {
+        let mut settings = Settings::default();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.auto_approve.enabled = false;
+        vm.ai.auto_approve.timeout_ms = "800".into();
+        vm.ai.auto_approve.deny_paths_text = " secrets \n\n.env*\n".into();
+        for (name, on) in &mut vm.ai.auto_approve.capabilities {
+            *on = name == "git:commit" || name == "help-bypass";
+        }
+        vm.apply(&mut settings).unwrap();
+        let aa = &settings.ai.auto_approve;
+        assert!(!aa.enabled);
+        assert_eq!(aa.classifier_timeout_ms, 800);
+        assert_eq!(aa.deny_paths, vec!["secrets", ".env*"]);
+        assert_eq!(aa.capabilities, vec!["git:commit", "help-bypass"]);
+    }
+
+    #[test]
+    fn invalid_auto_approve_blocks_apply_without_writing() {
+        let mut settings = Settings::default();
+        let before = settings.clone();
+        let mut vm = settings_vm(&settings, &|_| false);
+        vm.ai.auto_approve.timeout_ms = "0".into();
+        vm.ai.auto_approve.enabled = false;
+        assert!(vm.apply(&mut settings).is_err());
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn classifier_checkbox_forced_off_when_unavailable() {
+        let mut settings = Settings::default();
+        let mut vm = settings_vm(&settings, &|_| false);
+        assert!(!vm.ai.auto_approve.classifier_available);
+        vm.ai.auto_approve.local_classifier = true;
+        vm.clone().apply(&mut settings).unwrap();
+        assert!(!settings.ai.auto_approve.local_classifier);
+        vm.ai.auto_approve.classifier_available = true;
+        vm.apply(&mut settings).unwrap();
+        assert!(settings.ai.auto_approve.local_classifier);
     }
 }
