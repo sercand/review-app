@@ -794,6 +794,9 @@ fn xmllint_offline(seg: &Segment) -> bool {
         "postvalid",
         "schema",
         "relaxng",
+        "noent",
+        "schematron",
+        "catalogs",
     ];
     let args = || seg.argv.iter().skip(1);
     if args().any(|t| t.contains("://")) {
@@ -1072,7 +1075,10 @@ const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "cat-file",
     "merge-base",
 ];
-const GIT_COMMIT_DANGEROUS: &[&str] = &["--amend", "--no-verify", "--no-gpg-sign"];
+/// Long options `git commit` must not be approved with (matched with
+/// abbreviations: `--amen`, `--no-gpg-s`); `-n` (= `--no-verify`) is also
+/// rejected anywhere in a short-flag cluster.
+const GIT_COMMIT_DANGEROUS: &[&str] = &["amend", "no-verify", "no-gpg-sign"];
 
 /// git inspection: status, log, diff, show, branch (listing forms), blame,
 /// ls-files, ls-tree, rev-parse, rev-list, describe, reflog (not
@@ -1222,10 +1228,10 @@ fn git_commit_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
     if sub != "commit" {
         return None;
     }
-    if args
-        .iter()
-        .any(|t| GIT_COMMIT_DANGEROUS.contains(&t.as_str()))
-    {
+    if args.iter().any(|t| {
+        GIT_COMMIT_DANGEROUS.iter().any(|l| long_is(t, l))
+            || short_cluster(t).is_some_and(|c| c.contains('n'))
+    }) {
         return None;
     }
     Some(Verdict::Approve)
