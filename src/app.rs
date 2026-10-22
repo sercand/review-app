@@ -825,7 +825,9 @@ impl ReviewApp {
             | Event::AiApprovalRequest { .. }
             | Event::AiChat { .. }
             | Event::AiRestoreNeedsDecision { .. }
-            | Event::AiRestored { .. } => {}
+            | Event::AiRestored { .. }
+            // The Local tab's screen state arrives with Task 9's rendering.
+            | Event::RepoPrsLoaded { .. } => {}
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {

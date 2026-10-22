@@ -94,7 +94,7 @@ impl Scope {
 
 impl ScopeConstraint {
     /// The search qualifier for this constraint, if any.
-    fn qualifier(&self) -> Option<String> {
+    pub fn qualifier(&self) -> Option<String> {
         match self {
             ScopeConstraint::None => None,
             ScopeConstraint::Repo(repo) => Some(format!("repo:{repo}")),

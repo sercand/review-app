@@ -126,6 +126,21 @@ pub enum Command {
         /// The `endCursor` to fetch the page after, when paging.
         after: Option<String>,
     },
+    /// Search one repository's open PRs for the PR list's Local tab.
+    ///
+    /// Not PR-scoped: the reply is [`Event::RepoPrsLoaded`], keyed by the
+    /// generation and repo key. Unix-only with [`crate::ai`], whose linked
+    /// checkouts the tab lists.
+    #[cfg(unix)]
+    SearchRepoPrs {
+        /// The Local-repos generation that issued this search.
+        generation: u64,
+        /// The repo key, lowercased `host/owner/name`, echoed by the reply.
+        repo: String,
+        /// The search query, composed by the reducer:
+        /// `is:pr is:open repo:owner/name`.
+        query: String,
+    },
     /// Load a PR's changed files, one page at a time.
     LoadPrFiles {
         /// The session that opened the PR.
@@ -628,6 +643,18 @@ pub enum Event {
         request: u64,
         /// The classified failure.
         error: GhError,
+    },
+    /// A repo PR search answered: `Ok` carries the page, `Err` the failure.
+    /// The reply to [`Command::SearchRepoPrs`]; not PR-scoped, so the
+    /// generation and repo key identify it.
+    #[cfg(unix)]
+    RepoPrsLoaded {
+        /// The generation the search was issued at.
+        generation: u64,
+        /// The repo key the search was for, echoed from the command.
+        repo: String,
+        /// The page, or why the search failed.
+        result: Result<SearchPage, GhError>,
     },
     /// One page of a PR's changed files arrived.
     PrFilesPage {
@@ -1244,6 +1271,31 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 }),
                 Err(error) => events.send(Event::PrSearchFailed { request, error }),
             }
+        }
+        #[cfg(unix)]
+        Command::SearchRepoPrs {
+            generation,
+            repo,
+            query,
+        } => {
+            // Not PR-scoped: the generation and repo key identify the reply,
+            // and the reducer drops stale ones. A read, so the client's
+            // read-retry applies; the query is the reducer's, composed from
+            // the key via `ScopeConstraint::Repo`.
+            let Some(client) = ctx.client() else {
+                events.send(Event::RepoPrsLoaded {
+                    generation,
+                    repo,
+                    result: Err(GhError::Unauthorized),
+                });
+                return;
+            };
+            let result = client.search_prs(&query, None).await;
+            events.send(Event::RepoPrsLoaded {
+                generation,
+                repo,
+                result,
+            });
         }
         Command::LoadPrFiles {
             session,
