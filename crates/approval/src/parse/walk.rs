@@ -30,6 +30,24 @@ pub(super) const HANDLED: &[&str] = &[
     "comment",
 ];
 
+/// Words bash reserves at command position. tree-sitter only treats most of
+/// them as keywords inside their own compound statement; after `!` or `time`
+/// they come out as plain words, which must never become a simple command.
+const RESERVED: &[&str] = &[
+    "{", "}", "if", "then", "else", "elif", "fi", "while", "until", "do", "done", "for", "in",
+    "case", "esac", "select", "function", "coproc", "[[", "]]", "!",
+];
+
+/// Whether `node` (a word about to join `seg`) would sit in command position,
+/// possibly after `time [-p] [--]`, and is an unquoted reserved word.
+fn reserved_at_command_position(seg: &Segment, node: Node, src: &str) -> Result<bool, Bail> {
+    let leading = seg
+        .argv
+        .iter()
+        .all(|a| matches!(a.as_str(), "time" | "-p" | "--"));
+    Ok(leading && node.kind() == "word" && RESERVED.contains(&text(node, src)?))
+}
+
 /// The bail for a node kind with no explicit rule.
 fn bail_for(node: Node) -> Bail {
     match node.kind() {
@@ -312,12 +330,18 @@ fn command(node: Node, src: &str) -> Result<Segment, Bail> {
                     return Err(Bail::Unsupported("line_continuation"));
                 }
                 let inner = child.named_child(0).ok_or(Bail::Syntax)?;
+                if reserved_at_command_position(&seg, inner, src)? {
+                    return Err(Bail::Unsupported("reserved_word"));
+                }
                 let (v, d) = word_value(inner, src)?;
                 seg.argv.push(v);
                 seg.dynamic.push(d);
                 prev = Some((child.end_byte(), true));
             }
             kind if is_word_kind(kind) => {
+                if reserved_at_command_position(&seg, child, src)? {
+                    return Err(Bail::Unsupported("reserved_word"));
+                }
                 let (v, d) = word_value(child, src)?;
                 match (joins, prev) {
                     // `a\<newline>b` is the single word `ab`.

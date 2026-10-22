@@ -430,3 +430,25 @@ fn fixed_target_redirect_takes_following_words_as_args() {
     assert_eq!(parse("cat >&- x y"), Err(Bail::Syntax));
     assert_eq!(parse("cat <&- x y"), Err(Bail::Syntax));
 }
+
+/// tree-sitter reads `{`, `if`, ... after `!` or `time` as plain words; a
+/// reserved word in command position must never become a simple command.
+#[test]
+fn reserved_word_in_command_position_bails() {
+    for src in [
+        "! { echo hello; }",
+        "! if true; then false; fi",
+        "! while false; do echo x; done",
+        "! for i in 1; do false; done",
+        "time { echo hello; }",
+        "time -p { echo hello; }",
+        "coproc { cmd |& cat; }",
+        "ls; ! { rm x; }",
+    ] {
+        assert!(parse(src).is_err(), "{src:?} must bail");
+    }
+    // Quoted, escaped, or in argument position they are ordinary words.
+    for src in ["echo { } if fi", "'if' x", "i\\f x", "time ls", "! true"] {
+        assert!(parse(src).is_ok(), "{src:?} must parse");
+    }
+}
