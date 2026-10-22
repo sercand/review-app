@@ -258,6 +258,15 @@ fn intentional_changes() {
         asks(c, &[]);
     }
     runs("GIT_PAGER=cat git log", &[]);
+    // M4: a bare leading-metachar glob asks (it could match `*.pem` /
+    // `id_rsa*`, and it also blocks option injection via `-`-prefixed file
+    // names); a glob ending in an ordinary extension is fine.
+    for c in ["ls *", "cat src/*", "cat src/a*", "cat ?", "grep x -- *"] {
+        asks(c, &[]);
+    }
+    for c in ["ls *.rs", "cat src/a*.rs", "ls src/*.rs"] {
+        runs(c, &[]);
+    }
     runs("env FOO=1 ls", &[]);
     runs("sh -c 'ls'", &[]);
     // ...and still ask when it is not.

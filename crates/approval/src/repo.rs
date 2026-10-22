@@ -80,10 +80,24 @@ impl SegmentPolicy for RepoAllow<'_> {
 /// but only a literal component can make them a deny. Matching ignores ASCII
 /// case (macOS volumes are case-insensitive by default).
 // Adapted from amenocturne/da (MIT), src/main.rs (`custom_deny_verify`)
-#[derive(Debug, Clone, Copy)]
-pub struct DenyPaths<'a>(pub &'a [String]);
+///
+/// A bare leading-metachar glob (`ls *`, `cat src/*`) is withheld, so it asks:
+/// it could match `*.pem` or `id_rsa*`, and the same rule also blocks option
+/// injection through `-`-prefixed file names a PR might commit (M4). A glob
+/// ending in an ordinary extension no deny pattern can match (`ls *.rs`) is fine.
+#[derive(Debug, Clone)]
+pub struct DenyPaths {
+    /// The patterns split and lower-cased once, not per word (M1).
+    lowered: Vec<Vec<String>>,
+}
 
-impl DenyPaths<'_> {
+impl DenyPaths {
+    pub fn new(patterns: &[String]) -> Self {
+        DenyPaths {
+            lowered: lowered(patterns),
+        }
+    }
+
     fn words(seg: &Segment) -> impl Iterator<Item = &str> {
         seg.argv
             .iter()
@@ -93,15 +107,15 @@ impl DenyPaths<'_> {
     }
 }
 
-impl SegmentPolicy for DenyPaths<'_> {
+impl SegmentPolicy for DenyPaths {
     fn name(&self) -> &'static str {
         "deny-paths"
     }
 
     fn verify(&self, seg: &Segment, _cwd: Option<&Path>) -> Option<PolicyVerdict> {
-        if Self::words(seg).any(|w| token_matches_deny(w, self.0)) {
+        if Self::words(seg).any(|w| token_matches_deny(w, &self.lowered)) {
             Some(PolicyVerdict::Deny)
-        } else if Self::words(seg).any(|w| could_match_deny(w, self.0)) {
+        } else if Self::words(seg).any(|w| could_match_deny(w, &self.lowered)) {
             Some(PolicyVerdict::Withhold)
         } else {
             None
@@ -110,7 +124,7 @@ impl SegmentPolicy for DenyPaths<'_> {
 
     fn explain_deny(&self, seg: &Segment) -> Option<String> {
         Self::words(seg)
-            .find(|w| token_matches_deny(w, self.0))
+            .find(|w| token_matches_deny(w, &self.lowered))
             .map(|w| format!("protected path \"{w}\""))
     }
 }
@@ -131,7 +145,7 @@ fn component_matches(pattern: &str, component: &str) -> bool {
     }
 }
 
-fn lowered(patterns: &[String]) -> Vec<Vec<String>> {
+pub(crate) fn lowered(patterns: &[String]) -> Vec<Vec<String>> {
     patterns
         .iter()
         .map(|p| {
@@ -146,10 +160,10 @@ fn lowered(patterns: &[String]) -> Vec<Vec<String>> {
 
 // Adapted from amenocturne/da (MIT), src/main.rs (`token_matches_deny`)
 /// Whether some path component of `token` literally matches a deny pattern.
-pub(crate) fn token_matches_deny(token: &str, patterns: &[String]) -> bool {
+pub(crate) fn token_matches_deny(token: &str, patterns: &[Vec<String>]) -> bool {
     let token = token.to_ascii_lowercase();
     let tokens = components(&token);
-    lowered(patterns).iter().any(|pat| {
+    patterns.iter().any(|pat| {
         tokens
             .windows(pat.len())
             .any(|w| w.iter().zip(pat).all(|(c, p)| component_matches(p, c)))
@@ -159,12 +173,11 @@ pub(crate) fn token_matches_deny(token: &str, patterns: &[String]) -> bool {
 /// Whether `token`, once brace-expanded, has a glob component that could
 /// match a deny pattern. Over-approximate on purpose: a quoted `*` looks the
 /// same as a bare one here.
-pub(crate) fn could_match_deny(token: &str, patterns: &[String]) -> bool {
+pub(crate) fn could_match_deny(token: &str, pats: &[Vec<String>]) -> bool {
     let token = token.to_ascii_lowercase();
     let Some(variants) = expand_braces(&token) else {
         return true;
     };
-    let pats = lowered(patterns);
     variants.iter().any(|v| {
         let tokens = components(v);
         pats.iter().any(|pat| {
@@ -546,6 +559,7 @@ mod tests {
     #[test]
     fn glob_compatibility() {
         let pats = default_deny_paths();
+        let pats = super::lowered(&pats);
         let could = |t: &str| super::could_match_deny(t, &pats);
         assert!(could(".e*") && could("id_*") && could("*") && could("*.p?m"));
         assert!(!could("*.rs") && !could("?.x") && !could("src/*.rs") && !could("plain"));

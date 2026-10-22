@@ -471,7 +471,12 @@ fn parameter_transformation_operators_bail() {
         );
     }
     // Ordinary expansions are untouched.
-    for src in ["echo ${x}", "echo ${x:-a}", "echo \"${x}\" a@b", "echo ${#x}"] {
+    for src in [
+        "echo ${x}",
+        "echo ${x:-a}",
+        "echo \"${x}\" a@b",
+        "echo ${#x}",
+    ] {
         assert!(parse(src).is_ok(), "{src:?}");
     }
 }

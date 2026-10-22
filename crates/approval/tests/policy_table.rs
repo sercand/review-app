@@ -432,7 +432,10 @@ fn network_executing_and_interactive_tools_are_not_approved() {
         check(&[&READ_ONLY, &MACOS_ONLY], &[(c, Defer)]);
     }
     // The local-only neighbours stay.
-    check(&[&READ_ONLY], &[("netstat -an", Approve), ("lsof -i", Approve)]);
+    check(
+        &[&READ_ONLY],
+        &[("netstat -an", Approve), ("lsof -i", Approve)],
+    );
 }
 
 /// C1: a path-qualified argv[0] is never the bare tool (the checkout may
@@ -469,7 +472,10 @@ fn path_qualified_argv0_is_not_vouched_for() {
             ("find . -exec cat {} \\;", Approve),
         ],
     );
-    check(&[&HELP_BYPASS], &[("./evil --help", Defer), ("evil --help", Approve)]);
+    check(
+        &[&HELP_BYPASS],
+        &[("./evil --help", Defer), ("evil --help", Approve)],
+    );
 }
 
 #[test]

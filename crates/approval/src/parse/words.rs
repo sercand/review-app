@@ -124,7 +124,9 @@ fn has_transform_operator(t: &str) -> bool {
         let body = &rest[i + 2..];
         let end = body.find('}').unwrap_or(body.len());
         let b = body[..end].as_bytes();
-        if b.windows(2).any(|w| w[0] == b'@' && w[1].is_ascii_alphabetic()) {
+        if b.windows(2)
+            .any(|w| w[0] == b'@' && w[1].is_ascii_alphabetic())
+        {
             return true;
         }
         rest = body;

@@ -70,7 +70,7 @@ pub fn classify(command: &str, cfg: &ApprovalConfig<'_>) -> Verdict {
     {
         return Verdict::Run { source: "empty" };
     }
-    let deny = DenyPaths(cfg.deny_paths);
+    let deny = DenyPaths::new(cfg.deny_paths);
     let allow = RepoAllow(cfg.allowed);
     let mut stack: Vec<&dyn SegmentPolicy> = vec![
         &deny,

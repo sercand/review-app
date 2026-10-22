@@ -1049,7 +1049,11 @@ mod tests {
             "find . -exec rm {} \\;",
             "time touch x",
         ] {
-            assert_eq!(classify_stack(cmd, None, &stack).0, Decision::Defer, "{cmd}");
+            assert_eq!(
+                classify_stack(cmd, None, &stack).0,
+                Decision::Defer,
+                "{cmd}"
+            );
         }
         // The model still judges the inner command itself.
         let all = Named("ml", Some(PolicyVerdict::Approve));
@@ -1067,7 +1071,9 @@ mod tests {
         let stack: [&dyn SegmentPolicy; 2] = [&allow, &ml];
         assert_eq!(
             classify_stack("timeout 5 make", None, &stack).0,
-            Decision::Approve { source: "repo-allow" }
+            Decision::Approve {
+                source: "repo-allow"
+            }
         );
     }
 

@@ -1,14 +1,16 @@
 //! Arbitrary-input safety: no panics, no hangs, no approvals of command substitution.
 
-use review_approval::{ApprovalConfig, Verdict, classify};
+use review_approval::{ApprovalConfig, Verdict, classify, default_deny_paths};
 use std::time::{Duration, Instant};
 
 fn run(command: &str) -> Verdict {
+    // The production deny list, so timings measure the real setup (M1).
+    let deny = default_deny_paths();
     classify(
         command,
         &ApprovalConfig {
             allowed: &[],
-            deny_paths: &[],
+            deny_paths: &deny,
             cwd: None,
             extra: &[],
         },

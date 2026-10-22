@@ -1360,9 +1360,11 @@ async fn bash_deny_beats_repo_allowed_entry() {
     std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
     let interaction = Arc::new(ScriptedInteraction::new());
     let cx = interaction_ctx(&host, interaction.clone());
-    cx.allow_segments(["cat".to_string()]);
+    // `touch` is not read-only, so only the allowed entry could vouch for it:
+    // the deny must still win over that entry.
+    cx.allow_segments(["touch".to_string()]);
 
-    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    let out = bash(&cx, json!({"command": "touch .env"})).await;
     assert!(out.is_error);
     assert!(
         text(&out).starts_with("the command was blocked: "),
