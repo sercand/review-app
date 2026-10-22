@@ -1,6 +1,15 @@
 //! What the Settings window and the review run are told about the local
 //! classifier: where it is on its way from "switched on" to "ready".
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use review_approval::model_stage::CommandClassifier;
+
+use super::shiso;
+use super::weights::WeightsManager;
+
 /// Lifecycle of the local classifier.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ClassifierState {
@@ -21,28 +30,21 @@ pub enum ClassifierState {
     Failed(String),
 }
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-
-use review_approval::model_stage::CommandClassifier;
-
-use super::shiso;
-use super::weights::WeightsManager;
-
 /// Where the weights come from; a fake in tests.
 pub trait WeightsSource: Send + Sync {
     /// The verified install, without touching the network.
     fn installed_dir(&self) -> Option<PathBuf>;
     /// Blocking download + verify + install; call from a job thread.
-    fn ensure(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, String>;
+    /// `progress(done, total)` returns `false` to cancel: the download stops
+    /// (keeping partial files for resume) and `ensure` returns an error.
+    fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String>;
 }
 
 impl WeightsSource for WeightsManager {
     fn installed_dir(&self) -> Option<PathBuf> {
         WeightsManager::installed_dir(self)
     }
-    fn ensure(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, String> {
+    fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String> {
         self.ensure_blocking(progress)
     }
 }
@@ -85,6 +87,9 @@ struct Inner {
     classifier: Option<Arc<dyn CommandClassifier>>,
     /// A job thread is running; at most one at a time.
     job_running: bool,
+    /// What the running job last reported, even while disabled; shown again
+    /// if the setting is switched back on before the job notices.
+    phase: ClassifierState,
 }
 
 struct Shared {
@@ -116,6 +121,7 @@ impl Loader {
                 state: ClassifierState::Off,
                 classifier: None,
                 job_running: false,
+                phase: ClassifierState::Loading,
             }),
             source,
             engine,
@@ -136,7 +142,16 @@ impl Loader {
         }
         inner.enabled = enabled;
         if enabled {
-            self.start_job(inner);
+            if inner.job_running {
+                // A job from before the last disable is still winding down or
+                // carrying on: show where it is rather than Off.
+                let phase = inner.phase.clone();
+                inner.state = phase.clone();
+                drop(inner);
+                (self.0.on_state)(phase);
+            } else {
+                self.start_job(inner);
+            }
         } else {
             let dropped = inner.classifier.take();
             inner.state = ClassifierState::Off;
@@ -171,6 +186,7 @@ impl Loader {
             return;
         }
         inner.job_running = true;
+        inner.phase = ClassifierState::Loading;
         drop(inner);
         let this = self.clone();
         let spawned = std::thread::Builder::new()
@@ -197,6 +213,7 @@ impl Loader {
     /// off meanwhile and the job should stop.
     fn progress(&self, state: ClassifierState) -> bool {
         let mut inner = self.lock();
+        inner.phase = state.clone();
         if !inner.enabled {
             return false;
         }
@@ -222,9 +239,15 @@ impl Loader {
                 {
                     return None;
                 }
+                let mut cancelled = false;
                 let fetched = shared.source.ensure(&mut |done, total| {
-                    self.progress(ClassifierState::Downloading { done, total });
+                    let go = self.progress(ClassifierState::Downloading { done, total });
+                    cancelled |= !go;
+                    go
                 });
+                if cancelled {
+                    return None;
+                }
                 match fetched {
                     Ok(dir) => dir,
                     Err(e) => return Some(Outcome::State(ClassifierState::Failed(e))),
@@ -241,17 +264,23 @@ impl Loader {
         })
     }
 
-    /// Ends the job: records the outcome unless the setting was switched off
-    /// meanwhile, in which case the result is discarded.
+    /// Ends the job and records the outcome. A cancelled job (`None`) or a
+    /// result that arrives after a disable is discarded; if the setting was
+    /// switched back on meanwhile, a fresh job starts so that enable is not
+    /// lost.
     fn finish(&self, outcome: Option<Outcome>) {
         let mut inner = self.lock();
         inner.job_running = false;
-        let Some(outcome) = outcome.filter(|_| inner.enabled) else {
+        if !inner.enabled {
+            drop(inner);
+            // Freeing a model can be slow; never under the lock.
+            drop(outcome);
             return;
-        };
+        }
         let state = match outcome {
-            Outcome::State(state) => state,
-            Outcome::Ready(c) => {
+            None => return self.start_job(inner),
+            Some(Outcome::State(state)) => state,
+            Some(Outcome::Ready(c)) => {
                 inner.classifier = Some(c);
                 ClassifierState::Ready
             }
@@ -270,7 +299,7 @@ enum Outcome {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::time::Duration;
 
@@ -293,13 +322,19 @@ mod tests {
         ensure_calls: AtomicUsize,
         /// `ensure` blocks until this receiver yields (when set).
         gate: Mutex<Option<mpsc::Receiver<()>>>,
+        /// Set when `progress` told `ensure` to stop.
+        told_to_stop: AtomicBool,
+        /// On being told to stop, `ensure` signals here, then waits on
+        /// `hold` before returning (each used once).
+        stop_seen: Mutex<Option<mpsc::Sender<()>>>,
+        hold: Mutex<Option<mpsc::Receiver<()>>>,
     }
 
     impl WeightsSource for FakeSource {
         fn installed_dir(&self) -> Option<PathBuf> {
             self.installed.lock().unwrap().clone()
         }
-        fn ensure(&self, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, String> {
+        fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String> {
             self.ensure_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(rx) = self.gate.lock().unwrap().take() {
                 rx.recv().unwrap();
@@ -307,8 +342,18 @@ mod tests {
             if let Some(e) = self.ensure_errors.lock().unwrap().pop() {
                 return Err(e);
             }
-            progress(1, 4);
-            progress(4, 4);
+            for (done, total) in [(1, 4), (4, 4)] {
+                if !progress(done, total) {
+                    self.told_to_stop.store(true, Ordering::SeqCst);
+                    if let Some(tx) = self.stop_seen.lock().unwrap().take() {
+                        tx.send(()).unwrap();
+                    }
+                    if let Some(rx) = self.hold.lock().unwrap().take() {
+                        rx.recv().unwrap();
+                    }
+                    return Err("cancelled".into());
+                }
+            }
             let dir = PathBuf::from("/fake/model");
             *self.installed.lock().unwrap() = Some(dir.clone());
             Ok(dir)
@@ -505,6 +550,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         assert!(r.loader.classifier().is_none());
         assert_eq!(r.engine.loads.load(Ordering::SeqCst), 0);
+        assert!(r.source.told_to_stop.load(Ordering::SeqCst));
         while let Ok(s) = r.states.try_recv() {
             assert_eq!(s, Off, "no state after Off");
         }
@@ -551,5 +597,32 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("callback re-entry deadlocked");
+    }
+
+    #[test]
+    fn re_enable_while_the_old_job_is_cancelling_starts_a_new_job() {
+        let source = FakeSource::default();
+        let (release, gate) = mpsc::channel();
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let (hold_tx, hold_rx) = mpsc::channel();
+        *source.gate.lock().unwrap() = Some(gate);
+        *source.stop_seen.lock().unwrap() = Some(seen_tx);
+        *source.hold.lock().unwrap() = Some(hold_rx);
+        let r = rig(source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(|s| matches!(s, Downloading { .. }));
+        r.loader.set_enabled(false);
+        r.until(|s| *s == Off);
+        // The old job learns it was cancelled, and is held right there.
+        release.send(()).unwrap();
+        seen_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        r.loader.set_enabled(true);
+        // The UI is shown the in-flight state, not Off.
+        assert_eq!(r.until(|_| true), [Downloading { done: 1, total: 4 }]);
+        hold_tx.send(()).unwrap();
+        r.until(is_ready);
+        assert_eq!(r.source.ensure_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(r.engine.loads.load(Ordering::SeqCst), 1);
+        assert!(r.loader.classifier().is_some());
     }
 }

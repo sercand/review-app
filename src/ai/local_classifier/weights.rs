@@ -81,8 +81,13 @@ impl WeightsManager {
     }
 
     /// Downloads whatever is missing (resuming partial files), verifies every
-    /// digest and installs the files. `progress` gets `(done, total)` bytes.
-    pub async fn ensure(&self, mut progress: impl FnMut(u64, u64)) -> Result<PathBuf, String> {
+    /// digest and installs the files. `progress` gets `(done, total)` bytes
+    /// and returns `false` to cancel: the fetch is dropped (partial files stay
+    /// for the next resume) and an error comes back.
+    pub async fn ensure(
+        &self,
+        mut progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<PathBuf, String> {
         let total = total_bytes();
         if let Some(dir) = self.installed_dir() {
             progress(total, total);
@@ -122,7 +127,9 @@ impl WeightsManager {
                 ));
             }
         }
-        progress(done.iter().sum(), total);
+        if !progress(done.iter().sum(), total) {
+            return Err(CANCELLED.into());
+        }
 
         let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
         let fetch = async {
@@ -144,6 +151,8 @@ impl WeightsManager {
             }
             Ok::<(), shiso_hub::HubError>(())
         };
+        // Resolves to `true` if the caller cancelled, `false` once the fetch
+        // has dropped its sender.
         let report = async {
             while let Some(event) = rx.recv().await {
                 let (file, bytes) = match event {
@@ -153,19 +162,40 @@ impl WeightsManager {
                 };
                 if let Some(i) = entries.iter().position(|e| e.name == file) {
                     done[i] = bytes;
-                    progress(done.iter().sum(), total);
+                    if !progress(done.iter().sum(), total) {
+                        return true;
+                    }
                 }
             }
+            false
         };
-        let (fetched, ()) = tokio::join!(fetch, report);
+        let mut fetch = std::pin::pin!(fetch);
+        let mut report = std::pin::pin!(report);
+        let fetched = tokio::select! {
+            r = &mut fetch => {
+                // The sender is gone: let the reporter drain what is queued
+                // so the last progress call is the final one.
+                report.await;
+                r
+            }
+            cancelled = &mut report => {
+                if cancelled {
+                    return Err(CANCELLED.into());
+                }
+                fetch.await
+            }
+        };
         fetched.map_err(|e| e.to_string())?;
 
-        self.install(&downloader)
+        self.install(&downloader, &entries)
     }
 
     /// Blocking [`ensure`](Self::ensure) on its own current-thread runtime;
     /// call from a dedicated thread, never from the UI or a tokio worker.
-    pub fn ensure_blocking(&self, progress: impl FnMut(u64, u64)) -> Result<PathBuf, String> {
+    pub fn ensure_blocking(
+        &self,
+        progress: impl FnMut(u64, u64) -> bool,
+    ) -> Result<PathBuf, String> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -174,27 +204,51 @@ impl WeightsManager {
     }
 
     /// Links the verified blobs into the install directory, staged beside it
-    /// and renamed into place so a half-built directory is never visible.
-    fn install(&self, downloader: &Downloader) -> Result<PathBuf, String> {
+    /// and renamed into place so a half-built directory is never visible. The
+    /// staging name is unique to this process and call, so two app instances
+    /// installing at once cannot trample each other.
+    fn install(&self, downloader: &Downloader, entries: &[FileEntry]) -> Result<PathBuf, String> {
         let final_dir = self.install_dir();
         let parent = final_dir.parent().expect("install dir has a parent");
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        let staging = parent.join(format!(".{HF_REVISION}.staging"));
-        let _ = fs::remove_dir_all(&staging);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let staging = parent.join(format!(
+            ".{HF_REVISION}.{}-{nonce:x}.staging",
+            std::process::id()
+        ));
         fs::create_dir(&staging).map_err(|e| e.to_string())?;
-        for f in &FILES {
-            let sha = Sha256::parse(f.sha256).map_err(|e| e.to_string())?;
-            let blob = downloader.blob_path(&sha);
-            let target = staging.join(f.name);
-            if fs::hard_link(&blob, &target).is_err() {
-                fs::copy(&blob, &target).map_err(|e| format!("installing {}: {e}", f.name))?;
+        let linked = (|| {
+            for e in entries {
+                let blob = downloader.blob_path(&e.sha256);
+                let target = staging.join(&e.name);
+                if fs::hard_link(&blob, &target).is_err() {
+                    fs::copy(&blob, &target)
+                        .map_err(|err| format!("installing {}: {err}", e.name))?;
+                }
             }
+            Ok::<(), String>(())
+        })();
+        if let Err(e) = linked {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        // Another instance may have finished while we staged.
+        if self.installed_dir().is_some() {
+            let _ = fs::remove_dir_all(&staging);
+            return Ok(final_dir);
         }
         let _ = fs::remove_dir_all(&final_dir);
-        fs::rename(&staging, &final_dir).map_err(|e| e.to_string())?;
+        fs::rename(&staging, &final_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            e.to_string()
+        })?;
         Ok(final_dir)
     }
 }
+
+const CANCELLED: &str = "cancelled";
 
 #[cfg(test)]
 mod tests {
@@ -239,14 +293,19 @@ mod tests {
         let m = WeightsManager::new(dir.path());
         seed_blobs(&m);
         let mut last = (0, 0);
-        let installed = m.ensure_blocking(|d, t| last = (d, t)).unwrap();
+        let installed = m
+            .ensure_blocking(|d, t| {
+                last = (d, t);
+                true
+            })
+            .unwrap();
         assert_eq!(m.installed_dir(), Some(installed.clone()));
         assert_eq!(last, (total_bytes(), total_bytes()));
         for f in &FILES {
             assert_eq!(fs::metadata(installed.join(f.name)).unwrap().len(), f.size);
         }
         // A second call is a no-op that still reports completion.
-        m.ensure_blocking(|_, _| {}).unwrap();
+        m.ensure_blocking(|_, _| true).unwrap();
     }
 
     #[test]
@@ -254,12 +313,21 @@ mod tests {
         let dir = tempdir();
         let m = WeightsManager::new(dir.path());
         seed_blobs(&m);
-        let installed = m.ensure_blocking(|_, _| {}).unwrap();
+        let installed = m.ensure_blocking(|_, _| true).unwrap();
         let cfg = installed.join("config.json");
         fs::remove_file(&cfg).unwrap();
         fs::File::create(&cfg).unwrap().set_len(3).unwrap();
         assert_eq!(m.installed_dir(), None);
         fs::remove_file(&cfg).unwrap();
+        assert_eq!(m.installed_dir(), None);
+    }
+
+    #[test]
+    fn cancelling_before_the_fetch_stops_without_network() {
+        let dir = tempdir();
+        let m = WeightsManager::new(dir.path());
+        let err = m.ensure_blocking(|_, _| false).unwrap_err();
+        assert_eq!(err, CANCELLED);
         assert_eq!(m.installed_dir(), None);
     }
 
@@ -276,6 +344,7 @@ mod tests {
                     eprintln!("progress {d}/{t}");
                 }
                 last = (d, t);
+                true
             })
             .expect("download");
         eprintln!("downloaded and installed in {:?}", started.elapsed());

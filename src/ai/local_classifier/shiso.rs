@@ -5,8 +5,8 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use review_approval::model_stage::{CommandClassifier, ModelOutcome};
 use shiso_core::Backend;
@@ -109,13 +109,18 @@ impl CommandClassifier for ShisoClassifier {
     }
 }
 
-/// Opens the compute device: Metal on macOS, CUDA on Linux builds with
-/// `local-classifier-cuda`. Creation errors and panics are both `Err`.
+/// The compute device: Metal on macOS, CUDA on Linux builds with
+/// `local-classifier-cuda`. Created at most once per process and shared
+/// (the outcome, error included, is cached). Creation errors and panics are
+/// both `Err`.
 pub fn open_backend() -> Result<Arc<dyn Backend>, String> {
-    match catch_unwind(create_backend) {
-        Ok(r) => r,
-        Err(_) => Err("the GPU backend panicked while opening".into()),
-    }
+    static BACKEND: OnceLock<Result<Arc<dyn Backend>, String>> = OnceLock::new();
+    BACKEND
+        .get_or_init(|| match catch_unwind(create_backend) {
+            Ok(r) => r,
+            Err(_) => Err("the GPU backend panicked while opening".into()),
+        })
+        .clone()
 }
 
 #[cfg(target_os = "macos")]
@@ -175,7 +180,8 @@ pub fn load(model_dir: &Path) -> Result<ShisoClassifier, String> {
     load_with_backend(open_backend()?, model_dir)
 }
 
-/// [`load`] on an already opened backend (one per process).
+/// [`load`] on an already opened backend (see [`open_backend`]: one per
+/// process).
 pub fn load_with_backend(
     backend: Arc<dyn Backend>,
     model_dir: &Path,
