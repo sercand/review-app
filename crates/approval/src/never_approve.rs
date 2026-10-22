@@ -414,7 +414,12 @@ fn path_in_dir(path: &str, dir: &str) -> bool {
 fn word_names_listed(word: &str) -> bool {
     // `. evil.sh` inside a word (`'x; . evil.sh'`) sources a file; a lone `.`
     // word is just the current directory.
-    if word.split_whitespace().count() > 1 && word.split_whitespace().any(|t| t == ".") {
+    // Commands are separated by whitespace and the shell metacharacters.
+    let tokens = || {
+        word.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`'))
+            .filter(|t| !t.is_empty())
+    };
+    if tokens().count() > 1 && tokens().any(|t| t == ".") {
         return true;
     }
     word.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')))
@@ -563,6 +568,13 @@ mod tests {
             "man -P 'less +!.\\ evil.sh' ls",
             "mytool '. evil.sh'",
             "mytool 'a && . evil.sh'",
+            "mytool 'x;. evil.sh'",
+            "mytool 'x&&. evil.sh'",
+            "mytool 'x|. evil.sh'",
+            "mytool 'x(. evil.sh'",
+            "mytool 'x`. evil.sh'",
+            "mytool $'x\\n. evil.sh'",
+            "mytool 'x;source evil.sh'",
             "mytool '+!x'",
             "mytool '!x'",
             "mytool a+!x",

@@ -412,3 +412,7 @@ mytool -I../evil
 mytool -Idir/evil
 mytool mkfs.ext4
 mytool '. evil.sh'
+mytool 'x;. evil.sh'
+mytool 'x&&. evil.sh'
+mytool 'x|. evil.sh'
+mytool $'x\n. evil.sh'
