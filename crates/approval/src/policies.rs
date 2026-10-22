@@ -1070,7 +1070,6 @@ const GIT_READ_SUBCOMMANDS: &[&str] = &[
     "describe",
     "reflog",
     "shortlog",
-    "config",
     "grep",
     "cat-file",
     "merge-base",
@@ -1082,7 +1081,7 @@ const GIT_COMMIT_DANGEROUS: &[&str] = &["amend", "no-verify", "no-gpg-sign"];
 
 /// git inspection: status, log, diff, show, branch (listing forms), blame,
 /// ls-files, ls-tree, rev-parse, rev-list, describe, reflog (not
-/// expire/delete), shortlog, config (reading forms). `--output=FILE` and
+/// expire/delete), shortlog (`config` is not read-only: it can show a token in a remote URL). `--output=FILE` and
 /// `--ext-diff` are rejected everywhere.
 pub static GIT_READ: Policy = Policy {
     name: "git:read",
@@ -1102,7 +1101,6 @@ fn git_read_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
     }
     let ok = match sub {
         "branch" => git_branch_lists(args),
-        "config" => git_config_reads(args),
         // `-O<cmd>` / `--open-files-in-pager=<cmd>` runs a command.
         // `--textconv` / `--filters` run configured converter commands.
         "cat-file" => !args
@@ -1175,40 +1173,6 @@ fn git_branch_lists(args: &[String]) -> bool {
         }
     }
     operands == 0 || list_mode
-}
-
-/// `git config` in a reading form: an explicit `--get*`/`--list`, the
-/// `get`/`list` subcommands, or a single key.
-fn git_config_reads(args: &[String]) -> bool {
-    let mut reads = false;
-    let mut operands: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let t = args[i].as_str();
-        i += 1;
-        match t {
-            "--get" | "--get-all" | "--get-regexp" | "--get-urlmatch" | "--get-color"
-            | "--get-colorbool" | "-l" | "--list" => reads = true,
-            "--local" | "--global" | "--system" | "--worktree" | "-z" | "--null"
-            | "--name-only" | "--show-origin" | "--show-scope" | "--bool" | "--int"
-            | "--bool-or-int" | "--path" | "--includes" | "--no-includes" | "--all"
-            | "--regexp" | "--show-names" => {}
-            "-f" | "--file" | "--blob" | "--type" | "--default" | "--url" => i += 1,
-            _ if ["--file=", "--blob=", "--type=", "--default=", "--url="]
-                .iter()
-                .any(|p| t.starts_with(p)) => {}
-            _ if t.starts_with('-') => return false,
-            _ => operands.push(t),
-        }
-    }
-    if reads {
-        return true;
-    }
-    match operands.as_slice() {
-        ["get", ..] | ["list"] => true,
-        [key] => key.contains('.'),
-        _ => false,
-    }
 }
 
 /// `git add` — staging.
@@ -1765,7 +1729,20 @@ mod tests {
     #[test]
     fn git_config_get_safe_write_blocked() {
         let p: &[&Policy] = &[&GIT_READ];
-        assert!(approves("git config --get user.name", p));
+        // Config can hold a token in a remote URL: no form of it is read-only.
+        for cmd in [
+            "git config --get user.name",
+            "git config --get remote.origin.url",
+            "git config --get-all credential.helper",
+            "git config --get-regexp url",
+            "git config --list",
+            "git config -l",
+            "git config --list --show-origin",
+            "git config --show-origin --get user.name",
+            "git config user.name",
+        ] {
+            assert!(defers(cmd, p), "{cmd}");
+        }
         assert!(defers("git config --global user.name x", p));
         assert!(defers("git config --unset user.name", p));
     }

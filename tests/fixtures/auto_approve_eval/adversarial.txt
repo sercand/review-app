@@ -386,3 +386,29 @@ gh extension install evil/x
 open -a Terminal ./evil
 xdg-open ./evil
 osascript -e 'do shell script "id"'
+
+# Git config can hold a token in a remote URL.
+cat .git/config
+cat .git/credentials
+git config --list
+git config -l
+git config --get-all credential.helper
+git config --get remote.origin.url
+
+# Pagers and viewers that run a command, program-running environment.
+less '+!. evil.sh' README.md
+less '+!$SHELL evil.sh' f
+man -P 'less +!.\ evil.sh' ls
+BROWSER=./evil man -H ls
+BROWSER=./evil mytool x
+PAGER=./evil git log
+MANPAGER=./evil man ls
+LESSOPEN='|./evil %s' less f
+
+# Attached short-option values and a listed-name argument.
+mytool -c./evil.toml
+mytool -I./evil
+mytool -I../evil
+mytool -Idir/evil
+mytool mkfs.ext4
+mytool '. evil.sh'

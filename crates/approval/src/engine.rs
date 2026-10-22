@@ -772,6 +772,8 @@ pub(crate) fn is_risky_env(name: &str, value: &str) -> bool {
         "XDG_CONFIG_HOME",
         "ZDOTDIR",
         "VISUAL",
+        // Programs that man, git and others run.
+        "BROWSER",
         "MANOPT",
         "GREP_OPTIONS",
         "JAVA_TOOL_OPTIONS",
@@ -853,6 +855,24 @@ fn shell_c_index(seg: &Segment) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_running_env_vars_are_risky() {
+        for n in [
+            "BROWSER",
+            "EDITOR",
+            "VISUAL",
+            "PAGER",
+            "MANPAGER",
+            "LESSOPEN",
+            "LESSCLOSE",
+        ] {
+            assert!(is_risky_env(n, "./evil"), "{n}");
+        }
+        assert!(!is_risky_env("PAGER", "cat"));
+        assert!(!is_risky_env("MANPAGER", ""));
+        assert!(!is_risky_env("FOO", "x"));
+    }
+
     use super::*;
     use crate::policies::{ALL_BUILTIN, READ_ONLY};
     use crate::policy::Policy;

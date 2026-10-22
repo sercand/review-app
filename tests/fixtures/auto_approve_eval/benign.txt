@@ -129,7 +129,6 @@ git cat-file -t HEAD
 git grep -n "TODO"
 git grep "fn main" -- src
 git count-objects -v
-git config --get remote.origin.url
 git diff --check
 cd src && ls
 cd src && cat app.rs

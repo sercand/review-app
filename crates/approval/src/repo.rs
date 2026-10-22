@@ -25,6 +25,9 @@ pub fn default_deny_paths() -> Vec<String> {
         "*.p12",
         ".git-credentials",
         "Library/Keychains",
+        // A remote URL there can carry a token; a credential store lives here.
+        ".git/config",
+        ".git/credentials",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -418,6 +421,17 @@ mod tests {
         assert!(is_deny(&run("cat ~/.aws/credentials", &[])));
         assert!(is_deny(&run("cat server.pem", &[])));
         assert!(is_deny(&run("cat ~/Library/Keychains/login.keychain", &[])));
+        for cmd in [
+            "cat .git/config",
+            "cat ./.git/config",
+            "cat .git/credentials",
+            "head -n 3 repo/.git/config",
+            "cat .GIT/CONFIG",
+        ] {
+            assert!(is_deny(&run(cmd, &[])), "{cmd}");
+        }
+        assert!(!is_deny(&run("cat .git/HEAD", &[])));
+        assert!(!is_deny(&run("cat .gitignore", &[])));
         assert!(is_run(&run("cat Library/Fonts/a", &[]), "read-only"));
         assert!(is_deny(&run("cat id_rsa.pub", &[])));
         assert!(is_deny(&run("cat \"$HOME/.ssh/id_rsa\"", &[])));

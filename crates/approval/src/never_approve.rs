@@ -274,6 +274,12 @@ pub const NEVER_APPROVE: &[&str] = &[
     "parted",
     "mke2fs",
     "mkswap",
+    // Pagers and doc viewers: `!cmd` at their prompt, `+!cmd`, `-P`/`-H`.
+    "less",
+    "more",
+    "most",
+    "man",
+    "info",
 ];
 
 /// Options that name a program to run (matched on the word before any `=`).
@@ -322,7 +328,7 @@ pub fn model_may_approve(seg: &Segment) -> bool {
         return false;
     }
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
-    if listed(base) || base.to_ascii_lowercase().starts_with("mkfs.") {
+    if listed(base) {
         return false;
     }
     // Command names are ASCII: anything else is a look-alike or a name no
@@ -337,14 +343,16 @@ pub fn model_may_approve(seg: &Segment) -> bool {
         .argv
         .iter()
         .skip(1)
-        .any(|w| names_exec_option(w) || names_pr_path(w))
+        .any(|w| names_exec_option(w) || names_pr_path(w) || runs_from_prompt(w))
     {
         return false;
     }
     if !seg.redirects.iter().all(redirect_ok) {
         return false;
     }
-    !seg.assigns.iter().any(|(n, v)| is_risky_env(n, v))
+    !seg.assigns
+        .iter()
+        .any(|(n, v)| is_risky_env(n, v) || names_pr_path(v))
 }
 
 /// Whether `word` is an option that names a program to run.
@@ -353,25 +361,45 @@ fn names_exec_option(word: &str) -> bool {
     EXEC_OPTIONS.iter().any(|o| name.eq_ignore_ascii_case(o))
 }
 
+/// Whether `word` is, or holds, a pager or editor command (`!cmd`, `+!cmd`).
+fn runs_from_prompt(word: &str) -> bool {
+    word.starts_with('!') || word.contains("+!")
+}
+
 /// Whether `word` points into the working tree, where a PR's own code lives:
 /// `./x`, `../x` or `dir/x`, either as the word itself or as the value of
-/// `--opt=value`. Absolute paths and `~` paths are not covered; an option's own
+/// `--opt=value` or an attached short option (`-Ivalue`). Absolute paths and `~` paths are not covered; an option's own
 /// text (`--name=a/b`) is not a path, but a separate word after `-o` is
 /// (the filter cannot tell it from an operand).
+///
+/// Residual, accepted: a bare relative operand with no `/` (`mytool evil.sh`)
+/// stays approvable by the model. Executing a bare name goes through `PATH`
+/// (not the working tree), but an unlisted interpreter would read the file.
 fn names_pr_path(word: &str) -> bool {
-    let value = match word.strip_prefix('-') {
-        Some(_) => match word.split_once('=') {
-            Some((_, v)) => v,
+    let (value, is_option) = if word.starts_with("--") {
+        match word.split_once('=') {
+            Some((_, v)) => (v, true),
             None => return false,
-        },
-        None => word,
+        }
+    } else if word.starts_with('-') {
+        // Attached short option: `-c./x`, `-Idir/x`.
+        match word.get(2..) {
+            Some(v) if !v.is_empty() => (v, true),
+            _ => return false,
+        }
+    } else {
+        (word, false)
     };
     if value.starts_with(['/', '~']) {
         return false;
     }
     value.starts_with("./")
         || value.starts_with("../")
-        || (!word.starts_with('-') && value.contains('/'))
+        || value.contains('/') && {
+            // A bare `a/b` operand is a path; inside an option it may be the
+            // option's own text, but only `./x` and `../x` are certain.
+            !is_option || word.starts_with('-') && !word.starts_with("--")
+        }
 }
 
 /// `path` is `dir` plus one file name: no `..`, no nesting.
@@ -384,6 +412,11 @@ fn path_in_dir(path: &str, dir: &str) -> bool {
 /// `[A-Za-z0-9._+-]`, names a listed binary. Pieces made of dots only (`.`,
 /// `..`) are paths, not the `.` builtin.
 fn word_names_listed(word: &str) -> bool {
+    // `. evil.sh` inside a word (`'x; . evil.sh'`) sources a file; a lone `.`
+    // word is just the current directory.
+    if word.split_whitespace().count() > 1 && word.split_whitespace().any(|t| t == ".") {
+        return true;
+    }
     word.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')))
         .any(|piece| !piece.chars().all(|c| c == '.') && listed(piece))
 }
@@ -394,6 +427,10 @@ fn word_names_listed(word: &str) -> bool {
 fn listed(base: &str) -> bool {
     let lower = base.to_ascii_lowercase();
     let lower = lower.strip_suffix(".exe").unwrap_or(&lower).to_string();
+    // `mkfs.ext4`, `mkfs.xfs`, ...
+    if lower.starts_with("mkfs.") {
+        return true;
+    }
     let unversioned = lower
         .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
         .trim_end_matches(['-', '_']);
@@ -501,6 +538,7 @@ mod tests {
             "env CURL.EXE x",
             "ls cmd.exe",
             // Disk, power, firewall and system-settings tools.
+            "mytool mkfs.ext4",
             "mkfs.ext4 /dev/sda1",
             "mkfs.xfs /dev/sdb",
             "diskutil eraseDisk JHFS+ X /dev/disk2",
@@ -519,6 +557,37 @@ mod tests {
             "mytool -o a/b",
             "mytool --config=./evil.toml",
             "mytool --config=../evil.toml",
+            // Pagers and viewers that run a command from their own prompt.
+            "less '+!. evil.sh' README.md",
+            "less '+!$SHELL evil.sh' f",
+            "man -P 'less +!.\\ evil.sh' ls",
+            "mytool '. evil.sh'",
+            "mytool 'a && . evil.sh'",
+            "mytool '+!x'",
+            "mytool '!x'",
+            "mytool a+!x",
+            "less f",
+            "more f",
+            "most f",
+            "man ls",
+            "info ls",
+            "BROWSER=./evil man -H ls",
+            "BROWSER=./evil mytool x",
+            "FOO=./evil mytool x",
+            "FOO=dir/evil mytool x",
+            "BROWSER=x mytool y",
+            "EDITOR=x mytool y",
+            "VISUAL=x mytool y",
+            "PAGER=x mytool y",
+            "MANPAGER=x mytool y",
+            "LESSOPEN=x mytool y",
+            "LESSCLOSE=x mytool y",
+            // Attached short-option values.
+            "mytool -c./evil.toml",
+            "mytool -I./evil",
+            "mytool -I../evil",
+            "mytool -Idir/evil",
+            "mytool -Lsrc/lib",
             // Options that name a program to run.
             "rg --pre ./evil pattern",
             "rg --pre=evil pattern",
@@ -550,6 +619,13 @@ mod tests {
             "mytool ~/x",
             "mytool --preview x",
             "mytool --pre-commit-hint",
+            "mytool -c x",
+            "mytool -n5",
+            "mytool -I/abs/inc",
+            "mytool -Wall",
+            "mytool a!b",
+            "FOO=bar mytool y",
+            "FOO=a.b mytool y",
         ] {
             assert!(may(cmd), "{cmd}");
         }
