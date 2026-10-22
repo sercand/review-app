@@ -463,6 +463,22 @@ impl AiReviewState {
         })
     }
 
+    /// The summary-anchored findings the AI tab lists with Keep / Drop
+    /// (spec §5.6): open drafts, plus the verifier's drops while
+    /// `show_dropped` is on. These never reach the diff — `place_ai_draft`
+    /// has no row to anchor a whole-file remark to — so the tab is their
+    /// only Keep / Drop surface.
+    pub fn summary_drafts(&self, show_dropped: bool) -> Vec<&Finding> {
+        self.findings
+            .values()
+            .filter(move |f| {
+                matches!(f.anchor, FindingAnchor::Summary { .. })
+                    && (f.state == FindingState::Draft
+                        || (show_dropped && f.state == FindingState::DroppedByVerifier))
+            })
+            .collect()
+    }
+
     /// Open the inline editor of finding `id`, seeded with `body`.
     pub fn start_edit(&mut self, id: i64, body: String) {
         self.edit = Some((id, body));
@@ -521,10 +537,14 @@ impl AiReviewState {
         self.checkout = snap.checkout.clone();
         self.last_reviewed_sha = snap.last_reviewed_sha.clone();
         self.suggestions = brief_suggestions(snap.brief.as_deref());
-        // The snapshot carries neither the draft nor the usage tally, so a
-        // rebuild starts those fresh; the next run refills them.
-        self.draft = None;
-        self.usage = (0, 0);
+        // The snapshot replays the latest run's draft and usage (spec §10.3):
+        // a run that finished while the user was on another PR loses its
+        // `DraftReady` to the stale-event rule, and this is the second path
+        // that lands the assembler's draft and the token tally. A newer run
+        // that has not assembled yet carries neither, so the rebuild starts
+        // those fresh.
+        self.draft = snap.draft.clone();
+        self.usage = snap.usage;
         self.restore_decision = None;
         self.edit = None;
         self.chat_reply_open = false;
@@ -1245,6 +1265,44 @@ mod tests {
         );
     }
 
+    /// The AI tab's summary list is the Keep / Drop surface for findings the
+    /// diff cannot anchor: open summary drafts always, verifier drops only
+    /// with the toggle, and line-anchored or user-dropped ones never (spec
+    /// §5.6).
+    #[test]
+    fn summary_drafts_lists_only_summary_anchored_items() {
+        let summary = |id: i64, state: FindingState| Finding {
+            anchor: crate::ai::review::FindingAnchor::Summary {
+                path: format!("logo{id}.png"),
+            },
+            ..line_finding(id, Severity::Nit, state, "logo.png")
+        };
+        let mut st = AiReviewState::default();
+        for f in [
+            summary(1, FindingState::Draft),
+            summary(2, FindingState::DroppedByVerifier),
+            summary(3, FindingState::Kept),
+            summary(4, FindingState::DroppedByUser),
+            line_finding(5, Severity::Bug, FindingState::Draft, "a.rs"),
+            line_finding(6, Severity::Risk, FindingState::DroppedByVerifier, "a.rs"),
+        ] {
+            st.findings.insert(f.id, f);
+        }
+        let ids = |st: &AiReviewState, show| {
+            st.summary_drafts(show)
+                .into_iter()
+                .map(|f| f.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&st, false), vec![1], "only the open summary draft");
+        st.show_dropped = true;
+        assert_eq!(
+            ids(&st, true),
+            vec![1, 2],
+            "the verifier drop joins with the toggle; kept, user-dropped and line-anchored ones never"
+        );
+    }
+
     #[test]
     fn can_continue_only_when_head_moved_and_not_running() {
         let mut st = AiReviewState::default();
@@ -1278,6 +1336,8 @@ mod tests {
 
     #[test]
     fn snapshot_replaces_state() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
         let mut st = AiReviewState::default();
         st.timeline.push(TimelineEntry::Notice {
             text: "stale".to_string(),
@@ -1287,8 +1347,21 @@ mod tests {
             line_finding(99, Severity::Bug, FindingState::Draft, "z.rs"),
         );
         st.chat_input = "half-typed".to_string();
+        st.draft = Some(ReviewDraft {
+            summary: "the old run's draft".to_string(),
+            verdict: Verdict::Comment,
+            rationale: String::new(),
+            rewrites: Default::default(),
+        });
+        st.usage = (1, 1);
 
         let finding = line_finding(1, Severity::Risk, FindingState::Kept, "a.rs");
+        let draft = ReviewDraft {
+            summary: "adds the retry loop".to_string(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".to_string(),
+            rewrites: Default::default(),
+        };
         let snapshot = AiSnapshotData {
             findings: vec![finding.clone()],
             coverage: vec![coverage("a.rs", CheckResult::Ok)],
@@ -1298,6 +1371,8 @@ mod tests {
             checkout: Some(checkout_record()),
             bash_disabled: Some("no bwrap".to_string()),
             last_reviewed_sha: Some("sha_old".to_string()),
+            draft: Some(draft.clone()),
+            usage: (4200, 310),
         };
         st.apply(&Event::AiSnapshot {
             session: SESSION,
@@ -1315,6 +1390,16 @@ mod tests {
         assert_eq!(st.checkout, Some(checkout_record()));
         assert_eq!(st.last_reviewed_sha.as_deref(), Some("sha_old"));
         assert_eq!(st.chat_input, "half-typed", "the composer draft survives");
+        assert_eq!(
+            st.draft.as_ref(),
+            Some(&draft),
+            "the finished run's draft replays instead of vanishing"
+        );
+        assert_eq!(
+            st.usage,
+            (4200, 310),
+            "the token tally rides the snapshot too"
+        );
         assert_eq!(
             st.timeline,
             vec![
@@ -1336,6 +1421,43 @@ mod tests {
             "the transcript is rebuilt and the stale notice is gone"
         );
         assert!(st.can_continue("sha_new"), "a completed run can continue");
+    }
+
+    /// A snapshot whose newest run has not assembled yet (a fresh run that
+    /// was started and re-attached to) carries no draft: the rebuild starts
+    /// the draft and usage fresh, as before.
+    #[test]
+    fn snapshot_without_a_draft_clears_the_old_one() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
+        let mut st = AiReviewState {
+            draft: Some(ReviewDraft {
+                summary: "the old run's draft".to_string(),
+                verdict: Verdict::Comment,
+                rationale: String::new(),
+                rewrites: Default::default(),
+            }),
+            usage: (7, 7),
+            ..AiReviewState::default()
+        };
+        let snapshot = AiSnapshotData {
+            findings: Vec::new(),
+            coverage: Vec::new(),
+            timeline: Vec::new(),
+            brief: None,
+            run: Some(run("running", None)),
+            checkout: Some(checkout_record()),
+            bash_disabled: None,
+            last_reviewed_sha: None,
+            draft: None,
+            usage: (0, 0),
+        };
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot,
+        });
+        assert_eq!(st.draft, None);
+        assert_eq!(st.usage, (0, 0));
     }
 
     /// A tab awaiting a checkout confirmation.
@@ -1420,6 +1542,8 @@ mod tests {
                 checkout: Some(checkout_record()),
                 bash_disabled: None,
                 last_reviewed_sha: None,
+                draft: None,
+                usage: (0, 0),
             }
         }
 

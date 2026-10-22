@@ -58,6 +58,12 @@ pub enum AiPanelAction {
     Finish,
     /// Scroll the diff to a finding (Task 5 wires the scrolling).
     JumpToFinding(i64),
+    /// Keep a summary-anchored draft into the review body (spec §5.6): the
+    /// tab is its only Keep / Drop surface, since the diff has no row to
+    /// anchor a whole-file remark to.
+    KeepSummary(i64),
+    /// Drop a summary-anchored draft (spec §5.6).
+    DropSummary(i64),
     /// Toggle the dropped-by-verifier findings (spec §12).
     ShowDropped(bool),
     /// User clicked "Add to settings" on the suggested-commands card
@@ -513,15 +519,16 @@ fn render_entry(
     }
 }
 
-/// The findings summary: severity counts, the dropped toggle, skipped
-/// checks, and the prior review's states (spec §12).
+/// The findings summary: severity counts, the summary items with their
+/// Keep / Drop, the dropped toggle, skipped checks, and the prior review's
+/// states (spec §12).
 fn render_findings(
     ui: &mut egui::Ui,
     st: &AiReviewState,
     show_dropped: bool,
     actions: &mut Vec<AiPanelAction>,
 ) {
-    use crate::ai::review::FindingState;
+    use crate::ai::review::{FindingAnchor, FindingState};
 
     let p = theme::palette_of(ui);
     let counts = st.counts();
@@ -547,6 +554,43 @@ fn render_findings(
             }
         }
     });
+    // Summary-anchored drafts never reach the diff (`place_ai_draft` has no
+    // row to anchor a whole-file remark to), so this list is their only
+    // Keep / Drop surface (spec §5.6).
+    let summaries = st.summary_drafts(show_dropped);
+    if !summaries.is_empty() {
+        ui.label(RichText::new("Summary items").color(p.muted).size(11.5));
+        for finding in summaries {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(finding.severity.label())
+                        .color(severity_color(p, finding.severity))
+                        .size(11.0)
+                        .strong(),
+                );
+                ui.label(RichText::new(&finding.title).size(11.5));
+                ui.label(
+                    RichText::new(finding.anchor.path())
+                        .monospace()
+                        .color(p.faint)
+                        .size(11.0),
+                );
+                if finding.state == FindingState::DroppedByVerifier {
+                    ui.label(
+                        RichText::new("dropped by verifier")
+                            .color(p.muted)
+                            .size(11.0),
+                    );
+                }
+                if ui.button("Keep").clicked() {
+                    actions.push(AiPanelAction::KeepSummary(finding.id));
+                }
+                if ui.button("Drop").clicked() {
+                    actions.push(AiPanelAction::DropSummary(finding.id));
+                }
+            });
+        }
+    }
     if counts.dropped_by_verifier > 0 {
         let mut show = show_dropped;
         if ui
@@ -559,11 +603,12 @@ fn render_findings(
             actions.push(AiPanelAction::ShowDropped(show));
         }
         if show_dropped {
-            for finding in st
-                .findings
-                .values()
-                .filter(|finding| finding.state == FindingState::DroppedByVerifier)
-            {
+            // The summary-anchored drops carry Keep / Drop in the list
+            // above; this one names the line-anchored ones.
+            for finding in st.findings.values().filter(|finding| {
+                finding.state == FindingState::DroppedByVerifier
+                    && !matches!(finding.anchor, FindingAnchor::Summary { .. })
+            }) {
                 ui.label(
                     RichText::new(format!("#{} · {}", finding.id, finding.title))
                         .color(p.faint)
@@ -928,6 +973,34 @@ mod tests {
                 ..st.findings[&1].clone()
             },
         );
+        // Summary-anchored items: the tab's findings list is their only
+        // Keep / Drop surface (spec §5.6).
+        st.findings.insert(
+            3,
+            Finding {
+                id: 3,
+                anchor: FindingAnchor::Summary {
+                    path: "assets/logo.png".to_string(),
+                },
+                severity: Severity::Risk,
+                title: "the exported asset lost its license header".to_string(),
+                state: FindingState::Draft,
+                ..st.findings[&1].clone()
+            },
+        );
+        st.findings.insert(
+            4,
+            Finding {
+                id: 4,
+                anchor: FindingAnchor::Summary {
+                    path: "vendor/big.js".to_string(),
+                },
+                severity: Severity::Question,
+                title: "why is a vendored bundle in the diff?".to_string(),
+                state: FindingState::DroppedByVerifier,
+                ..st.findings[&1].clone()
+            },
+        );
 
         for (phase, show_dropped) in [
             (AiPhase::Idle, false),
@@ -1016,5 +1089,60 @@ mod tests {
         harness.step();
         harness.step();
         assert_eq!(*harness.state(), vec![AiPanelAction::Cancel]);
+    }
+
+    /// A summary-anchored draft is kept or dropped from the tab's findings
+    /// list: the diff has no row to anchor it to, so this is its only
+    /// Keep / Drop surface (spec §5.6).
+    #[test]
+    fn summary_drafts_report_keep_and_drop() {
+        use crate::ai::review::{Finding, FindingAnchor, FindingState, Severity};
+        use egui_kittest::kittest::Queryable;
+
+        let state = || AiReviewState {
+            phase: AiPhase::Done,
+            findings: std::collections::BTreeMap::from([(
+                7,
+                Finding {
+                    id: 7,
+                    run_id: 9,
+                    agent: AgentRef {
+                        id: 1,
+                        role: AgentRole::Reviewer,
+                        label: "reviewer:g1".to_string(),
+                    },
+                    anchor: FindingAnchor::Summary {
+                        path: "assets/logo.png".to_string(),
+                    },
+                    severity: Severity::Risk,
+                    title: "the asset lost its license header".to_string(),
+                    body: "body".to_string(),
+                    evidence: vec![],
+                    checklist_item: None,
+                    state: FindingState::Draft,
+                    state_reason: None,
+                    pending_local_id: None,
+                },
+            )]),
+            ..AiReviewState::default()
+        };
+
+        let mut harness = panel_harness(state());
+        harness.get_by_label("Keep").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::KeepSummary(7)],
+            "Keep routes to the same keep_draft path the inline row uses"
+        );
+
+        let mut harness = panel_harness(state());
+        harness.get_by_label("Drop").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::DropSummary(7)],
+            "Drop marks the summary item dropped"
+        );
     }
 }

@@ -1193,6 +1193,20 @@ async fn orchestrate(
         }
     };
     ctl.stage(StageKind::Assemble, StageStatus::Done);
+    // Persist the draft with the run before announcing it: a run that
+    // finishes while the user is on another PR loses `DraftReady` to the
+    // stale-event rule, and the attach snapshot replays this row instead
+    // (spec §10.3). A failure here costs only the replay, not the run.
+    match serde_json::to_string(&draft) {
+        Ok(json) => {
+            if let Err(error) = run.store().run_set_draft(run_id, &json) {
+                tracing::warn!(%error, "pipeline: persisting the assembler draft failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "pipeline: serializing the assembler draft failed");
+        }
+    }
     let _ = tx.send(PipelineEvent::DraftReady { draft });
 
     let status = if budget_hit {

@@ -629,6 +629,22 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
     ] {
         st.findings.insert(f.id, f);
     }
+    // A summary-anchored draft: the AI tab's findings list is its only
+    // Keep / Drop surface (spec §5.6).
+    st.findings.insert(
+        7,
+        Finding {
+            anchor: FindingAnchor::Summary {
+                path: "assets/logo.png".into(),
+            },
+            ..finding(
+                7,
+                Severity::Question,
+                FindingState::Draft,
+                "why does the exported asset lack a license header?",
+            )
+        },
+    );
     st
 }
 

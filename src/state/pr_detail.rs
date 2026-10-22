@@ -736,9 +736,25 @@ impl PrSession {
             // stale-event rule: a run keeps going when the PR is left, and
             // its events must not touch a different PR's tab (spec §12).
             // `AiUnrestored` is app-wide, not PR-scoped, so it is not here.
+            //
+            // A snapshot replays the latest run's assembler draft (spec
+            // §10.3), so its fold makes the same prefill decision the live
+            // DraftReady fold above does: a run that finished while the user
+            // was on another PR loses DraftReady to the stale-event rule,
+            // and this is the path that still lands its pre-filled review.
+            // The empty-body rule in `prefill_review` is the double-prefill
+            // guard: a draft already written from the live event is not
+            // overwritten.
             #[cfg(unix)]
-            Event::AiSnapshot { session, .. }
-            | Event::AiCheckoutPlanned { session, .. }
+            Event::AiSnapshot { session, .. } if *session == self.id => {
+                self.ai.apply(event);
+                if prefill_review(&mut self.pending, self.ai.draft.as_ref()) {
+                    self.save_pending_draft();
+                }
+                Vec::new()
+            }
+            #[cfg(unix)]
+            Event::AiCheckoutPlanned { session, .. }
             | Event::AiCheckoutFailed { session, .. }
             | Event::AiCheckoutHeld { session, .. }
             | Event::AiNotice { session, .. }
@@ -1494,6 +1510,8 @@ impl PrSession {
     /// Drop a pending comment from the review.
     pub fn delete_pending(&mut self, local_id: u64, now: Instant) {
         self.pending.delete(local_id);
+        #[cfg(unix)]
+        unlink_pending_finding(self, local_id);
         self.rebuild_rows();
         self.mark_session_dirty(now);
         self.save_pending_draft();
@@ -1515,6 +1533,8 @@ impl PrSession {
         let target = CommentTarget::Line(pending.anchor.clone());
         let body = pending.body.clone();
         self.pending.delete(local_id);
+        #[cfg(unix)]
+        unlink_pending_finding(self, local_id);
         self.open_comment(target);
         self.composer.body = body;
         self.mark_session_dirty(now);
@@ -1852,6 +1872,22 @@ pub fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
         owner: session.repo.owner.to_lowercase(),
         repo: session.repo.name.to_lowercase(),
         number: session.number,
+    }
+}
+
+/// Forget a deleted pending comment on any Kept AI finding that referenced
+/// it: `PendingReview::clear` resets the local-id counter, so a later draft
+/// reissues the id, and a stale link would falsely mark the unrelated new
+/// comment's finding `Posted` at submit (`posted_findings`). Summary keeps
+/// carry no link, and drafts or dropped findings never consult one.
+#[cfg(unix)]
+fn unlink_pending_finding(session: &mut PrSession, local_id: u64) {
+    use crate::ai::review::FindingState;
+
+    for finding in session.ai.findings.values_mut() {
+        if finding.state == FindingState::Kept && finding.pending_local_id == Some(local_id) {
+            finding.pending_local_id = None;
+        }
     }
 }
 
@@ -3209,6 +3245,73 @@ mod tests {
         assert_eq!(posted, vec![1, 2], "the store hears about the same two");
     }
 
+    /// Deleting the pending comment a Kept finding points at must clear the
+    /// link: the local-id counter restarts when the draft is cleared, so a
+    /// later submit whose comment reuses the id would otherwise flip the
+    /// unrelated Kept finding to Posted (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn deleting_a_pending_comment_unlinks_the_kept_finding() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "panics on empty input",
+                "line 1 indexes without a length check",
+            ),
+        );
+        // The Keep, as `app.rs` applies it: pending comment plus the link.
+        let kept = keep_draft(&mut s, 1).expect("the draft keeps into the pending review");
+        let local_id = kept
+            .pending_local_id
+            .expect("a line draft becomes a comment");
+        let finding = s.ai.findings.get_mut(&1).expect("the finding");
+        finding.state = FindingState::Kept;
+        finding.pending_local_id = kept.pending_local_id;
+
+        s.delete_pending(local_id, Instant::now());
+
+        assert!(s.pending.comments.is_empty());
+        assert_eq!(
+            s.ai.findings[&1].state,
+            FindingState::Kept,
+            "deleting the comment does not undo the keep"
+        );
+        assert_eq!(
+            s.ai.findings[&1].pending_local_id, None,
+            "the stale link is gone with the comment"
+        );
+
+        // A submit clears the draft (and the counter); the next comment
+        // reuses the id, and its submit must not post the old finding.
+        on_review_submitted(&mut s, review(ReviewState::Commented));
+        let reused = add_pending(&mut s, line_anchor("a.rs", 1), "**Bug:** unrelated".into())
+            .expect("the cleared draft pins to the head on screen");
+        assert_eq!(
+            reused, local_id,
+            "the counter restarted, so the id is reused"
+        );
+        let commands = on_review_submitted(&mut s, review(ReviewState::Commented));
+        assert_eq!(
+            s.ai.findings[&1].state,
+            FindingState::Kept,
+            "the reused id does not falsely mark the old finding Posted"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::AiFindingState { id: 1, .. })),
+            "the store is not told about a post that did not happen"
+        );
+    }
+
     #[test]
     fn moved_head_keeps_the_draft_pinned() {
         let (mut s, _dir) = ready_session("sha1");
@@ -4078,6 +4181,64 @@ mod tests {
             "whitespace is an empty body"
         );
         assert_eq!(blank.body, draft.summary);
+    }
+
+    /// A snapshot that replays a finished run's draft pre-fills the review
+    /// through the same rule the live DraftReady fold uses — and a re-attach
+    /// never overwrites a summary the reviewer wrote in between (spec §10.3).
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_replay_prefills_the_review_once() {
+        use crate::ai::hub::AiSnapshotData;
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+        use crate::ai::store::RunRecord;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let draft = ReviewDraft {
+            summary: "adds the retry loop; one bug in the backoff".into(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".into(),
+            rewrites: Default::default(),
+        };
+        let snapshot = AiSnapshotData {
+            findings: Vec::new(),
+            coverage: Vec::new(),
+            timeline: Vec::new(),
+            brief: None,
+            run: Some(RunRecord {
+                id: 9,
+                kind: "full".into(),
+                base_sha: None,
+                head_sha: "sha1".into(),
+                status: "completed".into(),
+                stop_reason: None,
+            }),
+            checkout: None,
+            bash_disabled: None,
+            last_reviewed_sha: Some("sha1".into()),
+            draft: Some(draft.clone()),
+            usage: (10, 2),
+        };
+
+        s.on_event(&Event::AiSnapshot {
+            session: SessionId(1),
+            snapshot: snapshot.clone(),
+        });
+        assert_eq!(
+            s.pending.body, draft.summary,
+            "the replayed draft prefills the empty body"
+        );
+        assert_eq!(s.pending.event, ReviewEvent::RequestChanges);
+        assert_eq!(s.ai.usage, (10, 2), "the tab shows the run's tokens");
+
+        // A re-attach after the reviewer wrote their own summary: the
+        // empty-body rule stands, nothing is clobbered or doubled.
+        s.set_pending_body("my own summary".into());
+        s.on_event(&Event::AiSnapshot {
+            session: SessionId(1),
+            snapshot,
+        });
+        assert_eq!(s.pending.body, "my own summary");
     }
 
     /// The verdict mapping the prefill uses, one-to-one with GitHub's events.

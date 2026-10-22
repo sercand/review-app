@@ -2,9 +2,9 @@
 //!
 //! One database at `<config>/ai.sqlite` holds AI sessions, runs, transcripts,
 //! findings, coverage, Q&A, and checkout records for crash recovery (§7.3).
-//! The schema is created by migration 1, tracked with `PRAGMA user_version`;
-//! opening an already-migrated database is a no-op. No secrets are ever
-//! stored here (spec §11).
+//! The migrations, tracked with `PRAGMA user_version`, create the schema and
+//! evolve it; opening an already-migrated database is a no-op. No secrets are
+//! ever stored here (spec §11).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::ai::review::{
     CheckResult, CoverageEntry, Evidence, Finding, FindingAnchor, FindingState, Severity,
 };
+use crate::ai::stages::assemble::ReviewDraft;
 use crate::ai::tools::AgentRef;
 
 /// Migration 1: creates every table from spec §11 so later milestones need
@@ -100,6 +101,14 @@ CREATE TABLE ai_checkout (
     head_sha     TEXT NOT NULL,
     state        TEXT NOT NULL CHECK (state IN ('started', 'active', 'restored', 'failed', 'superseded'))
 );
+"#;
+
+/// Migration 2: the assembler's draft travels with its run so the attach
+/// snapshot can replay it — a run that finished while the user was on
+/// another PR loses its `DraftReady` to the stale-event rule, and without
+/// this column the pre-filled review would never happen (spec §5.6, §10.3).
+const SCHEMA_V2: &str = r#"
+ALTER TABLE ai_runs ADD COLUMN draft_json TEXT;
 "#;
 
 /// Where the AI database lives under a config root: `<config>/ai.sqlite`.
@@ -358,7 +367,7 @@ impl Store {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Current schema version (`PRAGMA user_version`); 1 after migration 1.
+    /// Current schema version (`PRAGMA user_version`); 2 after the migrations.
     pub fn user_version(&self) -> anyhow::Result<i64> {
         Ok(self
             .conn()
@@ -958,6 +967,68 @@ impl Store {
             .map(|found| found.flatten())
     }
 
+    /// Record the assembler's draft for run `id` (spec §5.6). The attach
+    /// snapshot replays it so a run that finished while the user was on
+    /// another PR — whose `DraftReady` the stale-event rule dropped — still
+    /// pre-fills the review on re-attach.
+    pub fn run_set_draft(&self, run_id: i64, draft_json: &str) -> anyhow::Result<()> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE ai_runs SET draft_json = ?2 WHERE id = ?1",
+                rusqlite::params![run_id, draft_json],
+            )
+            .context("setting ai_runs draft_json")?;
+        anyhow::ensure!(n == 1, "no ai_runs row with id {run_id}");
+        Ok(())
+    }
+
+    /// The assembler draft of the newest run for `session_id`, when that run
+    /// filed one (spec §10.3 replay). A draft that no longer parses reads as
+    /// none, with a warning: a stale row must not fail the whole snapshot.
+    pub fn run_latest_draft(&self, session_id: i64) -> anyhow::Result<Option<ReviewDraft>> {
+        let raw = self.latest_run_json(session_id, "draft_json")?;
+        let Some(json) = raw else { return Ok(None) };
+        match serde_json::from_str(&json) {
+            Ok(draft) => Ok(Some(draft)),
+            Err(error) => {
+                tracing::warn!(%error, "ai store: the run draft_json did not parse");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The token totals `(input, output)` recorded by the newest run for
+    /// `session_id`; `(0, 0)` while that run has not ended, or when its
+    /// usage does not parse.
+    pub fn run_latest_usage(&self, session_id: i64) -> anyhow::Result<(u64, u64)> {
+        let raw = self.latest_run_json(session_id, "usage_json")?;
+        let Some(json) = raw else { return Ok((0, 0)) };
+        match serde_json::from_str::<UsageBlob>(&json) {
+            Ok(usage) => Ok((usage.input, usage.output)),
+            Err(error) => {
+                tracing::warn!(%error, "ai store: the run usage_json did not parse");
+                Ok((0, 0))
+            }
+        }
+    }
+
+    /// One TEXT column of the newest run row for `session_id`; `column` is a
+    /// literal from this file, never user input.
+    fn latest_run_json(&self, session_id: i64, column: &str) -> anyhow::Result<Option<String>> {
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT {column} FROM ai_runs WHERE session_id = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                rusqlite::params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .with_context(|| format!("reading ai_runs {column}"))
+            .map(|found| found.flatten())
+    }
+
     /// Move finding `id` to `state` from the UI, keeping the stored
     /// `pending_local_id` unless the caller supplies one (spec §11: the
     /// pending-comment link survives keeps and drops).
@@ -995,18 +1066,30 @@ struct EvidenceBlob {
     evidence: Vec<Evidence>,
 }
 
+/// The `ai_runs.usage_json` shape the pipeline's `finish_run` writes.
+#[derive(Deserialize)]
+struct UsageBlob {
+    input: u64,
+    output: u64,
+}
+
 /// Bring `conn` up to the latest schema. Each migration runs in one
 /// transaction together with its `user_version` bump, so a half-applied
 /// migration never reports as done.
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= 1 {
-        return Ok(());
+    if version < 1 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V1)?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
     }
-    let tx = conn.transaction()?;
-    tx.execute_batch(SCHEMA_V1)?;
-    tx.pragma_update(None, "user_version", 1)?;
-    tx.commit()?;
+    if version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(SCHEMA_V2)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -1317,12 +1400,12 @@ mod tests {
         let db = ai_db_path(dir.path());
         {
             let store = Store::open(&db).unwrap();
-            assert_eq!(store.user_version().unwrap(), 1);
+            assert_eq!(store.user_version().unwrap(), 2);
         }
         let store = Store::open(&db).unwrap();
         assert_eq!(
             store.user_version().unwrap(),
-            1,
+            2,
             "reopening must not re-migrate"
         );
         // The unique index from migration 1 survives the second open.
@@ -1336,6 +1419,141 @@ mod tests {
             store.session_id(&key).unwrap(),
             store.session_id(&key).unwrap()
         );
+    }
+
+    /// A database left at migration 1 (before `ai_runs.draft_json` existed)
+    /// upgrades on the next open and keeps every row (spec §11).
+    #[test]
+    fn migration_v2_upgrades_a_v1_database_and_keeps_rows() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+        use std::collections::BTreeMap;
+
+        let dir = tempdir();
+        let db = ai_db_path(dir.path());
+        let key = PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+        };
+        let run;
+        {
+            let store = Store::open(&db).unwrap();
+            let session = store.session_id(&key).unwrap();
+            run = store
+                .run_begin(session, RunKind::Full, None, "head1")
+                .unwrap();
+            store
+                .run_end(run, "completed", None, Some(r#"{"input":7,"output":3}"#))
+                .unwrap();
+            // Back to a migration-1 database: the new column goes, and the
+            // version with it.
+            store
+                .conn()
+                .execute_batch(
+                    "ALTER TABLE ai_runs DROP COLUMN draft_json; PRAGMA user_version = 1;",
+                )
+                .unwrap();
+            assert_eq!(store.user_version().unwrap(), 1);
+        }
+
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.user_version().unwrap(), 2, "the v1 database upgrades");
+        let session = store.session_id(&key).unwrap();
+        let latest = store
+            .latest_run(session)
+            .unwrap()
+            .expect("the run row survived the upgrade");
+        assert_eq!(latest.id, run);
+        assert_eq!(latest.status, "completed");
+        assert_eq!(
+            store.run_latest_usage(session).unwrap(),
+            (7, 3),
+            "the usage the v1 database already had still reads back"
+        );
+        assert_eq!(
+            store.run_latest_draft(session).unwrap(),
+            None,
+            "the upgraded column starts empty"
+        );
+
+        // And the new column works on the upgraded database.
+        let draft = ReviewDraft {
+            summary: "a clean change".to_string(),
+            verdict: Verdict::Approve,
+            rationale: "no findings".to_string(),
+            rewrites: BTreeMap::new(),
+        };
+        store
+            .run_set_draft(run, &serde_json::to_string(&draft).unwrap())
+            .unwrap();
+        assert_eq!(store.run_latest_draft(session).unwrap(), Some(draft));
+    }
+
+    /// The draft and usage the snapshot replays: both read from the newest
+    /// run row, and a run that has not ended (or never assembled) reads as
+    /// nothing (spec §10.3).
+    #[test]
+    fn run_draft_and_usage_replay_from_the_latest_run() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+        use std::collections::BTreeMap;
+
+        let store = Store::open_in_memory().unwrap();
+        let session = session(&store);
+        assert_eq!(store.run_latest_draft(session).unwrap(), None);
+        assert_eq!(store.run_latest_usage(session).unwrap(), (0, 0));
+
+        let first = store
+            .run_begin(session, RunKind::Full, None, "head1")
+            .unwrap();
+        let draft = ReviewDraft {
+            summary: "adds the retry loop".to_string(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".to_string(),
+            rewrites: BTreeMap::from([(4, "rewritten".to_string())]),
+        };
+        store
+            .run_set_draft(first, &serde_json::to_string(&draft).unwrap())
+            .unwrap();
+        store
+            .run_end(first, "completed", None, Some(r#"{"input":10,"output":2}"#))
+            .unwrap();
+        assert_eq!(
+            store.run_latest_draft(session).unwrap(),
+            Some(draft.clone())
+        );
+        assert_eq!(store.run_latest_usage(session).unwrap(), (10, 2));
+
+        // A newer run that has not assembled (or ended) shadows the old one.
+        let second = store
+            .run_begin(session, RunKind::Full, None, "head2")
+            .unwrap();
+        assert_eq!(store.run_latest_draft(session).unwrap(), None);
+        assert_eq!(store.run_latest_usage(session).unwrap(), (0, 0));
+        store
+            .run_set_draft(second, &serde_json::to_string(&draft).unwrap())
+            .unwrap();
+        assert_eq!(store.run_latest_draft(session).unwrap(), Some(draft));
+
+        // A row that does not parse reads as nothing, not an error.
+        store
+            .conn()
+            .execute(
+                "UPDATE ai_runs SET draft_json = 'not json' WHERE id = ?1",
+                [second],
+            )
+            .unwrap();
+        assert_eq!(store.run_latest_draft(session).unwrap(), None);
+        store
+            .conn()
+            .execute(
+                "UPDATE ai_runs SET usage_json = '{\"tokens\":10}' WHERE id = ?1",
+                [second],
+            )
+            .unwrap();
+        assert_eq!(store.run_latest_usage(session).unwrap(), (0, 0));
+
+        assert!(store.run_set_draft(999, "{}").is_err());
     }
 
     #[test]

@@ -1785,6 +1785,48 @@ impl ReviewApp {
                 // The diff's inline rows follow the toggle (AI Task 5).
                 session.rebuild_rows();
             }
+            // A summary-anchored draft has no inline row, so the tab's
+            // findings list is its only Keep / Drop surface (spec §5.6).
+            // The keep appends the item to the review body; every step
+            // mirrors the inline Keep, including the pinned-commit toast.
+            AiPanelAction::KeepSummary(id) => {
+                use crate::ai::review::FindingState;
+
+                match crate::state::pr_detail::keep_draft(session, id) {
+                    Ok(kept) => {
+                        if let Some(finding) = session.ai.findings.get_mut(&id) {
+                            finding.state = FindingState::Kept;
+                            finding.pending_local_id = kept.pending_local_id;
+                        }
+                        session.rebuild_rows();
+                        session.mark_session_dirty(now);
+                        self.worker.send(Command::AiFindingState {
+                            session: session.id,
+                            key: crate::state::pr_detail::pr_key(session),
+                            id,
+                            state: FindingState::Kept,
+                            pending_local_id: kept.pending_local_id,
+                        });
+                    }
+                    Err(why) => self.toasts.push(why, now),
+                }
+            }
+            AiPanelAction::DropSummary(id) => {
+                use crate::ai::review::FindingState;
+
+                if let Some(finding) = session.ai.findings.get_mut(&id) {
+                    finding.state = FindingState::DroppedByUser;
+                }
+                session.rebuild_rows();
+                session.mark_session_dirty(now);
+                self.worker.send(Command::AiFindingState {
+                    session: session.id,
+                    key: crate::state::pr_detail::pr_key(session),
+                    id,
+                    state: FindingState::DroppedByUser,
+                    pending_local_id: None,
+                });
+            }
             AiPanelAction::AddSuggestedCommands => {
                 // Copy the scout's proposals into the repo's settings and
                 // retire the card (Task 4). The run only suggests when the

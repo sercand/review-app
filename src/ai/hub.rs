@@ -40,6 +40,7 @@ use crate::ai::model::Llm;
 use crate::ai::pipeline::{PipelineControl, PipelineInputs, RunMode, RunStatus, start_pipeline};
 use crate::ai::review::{CoverageEntry, Finding, FindingState};
 use crate::ai::snapshot::gather_snapshot;
+use crate::ai::stages::assemble::ReviewDraft;
 use crate::ai::store::{
     CheckoutRecord, CheckoutState, OriginalRef, PrKey, RunRecord, Store, ai_db_path,
 };
@@ -114,6 +115,13 @@ pub struct AiSnapshotData {
     pub bash_disabled: Option<String>,
     /// The head the last completed review ran against (spec §5.8).
     pub last_reviewed_sha: Option<String>,
+    /// The latest run's assembler draft, when it filed one (spec §5.6):
+    /// replayed so a run that finished while the user was on another PR
+    /// still pre-fills the review on re-attach.
+    pub draft: Option<ReviewDraft>,
+    /// The latest run's token totals, `(input, output)`; `(0, 0)` while the
+    /// newest run is still open.
+    pub usage: (u64, u64),
 }
 
 /// Chat-stream events (spec §10.5). The chat agent arrives with Task 7;
@@ -437,6 +445,23 @@ impl AiHub {
         };
         let brief = self.store.session_brief(session_id)?;
         let last_reviewed_sha = self.store.session_last_reviewed(session_id)?;
+        // The draft and usage ride the snapshot so a run that finished while
+        // the user was elsewhere still lands its pre-filled review and token
+        // line on re-attach; a row that cannot be read costs only the replay.
+        let draft = self
+            .store
+            .run_latest_draft(session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "ai hub: could not read the run draft");
+                None
+            });
+        let usage = self
+            .store
+            .run_latest_usage(session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "ai hub: could not read the run usage");
+                (0, 0)
+            });
         let (checkout, bash_disabled) = match live.filter(|run| !run.starting) {
             Some(run) => (Some(run.checkout.clone()), run.bash_disabled.clone()),
             None => {
@@ -458,6 +483,8 @@ impl AiHub {
             checkout,
             bash_disabled,
             last_reviewed_sha,
+            draft,
+            usage,
         })
     }
 
@@ -1716,6 +1743,17 @@ mod tests {
         scripts: BTreeMap<String, Vec<ScriptStep>>,
         launcher: SandboxLauncher,
     ) -> HubFixture {
+        harness_usage(scripts, launcher, 0, 0).await
+    }
+
+    /// [`harness`] whose model reports `input`/`output` tokens on every
+    /// reply, for tests that watch the run's stored usage totals.
+    async fn harness_usage(
+        scripts: BTreeMap<String, Vec<ScriptStep>>,
+        launcher: SandboxLauncher,
+        input: u64,
+        output: u64,
+    ) -> HubFixture {
         let (dir, clone, pr) = fixture();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1753,7 +1791,8 @@ mod tests {
         );
 
         let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
-        let llm: Arc<ScriptedLlm> = Arc::new(ScriptedLlm::per_agent(model(), scripts));
+        let llm: Arc<ScriptedLlm> =
+            Arc::new(ScriptedLlm::per_agent(model(), scripts).usage_per_call(input, output));
         let llm_for_fixture = llm.clone();
         let llms: LlmFactory = Arc::new(move |_settings: &AiSettings, _tokens: &dyn TokenStore| {
             let main: Arc<dyn Llm> = llm.clone();
@@ -2019,6 +2058,43 @@ mod tests {
             Event::AiPipeline { session, .. } => assert_eq!(*session, SessionId(2)),
             _ => unreachable!(),
         }
+    }
+
+    /// The run's assembler draft and token totals survive the run: a user
+    /// who was on another PR when it finished — whose `DraftReady` the
+    /// stale-event rule dropped — gets both back from the attach snapshot,
+    /// so the pre-filled review and the "suggested" line still happen
+    /// (spec §5.6, §10.3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_replays_the_finished_run_draft_and_usage() {
+        use crate::ai::stages::assemble::Verdict;
+
+        let fx = harness_usage(clean_scripts(), host_launcher(), 100, 40).await;
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+
+        // The user re-enters the PR: a new session, and the snapshot that
+        // rebuilds the tab carries the finished run's draft and usage.
+        fx.hub.attach(SessionId(2), fx.key.clone(), &fx.tx);
+        let snapshot = match wait_for(
+            &fx.events,
+            |e| matches!(e, Event::AiSnapshot { session, .. } if *session == SessionId(2)),
+        ) {
+            Event::AiSnapshot { snapshot, .. } => snapshot,
+            _ => unreachable!(),
+        };
+        let draft = snapshot
+            .draft
+            .expect("the finished run's draft replays with the snapshot");
+        assert_eq!(draft.summary, "a clean change");
+        assert_eq!(draft.verdict, Verdict::Approve);
+        assert!(
+            snapshot.usage.0 > 0 && snapshot.usage.1 > 0,
+            "the token tally rides the snapshot too: {:?}",
+            snapshot.usage
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
