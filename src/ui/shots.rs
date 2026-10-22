@@ -359,6 +359,10 @@ fn detail(mode: DiffMode, dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: false,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -700,6 +704,10 @@ fn ai_detail_pane(
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -775,6 +783,10 @@ fn ai_inline_draft(dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -829,6 +841,10 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
         ai_dialogs::render(
@@ -837,12 +853,84 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
             &DialogInputs {
                 pr: Some(&pr),
                 prepare: &prepare,
-                error: None,
             },
             &mut Vec::new(),
         );
     });
     save_after(h, name, 8);
+}
+
+/// The Local checkout row at the top of the PR AI tab (AI settings Task 7)
+/// in its three states: `linked` shows a usable folder (the app's own
+/// checkout, so the clone check is real), otherwise the folder is absent —
+/// `missing` names one that was linked and has since gone, unlinked shows
+/// the Start-gating reason.
+#[cfg(unix)]
+fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
+    use crate::ai::repo_link::FolderStatus;
+    use crate::persist::settings::RepoAiSettings;
+    use crate::ui::widgets::ai_panel::LocalCheckoutVm;
+
+    let path = if linked {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    } else if missing {
+        std::path::PathBuf::from("/Users/sercand/Developer/src/widgets")
+    } else {
+        std::path::PathBuf::new()
+    };
+    let vm = LocalCheckoutVm {
+        repo: "acme/widgets".to_string(),
+        path: (!path.as_os_str().is_empty()).then(|| path.clone()),
+        status: match (linked, missing) {
+            (true, _) => FolderStatus::Ok,
+            (false, true) => FolderStatus::Missing,
+            (false, false) => FolderStatus::Missing,
+        },
+        error: None,
+        blockers: if linked {
+            Vec::new()
+        } else if missing {
+            vec!["The linked folder for github.com/acme/widgets is missing.".to_string()]
+        } else {
+            vec!["Link a local folder for github.com/acme/widgets.".to_string()]
+        },
+        change_blocked: None,
+    };
+    let repo = RepoAiSettings {
+        repo: "github.com/acme/widgets".to_string(),
+        path,
+        commands: vec!["cargo test".to_string(), "cargo clippy".to_string()],
+        prepare: vec!["cargo fetch".to_string()],
+        ..Default::default()
+    };
+
+    let mut s = session(DiffMode::Split);
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        ..Default::default()
+    };
+    state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
+    let h = harness(dark, move |ui| {
+        let mut diff_actions = Vec::new();
+        pr_detail::render(
+            ui,
+            &mut s,
+            &mut state,
+            &mut cache,
+            &mut diff_actions,
+            pr_detail::ScreenInputs {
+                login: "sercand",
+                write_blocked: None,
+                theme: theme::Theme::Dark,
+                system_dark: dark,
+                ai_configured: true,
+                local_checkout: Some(&vm),
+                repo_ai: Some(&repo),
+            },
+        );
+    });
+    save_after(h, name, 10);
 }
 
 #[test]
@@ -887,6 +975,25 @@ fn shots() {
             );
             ai_inline_draft(dark, &format!("pr-ai-inline-draft-{t}"));
             ai_checkout_dialog(dark, &format!("pr-checkout-dialog-{t}"));
+            // The Local checkout row in its three states (AI settings Task 7).
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-linked-{t}"),
+                true,
+                false,
+            );
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-unlinked-{t}"),
+                false,
+                false,
+            );
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-missing-{t}"),
+                false,
+                true,
+            );
         }
 
         let settings = Settings::default();
@@ -1160,6 +1267,10 @@ fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
                     theme: theme::Theme::Dark,
                     system_dark: true,
                     ai_configured: true,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
             *w.borrow_mut() = state.right_pane;

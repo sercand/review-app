@@ -139,6 +139,14 @@ pub struct ScreenInputs<'a> {
     /// Whether the AI surface is on (`settings.ai.models.default` is set),
     /// which decides whether the top bar shows its ✦ AI review button.
     pub ai_configured: bool,
+    /// The Local checkout row above the ✦ AI tab's controls (AI settings
+    /// Task 7); `None` hides the row.
+    #[cfg(unix)]
+    pub local_checkout: Option<&'a crate::ui::widgets::ai_panel::LocalCheckoutVm>,
+    /// The repo's AI settings entry for the row's commands summary; `None`
+    /// when the repo has no entry yet.
+    #[cfg(unix)]
+    pub repo_ai: Option<&'a crate::persist::settings::RepoAiSettings>,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -295,7 +303,7 @@ pub fn render(
             // 51, 13, and Plan 3).
             let web = endpoints_for(&session.host).web;
             let counts = metadata_panel::tab_counts(session);
-            let inputs = metadata_panel::PanelInputs {
+            let meta_inputs = metadata_panel::PanelInputs {
                 metadata: session.metadata.as_ref(),
                 commits: &session.commits,
                 check_runs: &session.check_runs,
@@ -314,15 +322,22 @@ pub fn render(
                     #[cfg(unix)]
                     if state.details_tab == metadata_panel::DetailsTab::Ai {
                         // The AI tab reads the session's reducer state and
-                        // reports its own actions (spec §12).
+                        // reports its own actions (spec §12); the Local
+                        // checkout row rides in through the screen inputs
+                        // (AI settings Task 7).
+                        let ai_inputs = crate::ui::widgets::ai_panel::PanelInputs {
+                            checkout: inputs.local_checkout,
+                            repo: inputs.repo_ai,
+                        };
                         ai_actions = crate::ui::widgets::ai_panel::render(
                             ui,
                             &session.ai,
+                            &ai_inputs,
                             session.ai.show_dropped,
                         );
                         return;
                     }
-                    metadata_panel::render_body(ui, &inputs, state.details_tab);
+                    metadata_panel::render_body(ui, &meta_inputs, state.details_tab);
                 });
         });
     // Only capture while open: the close animation slides the panel through
@@ -699,6 +714,10 @@ mod tests {
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
                     ai_configured: false,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
         });
@@ -754,6 +773,10 @@ mod tests {
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
                     ai_configured: false,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
         });

@@ -560,6 +560,10 @@ mod tests {
                             theme: crate::ui::theme::Theme::Dark,
                             system_dark: true,
                             ai_configured: false,
+                            #[cfg(unix)]
+                            local_checkout: None,
+                            #[cfg(unix)]
+                            repo_ai: None,
                         },
                     );
                 },

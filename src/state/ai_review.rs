@@ -26,7 +26,7 @@ use crate::ai::review::{
     CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
 };
 use crate::ai::stages::assemble::ReviewDraft;
-use crate::ai::store::CheckoutRecord;
+use crate::ai::store::{CheckoutRecord, CheckoutState};
 use crate::ai::tools::{AgentRef, AgentRole};
 use crate::ai::ui_interaction::ApprovalKind;
 use crate::runtime::Event;
@@ -906,6 +906,58 @@ pub fn why_question(f: &Finding) -> String {
         ),
         FindingAnchor::Summary { path } => format!("Why did you flag #{} ({})?", f.id, path),
     }
+}
+
+/// Why the repository's local folder cannot be changed or unlinked right
+/// now, or `None` when it can: a live run, or a checkout of this repo still
+/// awaiting its restore, depends on the path the link holds (spec: AI
+/// settings — Unlink / Change folder is blocked while a review or a
+/// checkout for that repo is active or unrestored).
+///
+/// `unrestored` is the app-wide recovery list ([`Event::AiUnrestored`]'s
+/// records); the open session's own held checkout rides in `ai_state`.
+/// Records name their repository by the `owner/repo` slug, matched
+/// case-insensitively against the `host/owner/name` `repo_key`.
+pub fn change_blocked(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+) -> Option<String> {
+    if matches!(
+        ai_state.phase,
+        AiPhase::Planning
+            | AiPhase::CheckingOut
+            | AiPhase::Running
+            | AiPhase::Paused
+            | AiPhase::Restoring
+    ) {
+        return Some(
+            "An AI review is running for this repository — finish it before changing the folder."
+                .to_string(),
+        );
+    }
+    ai_state
+        .checkout
+        .iter()
+        .chain(unrestored)
+        .any(|record| unrestored_holds_repo(record, repo_key))
+        .then(|| {
+            "This repository has an unrestored AI checkout — restore it before changing the folder."
+                .to_string()
+        })
+}
+
+/// Whether `record` is a checkout of `repo_key` that still awaits its
+/// restore. `Restored` and `Superseded` rows are done with the folder.
+fn unrestored_holds_repo(record: &CheckoutRecord, repo_key: &str) -> bool {
+    if !matches!(
+        record.state,
+        CheckoutState::Started | CheckoutState::Active | CheckoutState::Failed
+    ) {
+        return false;
+    }
+    let slug = repo_key.split_once('/').map_or(repo_key, |(_, slug)| slug);
+    record.repo.eq_ignore_ascii_case(slug)
 }
 
 #[cfg(test)]
@@ -1788,5 +1840,67 @@ mod tests {
             ],
             "pipeline order, latest status, agent progress"
         );
+    }
+
+    /// Changing or unlinking the repo's folder is blocked while a run for
+    /// it is live or a checkout of it awaits its restore — the restore
+    /// logic depends on the path (spec: AI settings, Unlink / Change).
+    #[test]
+    fn change_blocked_while_a_run_is_live_or_unrestored() {
+        let key = "github.com/acme/widgets";
+        let record = || CheckoutRecord {
+            repo: "acme/widgets".to_string(),
+            ..checkout_record()
+        };
+
+        // Idle with nothing held: the link can move.
+        let idle = AiReviewState::default();
+        assert_eq!(change_blocked(&idle, &[], key), None);
+
+        // Every live phase blocks, whatever else is or is not held.
+        for phase in [
+            AiPhase::Planning,
+            AiPhase::CheckingOut,
+            AiPhase::Running,
+            AiPhase::Paused,
+            AiPhase::Restoring,
+        ] {
+            let st = AiReviewState {
+                phase: phase.clone(),
+                ..AiReviewState::default()
+            };
+            let reason = change_blocked(&st, &[], key).expect("a live run blocks the change");
+            assert!(reason.contains("running"), "{phase:?}: {reason}");
+        }
+
+        // A finished run that still holds the checkout blocks: the restore
+        // needs the path it started with.
+        let st = AiReviewState {
+            phase: AiPhase::Done,
+            checkout: Some(record()),
+            ..AiReviewState::default()
+        };
+        let reason = change_blocked(&st, &[], key).expect("a held checkout blocks the change");
+        assert!(reason.contains("unrestored"), "{reason}");
+
+        // The app-wide recovery list blocks the same repo, matched
+        // case-insensitively, and leaves every other repo free.
+        let st = AiReviewState::default();
+        assert!(change_blocked(&st, &[record()], "GitHub.com/Acme/Widgets").is_some());
+        let other = CheckoutRecord {
+            repo: "acme/api".to_string(),
+            ..record()
+        };
+        assert_eq!(
+            change_blocked(&st, &[other], key),
+            None,
+            "another repo's checkout is none of this row's business"
+        );
+
+        // A record already restored (or superseded) is not unrestored.
+        for state in [CheckoutState::Restored, CheckoutState::Superseded] {
+            let done = CheckoutRecord { state, ..record() };
+            assert_eq!(change_blocked(&st, &[done], key), None, "{state:?}");
+        }
     }
 }

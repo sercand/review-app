@@ -1,31 +1,22 @@
-//! The AI review dialogs (spec §4 step 2, §7.3): the folder pick, the
-//! checkout confirmation, the restore decision, crash recovery, and the
-//! repo-held notice.
+//! The AI review dialogs (spec §4 step 2, §7.3): the checkout
+//! confirmation, the restore decision, crash recovery, and the repo-held
+//! notice.
 //!
 //! Like every widget here these never mutate state: each control reports an
-//! [`AiDialogAction`] for `app.rs` to apply, and the folder picker itself is
-//! the app's — the widget only asks for it and receives the chosen path.
-//! Unix-only with [`crate::ai`].
-
-use std::path::{Path, PathBuf};
+//! [`AiDialogAction`] for `app.rs` to apply. The folder pick is no longer a
+//! dialog — the PR AI tab's Local checkout row owns the link and drives the
+//! OS picker directly (AI settings Task 7). Unix-only with [`crate::ai`].
 
 use eframe::egui::{self, Frame, Margin, RichText};
 
-use crate::ai::checkout::{CheckoutPlan, PrTarget, RemoteRepo, find_remote};
-use crate::ai::repo_link::link_repo;
-use crate::ai::store::{CheckoutRecord, OriginalRef, PrKey};
-use crate::persist::settings::AiSettings;
+use crate::ai::checkout::{CheckoutPlan, PrTarget};
+use crate::ai::store::{CheckoutRecord, OriginalRef};
 use crate::ui::components::{Btn, BtnKind};
 use crate::ui::{fonts, icons, theme};
 
 /// The one AI dialog the app shows at a time (spec §4, §7.3).
 #[derive(Clone, Debug, PartialEq)]
 pub enum AiDialog {
-    /// No folder is configured for this repo; ask for one (spec §4 step 2).
-    PickFolder {
-        /// The PR whose repository needs a folder.
-        key: PrKey,
-    },
     /// The planned checkout, awaiting the user's confirmation (spec §4 step 2).
     ConfirmCheckout(CheckoutPlan),
     /// Finish found changes the review made; discard or leave as is (§7.3).
@@ -49,11 +40,6 @@ pub enum AiDialog {
 /// A control one of the dialogs reported.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AiDialogAction {
-    /// Open the OS folder picker (the pick dialog's button).
-    PickFolder,
-    /// The folder picker answered with a path; a cancelled picker sends
-    /// nothing and the dialog stays open.
-    FolderChosen(PathBuf),
     /// Run the confirmed checkout plan (spec §4 step 3).
     ConfirmCheckout,
     /// Abandon the checkout attempt; also dismisses the held notice.
@@ -66,16 +52,6 @@ pub enum AiDialogAction {
     RecoverRestore(i64),
     /// Close the recovery dialog; the checkouts stay as they are.
     RecoverLater,
-}
-
-/// Why `path` cannot serve as the checkout folder for `key`, or `None` when
-/// it can: a pure wrapper over [`find_remote`] returning the message the
-/// pick dialog shows when the folder is not a clone of the PR's repository
-/// (spec §4 step 2).
-pub fn folder_error(path: &Path, key: &PrKey) -> Option<String> {
-    find_remote(path, &key.host, &key.owner, &key.repo)
-        .err()
-        .map(|error| error.to_string())
 }
 
 /// The display text for a recorded original ref: the branch name, or the
@@ -92,19 +68,6 @@ fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
 }
 
-/// Save `path` as the checkout folder for `key` (spec §4 step 2): a re-pick
-/// moves the folder without losing the commands the user configured or
-/// accepted from the scout, and a new repo gets a fresh row with no commands.
-/// The link itself is [`link_repo`]'s; this adapts the PR key to it.
-pub fn save_folder(ai: &mut AiSettings, key: &PrKey, path: PathBuf) {
-    let repo = RemoteRepo {
-        host: key.host.clone(),
-        owner: key.owner.clone(),
-        name: key.repo.clone(),
-    };
-    link_repo(ai, &repo, path);
-}
-
 /// Window-level context the dialogs display but do not own.
 pub struct DialogInputs<'a> {
     /// The PR the dialog is about, for the confirm dialog's target line.
@@ -112,8 +75,6 @@ pub struct DialogInputs<'a> {
     /// The repo's configured prepare commands (spec §8.5), listed in the
     /// confirm dialog beside the git commands.
     pub prepare: &'a [String],
-    /// The folder validation error to show in the pick dialog.
-    pub error: Option<&'a str>,
 }
 
 /// Paint the dialog over every screen; `ctx` hosts the window the way the
@@ -147,7 +108,6 @@ pub fn render(
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             closed = header(ui, &title, dismiss.is_some());
             match dialog {
-                AiDialog::PickFolder { key } => pick_folder(ui, key, inputs, actions),
                 AiDialog::ConfirmCheckout(plan) => confirm_checkout(ui, plan, inputs, actions),
                 AiDialog::Restore { lines } => restore(ui, lines, actions),
                 AiDialog::Recovery(records) => recovery(ui, records, actions),
@@ -169,7 +129,7 @@ pub fn render(
 /// restore decision cannot be silently dropped.
 pub fn dismiss_action(dialog: &AiDialog) -> Option<AiDialogAction> {
     match dialog {
-        AiDialog::PickFolder { .. } | AiDialog::ConfirmCheckout(_) | AiDialog::Held { .. } => {
+        AiDialog::ConfirmCheckout(_) | AiDialog::Held { .. } => {
             Some(AiDialogAction::CancelCheckout)
         }
         AiDialog::Restore { .. } => None,
@@ -190,7 +150,6 @@ pub fn survives_navigation(dialog: &AiDialog) -> bool {
 fn dialog_meta(dialog: &AiDialog, inputs: &DialogInputs) -> (String, f32, Option<AiDialogAction>) {
     let dismiss = dismiss_action(dialog);
     match dialog {
-        AiDialog::PickFolder { .. } => ("Pick the repository folder".to_string(), 440.0, dismiss),
         AiDialog::ConfirmCheckout(_) => (checkout_title(inputs.pr), 500.0, dismiss),
         AiDialog::Restore { .. } => ("Changes made during the review".to_string(), 500.0, dismiss),
         AiDialog::Recovery(_) => ("Unrestored AI checkouts".to_string(), 580.0, dismiss),
@@ -221,35 +180,6 @@ fn header(ui: &mut egui::Ui, title: &str, dismissible: bool) -> bool {
         }
     });
     closed
-}
-
-/// No folder is configured for this repo: ask for one (spec §4 step 2).
-fn pick_folder(
-    ui: &mut egui::Ui,
-    key: &PrKey,
-    inputs: &DialogInputs,
-    actions: &mut Vec<AiDialogAction>,
-) {
-    ui.label(format!(
-        "Which folder holds your local clone of {}/{}?",
-        key.owner, key.repo
-    ));
-    ui.weak("The app checks that one of its git remotes points at the pull request's repository.");
-    if let Some(error) = inputs.error {
-        let p = theme::palette_of(ui);
-        ui.colored_label(p.bad, error);
-    }
-    ui.horizontal(|ui| {
-        if Btn::new(BtnKind::Primary, "Choose folder…")
-            .show(ui)
-            .clicked()
-        {
-            actions.push(AiDialogAction::PickFolder);
-        }
-        if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
-            actions.push(AiDialogAction::CancelCheckout);
-        }
-    });
 }
 
 /// The plan awaiting confirmation: where the tree goes, what gets stashed,
@@ -402,63 +332,7 @@ fn mono_line(ui: &mut egui::Ui, text: &str) {
 mod tests {
     use super::*;
     use crate::ai::store::CheckoutState;
-    use crate::test_support::tempdir;
-    use std::process::Command;
-
-    fn gitx(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .expect("git on PATH");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    fn key() -> PrKey {
-        PrKey {
-            host: "github.com".to_string(),
-            owner: "acme".to_string(),
-            repo: "app".to_string(),
-            number: 7,
-        }
-    }
-
-    #[test]
-    fn folder_error_for_non_repo_and_wrong_remote() {
-        // A plain directory: not a git repository at all.
-        let plain = tempdir();
-        let error =
-            folder_error(plain.path(), &key()).expect("a plain folder is not a checkout folder");
-        assert!(error.contains("github.com/acme/app"), "{error}");
-
-        // A repository whose remote points at another project.
-        let other = tempdir();
-        gitx(other.path(), &["init", "-b", "main"]);
-        gitx(
-            other.path(),
-            &[
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/other/app.git",
-            ],
-        );
-        let error = folder_error(other.path(), &key()).expect("a fork's clone is not the repo");
-        assert!(error.contains("github.com/acme/app"), "{error}");
-
-        // The right repository under an scp-form remote: no error.
-        let right = tempdir();
-        gitx(right.path(), &["init", "-b", "main"]);
-        gitx(
-            right.path(),
-            &["remote", "add", "origin", "git@github.com:acme/app.git"],
-        );
-        assert_eq!(folder_error(right.path(), &key()), None);
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn original_ref_label_shows_branch_or_short_sha() {
@@ -472,42 +346,6 @@ mod tests {
         );
     }
 
-    /// Picking a folder for a repo that already has one changes the folder
-    /// only: the commands the user configured (or accepted from the scout)
-    /// survive a re-pick, and a new repo gets a fresh entry (Task 4).
-    #[test]
-    fn picking_a_folder_keeps_the_repos_commands() {
-        use crate::persist::settings::{AiSettings, RepoAiSettings};
-
-        let mut ai = AiSettings {
-            repos: vec![RepoAiSettings {
-                repo: "github.com/acme/app".to_string(),
-                path: PathBuf::from("/old"),
-                commands: vec!["cargo test".to_string()],
-                prepare: vec!["cargo fetch".to_string()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        save_folder(&mut ai, &key(), PathBuf::from("/new"));
-        assert_eq!(ai.repos.len(), 1, "the existing row is updated in place");
-        assert_eq!(ai.repos[0].path, PathBuf::from("/new"));
-        assert_eq!(ai.repos[0].commands, vec!["cargo test".to_string()]);
-        assert_eq!(ai.repos[0].prepare, vec!["cargo fetch".to_string()]);
-
-        let other = PrKey {
-            host: "github.com".to_string(),
-            owner: "acme".to_string(),
-            repo: "other".to_string(),
-            number: 8,
-        };
-        save_folder(&mut ai, &other, PathBuf::from("/other"));
-        assert_eq!(ai.repos.len(), 2, "a new repo gets its own row");
-        assert_eq!(ai.repos[1].repo, "github.com/acme/other");
-        assert_eq!(ai.repos[1].path, PathBuf::from("/other"));
-        assert!(ai.repos[1].commands.is_empty(), "nothing to keep yet");
-    }
-
     /// The confirm dialog names the PR once metadata is in, and the X/Esc
     /// of each dialog resolves to its non-destructive answer — except the
     /// restore decision, which the user must make.
@@ -516,7 +354,6 @@ mod tests {
         let inputs = DialogInputs {
             pr: None,
             prepare: &[],
-            error: None,
         };
         assert_eq!(
             checkout_title(None),
@@ -541,10 +378,6 @@ mod tests {
             skip_stash: false,
             commands: Vec::new(),
         };
-        assert_eq!(
-            dialog_meta(&AiDialog::PickFolder { key: key() }, &inputs).2,
-            Some(AiDialogAction::CancelCheckout)
-        );
         assert_eq!(
             dialog_meta(&AiDialog::ConfirmCheckout(plan), &inputs).2,
             Some(AiDialogAction::CancelCheckout)
@@ -610,7 +443,6 @@ mod tests {
         };
         let prepare = vec!["cargo fetch".to_string()];
         for dialog in [
-            AiDialog::PickFolder { key: key() },
             AiDialog::ConfirmCheckout(plan),
             AiDialog::Restore {
                 lines: vec!["?? stray.txt".to_string()],
@@ -629,7 +461,6 @@ mod tests {
             let inputs = DialogInputs {
                 pr: Some(&pr),
                 prepare: &prepare,
-                error: Some("no remote in this repository points at github.com/acme/app"),
             };
             egui::__run_test_ui(|ui| {
                 render(ui.ctx(), &dialog, &inputs, &mut actions);
@@ -651,10 +482,6 @@ mod tests {
             skip_stash: false,
             commands: Vec::new(),
         };
-        assert_eq!(
-            dismiss_action(&AiDialog::PickFolder { key: key() }),
-            Some(AiDialogAction::CancelCheckout)
-        );
         assert_eq!(
             dismiss_action(&AiDialog::ConfirmCheckout(plan)),
             Some(AiDialogAction::CancelCheckout)
@@ -694,7 +521,6 @@ mod tests {
             commands: Vec::new(),
         };
         for dialog in [
-            AiDialog::PickFolder { key: key() },
             AiDialog::ConfirmCheckout(plan),
             AiDialog::Restore {
                 lines: vec!["?? stray.txt".to_string()],
@@ -727,7 +553,6 @@ mod tests {
                     let inputs = DialogInputs {
                         pr: None,
                         prepare: &[],
-                        error: None,
                     };
                     render(
                         ui.ctx(),

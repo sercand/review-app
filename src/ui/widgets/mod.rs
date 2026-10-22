@@ -4,6 +4,8 @@
 pub mod ai_dialogs;
 #[cfg(unix)]
 pub mod ai_panel;
+#[cfg(unix)]
+pub mod ai_repo_dialog;
 pub mod checks;
 pub mod command_palette;
 pub mod comment_composer;
