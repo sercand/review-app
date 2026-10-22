@@ -107,7 +107,29 @@ pub(super) fn check_expansion(node: Node, src: &str) -> Result<(), Bail> {
     if t.contains('`') || t.contains("$(") {
         return Err(Bail::CommandSubstitution);
     }
+    if has_transform_operator(t) {
+        return Err(Bail::Unsupported("parameter_transformation"));
+    }
     Ok(())
+}
+
+/// `${x@P}`, `${x@E}`, `${x@A}` …: bash 4.4+ transformation operators. `@P`
+/// expands prompt escapes (which can run `$(…)` held in the variable) and
+/// `@E` decodes escapes, so the word's value is not what the text says.
+/// Looks for `@` followed by a letter inside any `${…}` body; a `@` in other
+/// positions (`${@}`, `${x:-a@b}`) may bail needlessly, which fails closed.
+fn has_transform_operator(t: &str) -> bool {
+    let mut rest = t;
+    while let Some(i) = rest.find("${") {
+        let body = &rest[i + 2..];
+        let end = body.find('}').unwrap_or(body.len());
+        let b = body[..end].as_bytes();
+        if b.windows(2).any(|w| w[0] == b'@' && w[1].is_ascii_alphabetic()) {
+            return true;
+        }
+        rest = body;
+    }
+    false
 }
 
 /// True when `gap` (text between two sibling nodes) is only backslash-newline

