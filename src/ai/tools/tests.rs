@@ -1422,10 +1422,12 @@ impl CommandClassifier for FixedClassifier {
 /// sets `release` at the end so the runtime's shutdown does not wait on it.
 struct SlowClassifier {
     release: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
 }
 
 impl CommandClassifier for SlowClassifier {
     fn classify(&self, _segment: &str) -> ModelOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         for _ in 0..300 {
             if self.release.load(Ordering::SeqCst) {
                 break;
@@ -1516,9 +1518,8 @@ async fn bash_model_safe_still_asks_for_never_approved_commands() {
     ] {
         let (dir, host) = host();
         write_tool(dir.path());
-        let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny {
-            reason: None,
-        }));
+        let interaction =
+            Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny { reason: None }));
         let cx = classifier_ctx(
             &host,
             interaction.clone(),
@@ -1567,6 +1568,7 @@ async fn bash_classifier_timeout_falls_back_to_ask() {
         &settings,
         Some(Arc::new(SlowClassifier {
             release: release.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
         })),
     );
 
@@ -1578,6 +1580,54 @@ async fn bash_classifier_timeout_falls_back_to_ask() {
     assert!(!out.is_error, "{}", text(&out));
     assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
     assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+}
+
+/// I2: while one classification is still running (hung model), another bash
+/// command is decided without the model instead of spawning a second
+/// blocking thread, both concurrently and after the first timed out.
+#[tokio::test]
+async fn bash_busy_classifier_is_not_stacked() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(
+        ScriptedInteraction::new()
+            .approve(ApprovalDecision::Deny { reason: None })
+            .approve(ApprovalDecision::Deny { reason: None })
+            .approve(ApprovalDecision::Deny { reason: None }),
+    );
+    let release = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let settings = AutoApproveSettings {
+        classifier_timeout_ms: 100,
+        ..model_on()
+    };
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(Arc::new(SlowClassifier {
+            release: release.clone(),
+            calls: calls.clone(),
+        })),
+    );
+
+    let (a, b) = tokio::join!(
+        bash(&cx, json!({"command": "/usr/bin/pr -t tool.sh"})),
+        bash(&cx, json!({"command": "/usr/bin/pr -t -2 tool.sh"})),
+    );
+    assert!(a.is_error && b.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The hung call is still running: a third command does not wait for the
+    // timeout and does not reach the classifier either.
+    let started = std::time::Instant::now();
+    let c = bash(&cx, json!({"command": "/usr/bin/pr -t -3 tool.sh"})).await;
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+    assert!(c.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_millis(90), "{elapsed:?}");
+    assert_eq!(interaction.calls().len(), 3);
 }
 
 #[tokio::test]

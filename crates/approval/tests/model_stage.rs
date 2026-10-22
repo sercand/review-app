@@ -33,6 +33,7 @@ fn run_with(cmd: &str, fake: &dyn CommandClassifier, cache: &DecisionCache) -> V
     let policy = ModelPolicy {
         classifier: fake,
         cache,
+        deadline: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     let cfg = ApprovalConfig {
@@ -207,6 +208,7 @@ fn run_deny_paths(cmd: &str, outcome: ModelOutcome) -> Verdict {
     let policy = ModelPolicy {
         classifier: &fake,
         cache: &cache,
+        deadline: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     let deny = review_approval::default_deny_paths();
@@ -296,11 +298,66 @@ fn always_safe_model_never_runs_wrapped_or_dangerous_commands() {
 /// I1: an absolute system path and plain words still go through the model.
 #[test]
 fn always_safe_model_still_runs_plain_unknown_commands() {
-    for cmd in ["mytool --check", "/usr/bin/mytool --check", "mytool a.txt ."] {
+    for cmd in [
+        "mytool --check",
+        "/usr/bin/mytool --check",
+        "mytool a.txt .",
+    ] {
         assert_eq!(
             run(cmd, ModelOutcome::Safe),
             Verdict::Run { source: "ml" },
             "{cmd}"
         );
     }
+}
+
+fn run_with_deadline(
+    cmd: &str,
+    fake: &dyn CommandClassifier,
+    deadline: std::time::Instant,
+) -> Verdict {
+    let cache = DecisionCache::new();
+    let policy = ModelPolicy {
+        classifier: fake,
+        cache: &cache,
+        deadline: Some(deadline),
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    classify(
+        cmd,
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &[],
+            cwd: None,
+            extra: &extra,
+        },
+    )
+}
+
+/// I2: past the deadline the model is not consulted at all.
+#[test]
+fn past_deadline_skips_the_classifier() {
+    let fake = FakeClassifier::new(ModelOutcome::Safe);
+    let v = run_with_deadline("mytool --check", &fake, std::time::Instant::now());
+    assert_eq!(fake.calls(), 0);
+    assert_eq!(v, without_model("mytool --check"));
+}
+
+/// I2: a classify that overruns the deadline stops the model being asked
+/// about the command's remaining segments.
+#[test]
+fn overrun_stops_consulting_the_model_for_later_segments() {
+    struct Slow(AtomicUsize);
+    impl CommandClassifier for Slow {
+        fn classify(&self, _segment: &str) -> ModelOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            ModelOutcome::Safe
+        }
+    }
+    let slow = Slow(AtomicUsize::new(0));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    let v = run_with_deadline("mytool a && mytool b && mytool c", &slow, deadline);
+    assert_eq!(slow.0.load(Ordering::SeqCst), 1);
+    assert!(is_ask(&v), "{v:?}");
 }

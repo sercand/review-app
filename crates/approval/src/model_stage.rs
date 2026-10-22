@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use crate::model::Segment;
 use crate::never_approve::model_may_approve;
@@ -26,8 +27,10 @@ pub enum ModelOutcome {
 
 pub trait CommandClassifier: Send + Sync {
     /// `segment` is argv joined by single spaces. The caller enforces the
-    /// timeout; an implementation should still return `Unavailable` instead
-    /// of panicking.
+    /// timeout, but it can only stop waiting, not stop the call: an
+    /// implementation must return `Unavailable` promptly when it is busy
+    /// (use `try_lock`, never queue behind another call), must never block
+    /// indefinitely, and should return `Unavailable` instead of panicking.
     fn classify(&self, segment: &str) -> ModelOutcome;
 }
 
@@ -66,6 +69,10 @@ impl DecisionCache {
 pub struct ModelPolicy<'a> {
     pub classifier: &'a dyn CommandClassifier,
     pub cache: &'a DecisionCache,
+    /// When set, a segment not already cached is not sent to the classifier
+    /// once this instant has passed (the caller's timeout for the whole
+    /// command), so one slow call is the last for that command.
+    pub deadline: Option<Instant>,
 }
 
 impl SegmentPolicy for ModelPolicy<'_> {
@@ -81,6 +88,9 @@ impl SegmentPolicy for ModelPolicy<'_> {
         let outcome = match self.cache.get(&key) {
             Some(o) => o,
             None => {
+                if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                    return None;
+                }
                 match catch_unwind(AssertUnwindSafe(|| self.classifier.classify(&key))) {
                     // Unavailable (still loading, transient timeout) is not
                     // cached, so the next call retries.

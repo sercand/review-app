@@ -4,7 +4,7 @@
 //! are blocked without asking, everything else waits for the user's approval,
 //! and a refused command never reaches the shell.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use review_approval::model_stage::ModelPolicy;
 use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
@@ -153,7 +153,8 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
 /// one, the model may block (a GPU call, a lock), so the whole classification
 /// runs on a blocking thread under [`ApprovalSetup::timeout`]; on a timeout or
 /// a panicked thread the verdict is the engine's with no model at all. The
-/// slow thread is detached, never awaited past the timeout.
+/// slow thread is detached, never awaited past the timeout, and the in-flight
+/// guard keeps later commands off the model until it finishes.
 ///
 /// With auto-approve off, no rule policy or model is consulted: a `Deny`
 /// (secret paths) still applies, and anything that would have run asks.
@@ -165,36 +166,41 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
     let allowed = cx.allowed_snapshot();
     let deny_paths = setup.effective_deny_paths();
     let repo_root = cx.repo_root.clone();
-    let run = move |command: &str, with_model: bool| {
-        classify_with(
-            command,
-            &setup,
-            &allowed,
-            &deny_paths,
-            &repo_root,
-            with_model,
-        )
+    let run = move |command: &str, deadline: Option<Instant>| {
+        classify_with(command, &setup, &allowed, &deny_paths, &repo_root, deadline)
     };
-    let verdict = if cx.approval.enabled && cx.approval.classifier.is_some() {
+    // At most one model classification runs at a time: a hung one keeps its
+    // thread, and more of them would starve tokio's shared blocking pool.
+    let guard = if cx.approval.enabled && cx.approval.classifier.is_some() {
+        cx.approval.try_begin_model()
+    } else {
+        None
+    };
+    let verdict = if let Some(guard) = guard {
         let owned = command.to_string();
         let timeout = cx.approval.timeout;
+        let deadline = Instant::now() + timeout;
         let blocking = {
             let run = run.clone();
-            tokio::task::spawn_blocking(move || run(&owned, true))
+            tokio::task::spawn_blocking(move || {
+                // Released when the model call really ends, not at the timeout.
+                let _guard = guard;
+                run(&owned, Some(deadline))
+            })
         };
         match tokio::time::timeout(timeout, blocking).await {
             Ok(Ok(verdict)) => verdict,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "command classifier thread failed; asking");
-                run(command, false)
+                run(command, None)
             }
             Err(_) => {
                 tracing::warn!(?timeout, "command classifier timed out; asking");
-                run(command, false)
+                run(command, None)
             }
         }
     } else {
-        run(command, false)
+        run(command, None)
     };
     match verdict {
         Verdict::Run { .. } if !cx.approval.enabled => Verdict::Ask {
@@ -205,14 +211,15 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
 }
 
 /// One synchronous `classify` run: rule policies, the opt-in capabilities and
-/// (when asked, and a classifier is installed) the model last.
+/// (when `model_deadline` is given, and a classifier is installed) the model
+/// last, consulted only until that deadline.
 fn classify_with(
     command: &str,
     setup: &crate::ai::approval_setup::ApprovalSetup,
     allowed: &[String],
     deny_paths: &[String],
     repo_root: &std::path::Path,
-    with_model: bool,
+    model_deadline: Option<Instant>,
 ) -> Verdict {
     // With auto-approve off nothing may vouch for the command; only the deny
     // list and the repo's own allowed lines (which `Run` is mapped away from
@@ -223,10 +230,11 @@ fn classify_with(
             extra.push(*policy);
         }
     }
-    let model = match (&setup.classifier, with_model && setup.enabled) {
+    let model = match (&setup.classifier, model_deadline.is_some() && setup.enabled) {
         (Some(classifier), true) => Some(ModelPolicy {
             classifier: classifier.as_ref(),
             cache: &setup.cache,
+            deadline: model_deadline,
         }),
         _ => None,
     };

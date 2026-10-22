@@ -5,6 +5,7 @@
 //! and shared, so the model's [`DecisionCache`] lives as long as the run.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use review_approval::Policy;
@@ -31,6 +32,19 @@ pub struct ApprovalSetup {
     pub cache: Arc<DecisionCache>,
     /// How long the classifier may take before the command asks instead.
     pub timeout: Duration,
+    /// Set while a model classification is running on a blocking thread. A
+    /// timed-out call cannot be cancelled, so while it lingers later commands
+    /// are decided without the model rather than stacking more threads.
+    pub in_flight: Arc<AtomicBool>,
+}
+
+/// Holds [`ApprovalSetup::in_flight`]; releases it on drop, also on panic.
+pub struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl Default for ApprovalSetup {
@@ -80,7 +94,17 @@ impl ApprovalSetup {
             classifier: classifier.filter(|_| settings.local_classifier),
             cache: Arc::new(DecisionCache::new()),
             timeout: settings.timeout(),
+            in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Claims the right to run one model classification, or `None` while an
+    /// earlier one is still running.
+    pub fn try_begin_model(&self) -> Option<InFlightGuard> {
+        self.in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| InFlightGuard(self.in_flight.clone()))
     }
 
     /// The built-in deny patterns followed by the user's, without duplicates.
