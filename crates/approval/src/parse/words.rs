@@ -123,7 +123,7 @@ fn has_transform_operator(t: &str) -> bool {
     while let Some(i) = rest.find("${") {
         let body = &rest[i + 2..];
         let end = body.find('}').unwrap_or(body.len());
-        let b = body[..end].as_bytes();
+        let b = &body.as_bytes()[..end];
         if b.windows(2)
             .any(|w| w[0] == b'@' && w[1].is_ascii_alphabetic())
         {
