@@ -119,14 +119,14 @@ and passes it. The decision cache key becomes `(cwd, segment)`.
     {"value": "ask",     "description": "<rubric>"},
     {"value": "deny",    "description": "<rubric>"}
   ],
-  "approve_threshold": 0.9
+  "approve_threshold": 0.6
 }
 ```
 
-- Loaded at model load; `approve_threshold` defaults to 0.90 when absent; the three values must be
+- Loaded at model load; `approve_threshold` defaults to 0.60 when absent; the three values must be
   exactly `approve`, `ask`, `deny` or the model is `Unavailable("invalid decision schema")`.
 - If the file is missing, the app uses its **built-in default schema** (a constant in review-app with
-  the instructions above, an approve/ask/deny rubric we write, and `approve_threshold` 0.90) for any
+  the instructions above, an approve/ask/deny rubric we write, and `approve_threshold` 0.60) for any
   model. A file that is present but invalid is still `Unavailable("invalid decision schema")`; the
   default is never substituted for a broken file. Settings shows whether the model's own schema or the
   default is in use.
