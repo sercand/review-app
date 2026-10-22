@@ -31,25 +31,19 @@ pub fn parse(src: &str) -> Result<Vec<Segment>, Bail> {
     walk::segments(root, src)
 }
 
-/// `Bail::Unsupported` for `node`. `Node::kind` and `Language::node_kind_for_id`
-/// borrow, so the `'static` names come from a table built once per process
-/// (a few hundred short strings, leaked on purpose).
+/// `Bail::Unsupported` for `node`. `Node::kind` borrows from the node, so the
+/// `'static` name is located in the grammar's own `NODE_TYPES` JSON; a kind
+/// that cannot be found (or needs JSON escaping) is reported as "unknown".
 fn unsupported(node: tree_sitter::Node) -> Bail {
-    static KINDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
-    let kinds = KINDS.get_or_init(|| {
-        let lang: tree_sitter::Language = tree_sitter_bash::LANGUAGE.into();
-        let count = u16::try_from(lang.node_kind_count()).unwrap_or(u16::MAX);
-        (0..count)
-            .map(|id| {
-                let name = lang.node_kind_for_id(id).unwrap_or("unknown");
-                &*Box::leak(name.to_owned().into_boxed_str())
-            })
-            .collect()
-    });
-    Bail::Unsupported(
-        kinds
-            .get(usize::from(node.kind_id()))
-            .copied()
-            .unwrap_or("unknown"),
-    )
+    let kind = node.kind();
+    let needle = format!("\"type\": \"{kind}\"");
+    let name = tree_sitter_bash::NODE_TYPES
+        .find(&needle)
+        .and_then(|at| {
+            let start = at + needle.len() - kind.len() - 1;
+            tree_sitter_bash::NODE_TYPES.get(start..start + kind.len())
+        })
+        .filter(|found| *found == kind)
+        .unwrap_or("unknown");
+    Bail::Unsupported(name)
 }

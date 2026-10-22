@@ -152,3 +152,51 @@ fn only_assignments_make_one_segment() {
     assert_eq!(segs[0].assigns.len(), 2);
     assert!(segs[0].argv.is_empty());
 }
+
+#[test]
+fn substitutions_nested_in_expansions_bail() {
+    for src in [
+        "echo ${A:-$(touch pwned)}",
+        "echo \"${A:-$(touch pwned)}\"",
+        "echo ${A[$(touch pwned)]}",
+        "echo ${A/x/$(ls)}",
+        "echo ${A:-`touch pwned`}",
+        "echo \"${A:-`touch pwned`}\"",
+    ] {
+        assert_eq!(parse(src), Err(Bail::CommandSubstitution), "{src}");
+    }
+    assert!(parse("echo ${A:-$((1+2))}").is_err());
+    // Plain expansions stay fine.
+    assert!(parse("echo ${A:-b} ${#A} \"${A}\"").is_ok());
+}
+
+#[test]
+fn number_with_substitution_child_bails() {
+    assert_eq!(
+        parse("echo 10#$(touch pwned)"),
+        Err(Bail::CommandSubstitution)
+    );
+}
+
+#[test]
+fn continuation_cannot_assemble_brace_expansion() {
+    for src in ["find . {-delete\\\n,}", "ls {a\\\n,b}"] {
+        assert_eq!(
+            parse(src),
+            Err(Bail::Unsupported("line_continuation")),
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_kind_names_come_from_the_grammar() {
+    assert_eq!(
+        parse("for i in a; do b; done"),
+        Err(Bail::Unsupported("for_statement"))
+    );
+    assert_eq!(
+        parse("echo hi > f"),
+        Err(Bail::Unsupported("redirected_statement"))
+    );
+}

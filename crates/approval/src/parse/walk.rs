@@ -147,6 +147,12 @@ fn command(node: Node, src: &str) -> Result<Segment, Bail> {
                         if let (Some(last), Some(dynamic)) =
                             (seg.argv.last_mut(), seg.dynamic.last_mut())
                         {
+                            // Brace expansion could now span the join
+                            // (`{-delete\<nl>,}`), so refuse braces.
+                            let braces = |t: &str| t.contains(['{', '}']);
+                            if braces(last) || braces(&v) {
+                                return Err(Bail::Unsupported("line_continuation"));
+                            }
                             last.push_str(&v);
                             *dynamic |= d;
                         }

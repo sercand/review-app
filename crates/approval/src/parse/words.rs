@@ -38,6 +38,11 @@ pub(super) fn text<'a>(node: Node, src: &'a str) -> Result<&'a str, Bail> {
 
 pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
     match node.kind() {
+        // A word/number with children hides a substitution (`10#$(cmd)`).
+        "word" | "number" if node.named_child_count() > 0 => {
+            check_expansion(node, src)?;
+            Err(unsupported(node))
+        }
         "word" | "number" => {
             let t = text(node, src)?;
             Ok((unescape_unquoted(t), has_brace_expansion(t)))
@@ -51,7 +56,8 @@ pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> 
                 .ok_or(Bail::Syntax)?;
             Ok((inner.to_string(), false))
         }
-        // `$'...'` is decoded (so `$'\x2d\x72'` is seen as `-r`). A decoded NUL
+        // Decoded rather than kept raw, on purpose: a raw `$'\x2d\x72'` would look
+        // like an innocuous word while bash runs it as `-r`. So `$'...'` is decoded (so `$'\x2d\x72'` is seen as `-r`). A decoded NUL
         // would make bash truncate the word, so it is treated as dynamic.
         "ansi_c_string" => {
             let t = text(node, src)?;
@@ -63,7 +69,10 @@ pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> 
             let dynamic = v.contains('\0');
             Ok((v, dynamic))
         }
-        "simple_expansion" | "expansion" => Ok((text(node, src)?.to_string(), true)),
+        "simple_expansion" | "expansion" => {
+            check_expansion(node, src)?;
+            Ok((text(node, src)?.to_string(), true))
+        }
         "string" => string_value(node, src),
         "concatenation" => concat_value(node, src),
         "command_substitution" => Err(Bail::CommandSubstitution),
@@ -71,6 +80,31 @@ pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> 
         "arithmetic_expansion" => Err(Bail::Arithmetic),
         _ => Err(unsupported(node)),
     }
+}
+
+/// Bail when the expansion `node` contains a substitution anywhere inside it.
+/// Tree-sitter parses some bodies (a backtick inside `${A:-...}`) as plain
+/// words, so the source text is checked as well as the subtree.
+pub(super) fn check_expansion(node: Node, src: &str) -> Result<(), Bail> {
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "arithmetic_expansion" => return Err(Bail::Arithmetic),
+            "process_substitution" => return Err(Bail::ProcessSubstitution),
+            "command_substitution" => return Err(Bail::CommandSubstitution),
+            _ => {}
+        }
+        let mut cursor = n.walk();
+        stack.extend(n.children(&mut cursor));
+    }
+    let t = text(node, src)?;
+    if t.contains("$((") {
+        return Err(Bail::Arithmetic);
+    }
+    if t.contains('`') || t.contains("$(") {
+        return Err(Bail::CommandSubstitution);
+    }
+    Ok(())
 }
 
 /// True when `gap` (text between two sibling nodes) is only backslash-newline
@@ -123,7 +157,7 @@ fn string_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
             continue;
         }
         if child.start_byte() < pos || child.end_byte() > end {
-            continue;
+            return Err(Bail::Syntax);
         }
         value.push_str(&unescape_double(
             src.get(pos..child.start_byte()).ok_or(Bail::Syntax)?,
@@ -131,6 +165,7 @@ fn string_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
         pos = child.end_byte();
         match child.kind() {
             "simple_expansion" | "expansion" => {
+                check_expansion(child, src)?;
                 value.push_str(text(child, src)?);
                 dynamic = true;
             }

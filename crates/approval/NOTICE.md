@@ -29,7 +29,8 @@ SOFTWARE.
 ## Corpus provenance
 
 
-The `.tests` files in this directory are vendored from the
+The test corpus lives in `tests/corpus/` (with its own `NOTICE.md`, copied
+alongside the files). Its `.tests` files are vendored from the
 [Parable](https://github.com/ldayton/Parable) bash-parser test suite,
 obtained via [rable](https://github.com/mpecan/rable) at commit
 [`411dd22`](https://github.com/mpecan/rable/tree/411dd22) (rable 0.2.0,
@@ -60,6 +61,3 @@ Bail-expected (the parser must correctly refuse):
 
 - Parable — MIT, Copyright © Logan Dayton
 - rable — MIT, Copyright © 2025 Matjaz Domen Pecan
-
-The differential harness at `src/shparse/corpus_tests.rs` consumes these
-files verbatim; any modifications should be upstream contributions.
