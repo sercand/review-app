@@ -278,10 +278,10 @@ mod tests {
         assert_eq!(Theme::Light.resolve(true), egui::Theme::Light);
 
         let mut s = Settings::default();
-        let mut vm = settings_vm(&s, &|_| false);
+        let mut vm = settings_vm(&s);
         vm.host = "ghe.example.com".into();
         vm.default_scopes = vec![Scope::Assigned];
-        assert!(vm.apply(&mut s).unwrap()); // host changed
+        assert!(vm.apply(&mut s)); // host changed
         assert_eq!(s.host, "ghe.example.com");
         assert_eq!(s.default_scopes, vec![Scope::Assigned]);
     }
@@ -292,10 +292,10 @@ mod tests {
             client_id: Some("cid".into()),
             ..Settings::default()
         };
-        let mut vm = settings_vm(&s, &|_| false);
+        let mut vm = settings_vm(&s);
         assert_eq!(vm.client_id, "cid");
         vm.client_id = String::new();
-        assert!(!vm.apply(&mut s).unwrap(), "the host did not change");
+        assert!(!vm.apply(&mut s), "the host did not change");
         assert_eq!(s.client_id, None, "an empty client id flattens to None");
     }
 

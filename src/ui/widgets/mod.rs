@@ -18,6 +18,8 @@ pub mod merge_panel;
 pub mod metadata_panel;
 pub mod pr_row;
 pub mod review_panel;
+#[cfg(unix)]
+pub mod settings_ai_tab;
 pub mod settings_window;
 pub mod thread_view;
 pub mod title_bar;

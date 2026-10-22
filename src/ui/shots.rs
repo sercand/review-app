@@ -20,6 +20,10 @@ use crate::state::pr_detail::PrSession;
 use crate::state::pr_list::PrListState;
 use crate::test_support::{line_anchor, loaded, meta, pr_summary, repo};
 use crate::ui::screens::{login, pr_detail, pr_list};
+#[cfg(unix)]
+use crate::ui::widgets::settings_ai_tab::ProviderDialog;
+#[cfg(unix)]
+use crate::ui::widgets::settings_window::SettingsTab;
 use crate::ui::widgets::settings_window::{self, AccountInfo, SettingsWindowState};
 use crate::ui::{fonts, theme};
 
@@ -896,7 +900,7 @@ fn shots() {
         save(h, &format!("login-{t}"));
 
         let mut win = SettingsWindowState::default();
-        win.open_with(&settings, &|_| false);
+        win.open_with(&settings);
         let scopes: Vec<String> = [
             "admin:org",
             "gist",
@@ -912,6 +916,7 @@ fn shots() {
         .collect();
         let mut list = pr_list_state();
         let mut form = pr_list::PrListForm::default();
+        let settings_for_shot = settings.clone();
         let h = harness(dark, move |ui| {
             pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
             egui::CentralPanel::default().show(ui, |ui| {
@@ -932,25 +937,35 @@ fn shots() {
                     host: "github.com",
                     scopes: &scopes,
                 }),
+                &settings_for_shot.ai,
+                &std::collections::BTreeMap::new(),
                 &mut Vec::new(),
             );
         });
         save(h, &format!("settings-{t}"));
 
-        // The AI section (spec §10), rendered only on Unix like the feature.
+        // The AI tab's providers table and provider dialog (spec §10, Task 5),
+        // rendered only on Unix like the feature.
         #[cfg(unix)]
         {
-            let mut ai = SettingsWindowState::default();
-            ai.open_with(&ai_shot_settings(), &|name| name == "work");
-            ai.vm
-                .ai
-                .test_results
-                .insert("work".to_owned(), Ok("model-id".to_owned()));
-            let mut list = pr_list_state();
-            let mut form = pr_list::PrListForm::default();
+            let ai_settings = ai_shot_settings();
+            let keys = ai_shot_keys();
             let scopes_ai: Vec<String> =
                 ["repo", "read:org"].iter().map(|s| s.to_string()).collect();
-            let h = harness_sized(dark, [1440.0, 1200.0], move |ui| {
+
+            let mut providers = SettingsWindowState::default();
+            providers.open_with(&ai_settings);
+            providers.tab = SettingsTab::Ai;
+            providers
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = keys.clone();
+            let scopes_for_dialog = scopes_ai.clone();
+            let h = harness_sized(dark, SIZE, move |ui| {
                 pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
                 egui::CentralPanel::default().show(ui, |ui| {
                     pr_list::render(
@@ -964,16 +979,59 @@ fn shots() {
                 });
                 settings_window::render(
                     ui.ctx(),
-                    &mut ai,
+                    &mut providers,
                     Some(AccountInfo {
                         login: "sercand",
                         host: "github.com",
                         scopes: &scopes_ai,
                     }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
                     &mut Vec::new(),
                 );
             });
-            save_after(h, &format!("settings-ai-{t}"), 10);
+            save_after(h, &format!("settings-ai-providers-{t}"), 8);
+
+            let mut dialog = SettingsWindowState::default();
+            dialog.open_with(&ai_settings);
+            dialog.tab = SettingsTab::Ai;
+            dialog
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            if let Some(provider) = ai_settings.ai.providers.first() {
+                dialog.ai_tab.dialog = Some(ProviderDialog::for_provider(provider));
+            }
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = keys;
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut dialog,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_dialog,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-provider-dialog-{t}"), 8);
         }
     }
 }
@@ -1037,33 +1095,58 @@ fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
     );
 }
 
-/// The settings the AI shot opens with: one provider, a default model and one
-/// repository.
+/// The settings the AI shots open with: three providers (two with a stored key
+/// in [`ai_shot_keys`]) and both model roles, like the approved mockup.
 #[cfg(unix)]
 fn ai_shot_settings() -> Settings {
-    use crate::persist::settings::{
-        LlmApi, ModelSettings, ProviderSettings, ReasoningLevel, RepoAiSettings,
-    };
+    use crate::persist::settings::{LlmApi, ModelSettings, ProviderSettings, ReasoningLevel};
     let mut settings = Settings::default();
-    settings.ai.providers = vec![ProviderSettings {
-        name: "work".into(),
-        api: LlmApi::AnthropicMessages,
-        base_url: "https://llm.example.com".into(),
-        headers: Default::default(),
-    }];
+    settings.ai.providers = vec![
+        ProviderSettings {
+            name: "work".into(),
+            api: LlmApi::AnthropicMessages,
+            base_url: String::new(),
+            headers: Default::default(),
+        },
+        ProviderSettings {
+            name: "openai-eu".into(),
+            api: LlmApi::OpenaiResponses,
+            base_url: "api.openai.com".into(),
+            headers: Default::default(),
+        },
+        ProviderSettings {
+            name: "local".into(),
+            api: LlmApi::OpenaiResponses,
+            base_url: "localhost:11434".into(),
+            headers: Default::default(),
+        },
+    ];
     settings.ai.models.default = Some(ModelSettings {
         provider: "work".into(),
-        model: "model-id".into(),
+        model: "claude-sonnet-5-5".into(),
         context_window: 200_000,
-        max_tokens: 8192,
+        max_tokens: 16_384,
         reasoning: Some(ReasoningLevel::Medium),
     });
-    settings.ai.repos = vec![RepoAiSettings {
-        repo: "github.com/owner/name".into(),
-        path: "/Users/me/src/owner/name".into(),
-        commands: vec!["cargo test".into(), "cargo clippy --all-targets".into()],
-        prepare: vec!["cargo fetch".into()],
-        ..RepoAiSettings::default()
-    }];
+    settings.ai.models.lookup = Some(ModelSettings {
+        provider: "work".into(),
+        model: "claude-haiku-5-5".into(),
+        context_window: 200_000,
+        max_tokens: 8_192,
+        reasoning: None,
+    });
     settings
+}
+
+/// The keychain presence the AI shots show: `work` and `openai-eu` have a
+/// key, `local` does not (mockup: "✓ stored" / "no key").
+#[cfg(unix)]
+fn ai_shot_keys() -> std::collections::BTreeMap<String, bool> {
+    [
+        ("work".to_owned(), true),
+        ("openai-eu".to_owned(), true),
+        ("local".to_owned(), false),
+    ]
+    .into_iter()
+    .collect()
 }

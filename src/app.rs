@@ -5,6 +5,7 @@
 //! goes to the worker (see [`crate::runtime::execute`]), which wakes the UI via
 //! `EventSender::with_repaint`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -25,8 +26,12 @@ use crate::model::review::ReviewEvent;
 use crate::persist::config_root;
 use crate::persist::session::DebouncedWriter;
 #[cfg(unix)]
+use crate::persist::settings::ProviderSettings;
+#[cfg(unix)]
 use crate::persist::settings::RepoAiSettings;
 use crate::persist::settings::Settings;
+#[cfg(unix)]
+use crate::runtime::KeyOp;
 use crate::runtime::{
     Command, Event, EventReceiver, ExecCtx, SessionId, Worker, event_channel, execute, spawn_worker,
 };
@@ -43,6 +48,8 @@ use crate::ui::widgets::diff_view::{DiffAction, DiffMode, DiffViewState};
 use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFooterAction};
 use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::review_panel::ReviewAction;
+#[cfg(unix)]
+use crate::ui::widgets::settings_ai_tab;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::title_bar;
@@ -208,6 +215,44 @@ fn account_login(settings: &Settings) -> String {
         .unwrap_or_default()
 }
 
+/// The follow-up one in-flight [`Command::AiKeyOp`] needs when its reply
+/// arrives. Replies are matched by token, so a late answer for an op the app
+/// no longer tracks is dropped (the non-PR-scoped stale rule).
+#[cfg(unix)]
+#[derive(Debug)]
+enum AiKeyOpKind {
+    /// A rename: the key was copied to `to`, and once the settings naming
+    /// `to` are written `from` is removed (or the copy is undone if the write
+    /// fails).
+    Rename {
+        /// The old provider name the settings file still holds.
+        from: String,
+        /// The new provider name the file will hold.
+        to: String,
+        /// The edited row to write once the copy succeeded.
+        provider: ProviderSettings,
+        /// A key typed in the dialog, which wins over the stored one when
+        /// the presence cache is updated.
+        key: Option<String>,
+    },
+    /// A key typed for a provider whose name did not change; the settings
+    /// row is already written.
+    Store {
+        /// The provider the key belongs to.
+        name: String,
+    },
+    /// An old provider account to clear after its row left the settings.
+    Remove {
+        /// The provider name to clear.
+        name: String,
+    },
+    /// Delete the copy of a rename whose settings write failed.
+    Undo {
+        /// The new provider name whose copied key must go.
+        name: String,
+    },
+}
+
 /// The root app: owns settings, the worker bridge, and every piece of UI state.
 pub struct ReviewApp {
     screen: ScreenKind,
@@ -236,6 +281,16 @@ pub struct ReviewApp {
     write_blocked_until: Option<SystemTime>,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
+    /// Whether the keychain holds an API key per provider name, probed once
+    /// at startup and kept current by the key ops below. The cache means the
+    /// Settings AI tab never reads the keychain in a frame.
+    llm_keys: BTreeMap<String, bool>,
+    /// The token the next non-PR-scoped keychain op carries.
+    #[cfg(unix)]
+    next_ai_key_token: u64,
+    /// The keychain ops this app is still waiting for, by token.
+    #[cfg(unix)]
+    ai_key_ops: BTreeMap<u64, AiKeyOpKind>,
     exec: Arc<ExecCtx>,
     worker: Worker,
     events: EventReceiver,
@@ -319,6 +374,23 @@ impl ReviewApp {
             }
         };
 
+        // The AI tab's Key column reads this cache, never the keychain: a
+        // keychain read blocks, and no frame may block. The key ops keep the
+        // cache current after startup; a failed probe leaves the name
+        // unknown instead of claiming "no key".
+        #[cfg(unix)]
+        let llm_keys = {
+            let mut keys = BTreeMap::new();
+            for provider in &settings.ai.providers {
+                if let Ok(key) = crate::auth::store::llm_key(store.as_ref(), &provider.name) {
+                    keys.insert(provider.name.clone(), key.is_some());
+                }
+            }
+            keys
+        };
+        #[cfg(not(unix))]
+        let llm_keys = BTreeMap::new();
+
         // The AI hub opens the persisted AI database beside the settings;
         // its settings snapshot is replaced whenever the user saves (Task 1).
         #[cfg(unix)]
@@ -377,6 +449,11 @@ impl ReviewApp {
             write_blocked_until: None,
             config_dir,
             store,
+            llm_keys,
+            #[cfg(unix)]
+            next_ai_key_token: 1,
+            #[cfg(unix)]
+            ai_key_ops: BTreeMap::new(),
             exec,
             worker,
             events: receiver,
@@ -537,10 +614,9 @@ impl ReviewApp {
             // The session folds the conversation into its timeline input
             // through `apply_session_event` above (Task 51).
             Event::ConversationLoaded { .. } => {}
-            // Spec §10: the Settings window's AI section shows the outcome.
-            // The VM outlives a closed window, so the result lands there
-            // without stealing the window back over whatever screen the user
-            // moved on to; a closed window gets a toast instead.
+            // Spec §10: the Settings window's AI tab shows the outcome when it
+            // is still open; a window the user closed while the test ran gets a
+            // toast instead, and reopening the window starts from a clean tab.
             Event::AiProviderTested { provider, result } => {
                 let window_open = self.settings_window.open;
                 if !window_open {
@@ -550,20 +626,24 @@ impl ReviewApp {
                     };
                     self.toasts.push(format!("{provider} test: {outcome}"), now);
                 }
-                self.settings_window
-                    .vm
-                    .ai
-                    .test_results
-                    .insert(provider, result);
+                #[cfg(unix)]
+                {
+                    self.settings_window
+                        .ai_tab
+                        .test_results
+                        .insert(provider, result);
+                }
+                #[cfg(not(unix))]
+                let _ = (provider, result);
             }
             // The folder probe's answer (spec §4 step 2): the dialog that asks
             // arrives with the local-repos UI, which consumes it there.
             #[cfg(unix)]
             Event::AiFolderProbed { .. } => {}
-            // The keychain op's answer: the Settings AI tab matches it by
-            // token and shows the outcome once its dialog exists (Task 5).
+            // The keychain op's answer (spec §10): matched by token, so a
+            // reply for an op the app no longer tracks is dropped.
             #[cfg(unix)]
-            Event::AiKeyOpDone { .. } => {}
+            Event::AiKeyOpDone { token, result } => self.on_ai_key_op_done(token, result, now),
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -878,26 +958,17 @@ impl ReviewApp {
 
     /// Open the settings window on a fresh copy of the current settings.
     ///
-    /// The AI section's "stored" marks come from a pure keychain probe:
-    /// whether a key exists, never what it is.
+    /// The AI tab's "stored" marks come from [`Self::llm_keys`], the cache
+    /// probed once at startup: a frame never reads the keychain.
     fn open_settings(&mut self) {
-        let store = self.store.clone();
-        self.settings_window.open_with(&self.settings, &|provider| {
-            crate::auth::store::llm_key(store.as_ref(), provider)
-                .ok()
-                .flatten()
-                .is_some()
-        });
+        self.settings_window.open_with(&self.settings);
     }
 
-    /// Fold the settings window's actions in: Save persists (and a host
-    /// change ends the session, since the stored token belongs to the old
-    /// host), a typed AI key goes to the keychain, Test connection asks the
-    /// worker, and Sign out rides the existing sign-out flow (RULING R10).
-    ///
-    /// Save is emitted before any key action: a rejected apply stops the loop,
-    /// so a key is never stored for settings that were not saved. A successful
-    /// apply also clears the keys of removed/renamed providers.
+    /// Fold the settings window's actions in: General/Appearance Save persists
+    /// (and a host change ends the session, since the stored token belongs to
+    /// the old host), an AI provider row is written and its key moved on the
+    /// worker, Test connection asks the worker, and Sign out rides the
+    /// existing sign-out flow (RULING R10).
     fn apply_settings_actions(
         &mut self,
         actions: Vec<SettingsAction>,
@@ -907,52 +978,8 @@ impl ReviewApp {
         for action in actions {
             match action {
                 SettingsAction::Apply(vm) => {
-                    // A removed or renamed provider must not leave its key
-                    // behind in the keychain (§10), or re-adding the name
-                    // would silently reuse a stale credential.
-                    let old_names: Vec<String> = self
-                        .settings
-                        .ai
-                        .providers
-                        .iter()
-                        .map(|provider| provider.name.clone())
-                        .collect();
-                    let host_changed = match vm.apply(&mut self.settings) {
-                        Ok(host_changed) => host_changed,
-                        Err(error) => {
-                            // The window keeps Save disabled on invalid input,
-                            // so this is the defensive path; still say why
-                            // nothing was saved. Stop here: nothing is
-                            // persisted, so no key in a later action may be
-                            // stored either.
-                            self.toasts
-                                .push(format!("settings not saved: {error}"), now);
-                            return;
-                        }
-                    };
+                    let host_changed = vm.apply(&mut self.settings);
                     self.save_settings(now);
-                    let new_names: Vec<String> = self
-                        .settings
-                        .ai
-                        .providers
-                        .iter()
-                        .map(|provider| provider.name.clone())
-                        .collect();
-                    // Best-effort, exactly like storing a key: the settings
-                    // are already saved, so a keychain failure is a toast.
-                    for name in settings_window::removed_provider_names(&old_names, &new_names) {
-                        if let Err(error) =
-                            crate::auth::store::clear_llm_key(self.store.as_ref(), &name)
-                        {
-                            tracing::warn!(
-                                %error,
-                                %name,
-                                "could not clear the removed LLM API key"
-                            );
-                            self.toasts
-                                .push(format!("could not clear the key for {name}: {error}"), now);
-                        }
-                    }
                     // The code font size lives in the styles; re-register
                     // both so the next frame picks it up (Task 14).
                     theme::install(ctx, self.settings.code_font_size);
@@ -971,32 +998,302 @@ impl ReviewApp {
                             .push("host changed, please sign in again".to_owned(), now);
                     }
                 }
-                // Spec §10: API keys live only in the keychain. The key is
-                // never logged and never written to `settings.toml`.
-                SettingsAction::SetLlmKey { provider, key } => {
-                    if let Err(error) =
-                        crate::auth::store::set_llm_key(self.store.as_ref(), &provider, &key)
-                    {
-                        tracing::warn!(%error, %provider, "could not store the LLM API key");
-                        self.toasts.push(
-                            format!("could not store the key for {provider}: {error}"),
-                            now,
-                        );
-                    }
-                }
-                SettingsAction::TestProvider { provider, model } => {
-                    // The Settings window has no key field yet (the AI tab
-                    // dialog that supplies one arrives with Task 5), so this
-                    // falls back to the keychain.
+                // Spec §10: AI rows are saved by their own dialogs, so this
+                // action carries one row and its typed key only.
+                #[cfg(unix)]
+                SettingsAction::SaveProvider {
+                    original,
+                    provider,
+                    key,
+                } => self.save_provider(original, provider, key, now),
+                #[cfg(unix)]
+                SettingsAction::DeleteProvider { name } => self.delete_provider(&name, now),
+                #[cfg(unix)]
+                SettingsAction::TestProvider {
+                    provider,
+                    model,
+                    key,
+                } => {
+                    // A typed key is used for this probe only; the dialog's
+                    // Test works before Save (spec §10).
                     self.worker.send(Command::AiTestProvider {
                         provider,
                         model,
-                        key: None,
+                        key,
                     });
                 }
+                // The AI tab is Unix-only, so these never arise elsewhere.
+                #[cfg(not(unix))]
+                SettingsAction::SaveProvider { .. }
+                | SettingsAction::DeleteProvider { .. }
+                | SettingsAction::TestProvider { .. } => {}
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }
         }
+    }
+
+    /// Commit one AI provider row (spec §10).
+    ///
+    /// A rename copies the keychain entry on the worker first and writes the
+    /// settings only once the copy succeeded (then removes the old entry); an
+    /// unchanged name writes the row now and stores a typed key in parallel.
+    #[cfg(unix)]
+    fn save_provider(
+        &mut self,
+        original: Option<String>,
+        provider: ProviderSettings,
+        key: Option<String>,
+        now: Instant,
+    ) {
+        if let Err(error) = settings_ai_tab::validate_provider(
+            &self.settings.ai.providers,
+            original.as_deref(),
+            &provider,
+        ) {
+            // The dialog keeps Save disabled on invalid input, so this is the
+            // defensive path.
+            self.toasts
+                .push(format!("provider not saved: {error}"), now);
+            return;
+        }
+
+        if let Some(from) = original
+            .as_deref()
+            .filter(|from| *from != provider.name)
+            .map(str::to_owned)
+        {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Rename {
+                    from: from.clone(),
+                    to: provider.name.clone(),
+                    provider: provider.clone(),
+                    key: key.clone(),
+                },
+            );
+            // Copy only: `Remove { from }` follows once the settings naming
+            // `to` are on disk (spec §10).
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Move {
+                    from,
+                    to: provider.name,
+                    key,
+                },
+            });
+            return;
+        }
+
+        // The name did not change, so the row is written first and the key is
+        // stored only once it landed: no key may outlive settings that failed
+        // to save.
+        let mut candidate = self.settings.clone();
+        settings_ai_tab::put_provider(&mut candidate.ai, original.as_deref(), provider.clone());
+        if !self.try_save_settings(candidate, now) {
+            return;
+        }
+        if let Some(key) = key {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Store {
+                    name: provider.name.clone(),
+                },
+            );
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Store {
+                    name: provider.name,
+                    key,
+                },
+            });
+        }
+    }
+
+    /// Remove one AI provider row (spec §10). A model that routes through it
+    /// blocks the delete; its keychain entry is cleared once the settings no
+    /// longer name it.
+    #[cfg(unix)]
+    fn delete_provider(&mut self, name: &str, now: Instant) {
+        if let Some(model) = settings_ai_tab::provider_delete_blocker(&self.settings.ai, name) {
+            self.toasts.push(
+                format!("{name} is used by the model {model}; change that model first"),
+                now,
+            );
+            return;
+        }
+        let mut candidate = self.settings.clone();
+        candidate
+            .ai
+            .providers
+            .retain(|provider| provider.name != name);
+        if self.try_save_settings(candidate, now) {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Remove {
+                    name: name.to_owned(),
+                },
+            );
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Remove {
+                    name: name.to_owned(),
+                },
+            });
+        }
+    }
+
+    /// The next token for a non-PR-scoped keychain op.
+    #[cfg(unix)]
+    fn ai_key_op_token(&mut self) -> u64 {
+        let token = self.next_ai_key_token;
+        self.next_ai_key_token = self.next_ai_key_token.wrapping_add(1);
+        token
+    }
+
+    /// Fold one keychain op's reply in. A token this app no longer tracks is
+    /// a stale reply and is dropped.
+    #[cfg(unix)]
+    fn on_ai_key_op_done(&mut self, token: u64, result: Result<(), String>, now: Instant) {
+        let Some(kind) = self.ai_key_ops.remove(&token) else {
+            tracing::debug!(token, "dropping a stale keychain reply");
+            return;
+        };
+        match kind {
+            AiKeyOpKind::Rename {
+                from,
+                to,
+                provider,
+                key,
+            } => match result {
+                // The copy landed: write the settings naming `to`, then clear
+                // `from` (or undo the copy if the write fails).
+                Ok(()) => self.finish_rename(from, to, provider, key, now),
+                Err(error) => self
+                    .toasts
+                    .push(format!("could not move the key for {from}: {error}"), now),
+            },
+            AiKeyOpKind::Store { name } => match result {
+                Ok(()) => {
+                    self.llm_keys.insert(name, true);
+                }
+                Err(error) => self
+                    .toasts
+                    .push(format!("could not store the key for {name}: {error}"), now),
+            },
+            AiKeyOpKind::Remove { name } => match result {
+                Ok(()) => {
+                    self.llm_keys.remove(&name);
+                }
+                Err(error) => self.toasts.push(
+                    format!("could not remove the old key for {name}: {error}"),
+                    now,
+                ),
+            },
+            AiKeyOpKind::Undo { name } => {
+                if let Err(error) = result {
+                    self.toasts.push(
+                        format!("could not undo the key move for {name}: {error}"),
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Write the settings a successful key move was for, then remove the old
+    /// keychain account; a failed write deletes the copy again, so the
+    /// keychain never holds a name the settings file lost (spec §10).
+    #[cfg(unix)]
+    fn finish_rename(
+        &mut self,
+        from: String,
+        to: String,
+        provider: ProviderSettings,
+        key: Option<String>,
+        now: Instant,
+    ) {
+        // The settings may have moved on while the keychain worked (it can
+        // prompt): the row was deleted, or another row took the new name.
+        // Either way `to` must not land, so the copy is undone.
+        if !self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .any(|row| row.name == from)
+        {
+            self.undo_key_copy(to, now, format!("{from} was removed meanwhile"));
+            return;
+        }
+        if self.settings.ai.providers.iter().any(|row| row.name == to) {
+            let reason = format!("another provider is now called {to}");
+            self.undo_key_copy(to, now, reason);
+            return;
+        }
+
+        let mut candidate = self.settings.clone();
+        settings_ai_tab::rename_provider(&mut candidate.ai, &from, provider);
+        if !self.try_save_settings(candidate, now) {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops
+                .insert(token, AiKeyOpKind::Undo { name: to.clone() });
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Undo { name: to },
+            });
+            return;
+        }
+
+        let token = self.ai_key_op_token();
+        self.ai_key_ops
+            .insert(token, AiKeyOpKind::Remove { name: from.clone() });
+        self.worker.send(Command::AiKeyOp {
+            token,
+            op: KeyOp::Remove { name: from.clone() },
+        });
+
+        // The presence cache follows the key: a typed key means `to` has one;
+        // otherwise it inherits whatever `from` had (or stays unknown).
+        let old = self.llm_keys.remove(&from);
+        if key.is_some() {
+            self.llm_keys.insert(to, true);
+        } else if let Some(present) = old {
+            self.llm_keys.insert(to, present);
+        }
+    }
+
+    /// Delete the key copy a rename made after the rename could not land,
+    /// and say why.
+    #[cfg(unix)]
+    fn undo_key_copy(&mut self, to: String, now: Instant, reason: String) {
+        self.toasts
+            .push(format!("could not rename the provider: {reason}"), now);
+        let token = self.ai_key_op_token();
+        self.ai_key_ops
+            .insert(token, AiKeyOpKind::Undo { name: to.clone() });
+        self.worker.send(Command::AiKeyOp {
+            token,
+            op: KeyOp::Undo { name: to },
+        });
+    }
+
+    /// Save a candidate settings value, adopting it only when the write
+    /// succeeded. Returns whether it landed; failures toast.
+    fn try_save_settings(&mut self, candidate: Settings, now: Instant) -> bool {
+        if let Err(error) = candidate.save(&self.config_dir) {
+            tracing::warn!(%error, "could not save settings");
+            self.toasts
+                .push(format!("could not save settings: {error}"), now);
+            return false;
+        }
+        self.settings = candidate;
+        // The worker's AI hub reads its settings from its own copy (Task 1).
+        #[cfg(unix)]
+        self.exec.ai.set_settings(self.settings.ai.clone());
+        true
     }
 
     /// Flip between dark and light from a title bar's theme button, and
@@ -2896,6 +3193,8 @@ impl eframe::App for ReviewApp {
             &ctx,
             &mut self.settings_window,
             account,
+            &self.settings.ai,
+            &self.llm_keys,
             &mut settings_actions,
         );
         self.apply_settings_actions(settings_actions, &ctx, now);
