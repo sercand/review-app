@@ -288,7 +288,7 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
             can_start = true;
         }
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if can_start && ui.button("Start AI review").clicked() {
             actions.push(AiPanelAction::Start);
         }
@@ -376,12 +376,12 @@ fn render_entry(
                 .default_open(stop.is_none())
                 .show(ui, |ui| {
                     for (name, summary) in tools {
-                        ui.label(
-                            RichText::new(format!("{name} {summary}"))
-                                .monospace()
-                                .color(p.muted)
-                                .size(11.5),
-                        );
+                        // Tool summaries are JSON one-liners with long
+                        // unbreakable tokens; truncate to the pane width and
+                        // show the full line on hover, or the tab's min width
+                        // would widen the right pane past the splitter
+                        // (the ScrollArea expands to fit its content).
+                        tool_line(ui, &format!("{name} {summary}"), p.muted);
                     }
                     if !text.is_empty() {
                         markdown::render(ui, &markdown::to_doc(text));
@@ -488,10 +488,17 @@ fn render_entry(
                 label = format!("{label} · {}", finding.title);
             }
             let color = finding.map_or(p.muted, |finding| severity_color(p, finding.severity));
-            if ui
-                .button(RichText::new(label).color(color).size(11.5))
-                .clicked()
-            {
+            // Truncate like the tool lines: a long finding title must not
+            // widen the pane past the splitter. The tooltip repeats the full
+            // label only when there is one to reveal.
+            let button =
+                egui::Button::new(RichText::new(label.clone()).color(color).size(11.5)).truncate();
+            let button = if finding.is_some() {
+                ui.add(button).on_hover_text(label)
+            } else {
+                ui.add(button)
+            };
+            if button.clicked() {
                 actions.push(AiPanelAction::JumpToFinding(*id));
             }
         }
@@ -506,12 +513,7 @@ fn render_entry(
             markdown::render(ui, &markdown::to_doc(text));
         }
         TimelineEntry::ChatTool { name, summary } => {
-            ui.label(
-                RichText::new(format!("{name} {summary}"))
-                    .monospace()
-                    .color(p.muted)
-                    .size(11.5),
-            );
+            tool_line(ui, &format!("{name} {summary}"), p.muted);
         }
         TimelineEntry::Notice { text } => {
             ui.colored_label(p.pending, text);
@@ -569,12 +571,18 @@ fn render_findings(
                         .strong(),
                 );
                 ui.label(RichText::new(&finding.title).size(11.5));
-                ui.label(
-                    RichText::new(finding.anchor.path())
-                        .monospace()
-                        .color(p.faint)
-                        .size(11.0),
-                );
+                // The path is one unbreakable word: truncate, full path on
+                // hover, so a deep path cannot widen the pane.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(finding.anchor.path())
+                            .monospace()
+                            .color(p.faint)
+                            .size(11.0),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(finding.anchor.path());
                 if finding.state == FindingState::DroppedByVerifier {
                     ui.label(
                         RichText::new("dropped by verifier")
@@ -649,14 +657,19 @@ fn render_chat(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanelA
     let text_id = ui.scope_id().with("ai-chat-input");
     let enabled = chat_enabled(&st.phase);
     ui.add_enabled_ui(enabled, |ui| {
-        ui.horizontal(|ui| {
+        // Right-to-left so the send button claims its width first and the
+        // field fills the rest: in a left-to-right row an `INFINITY` field
+        // takes the full available width and the button overflows past it,
+        // which grows the pane a little every frame (the details ScrollArea
+        // expands to its content's min width).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let send = icons::icon_button(ui, icons::SEND, "Send message");
             let mut text: String = ui.data_mut(|d| d.get_persisted(text_id).unwrap_or_default());
             let field = ui.add(
                 egui::TextEdit::singleline(&mut text)
                     .hint_text("Ask the review…")
                     .desired_width(f32::INFINITY),
             );
-            let send = icons::icon_button(ui, icons::SEND, "Send message");
             ui.data_mut(|d| d.insert_persisted(text_id, text.clone()));
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if (send.clicked() || enter) && !text.trim().is_empty() {
@@ -672,7 +685,7 @@ fn render_chat(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanelA
 
 /// Pause / Resume · Finish · Cancel (spec §12).
 fn render_run_controls(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanelAction>) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if matches!(st.phase, AiPhase::Running) && ui.button("Pause").clicked() {
             actions.push(AiPanelAction::Pause);
         }
@@ -702,7 +715,9 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         .show(ui, add);
 }
 
-/// A mono command line inside a card.
+/// A mono command line inside a card. Long paths and flags are unbreakable
+/// words: truncate to the available width and show the full command on
+/// hover, so the card never forces the right pane wider than the splitter.
 fn mono_line(ui: &mut egui::Ui, text: &str) {
     let p = theme::palette_of(ui);
     Frame::new()
@@ -710,8 +725,15 @@ fn mono_line(ui: &mut egui::Ui, text: &str) {
         .corner_radius(4.0)
         .inner_margin(Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).monospace().size(11.5).color(p.text));
+            tool_line(ui, text, p.text);
         });
+}
+
+/// One monospace line (a tool call, a command) that truncates instead of
+/// widening the pane; the full text lives in the hover tooltip.
+fn tool_line(ui: &mut egui::Ui, text: &str, color: Color32) {
+    ui.add(egui::Label::new(RichText::new(text).monospace().color(color).size(11.5)).truncate())
+        .on_hover_text(text);
 }
 
 /// The accent for a finding's severity, matching the diff's draft styling.
@@ -1068,6 +1090,100 @@ mod tests {
             *harness.state(),
             vec![AiPanelAction::Start],
             "a restored run can be started again from the tab"
+        );
+    }
+
+    /// The right-pane layout from `pr_detail.rs`: a resizable panel whose
+    /// details `ScrollArea` uses `auto_shrink([false, false])`, which makes
+    /// the tab's min content width the pane's min width (the panel feeds its
+    /// own response rect back as the next frame's size). A 400+ char tool
+    /// JSON with unbreakable path tokens and a long approval command must
+    /// therefore neither widen the pane past its splitter width nor leave
+    /// content outside the visible clip rect.
+    #[test]
+    fn long_tool_and_approval_lines_fit_a_narrow_right_pane() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let agent = AgentRef {
+            id: 1,
+            role: AgentRole::Reviewer,
+            label: "reviewer:g1".to_string(),
+        };
+        let long_json = "bash {\"command\":\"for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md docs/superpowers/plans/2026-10-20-ai-review-3-ui-chat.md docs/superpowers/specs/2026-10-19-ai-review-design.md ; do echo \\\"=== $f ===\\\"; head -40 \\\"$f\\\"; done\"}".to_string();
+        assert!(
+            long_json.len() > 300,
+            "the fixture must be a real tool line"
+        );
+        let st = AiReviewState {
+            phase: AiPhase::Running,
+            timeline: vec![
+                TimelineEntry::Agent {
+                    agent: agent.clone(),
+                    group: Some("notifications".into()),
+                    tools: vec![
+                        ("bash".into(), long_json),
+                        (
+                            "read_file".into(),
+                            "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
+                        ),
+                    ],
+                    text: String::new(),
+                    stop: None,
+                },
+                TimelineEntry::Approval {
+                    id: 3,
+                    agent,
+                    kind: crate::ai::ui_interaction::ApprovalKind::Command {
+                        command: "git -C /Users/sercand/Developer/otsimo/web log --format=%H%n%an%n%s --since=2026-10-01 -- src/lib/data-tools/push-notification-default-links.ts".into(),
+                        reason: "it runs code".into(),
+                    },
+                    decided: None,
+                },
+            ],
+            ..AiReviewState::default()
+        };
+
+        let panel = Rc::new(RefCell::new(egui::Rect::NOTHING));
+        let content = Rc::new(RefCell::new(egui::Rect::NOTHING));
+        let clip = Rc::new(RefCell::new(egui::Rect::NOTHING));
+        let (p, c, k) = (panel.clone(), content.clone(), clip.clone());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([1440.0, 900.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui(move |ui| {
+                let resp = egui::Panel::right("pr-detail-right")
+                    .resizable(true)
+                    .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(12, 8)))
+                    .default_size(420.0)
+                    .show(ui, |ui| {
+                        ui.label("Files Overview Conversation Commits Checks AI");
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("metadata-panel")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let _ = render(ui, &st, false);
+                                *c.borrow_mut() = ui.min_rect();
+                                *k.borrow_mut() = ui.clip_rect();
+                            });
+                    });
+                *p.borrow_mut() = resp.response.rect;
+            });
+        // The growth compounds every frame: it grew the pane 36 pt per
+        // frame before the fix, so give it ten frames to show itself.
+        harness.run_steps(10);
+
+        let panel = *panel.borrow();
+        assert!(
+            panel.width() <= 421.0,
+            "the pane grew to {:.0} pt past its 420 pt splitter width",
+            panel.width()
+        );
+        let (content, clip) = (*content.borrow(), *clip.borrow());
+        assert!(
+            content.min.x >= clip.min.x - 1.0 && content.max.x <= clip.max.x + 1.0,
+            "tab content outside the visible pane: content {content:?} vs clip {clip:?}"
         );
     }
 

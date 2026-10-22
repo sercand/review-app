@@ -407,8 +407,16 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
             agent: reviewer.clone(),
             group: Some("notifications".into()),
             tools: vec![
-                ("read_file".into(), "src/lib/data-tools/push.ts".into()),
-                ("grep".into(), "withDefaultLinks".into()),
+                (
+                    "bash".into(),
+                    // A real scout/reviewer tool call: 400+ chars of JSON with
+                    // long unbreakable path tokens (the live smoke-test bug).
+                    "{\"command\":\"for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md docs/superpowers/plans/2026-10-20-ai-review-3-ui-chat.md docs/superpowers/specs/2026-10-19-ai-review-design.md ; do echo \\\"=== $f ===\\\"; head -40 \\\"$f\\\"; done\"}".into(),
+                ),
+                (
+                    "read_file".into(),
+                    "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
+                ),
             ],
             text: "The create path looks up links even when the author set them. Checking whether the lookup can fail the create.".into(),
             stop: None,
@@ -424,8 +432,8 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
             id: 3,
             agent: reviewer.clone(),
             kind: ApprovalKind::Command {
-                command: "cargo test -p notifier".into(),
-                reason: "it runs code".into(),
+                command: "git -C /Users/sercand/Developer/otsimo/web log --format=%H%n%an%n%s --since=2026-10-01 -- src/lib/data-tools/push-notification-default-links.ts".into(),
+                reason: "the agent wants the recent history of the default-links module to see whether the lookup was changed on purpose".into(),
             },
             decided: None,
         },
@@ -651,12 +659,27 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
 /// The PR detail screen with the ✦ AI tab open on `ai`.
 #[cfg(unix)]
 fn ai_detail(dark: bool, name: &str, ai: crate::state::ai_review::AiReviewState) {
+    ai_detail_pane(dark, name, ai, None);
+}
+
+/// [`ai_detail`] with an explicit right-pane width: the layout bug this shot
+/// guards was only visible at the splitter widths users actually pick.
+#[cfg(unix)]
+fn ai_detail_pane(
+    dark: bool,
+    name: &str,
+    ai: crate::state::ai_review::AiReviewState,
+    right_pane: Option<f32>,
+) {
     let mut s = session(DiffMode::Split);
     s.ai = ai;
     let mut state = pr_detail::PrDetailState {
         right_open: true,
         ..Default::default()
     };
+    if let Some(right_pane) = right_pane {
+        state.right_pane = right_pane;
+    }
     state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
     let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
     let h = harness(dark, move |ui| {
@@ -676,7 +699,10 @@ fn ai_detail(dark: bool, name: &str, ai: crate::state::ai_review::AiReviewState)
             },
         );
     });
-    save(h, name);
+    // The right pane's width feeds back from its own response rect (the app
+    // stores it as `right_pane`, egui as `PanelState`), so an oversized tab
+    // needs several frames to show its full growth.
+    save_after(h, name, 10);
 }
 
 /// The diff with one inline AI draft row: ✦ tag, severity, body, evidence
@@ -846,6 +872,15 @@ fn shots() {
         {
             ai_detail(dark, &format!("pr-ai-running-{t}"), ai_state_running());
             ai_detail(dark, &format!("pr-ai-done-{t}"), ai_state_done());
+            // The same running tab in a narrow right pane: the layout bug
+            // this guards (pane growth past the splitter + clipped content)
+            // only shows at user-real widths.
+            ai_detail_pane(
+                dark,
+                &format!("pr-ai-running-narrow-{t}"),
+                ai_state_running(),
+                Some(420.0),
+            );
             ai_inline_draft(dark, &format!("pr-ai-inline-draft-{t}"));
             ai_checkout_dialog(dark, &format!("pr-checkout-dialog-{t}"));
         }
@@ -941,6 +976,65 @@ fn shots() {
             save_after(h, &format!("settings-ai-{t}"), 10);
         }
     }
+}
+
+/// Screen-level guard for the narrow-pane layout bug: the right pane feeds
+/// its own response rect back as the next frame's `default_size`, so an AI
+/// tab whose min content width exceeds the splitter width grows the pane a
+/// little every frame until the diff is crushed. At a 420 pt pane the tab's
+/// long tool JSON and approval commands must keep the pane at 420.
+///
+/// Not `#[ignore]`d: this is a layout assertion, not a screenshot, and the
+/// software harness needs no GPU.
+#[cfg(unix)]
+#[test]
+fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
+    let mut s = session(DiffMode::Split);
+    s.ai = ai_state_running();
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        right_pane: 420.0,
+        ..Default::default()
+    };
+    state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(true)));
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(420.0));
+    let w = seen.clone();
+    let mut harness = Harness::builder()
+        .with_size(SIZE)
+        .with_theme(egui::Theme::Dark)
+        .with_context_setup(|ctx| {
+            ctx.set_fonts(fonts::font_definitions());
+            egui_extras::install_image_loaders(ctx);
+            theme::install(ctx, 13.0);
+        })
+        .with_accessibility_check(false)
+        .build_ui(move |ui| {
+            let mut diff_actions = Vec::new();
+            pr_detail::render(
+                ui,
+                &mut s,
+                &mut state,
+                &mut cache,
+                &mut diff_actions,
+                pr_detail::ScreenInputs {
+                    login: "sercand",
+                    write_blocked: None,
+                    theme: theme::Theme::Dark,
+                    system_dark: true,
+                    ai_configured: true,
+                },
+            );
+            *w.borrow_mut() = state.right_pane;
+        });
+    // The growth compounds per frame; ten frames grew the pane ~360 pt before
+    // the fix.
+    harness.run_steps(10);
+    let width = *seen.borrow();
+    assert!(
+        width <= 421.0,
+        "the right pane grew to {width:.0} pt past its 420 pt splitter width"
+    );
 }
 
 /// The settings the AI shot opens with: one provider, a default model and one
