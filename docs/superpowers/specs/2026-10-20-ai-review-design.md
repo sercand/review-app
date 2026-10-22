@@ -803,8 +803,18 @@ API keys: keychain service `gh-review-desktop`, account `llm:<provider name>`.
 one tiny request), model selection, per-repo folders and commands, and the
 "Auto-approve bash commands" section (the `[ai.auto_approve]` keys above). The
 classifier checkbox is disabled while no classifier is available; the model
-never approves a command in the never-approve table and any failure falls back
-to the rule engine's verdict.
+can approve a segment only if the never-approve filter allows it: the command
+is a bare name or an absolute system path (`/bin`, `/usr/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin`, `/sbin`, `/usr/sbin`), its basename (case-insensitive, with
+version suffixes such as `python3.12` or `node-18`) is not in the table of
+network, interpreter, shell, exec-wrapper, script-capable (`awk`, `sed`, `tar`,
+`sqlite3`, editors), installer and data-changing binaries, no later argument
+word (split on characters outside `[A-Za-z0-9._+-]`) names a table binary, it
+writes nowhere but `/dev/null`, and it sets no risky environment variable.
+Anything else asks. The timeout is one deadline per bash command, shared by all
+its segments, not per model call; after it, or while an earlier classification
+is still running, the remaining segments are decided without the model. Any
+failure falls back to the rule engine's verdict.
 
 ## 11. Storage (SQLite)
 

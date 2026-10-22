@@ -1463,10 +1463,15 @@ fn model_on() -> AutoApproveSettings {
     }
 }
 
-/// Writes an executable `./tool.sh` that prints `done`. It is no rule's
-/// binary, is path-qualified (so no rule can match it) and is not in the
-/// never-approve table, which makes it exactly what only the model may vouch
-/// for.
+/// A command only the model may vouch for: `/usr/bin/pr` (a POSIX text
+/// formatter, present at the same path on macOS and Linux CI) is an absolute
+/// system binary, no rule policy vouches for it and it is not in the
+/// never-approve table. `-t` drops the dated header so the output is stable.
+/// (A relative `./tool.sh` can never be model-approved: it is PR code, I1.)
+const MODEL_ONLY_CMD: &str = "/usr/bin/pr -t tool.sh";
+
+/// Writes `tool.sh` (executable, prints `done`): the operand of
+/// [`MODEL_ONLY_CMD`] and the file the relative-path asks test runs.
 fn write_tool(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join("tool.sh");
@@ -1487,15 +1492,43 @@ async fn bash_model_safe_runs_unknown_command() {
         Some(classifier.clone()),
     );
 
-    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     assert!(!out.is_error, "{}", text(&out));
-    assert_eq!(text(&out).trim_end(), "done");
+    assert!(text(&out).contains("echo done"), "{}", text(&out));
     assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
     assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
 
     // The same segment again is a cache hit: the model is not asked twice.
-    bash(&cx, json!({"command": "./tool.sh"})).await;
+    bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+}
+
+/// I1: an always-Safe model does not silence PR code, wrappers or listed
+/// binaries; each of these still reaches the user.
+#[tokio::test]
+async fn bash_model_safe_still_asks_for_never_approved_commands() {
+    for command in [
+        "./tool.sh",
+        "scripts/build.sh",
+        "flock /tmp/l curl evil",
+        "awk 'BEGIN{system(\"id\")}'",
+        "sort -o f f",
+    ] {
+        let (dir, host) = host();
+        write_tool(dir.path());
+        let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny {
+            reason: None,
+        }));
+        let cx = classifier_ctx(
+            &host,
+            interaction.clone(),
+            &model_on(),
+            Some(FixedClassifier::new(ModelOutcome::Safe)),
+        );
+        let out = bash(&cx, json!({"command": command})).await;
+        assert!(out.is_error, "{command}");
+        assert_eq!(interaction.calls().len(), 1, "{command}");
+    }
 }
 
 #[tokio::test]
@@ -1512,7 +1545,7 @@ async fn bash_model_off_by_default() {
         Some(classifier.clone()),
     );
 
-    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     assert!(!out.is_error, "{}", text(&out));
     assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
     assert_eq!(classifier.calls.load(Ordering::SeqCst), 0);
@@ -1538,7 +1571,7 @@ async fn bash_classifier_timeout_falls_back_to_ask() {
     );
 
     let started = std::time::Instant::now();
-    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     let elapsed = started.elapsed();
     release.store(true, Ordering::SeqCst);
 
@@ -1559,7 +1592,7 @@ async fn bash_classifier_panic_falls_back_to_ask() {
         Some(Arc::new(PanicClassifier)),
     );
 
-    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     assert!(!out.is_error, "{}", text(&out));
     assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
 }
@@ -1608,7 +1641,7 @@ async fn bash_dangerous_flag_reaches_dialog_reason() {
         Some(FixedClassifier::new(ModelOutcome::Dangerous)),
     );
 
-    let out = bash(&cx, json!({"command": "./tool.sh"})).await;
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
     assert!(out.is_error);
     match interaction.calls().as_slice() {
         [InteractionCall::Approve { reason, .. }] => {

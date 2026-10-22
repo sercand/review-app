@@ -161,11 +161,85 @@ pub const NEVER_APPROVE: &[&str] = &[
     "command",
     "builtin",
     "find",
+    // Exec wrappers a rule does not know: they run their operand.
+    "busybox",
+    "toybox",
+    "flock",
+    "arch",
+    "strace",
+    "ltrace",
+    "valgrind",
+    "gdb",
+    "lldb",
+    "xvfb-run",
+    "unbuffer",
+    "hyperfine",
+    "entr",
+    "watchexec",
+    "firejail",
+    "proxychains",
+    "torsocks",
+    "unshare",
+    "chroot",
+    "nsenter",
+    "sg",
+    "runuser",
+    "systemd-run",
+    "sandbox-exec",
+    // Programs and editors that can run a command from their own script.
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    "tar",
+    "sqlite3",
+    "vi",
+    "vim",
+    "nvim",
+    "ex",
+    "emacs",
+    // More network clients.
+    "http",
+    "https",
+    "xh",
+    "aria2c",
+    "wget2",
+    "openssl",
+    "aws",
+    "gcloud",
+    "az",
+    "gsutil",
+    "rclone",
+    // Change or remove data (`sort -o` writes).
+    "unlink",
+    "gzip",
+    "gunzip",
+    "bzip2",
+    "xz",
+    "zstd",
+    "patch",
+    "unzip",
+    "trash",
+    "sort",
+];
+
+/// Directories whose binaries are the system's, not the PR's.
+const SYSTEM_BIN_DIRS: &[&str] = &[
+    "/bin/",
+    "/usr/bin/",
+    "/usr/local/bin/",
+    "/opt/homebrew/bin/",
+    "/sbin/",
+    "/usr/sbin/",
 ];
 
 /// Whether a model's "safe" may approve `seg`: it has a literal command word
-/// whose basename is not in [`NEVER_APPROVE`], writes nowhere but `/dev/null`
-/// or an fd, and sets no environment variable that changes what runs.
+/// that is a bare name or an absolute system path (a relative path is PR
+/// code) whose basename is not in [`NEVER_APPROVE`], no later word names a
+/// listed binary (wrappers, `awk 'BEGIN{system("curl …")}'`), it writes
+/// nowhere but `/dev/null` or an fd, and it sets no environment variable that
+/// changes what runs.
 pub fn model_may_approve(seg: &Segment) -> bool {
     let Some(argv0) = seg.argv.first() else {
         return false;
@@ -173,8 +247,14 @@ pub fn model_may_approve(seg: &Segment) -> bool {
     if seg.is_dynamic(0) {
         return false;
     }
+    if argv0.contains('/') && !SYSTEM_BIN_DIRS.iter().any(|d| path_in_dir(argv0, d)) {
+        return false;
+    }
     let base = argv0.rsplit('/').next().unwrap_or(argv0);
     if listed(base) {
+        return false;
+    }
+    if seg.argv.iter().skip(1).any(|w| word_names_listed(w)) {
         return false;
     }
     if !seg.redirects.iter().all(redirect_ok) {
@@ -183,12 +263,28 @@ pub fn model_may_approve(seg: &Segment) -> bool {
     !seg.assigns.iter().any(|(n, v)| is_risky_env(n, v))
 }
 
+/// `path` is `dir` plus one file name: no `..`, no nesting.
+fn path_in_dir(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/') && rest != "..")
+}
+
+/// Whether any piece of `word`, split on characters outside
+/// `[A-Za-z0-9._+-]`, names a listed binary. Pieces made of dots only (`.`,
+/// `..`) are paths, not the `.` builtin.
+fn word_names_listed(word: &str) -> bool {
+    word.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')))
+        .any(|piece| !piece.chars().all(|c| c == '.') && listed(piece))
+}
+
 /// Whether `base` names a table entry, allowing for a case-insensitive
-/// filesystem (`CURL`), a version suffix (`python3.12`, `perl5.34`) and the
-/// GNU-coreutils `g` prefix (`gtimeout`).
+/// filesystem (`CURL`), a version suffix (`python3.12`, `perl5.34`,
+/// `node-18`, `ruby_3`) and the GNU-coreutils `g` prefix (`gtimeout`).
 fn listed(base: &str) -> bool {
     let lower = base.to_ascii_lowercase();
-    let unversioned = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    let unversioned = lower
+        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
+        .trim_end_matches(['-', '_']);
     [lower.as_str(), unversioned].into_iter().any(|name| {
         let hit =
             |n: &str| !n.is_empty() && NEVER_APPROVE.iter().any(|e| e.eq_ignore_ascii_case(n));
@@ -252,6 +348,18 @@ mod tests {
             "make test",
             "pytest",
             "open x",
+            // I1: wrappers, relative programs, listed words as operands.
+            "flock /tmp/l curl x",
+            "./tool.sh",
+            "scripts/build.sh",
+            "/tmp/x/tool",
+            "/usr/bin/../../tmp/x",
+            "/usr/bin/sub/tool",
+            "ls curl",
+            "mytool --to-command=curl",
+            "node-18 x.js",
+            "ruby_3 x.rb",
+            "sort -o f f",
         ] {
             assert!(!may(cmd), "{cmd}");
         }
@@ -261,6 +369,9 @@ mod tests {
             "mycustomtool --check",
             "ls 2>&1",
             "foo > /dev/null",
+            "/usr/bin/mytool x",
+            "mytool a.txt . ..",
+            "mytool --name=a/b",
         ] {
             assert!(may(cmd), "{cmd}");
         }

