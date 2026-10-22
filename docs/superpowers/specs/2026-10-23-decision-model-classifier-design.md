@@ -125,9 +125,11 @@ and passes it. The decision cache key becomes `(cwd, segment)`.
 
 - Loaded at model load; `approve_threshold` defaults to 0.90 when absent; the three values must be
   exactly `approve`, `ask`, `deny` or the model is `Unavailable("invalid decision schema")`.
-- If the file is missing, a **built-in schema is used only for known model names** (`d1-3b` gets one we
-  write); any other model without a schema is `Unavailable("model has no decision schema")` — the app
-  never scores against a rubric the model was not trained on.
+- If the file is missing, the app uses its **built-in default schema** (a constant in review-app with
+  the instructions above, an approve/ask/deny rubric we write, and `approve_threshold` 0.90) for any
+  model. A file that is present but invalid is still `Unavailable("invalid decision schema")`; the
+  default is never substituted for a broken file. Settings shows whether the model's own schema or the
+  default is in use.
 
 **Model selection and download:** new setting `ai.auto_approve.decision_model` (registry name, default
 `d1-3b`, `#[serde(default)]`). The loader calls `shiso_decision::ensure_model(name, <config root>/models,
@@ -154,7 +156,8 @@ are removed.
 |---|---|
 | Classifier off / not loaded / downloading / loading | `Unavailable` → rules + human as before |
 | No GPU, backend open fails, model load fails | state `Unavailable(why)` / `Failed(why)`; retry via Settings |
-| Missing/invalid schema | `Unavailable(why)`, no scoring |
+| Missing schema file | built-in default schema |
+| Invalid schema file | `Unavailable(why)`, no scoring |
 | `decide` error, NaN, missing option | `Unavailable` for that call; counts toward the breaker |
 | Busy (another call in flight) or timeout | no-model verdict (cached outcomes still apply while active) |
 | 3 consecutive failures | stage disabled for the session; Settings shows why |
