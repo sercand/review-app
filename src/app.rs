@@ -270,11 +270,29 @@ pub struct ReviewApp {
     /// `ViewportCommand::Close` (Task 8).
     #[cfg(unix)]
     quit_close_now: bool,
+    /// Set once the app has sent its own `ViewportCommand::Close`: egui
+    /// reports `close_requested` again for that close, and the hook must
+    /// let this frame through uncancelled — cancelling it would restart
+    /// the quit check forever and the window would never shut
+    /// (Task 8 review).
+    #[cfg(unix)]
+    quit_close_sent: bool,
     /// The `since_sha` of the Continue review whose checkout plan awaits
     /// confirmation: the confirm dialog then starts the run Incremental
     /// instead of Full (Task 8, spec §5.8).
     #[cfg(unix)]
     ai_continue_since: Option<String>,
+}
+
+/// Whether a frame reporting `close_requested` must be intercepted to run the
+/// Finish flow before the window shuts (spec §7.3, Task 8). A close the app
+/// triggered itself — `self_triggered`, set once `ViewportCommand::Close` has
+/// been sent — must pass through uncancelled: egui re-reports
+/// `close_requested` for the app's own close, and cancelling that frame would
+/// re-run the quit check forever, so the window would never actually shut.
+#[cfg(unix)]
+fn quit_close_needs_intercept(close_requested: bool, self_triggered: bool) -> bool {
+    close_requested && !self_triggered
 }
 
 impl ReviewApp {
@@ -377,6 +395,8 @@ impl ReviewApp {
             quit_restore: None,
             #[cfg(unix)]
             quit_close_now: false,
+            #[cfg(unix)]
+            quit_close_sent: false,
             #[cfg(unix)]
             ai_continue_since: None,
         }
@@ -2730,15 +2750,21 @@ impl eframe::App for ReviewApp {
         // cancelled, the hub reports the held runs (`AiQuitHeld`), each
         // gets the ask-first finish, and the `AiQuitClear` that follows
         // the last restore closes the window. A decision the user ignores
-        // keeps the app open — a repo is never left stashed silently.
+        // keeps the app open — a repo is never left stashed silently. The
+        // app's own `Close` (below) re-reports `close_requested`, so it is
+        // let through uncancelled or the quit check would loop forever.
         #[cfg(unix)]
-        if ui.input(|i| i.viewport().close_requested()) {
+        if quit_close_needs_intercept(
+            ui.input(|i| i.viewport().close_requested()),
+            self.quit_close_sent,
+        ) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_pending = true;
             self.worker.send(Command::AiQuitCheck);
         }
         #[cfg(unix)]
         if std::mem::take(&mut self.quit_close_now) {
+            self.quit_close_sent = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -2878,6 +2904,27 @@ mod tests {
     use crate::github::client::GitHubUser;
     use crate::github::error::GhError;
     use crate::runtime::Event;
+
+    /// The quit hook intercepts a user close but lets the app's own
+    /// `ViewportCommand::Close` through, so the window actually shuts once
+    /// the Finish flow is done (Task 8 review: cancelling the self-triggered
+    /// close would re-run the quit check forever).
+    #[cfg(unix)]
+    #[test]
+    fn only_a_foreign_close_is_intercepted() {
+        assert!(
+            quit_close_needs_intercept(true, false),
+            "a user close is held for the Finish flow"
+        );
+        assert!(
+            !quit_close_needs_intercept(true, true),
+            "the app's own Close passes through so eframe exits"
+        );
+        assert!(
+            !quit_close_needs_intercept(false, false),
+            "no close, nothing to intercept"
+        );
+    }
 
     #[test]
     fn routing_follows_auth_events() {

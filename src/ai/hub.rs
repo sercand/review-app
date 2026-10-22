@@ -1189,18 +1189,28 @@ impl AiHub {
                                 events.send(Event::AiRestoreNeedsDecision { session, changes });
                                 self.put_back(key, run);
                             }
-                            Ok(Err(error)) => events.send(Event::Toast(format!(
-                                "restoring the checkout failed: {error}"
-                            ))),
+                            Ok(Err(error)) => {
+                                // The run goes back so a later finish — the
+                                // quit flow's re-check, or the user's retry
+                                // — can try again instead of hitting the
+                                // `finishing` guard forever (Task 8 review).
+                                events.send(Event::Toast(format!(
+                                    "restoring the checkout failed: {error}"
+                                )));
+                                self.put_back(key, run);
+                            }
                             Err(_) => {
                                 events.send(Event::Toast("the restore was cancelled".to_owned()));
                                 self.put_back(key, run);
                             }
                         }
                     }
-                    Ok(Err(error)) => events.send(Event::Toast(format!(
-                        "could not inspect the checkout: {error}"
-                    ))),
+                    Ok(Err(error)) => {
+                        events.send(Event::Toast(format!(
+                            "could not inspect the checkout: {error}"
+                        )));
+                        self.put_back(key, run);
+                    }
                     Err(_) => {
                         events.send(Event::Toast("the restore was cancelled".to_owned()));
                         self.put_back(key, run);
@@ -2499,6 +2509,38 @@ mod tests {
                 ],
             }),
             "one held checkout is enough to hold the window open"
+        );
+    }
+
+    /// A finish whose preview fails must not wedge the run: the run goes
+    /// back into the map, so the next finish actually attempts the restore
+    /// again instead of being silently swallowed by the `finishing` guard
+    /// forever (Task 8 review).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_preview_leaves_the_run_finishable() {
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        fx.start();
+        wait_for(&fx.events, |e| {
+            is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
+        });
+
+        // The clone vanishes: the preview's `git status` cannot run.
+        std::fs::remove_dir_all(&fx.clone).expect("remove the clone");
+
+        fx.hub.finish(SessionId(1), &fx.key, None, &fx.tx).await;
+        let first = wait_for(&fx.events, |e| matches!(e, Event::Toast(_)));
+        assert!(
+            matches!(&first, Event::Toast(t) if t.contains("could not inspect")),
+            "the failed preview is reported: {first:?}"
+        );
+
+        // The run is finishable again: the second attempt really runs —
+        // its own toast arrives — instead of being silently ignored.
+        fx.hub.finish(SessionId(1), &fx.key, None, &fx.tx).await;
+        let second = wait_for(&fx.events, |e| matches!(e, Event::Toast(_)));
+        assert!(
+            matches!(&second, Event::Toast(t) if t.contains("could not inspect")),
+            "the second finish attempted the restore again: {second:?}"
         );
     }
 
