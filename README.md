@@ -139,6 +139,30 @@ prepare commands; you approve, and the app runs the same fixed list.
 
 AI review is Unix-only for now: the sandbox has no Windows backend.
 
+### Local command classifier
+
+An optional on-device model that helps decide which shell commands the agent
+may run without asking. It only sees commands the built-in rules could not
+vouch for, and it is advisory: it can let a harmless command through, but it
+never approves anything on the never-approve list (network tools,
+interpreters, scripts from the PR and so on), and if it is missing, loading or
+failing, you are asked exactly as without it. Command text never leaves your
+machine.
+
+It is **off by default**: the rules alone already auto-run about 91 % of
+benign commands in our evaluation set, and the model adds one more (see
+`docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
+
+- macOS only for now (Apple GPU through Metal). The release builds include it;
+  from source, build with `--features local-classifier`. A Linux CUDA build
+  (`local-classifier-cuda`) exists but is untested.
+- Turning it on in **Settings → AI** downloads the weights (about 135 MB) from
+  Hugging Face (`sercand/da-command-classifier-fp16`), verifies their sha256
+  and stores them under the app config folder in `models/`. Nothing is
+  downloaded until you turn it on, and the weights are never bundled.
+- To turn it off, untick the setting. You can delete `models/` to reclaim the
+  space.
+
 ## Where data is stored
 
 Everything is stored locally in the platform config directory

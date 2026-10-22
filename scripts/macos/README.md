@@ -7,6 +7,10 @@ scripts/macos/notarize.sh   # notarize, staple, and build the .dmg / .zip
 
 Outputs land in `target/dist/`.
 
+`archive.sh` builds with `--features local-classifier` (the optional on-device
+command classifier, Metal); the weights are not bundled, the app downloads them
+only when the user turns the classifier on. Metal needs no entitlement.
+
 ## One-time setup
 
 - A **Developer ID Application** certificate for team `8SWC36YF9N` in the login

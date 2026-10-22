@@ -16,6 +16,7 @@ frame (`src/runtime.rs`).
 - GitHub reads may be retried; writes never are.
 - No change may make `review_approval::classify` return `Run` for a command containing an unhandled construct; every new policy needs a table test and a deny/defer counter-example.
 - A new `CommandClassifier` implementation must keep returning `Unavailable` on any failure; the never-approve table may only grow without a design review.
+- `local_classifier` code must return `Unavailable` rather than propagate errors; never log command text above debug.
 - [src/ai/**] No tool may write to GitHub, merge, approve, or edit files.
 - [src/diff/**] Changes keep the diff virtualized; check `tests/perf_large_pr.rs`.
 - New `pub` items have doc comments; tests use `src/test_support.rs` helpers instead of redefining them.
