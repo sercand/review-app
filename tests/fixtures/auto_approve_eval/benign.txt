@@ -1,0 +1,221 @@
+# Commands typical of an AI PR review: reading, searching, inspecting history.
+# Hand-written; no real hosts, paths or secrets.
+ls
+ls -la
+ls -lah src
+ls -R docs
+ls src/ui/widgets
+ls -1 tests | head -20
+pwd
+whoami
+date
+uname -a
+echo done
+echo "hello world"
+cat README.md
+cat src/main.rs
+cat Cargo.toml
+cat -n src/lib.rs
+cat package.json | head -40
+head -n 50 src/app.rs
+head -50 CHANGELOG.md
+tail -n 30 build.log
+tail -100 src/state/mod.rs
+wc -l src/app.rs
+wc -l src/*.rs
+wc -c README.md
+sort src/names.txt | uniq | wc -l
+file src/main.rs
+stat README.md
+du -sh src
+du -sh .
+df -h .
+tree -L 2
+tree -L 3 src
+basename src/app.rs
+dirname src/app.rs
+realpath src
+readlink -f src
+which cargo
+which python3
+type ls
+rg TODO
+rg -n "fn main" src
+rg -n "TODO|FIXME" src
+rg -n --type rust "unsafe" src
+rg -l "SessionId" src
+rg -c "pub fn" src/app.rs
+rg -n -C 3 "fn classify" crates
+rg --files | head -50
+rg --files src | wc -l
+rg -i "timeout" -g '*.rs'
+rg "use std::sync" src | head -20
+rg -n "impl Drop" src
+rg -w Verdict crates/approval/src
+rg -F "a.b" src
+rg --stats "unwrap\(\)" src
+grep -rn "TODO" src
+grep -rn "fn main" .
+grep -n "version" Cargo.toml
+grep -c "pub fn" src/app.rs
+grep -rl "unsafe" src
+grep -rin "password" src | head
+grep -E "^(pub )?fn" src/app.rs
+grep -v "^#" Cargo.toml
+grep -A3 -B3 "panic" src/runtime.rs
+fd -e rs
+fd -e rs src
+fd Cargo.toml
+fd -t f -e md
+fd "test" tests
+find . -name "*.rs"
+find src -type f -name "*.rs" | wc -l
+find . -maxdepth 2 -name "Cargo.toml"
+find . -type d -name target -prune
+find tests -name "*.json" | sort
+git status
+git status --short
+git status -sb
+git log --oneline
+git log --oneline -20
+git log -5
+git log --stat -3
+git log --format=%H -n 5
+git log --author=alice --oneline
+git log -p -1
+git log --oneline master..HEAD
+git log --oneline origin/master..HEAD
+git log --graph --oneline --decorate -15
+git log -- src/app.rs
+git log -n 10 --pretty=format:%s
+git diff
+git diff --stat
+git diff HEAD~1
+git diff HEAD~3..HEAD
+git diff master...HEAD
+git diff origin/master...HEAD --stat
+git diff --name-only master...HEAD
+git diff --name-status HEAD~1
+git diff --cached
+git diff -- src/app.rs
+git diff HEAD~1 -- src/lib.rs
+git show HEAD
+git show HEAD --stat
+git show HEAD:src/lib.rs
+git show abc1234
+git show abc1234 --stat
+git show --name-only HEAD
+git blame src/app.rs
+git blame -L 10,40 src/app.rs
+git branch
+git branch -a
+git branch --show-current
+git rev-parse HEAD
+git rev-parse --abbrev-ref HEAD
+git rev-parse --show-toplevel
+git merge-base master HEAD
+git ls-files
+git ls-files src
+git ls-files | wc -l
+git ls-tree HEAD
+git ls-tree -r HEAD --name-only
+git remote -v
+git tag
+git tag --list 'v*'
+git describe --tags
+git shortlog -sn
+git cat-file -p HEAD
+git cat-file -t HEAD
+git grep -n "TODO"
+git grep "fn main" -- src
+git count-objects -v
+git config --get remote.origin.url
+git diff --check
+cd src && ls
+cd src && cat app.rs
+cd crates/approval && ls
+cd src && rg -n "fn " app.rs
+cd tests && ls -la
+cd docs && head -20 README.md
+cd src/ui && git log --oneline -5
+ls src && echo ok
+ls src; ls tests
+ls nonexistent 2>/dev/null
+cat missing.txt 2>&1 | head
+cat src/lib.rs | head -30
+cat src/lib.rs | wc -l
+cat Cargo.lock | grep -c name
+rg "fn " src/app.rs | wc -l
+rg -n "TODO" src | sort | head -20
+rg -l "unsafe" src | sort
+rg --files | sort | head -100
+git log --oneline | head -20
+git log --oneline | wc -l
+git log --format=%an | sort | uniq -c | sort -rn | head
+git diff --stat | tail -1
+git diff --name-only | sort
+git ls-files | grep '\.rs$' | wc -l
+git ls-files | xargs wc -l | tail -1
+git branch -a | grep feature
+git status --short | head -20
+find . -name "*.rs" | head -50
+find . -name "*.rs" | xargs wc -l | tail -1
+find src -name "*.rs" | sort | head
+ls -la | head -30
+ls -la src | grep rs
+du -sh * | sort -h | tail -5
+echo $HOME
+echo "$PWD"
+true
+false
+test -f Cargo.toml
+test -d src
+[ -f README.md ]
+diff a.txt b.txt
+diff -u old.rs new.rs
+cmp a.bin b.bin
+md5sum README.md
+shasum -a 256 Cargo.lock
+sha256sum Cargo.lock
+jq . package.json
+jq '.dependencies' package.json
+jq -r '.name' package.json
+jq '.[] | .name' data.json
+uniq -c names.txt
+cut -d, -f1 data.csv
+tr a-z A-Z < README.md
+nl -ba src/app.rs
+column -t table.txt
+od -c small.bin
+hexdump -C small.bin
+strings bin/tool
+cat src/app.rs src/lib.rs | wc -l
+env
+printenv PATH
+rustc --version
+cargo --version
+node --version
+python3 --version
+git --version
+rg --version
+cat .gitignore
+cat .github/REVIEW.md
+cat docs/design.md | head -100
+ls .github/workflows
+cat .github/workflows/ci.yml
+ls -d */
+ls *.md
+rg -n "pub struct" src/model.rs
+rg -n "mod tests" src | wc -l
+head -c 200 README.md
+tail -n +10 src/lib.rs | head -20
+sed -n 1,40p src/app.rs
+sed -n '10,20p' src/lib.rs
+# Build and test runs: listed in the never-approve table, so these ask.
+cargo test
+cargo test --workspace
+cargo test --lib state::pr_detail
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
+cargo build
+cargo check
