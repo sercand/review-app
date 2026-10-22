@@ -5,5 +5,7 @@
 //! no I/O and fails closed: anything it cannot account for is a [`model::Bail`].
 
 pub mod model;
+pub mod parse;
 
 pub use model::{Bail, RedirOp, Redirect, Segment, Separator};
+pub use parse::parse;
