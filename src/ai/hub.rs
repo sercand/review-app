@@ -550,7 +550,7 @@ impl AiHub {
     ) {
         let Some(repo) = self.repo_settings(&key) else {
             events.send(Event::Toast(format!(
-                "no AI checkout folder is configured for {}/{}/{} — set it in Settings",
+                "no local folder is linked for {}/{}/{} — link one in this PR's AI tab",
                 key.host, key.owner, key.repo
             )));
             return;
@@ -631,7 +631,7 @@ impl AiHub {
 
         let Some(repo_settings) = self.repo_settings(&key) else {
             events.send(Event::Toast(format!(
-                "no AI checkout folder is configured for {}/{}/{} — set it in Settings",
+                "no local folder is linked for {}/{}/{} — link one in this PR's AI tab",
                 key.host, key.owner, key.repo
             )));
             return;
@@ -1609,7 +1609,7 @@ fn default_llm_factory(
         .models
         .default
         .as_ref()
-        .ok_or("no AI review model is configured — pick one in Settings")?;
+        .ok_or("no AI review model is configured — pick one in Settings → AI")?;
     let main = build(main)?;
     let lookup = match settings.models.lookup.as_ref() {
         Some(model) => Some(build(model)?),

@@ -104,13 +104,18 @@ submit it yourself.
 
 ### Setup
 
-In **Settings → AI**:
-
-1. Add a provider (name, API type, base URL, API key) and pick a model. The
-   key goes to the OS keychain, like the GitHub token.
-2. Per repository, set the local folder and the commands the agent may run
-   without asking (e.g. `cargo test`). On your first review of a repo, the
-   scout agent proposes these and you confirm them.
+1. In **Settings → AI**, add a provider (name, API type, base URL, API key)
+   and pick the models to use. Click a row, or "Add …", to edit it in a
+   dialog; the API key goes to the OS keychain, like the GitHub token, and
+   "Test connection" works from the dialog before you save.
+2. Link a local folder to the repository, either from a PR's **AI tab** (the
+   Local checkout row) or from the **Local repos** tab on the PR list, where
+   linked repos are listed and their open PRs expand per row. The app reads
+   the folder's git remote to check it is a clone of that repository.
+3. Under the Local checkout row, set the commands the agent may run without
+   asking (e.g. `cargo test`) and the prepare commands it can't run itself.
+   On your first review of a repo, the scout agent proposes these and you
+   confirm them.
 
 Other commands ask for approval in the AI tab, once or for the whole review.
 

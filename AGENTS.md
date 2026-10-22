@@ -10,8 +10,8 @@ CI (`.github/workflows/ci.yml`) runs these on Linux, macOS and Windows; all must
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --features ai-testing -- -D warnings
+cargo test --workspace --features ai-testing
 cargo test --release -- --ignored          # perf guardrail (tests/perf_large_pr.rs), Linux CI only
 ```
 
@@ -44,9 +44,9 @@ The crate is a library (`src/lib.rs`) plus a thin `src/main.rs` that calls `app:
 
 **GitHub client (`src/github/`).** Hand-written over reqwest, REST + GraphQL (PR list is one GraphQL search). Reads may be retried; writes never are. `error.rs` classifies failures into `GhError`. Supports GitHub Enterprise Server via `Endpoints`.
 
-**Persistence (`src/persist/`).** `settings.toml` plus per-PR `sessions/<host>/<owner>/<repo>/<number>.json` (viewed marks, pending review, composer drafts) with atomic, debounced writes. Tokens live only in the OS keychain (`src/auth/store.rs`, service `gh-review-desktop`) — never in session files.
+**Persistence (`src/persist/`).** `settings.toml` plus per-PR `sessions/<host>/<owner>/<repo>/<number>.json` (viewed marks, pending review, composer drafts) with atomic, debounced writes. Tokens and LLM API keys live only in the OS keychain (`src/auth/store.rs`, service `gh-review-desktop`; LLM keys under the `llm:<provider>` account) — never in settings or session files.
 
-**AI review (`src/ai/`, `#[cfg(unix)]`).** The engine: `llm.rs` builds provider clients from the vendored `crates/llm` (Anthropic + OpenAI behind neutral types); `crates/sandbox` (vendored) runs the agent's bash on a PTY inside an OS sandbox (Seatbelt / bubblewrap) that can't write `.git/` and has no credentials, and classifies commands for approval; `tools/` are the agent tools, `agent.rs` the agent loop, `pipeline.rs` the scout → reviewers → challengers → verifiers → assembler orchestrator, `context.rs`/`checklist.rs` the repo context (`.github/REVIEW.md` `## Checks` → `repo:*` items, directory-scoped `AGENTS.md`/`CLAUDE.md`, skills index), `store.rs` the SQLite persistence (`ai.sqlite`), `checkout.rs` the app-run git checkout/restore and prepare commands, and `hub.rs` the worker-side hub that turns AI `Command`s into `Event`s like the rest of `runtime.rs`. The UI side is `state/ai_review.rs` plus `ui/widgets/ai_panel.rs` and `ai_dialogs.rs`, following the same action-enum and `SessionId` rules. The agent has no GitHub credentials and no write path: nothing reaches GitHub except the user's own review submit.
+**AI review (`src/ai/`, `#[cfg(unix)]`).** The engine: `llm.rs` builds provider clients from the vendored `crates/llm` (Anthropic + OpenAI behind neutral types); `crates/sandbox` (vendored) runs the agent's bash on a PTY inside an OS sandbox (Seatbelt / bubblewrap) that can't write `.git/` and has no credentials, and classifies commands for approval; `tools/` are the agent tools, `agent.rs` the agent loop, `pipeline.rs` the scout → reviewers → challengers → verifiers → assembler orchestrator, `context.rs`/`checklist.rs` the repo context (`.github/REVIEW.md` `## Checks` → `repo:*` items, directory-scoped `AGENTS.md`/`CLAUDE.md`, skills index), `store.rs` the SQLite persistence (`ai.sqlite`), `checkout.rs` the app-run git checkout/restore and prepare commands, and `hub.rs` the worker-side hub that turns AI `Command`s into `Event`s like the rest of `runtime.rs`. The UI side is `state/ai_review.rs` plus `ui/widgets/ai_panel.rs` and `ai_dialogs.rs`, following the same action-enum and `SessionId` rules. AI setup lives where it is used, not in a Settings list: providers and models are edited in Settings' AI tab (`ui/widgets/settings_ai_tab.rs`, built-in model presets in `ai/presets.rs`); the repo↔folder link and a repo's commands/prepare/extra paths live in the PR's AI tab Local checkout row (`ai_panel.rs`, `ai_repo_dialog.rs`, link and start pre-check helpers in `ai/repo_link.rs`) and the PR list's Local repos tab (`state/local_repos.rs`, `ui/widgets/local_repos.rs`). The agent has no GitHub credentials and no write path: nothing reaches GitHub except the user's own review submit.
 
 ## Tests
 
