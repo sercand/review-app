@@ -585,9 +585,11 @@ impl AiHub {
                 provider.set_model(&model);
                 provider.set_enabled(true);
             }
-            Some((false, model)) => {
+            Some((false, _)) => {
+                // Only switch off: setting the model would start a load while
+                // the user is turning the classifier off. The next enable
+                // carries the model.
                 if let Some(provider) = self.classifier.get() {
-                    provider.set_model(&model);
                     provider.set_enabled(false);
                 }
             }
@@ -599,18 +601,18 @@ impl AiHub {
     ///
     /// [`Command::ClassifierDownload`]: crate::runtime::Command::ClassifierDownload
     pub fn classifier_download(&self, events: &EventSender) {
-        // The model of the last request; before any, the default.
+        // Retry needs a request to have named the model; with none there is
+        // nothing to retry.
         let model = self
             .classifier_desired
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .1
             .as_ref()
-            .map_or_else(
-                || crate::persist::settings::DEFAULT_DECISION_MODEL.to_owned(),
-                |(_, model)| model.clone(),
-            );
-        self.classifier_provider(&model, events).download();
+            .map(|(_, model)| model.clone());
+        if let Some(model) = model {
+            self.classifier_provider(&model, events).download();
+        }
     }
 
     /// The classifier a run starting now gets: with the setting on, a
@@ -2124,6 +2126,39 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(models, ["model d1-3b", "model d1-7b", "model d1-7b"]);
+    }
+
+    /// One save that turns the classifier off and changes the model must
+    /// only switch it off: no model change reaches the provider (which would
+    /// start a load).
+    #[test]
+    fn switching_off_with_a_model_change_only_switches_off() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        hub.classifier_request(true, "a", 1);
+        hub.classifier_apply_desired(&events);
+        hub.classifier_request(false, "b", 2);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            ["model a", "enabled true", "enabled false"]
+        );
+        // The next enable carries the new model.
+        hub.classifier_request(true, "b", 3);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            provider.calls.lock().unwrap()[3..],
+            ["model b", "enabled true"]
+        );
+    }
+
+    #[test]
+    fn download_without_a_request_is_a_no_op() {
+        let hub = plain_hub();
+        let (events, _rx) = event_channel();
+        hub.classifier_download(&events);
+        assert!(hub.classifier.get().is_none());
     }
 
     #[test]

@@ -9,11 +9,6 @@ pub enum ClassifierState {
     /// The setting is off.
     #[default]
     Off,
-    /// On, but the weights are not on disk. `total_bytes` is the download
-    /// size when it is known.
-    NotInstalled {
-        total_bytes: Option<u64>,
-    },
     Downloading {
         done: u64,
         total: u64,
@@ -37,17 +32,6 @@ pub enum SchemaSource {
     BuiltIn,
 }
 
-/// A byte count for people: `3.5 GB`, `135 MB`.
-fn human_bytes(bytes: u64) -> String {
-    const MB: f64 = 1_000_000.0;
-    let mb = bytes as f64 / MB;
-    if mb >= 1000.0 {
-        format!("{:.1} GB", mb / 1000.0)
-    } else {
-        format!("{} MB", mb.round().max(1.0))
-    }
-}
-
 /// Whether this build contains the classifier at all.
 pub const COMPILED: bool = cfg!(all(unix, feature = "_classifier"));
 
@@ -59,10 +43,6 @@ impl ClassifierState {
         }
         match self {
             ClassifierState::Off => "Off".to_owned(),
-            ClassifierState::NotInstalled {
-                total_bytes: Some(bytes),
-            } if *bytes > 0 => format!("Model not downloaded ({})", human_bytes(*bytes)),
-            ClassifierState::NotInstalled { .. } => "Model not downloaded".to_owned(),
             ClassifierState::Downloading { done, total } if *total > 0 => {
                 format!(
                     "Downloading… {} %",
@@ -87,11 +67,7 @@ impl ClassifierState {
 
     /// Whether Settings offers the Download / Retry button.
     pub fn can_download(&self, compiled: bool) -> bool {
-        compiled
-            && matches!(
-                self,
-                ClassifierState::NotInstalled { .. } | ClassifierState::Failed(_)
-            )
+        compiled && matches!(self, ClassifierState::Failed(_))
     }
 }
 
@@ -100,31 +76,10 @@ mod tests {
     use super::ClassifierState::*;
     use super::SchemaSource;
 
-    const NOT_INSTALLED: super::ClassifierState = NotInstalled { total_bytes: None };
-
     #[test]
     fn state_text_table() {
         let rows = [
             (Off, "Off"),
-            (NOT_INSTALLED, "Model not downloaded"),
-            (
-                NotInstalled {
-                    total_bytes: Some(3_500_000_000),
-                },
-                "Model not downloaded (3.5 GB)",
-            ),
-            (
-                NotInstalled {
-                    total_bytes: Some(135_000_000),
-                },
-                "Model not downloaded (135 MB)",
-            ),
-            (
-                NotInstalled {
-                    total_bytes: Some(0),
-                },
-                "Model not downloaded",
-            ),
             (Downloading { done: 0, total: 0 }, "Downloading…"),
             (
                 Downloading {
@@ -146,10 +101,9 @@ mod tests {
     }
 
     #[test]
-    fn download_button_only_when_not_installed_or_failed() {
+    fn download_button_only_when_failed() {
         let states = [
             Off,
-            NOT_INSTALLED,
             Downloading { done: 1, total: 2 },
             Loading,
             Ready(SchemaSource::Model),
@@ -157,7 +111,7 @@ mod tests {
             Failed("x".into()),
         ];
         for state in states {
-            let expected = matches!(state, NotInstalled { .. } | Failed(_));
+            let expected = matches!(state, Failed(_));
             assert_eq!(state.can_download(true), expected, "{state:?}");
             assert!(!state.can_download(false), "{state:?}");
         }

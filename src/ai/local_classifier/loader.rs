@@ -216,9 +216,12 @@ impl Loader {
         let dropped = inner.classifier.take();
         if inner.job_running {
             // The running job sees the new name at its next progress report
-            // (or when it finishes), stops, and the restart is announced
-            // then.
+            // (or when it finishes) and stops; say at once that the old
+            // model's progress no longer applies.
+            inner.state = ClassifierState::Loading;
+            inner.phase = ClassifierState::Loading;
             drop(inner);
+            (self.0.on_state)(ClassifierState::Loading);
         } else {
             self.start_job(inner, Some(ClassifierState::Loading));
         }
@@ -226,13 +229,10 @@ impl Loader {
         drop(dropped);
     }
 
-    /// Retry after a `Failed` (or `NotInstalled`) state.
+    /// Retry after a `Failed` state.
     pub fn download(&self) {
         let inner = self.lock();
-        let retryable = matches!(
-            inner.state,
-            ClassifierState::Failed(_) | ClassifierState::NotInstalled { .. }
-        );
+        let retryable = matches!(inner.state, ClassifierState::Failed(_));
         if inner.enabled && !inner.job_running && retryable {
             self.start_job(inner, None);
         }
@@ -317,9 +317,7 @@ impl Loader {
             None => {
                 // Shown for an install too (shiso has no offline probe): the
                 // call below then returns at once and `Loading` follows.
-                if !self.progress(model, ClassifierState::NotInstalled { total_bytes: None })
-                    || !self.progress(model, ClassifierState::Downloading { done: 0, total: 0 })
-                {
+                if !self.progress(model, ClassifierState::Downloading { done: 0, total: 0 }) {
                     return None;
                 }
                 let mut cancelled = false;
@@ -385,7 +383,10 @@ impl Loader {
         if model.is_some_and(|m| m != inner.model) {
             // The model was switched while this job ran: whatever it made is
             // for the wrong model.
-            self.start_job(inner, Some(ClassifierState::Loading));
+            // `set_model` usually announced `Loading` already.
+            let announce =
+                (inner.state != ClassifierState::Loading).then_some(ClassifierState::Loading);
+            self.start_job(inner, announce);
             drop(outcome);
             return;
         }
@@ -612,8 +613,6 @@ mod tests {
 
     use ClassifierState::*;
 
-    const NOT_INSTALLED: ClassifierState = NotInstalled { total_bytes: None };
-
     #[test]
     fn enable_without_weights_downloads_then_loads() {
         let r = rig(FakeSource::default(), FakeEngine::ok());
@@ -621,7 +620,6 @@ mod tests {
         assert_eq!(
             r.until(is_ready),
             [
-                NOT_INSTALLED,
                 Downloading { done: 0, total: 0 },
                 Downloading { done: 1, total: 4 },
                 Downloading { done: 4, total: 4 },
@@ -866,7 +864,6 @@ mod tests {
             seen,
             [
                 Loading,
-                NOT_INSTALLED,
                 Downloading { done: 0, total: 0 },
                 Downloading { done: 1, total: 4 },
                 Downloading { done: 4, total: 4 },
@@ -963,6 +960,23 @@ mod tests {
         r.loader.set_enabled(true);
         r.until(is_ready);
         assert_eq!(*r.source.ensure_models.lock().unwrap(), ["new"]);
+    }
+
+    /// Switching off and then naming another model (what one save that does
+    /// both comes to) starts nothing: no `ensure`, no state.
+    #[test]
+    fn a_model_name_set_after_switching_off_never_downloads() {
+        let r = rig_for("old", FakeSource::default(), FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(is_ready);
+        r.loader.set_enabled(false);
+        r.until(|s| *s == Off);
+        r.loader.set_model("new");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(r.states.try_recv().is_err());
+        assert_eq!(*r.source.ensure_models.lock().unwrap(), ["old"]);
+        assert_eq!(r.engine.loads.load(Ordering::SeqCst), 1);
+        assert!(r.loader.classifier().is_none());
     }
 
     #[test]
