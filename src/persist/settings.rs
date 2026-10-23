@@ -493,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn old_settings_default_to_d1_3b() {
+    fn old_settings_default_to_the_default_model() {
         let dir = tempdir();
         std::fs::write(
             dir.path().join("settings.toml"),

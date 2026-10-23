@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use review_approval::model_stage::CommandClassifier;
 use shiso_runtime::boot_error::BootError;
 use shiso_runtime::hub::PullError;
-use shiso_runtime::options::ExplicitlySet;
 use shiso_runtime::runtime::{OpenError, Runtime, RuntimeOptions, Source};
 
 use super::decision::DecisionClassifier;
@@ -19,9 +18,9 @@ pub use crate::state::classifier::ClassifierState;
 
 /// Where the weights come from; a fake in tests.
 pub trait WeightsSource: Send + Sync {
-    /// The install of `model` known to be complete, without touching the
-    /// network. `None` does not mean it is absent, only that this source
-    /// cannot tell cheaply: `ensure` then returns at once if it is there.
+    /// The install of `model` if it is complete, found without touching the
+    /// network and checked on every call, so a deleted install reads as
+    /// absent and `ensure` fetches it again.
     fn installed_dir(&self, model: &str) -> Option<PathBuf>;
     /// Blocking download + verify + install; call from a job thread.
     /// `progress(done, total)` returns `false` to cancel: the download stops
@@ -56,6 +55,10 @@ pub enum LoadError {
     Failed(String),
 }
 
+/// What boot says when the compute device itself will not open (Metal, CUDA).
+/// Other "opening the ..." steps are model files and stay retryable.
+const DEVICE_STEPS: [&str; 2] = ["opening the Metal device", "opening the CUDA device"];
+
 /// Maps a runtime error to the state it should show. A missing device is
 /// `Unavailable`; everything else is retryable.
 pub(super) fn load_error(error: OpenError) -> LoadError {
@@ -64,8 +67,10 @@ pub(super) fn load_error(error: OpenError) -> LoadError {
         OpenError::Boot(BootError::Refused(why)) if why.contains("no compute backend") => {
             Some(why.as_str())
         }
-        // Boot's device step: "opening the Metal device" (or CUDA).
-        OpenError::Boot(BootError::Step { context, .. }) if context.starts_with("opening the ") => {
+        // Boot's device step; the context strings are shiso-runtime's own.
+        OpenError::Boot(BootError::Step { context, .. })
+            if DEVICE_STEPS.contains(&context.as_str()) =>
+        {
             Some(context.as_str())
         }
         _ => None,
@@ -76,26 +81,31 @@ pub(super) fn load_error(error: OpenError) -> LoadError {
     }
 }
 
-/// Opens the model in `dir` for decisions. One sequence at a time: the
-/// classifier never makes concurrent calls, so the server's default of
-/// several resident sequences would only hold memory. Warms the device.
-pub fn open_runtime(dir: &Path) -> Result<Runtime, OpenError> {
-    let mut options = RuntimeOptions::default();
+/// Opens the model `source` names for decisions. One sequence at a time: the
+/// classifier never makes concurrent calls, so the server's default of several
+/// resident sequences would only hold memory. Warms the device.
+pub fn open_runtime(source: Source<'_>, home: Option<&Path>) -> Result<Runtime, OpenError> {
+    let mut options = RuntimeOptions {
+        home: home.map(Path::to_owned),
+        ..RuntimeOptions::default()
+    };
     options.serve.max_num_seqs = 1;
-    options.explicit = ExplicitlySet::default();
     options.explicit.insert("max_num_seqs");
-    Runtime::open(Source::Dir(dir), options, &mut |_, _| true)
+    Runtime::open(source, options, &mut |_, _| true)
 }
 
 /// The compute side; a fake in tests.
 pub trait Engine: Send + Sync {
     /// Cheap check that a GPU backend exists, run before any download.
     fn gpu_available(&self) -> bool;
-    /// Opens the backend and the model. Blocking; call from a job thread.
+    /// Opens the backend and the installed `model` (at `dir`). The classifier
+    /// owns whatever keeps the install in place. Blocking; call from a job
+    /// thread.
     /// `on_trip` is called (from any thread) if the classifier disables
     /// itself after repeated failures.
     fn load(
         &self,
+        model: &str,
         dir: &Path,
         on_trip: Box<dyn Fn() + Send + Sync>,
     ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError>;
@@ -107,7 +117,10 @@ pub trait Engine: Send + Sync {
 /// whether this build has a backend at all. On a machine whose device is
 /// unusable the download therefore still happens and the failure shows at open
 /// time (a missing device becomes `Unavailable`).
-struct ShisoEngine;
+struct ShisoEngine {
+    /// The model store the runtime opens `model` from.
+    home: PathBuf,
+}
 
 impl Engine for ShisoEngine {
     fn gpu_available(&self) -> bool {
@@ -119,13 +132,18 @@ impl Engine for ShisoEngine {
 
     fn load(
         &self,
+        model: &str,
         dir: &Path,
         on_trip: Box<dyn Fn() + Send + Sync>,
     ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError> {
         // An unreadable schema is never replaced by the default: the model
         // was shipped with a question this build cannot ask.
         let (schema, source) = load_schema(dir).map_err(LoadError::Unavailable)?;
-        let runtime = open_runtime(dir).map_err(load_error)?;
+        // From the registry name, not the bare directory: the `Runtime` then
+        // holds the install's lock itself, for as long as the classifier
+        // lives, and `shiso rm` waits for exactly that.
+        let runtime =
+            open_runtime(Source::Registry(model), Some(&self.home)).map_err(load_error)?;
         let classifier = DecisionClassifier::new(Arc::new(runtime), schema, on_trip);
         classifier.check_schema().map_err(LoadError::Unavailable)?;
         Ok((Arc::new(classifier), source))
@@ -166,7 +184,10 @@ pub struct Loader(Arc<Shared>);
 impl Loader {
     /// A loader for the registry model `model`.
     pub fn new(manager: WeightsManager, model: &str, on_state: OnState) -> Loader {
-        Loader::with_parts(Arc::new(manager), Arc::new(ShisoEngine), model, on_state)
+        let engine = ShisoEngine {
+            home: manager.home().to_owned(),
+        };
+        Loader::with_parts(Arc::new(manager), Arc::new(engine), model, on_state)
     }
 
     fn with_parts(
@@ -369,7 +390,7 @@ impl Loader {
                 Loader(shared).tripped(generation);
             }
         });
-        Some(match shared.engine.load(&dir, on_trip) {
+        Some(match shared.engine.load(model, &dir, on_trip) {
             Ok((c, source)) => Outcome::Ready(c, source),
             Err(e) => Outcome::State(e.into()),
         })
@@ -457,6 +478,8 @@ mod tests {
     /// model named `old`, `Safe` for any other.
     struct Fake {
         old: bool,
+        /// Stands for the `Runtime` and the install lock it holds.
+        _claim: Arc<()>,
     }
     impl CommandClassifier for Fake {
         fn classify(&self, _: &ClassifyInput<'_>) -> ModelOutcome {
@@ -534,6 +557,8 @@ mod tests {
         loaded: Mutex<Vec<PathBuf>>,
         schema: SchemaSource,
         delay: Duration,
+        /// One clone lives in every classifier this engine loaded.
+        claim: Arc<()>,
         /// The trip callback of the latest load.
         trip: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     }
@@ -547,6 +572,7 @@ mod tests {
                 loaded: Mutex::new(Vec::new()),
                 schema: SchemaSource::BuiltIn,
                 delay: Duration::ZERO,
+                claim: Arc::new(()),
                 trip: Mutex::new(None),
             }
         }
@@ -558,6 +584,7 @@ mod tests {
         }
         fn load(
             &self,
+            _model: &str,
             dir: &Path,
             on_trip: Box<dyn Fn() + Send + Sync>,
         ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError> {
@@ -570,6 +597,7 @@ mod tests {
                 None => Ok((
                     Arc::new(Fake {
                         old: dir.ends_with("old"),
+                        _claim: self.claim.clone(),
                     }),
                     self.schema,
                 )),
@@ -1036,6 +1064,25 @@ mod tests {
         assert_eq!(r.engine.loads.load(Ordering::SeqCst), 1);
     }
 
+    /// The install lock rides with the classifier: switching off drops the
+    /// loader's handle, and the claim goes with the last user's handle.
+    #[test]
+    fn the_claim_is_released_when_the_last_classifier_user_lets_go() {
+        let source = FakeSource::default();
+        *source.installed.lock().unwrap() = Some("/fake/model".into());
+        let r = rig(source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(is_ready);
+        let in_use = r.loader.classifier().expect("ready");
+        assert_eq!(Arc::strong_count(&r.engine.claim), 2);
+        r.loader.set_enabled(false);
+        assert!(r.loader.classifier().is_none());
+        // A review run still holds it: the claim stays.
+        assert_eq!(Arc::strong_count(&r.engine.claim), 2);
+        drop(in_use);
+        assert_eq!(Arc::strong_count(&r.engine.claim), 1);
+    }
+
     #[test]
     fn shiso_errors_map_to_states() {
         let pull = |e: PullError| load_error(OpenError::Pull(e));
@@ -1059,6 +1106,23 @@ mod tests {
             ))),
             LoadError::Unavailable(_)
         ));
+        let step = |context: &str| {
+            load_error(OpenError::Boot(BootError::Step {
+                context: context.into(),
+                source: "boom".into(),
+            }))
+        };
+        for device in DEVICE_STEPS {
+            assert!(
+                matches!(step(device), LoadError::Unavailable(m) if m == format!("no usable GPU: {device}")),
+                "{device}"
+            );
+        }
+        // A model file that will not open is not the device.
+        assert!(matches!(
+            step("opening the audio tower in /m"),
+            LoadError::Failed(_)
+        ));
         assert!(matches!(
             load_error(OpenError::NothingLoaded),
             LoadError::Failed(_)
@@ -1071,7 +1135,7 @@ mod tests {
     fn invalid_schema_is_unavailable_not_the_default() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("decision_schema.json"), "{ not json").unwrap();
-        let got = ShisoEngine.load(dir.path(), Box::new(|| {}));
+        let got = real_engine().load("m", dir.path(), Box::new(|| {}));
         match got {
             Err(LoadError::Unavailable(m)) => {
                 assert!(m.starts_with("invalid decision schema"), "{m}")
@@ -1081,10 +1145,16 @@ mod tests {
         }
     }
 
+    fn real_engine() -> ShisoEngine {
+        ShisoEngine {
+            home: PathBuf::new(),
+        }
+    }
+
     #[test]
     fn the_real_engine_needs_a_compiled_backend() {
         assert_eq!(
-            ShisoEngine.gpu_available(),
+            real_engine().gpu_available(),
             cfg!(any(
                 feature = "local-classifier",
                 feature = "local-classifier-cuda"
@@ -1102,8 +1172,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let loader = Loader::with_parts(
-            Arc::new(WeightsManager::with_home(PathBuf::from(home))),
-            Arc::new(ShisoEngine),
+            Arc::new(WeightsManager::with_home(PathBuf::from(&home))),
+            Arc::new(ShisoEngine {
+                home: PathBuf::from(&home),
+            }),
             "smollm2-135m-decision",
             Arc::new(move |s| {
                 eprintln!("state: {s:?}");

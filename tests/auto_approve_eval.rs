@@ -176,6 +176,7 @@ mod device {
     use gh_review_desktop::ai::local_classifier::decision::DecisionClassifier;
     use gh_review_desktop::ai::local_classifier::loader::open_runtime;
     use gh_review_desktop::ai::local_classifier::schema::load_schema;
+    use shiso_runtime::runtime::Source;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,7 +211,7 @@ mod device {
         };
         let (schema, source) = load_schema(Path::new(&dir)).expect("the model's schema");
         println!("schema source: {source:?}");
-        let runtime = open_runtime(Path::new(&dir)).expect("open the model");
+        let runtime = open_runtime(Source::Dir(Path::new(&dir)), None).expect("open the model");
         let classifier = DecisionClassifier::new(
             Arc::new(runtime),
             schema,

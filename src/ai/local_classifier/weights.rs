@@ -1,23 +1,20 @@
 //! The on-disk model store under `<data dir>/models`, filled from the shiso
 //! registry by `shiso_runtime::hub`.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-use shiso_runtime::hub::{self, InstalledModel};
+use shiso_runtime::hub;
 use shiso_runtime::runtime::OpenError;
 
 use super::loader::{LoadError, load_error};
 
 /// Owns the on-disk model store under `<data dir>/models`.
+///
+/// It keeps no claim on an install: a loaded model holds its own lock through
+/// its `Runtime` (see `ShisoEngine`), so the lock lives exactly as long as the
+/// classifier that reads the files.
 pub struct WeightsManager {
     home: PathBuf,
-    /// The installs this process has found or pulled, by name. Each entry
-    /// holds the install's lock, which is what keeps `shiso rm` and a
-    /// reinstall from removing files a loaded model is reading: the model is
-    /// opened from the bare directory, so the lock must outlive it.
-    installed: Mutex<HashMap<String, InstalledModel>>,
 }
 
 impl WeightsManager {
@@ -28,23 +25,22 @@ impl WeightsManager {
 
     /// A store rooted at `home` itself.
     pub fn with_home(home: PathBuf) -> WeightsManager {
-        WeightsManager {
-            home,
-            installed: Mutex::new(HashMap::new()),
-        }
+        WeightsManager { home }
     }
 
-    /// The complete install of `model`, found offline (no network). `None`
-    /// when it is not installed or the store cannot be read.
+    /// The store's root.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// The complete install of `model`, found offline (no network, checked on
+    /// every call). `None` when it is not installed or the store cannot be
+    /// read.
     pub fn installed_dir(&self, model: &str) -> Option<PathBuf> {
-        let mut installed = self.installed.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(found) = installed.get(model) {
-            return Some(found.dir.clone());
-        }
-        let found = hub::resolve(model, &hub::config_for_home(&self.home)).ok()??;
-        let dir = found.dir.clone();
-        installed.insert(model.to_owned(), found);
-        Some(dir)
+        // The claim is dropped at once: only the path is wanted here.
+        hub::resolve(model, &hub::config_for_home(&self.home))
+            .ok()?
+            .map(|found| found.dir.clone())
     }
 
     /// Blocking: finds `model` in the store or downloads it, verifying and
@@ -56,19 +52,12 @@ impl WeightsManager {
         model: &str,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<PathBuf, LoadError> {
-        // Not `pull` for an install already held: reinstalling a variant
-        // needs its lock exclusively.
         if let Some(dir) = self.installed_dir(model) {
             return Ok(dir);
         }
-        let pulled = hub::pull(model, &hub::config_for_home(&self.home), progress)
-            .map_err(|e| load_error(OpenError::Pull(e)))?;
-        let dir = pulled.dir.clone();
-        self.installed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(model.to_owned(), pulled);
-        Ok(dir)
+        hub::pull(model, &hub::config_for_home(&self.home), progress)
+            .map(|pulled| pulled.dir.clone())
+            .map_err(|e| load_error(OpenError::Pull(e)))
     }
 }
 

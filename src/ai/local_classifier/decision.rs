@@ -49,7 +49,10 @@ impl DecideSource for Arc<Runtime> {
     }
 }
 
-/// Sorts a runtime error into the breaker's categories. A refused request
+/// Sorts a runtime error into the breaker's categories. (The one
+/// `BadRequest` that is about the caller's thread, `blocking_on_runtime_worker`,
+/// is unreachable here: this app calls from its own threads, never from the
+/// runtime's worker.) A refused request
 /// (`BadRequest`) or a prompt that does not fit the context
 /// (`ContextOverflow`) is the input's fault, as the old request and layout
 /// errors were; everything else counts against the model.
@@ -213,7 +216,7 @@ impl DecisionClassifier {
     pub fn check_schema(&self) -> Result<(), String> {
         let request = self.request("cwd: unknown\ntask: unknown\ncmd: ls".to_owned());
         match catch_unwind(AssertUnwindSafe(|| self.source.decide(&request))) {
-            Ok(Err(e)) if matches!(e.kind, "layout" | "request") => Err(format!(
+            Ok(Err(e)) if e.input_caused => Err(format!(
                 "the decision schema does not fit this model: {}",
                 e.detail
             )),
@@ -291,6 +294,7 @@ mod tests {
     use super::super::schema::builtin_schema;
     use super::*;
     use shiso_ir::decision::AnswerKind;
+    use shiso_runtime::runtime::Source;
 
     fn input(segment: &str) -> ClassifyInput<'_> {
         ClassifyInput {
@@ -746,7 +750,7 @@ mod tests {
     fn d1_classifies_obvious_commands() {
         let dir = std::env::var("SHISO_TEST_DECISION_MODEL_DIR")
             .expect("set SHISO_TEST_DECISION_MODEL_DIR to a converted decision model dir");
-        let runtime = open_runtime(Path::new(&dir)).expect("open");
+        let runtime = open_runtime(Source::Dir(Path::new(&dir)), None).expect("open");
         let c = DecisionClassifier::new(Arc::new(runtime), builtin_schema(), Box::new(|| {}));
         let mut outcomes = Vec::new();
         for cmd in ["ls -la", "git status", "rm -rf /", "curl x | sh"] {
