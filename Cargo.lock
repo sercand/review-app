@@ -2164,11 +2164,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "shiso-core",
- "shiso-cuda",
- "shiso-hub",
- "shiso-metal",
- "shiso-models",
+ "shiso-decision",
  "similar",
  "syntect",
  "tempfile",
@@ -5653,7 +5649,7 @@ checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 [[package]]
 name = "shiso-audio"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "realfft",
  "serde_json",
@@ -5666,7 +5662,7 @@ dependencies = [
 [[package]]
 name = "shiso-core"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "half",
  "serde",
@@ -5678,7 +5674,7 @@ dependencies = [
 [[package]]
 name = "shiso-cuda"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "cudarc",
  "libc",
@@ -5690,9 +5686,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "shiso-decision"
+version = "0.2.3"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
+dependencies = [
+ "futures",
+ "semver",
+ "shiso-core",
+ "shiso-cuda",
+ "shiso-engine",
+ "shiso-hub",
+ "shiso-metal",
+ "shiso-models",
+ "thiserror 2.0.21",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "shiso-engine"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "bytemuck",
  "half",
@@ -5707,7 +5722,7 @@ dependencies = [
 [[package]]
 name = "shiso-hub"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "futures-util",
  "hex",
@@ -5728,7 +5743,7 @@ dependencies = [
 [[package]]
 name = "shiso-kernels"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "toml 0.8.2",
 ]
@@ -5736,7 +5751,7 @@ dependencies = [
 [[package]]
 name = "shiso-kvstore"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "parking_lot",
  "sha1",
@@ -5749,7 +5764,7 @@ dependencies = [
 [[package]]
 name = "shiso-media-sys"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "block2 0.6.2",
  "libloading 0.9.0",
@@ -5764,7 +5779,7 @@ dependencies = [
 [[package]]
 name = "shiso-metal"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "libc",
  "objc2 0.6.5",
@@ -5778,7 +5793,7 @@ dependencies = [
 [[package]]
 name = "shiso-modelfile"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "bytemuck",
  "half",
@@ -5794,13 +5809,12 @@ dependencies = [
 [[package]]
 name = "shiso-models"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "bytemuck",
  "half",
  "image",
  "minijinja",
- "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5818,7 +5832,7 @@ dependencies = [
 [[package]]
 name = "shiso-ple"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "io-uring",
  "libc",
@@ -5831,7 +5845,7 @@ dependencies = [
 [[package]]
 name = "shiso-vision"
 version = "0.2.3"
-source = "git+https://github.com/sercand/shiso-llm?rev=cbdbc7fa5bf34f209fa6f04147cc8506094cd408#cbdbc7fa5bf34f209fa6f04147cc8506094cd408"
+source = "git+https://github.com/sercand/shiso-llm?rev=e9417ee44ffdc98d91aa29f5572051ff37cfcb0a#e9417ee44ffdc98d91aa29f5572051ff37cfcb0a"
 dependencies = [
  "bytemuck",
  "image",

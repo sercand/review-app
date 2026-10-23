@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use review_approval::model_stage::CommandClassifier;
 
-use super::shiso;
 use super::weights::WeightsManager;
 
 pub use crate::state::classifier::ClassifierState;
@@ -54,22 +53,22 @@ pub trait Engine: Send + Sync {
     ) -> Result<Arc<dyn CommandClassifier>, LoadError>;
 }
 
+/// The real engine. Compile-only stand-in until Task B4 opens a
+/// `shiso_decision::Decider` here: with no backend, nothing is available.
 struct ShisoEngine;
 
 impl Engine for ShisoEngine {
     fn gpu_available(&self) -> bool {
-        shiso::gpu_available()
+        false
     }
     fn load(
         &self,
-        dir: &Path,
-        on_trip: Box<dyn Fn() + Send + Sync>,
+        _dir: &Path,
+        _on_trip: Box<dyn Fn() + Send + Sync>,
     ) -> Result<Arc<dyn CommandClassifier>, LoadError> {
-        let backend = shiso::open_backend().map_err(LoadError::Unavailable)?;
-        let classifier = shiso::load_with_backend(backend, dir)
-            .map_err(LoadError::Failed)?
-            .with_on_trip(on_trip);
-        Ok(Arc::new(classifier))
+        Err(LoadError::Unavailable(
+            "the decision-model backend is not implemented yet".into(),
+        ))
     }
 }
 

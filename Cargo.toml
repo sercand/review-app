@@ -13,12 +13,16 @@ license = "MIT"
 # Test doubles for the AI pipeline (`ai::testing`), for integration tests that
 # drive the worker. Unit tests compile them unconditionally.
 ai-testing = []
-# Local DistilBERT command classifier on the shiso inference stack. Off by
-# default: pulls a large git dependency. Metal works on macOS with this feature
-# alone. Linux GPU support needs `local-classifier-cuda` plus the CUDA toolkit
-# and `SHISO_CUDA_COMPILE=1`; the resulting binary links cuBLAS.
-local-classifier = ["dep:shiso-core", "dep:shiso-hub", "dep:shiso-metal", "dep:shiso-models"]
-local-classifier-cuda = ["local-classifier", "dep:shiso-cuda"]
+# Local command classifier: a shiso decision model (`shiso-decision`). Off by
+# default: pulls a large git dependency. Cargo features are target-independent
+# and shiso refuses both backends at once, so pick exactly one:
+#   macOS (Metal):  --features local-classifier
+#   Linux (CUDA):   --features local-classifier-cuda  (CUDA toolkit and
+#                   SHISO_CUDA_COMPILE=1; the binary links cuBLAS)
+# `local-classifier` is a Metal build; off macOS shiso-metal is a stub, so it
+# still compiles on Linux but has no usable device there.
+local-classifier = ["dep:shiso-decision", "shiso-decision/metal"]
+local-classifier-cuda = ["dep:shiso-decision", "shiso-decision/cuda"]
 
 [[test]]
 name = "ai_pipeline"
@@ -64,13 +68,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
 tokio-util = "0.7"
 url = "2.5"
-shiso-core = { git = "https://github.com/sercand/shiso-llm", rev = "cbdbc7fa5bf34f209fa6f04147cc8506094cd408", optional = true }
-shiso-hub = { git = "https://github.com/sercand/shiso-llm", rev = "cbdbc7fa5bf34f209fa6f04147cc8506094cd408", optional = true }
-shiso-metal = { git = "https://github.com/sercand/shiso-llm", rev = "cbdbc7fa5bf34f209fa6f04147cc8506094cd408", optional = true }
-shiso-models = { git = "https://github.com/sercand/shiso-llm", rev = "cbdbc7fa5bf34f209fa6f04147cc8506094cd408", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-shiso-cuda = { git = "https://github.com/sercand/shiso-llm", rev = "cbdbc7fa5bf34f209fa6f04147cc8506094cd408", optional = true }
+shiso-decision = { git = "https://github.com/sercand/shiso-llm", rev = "e9417ee44ffdc98d91aa29f5572051ff37cfcb0a", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.21"
