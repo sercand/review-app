@@ -1,13 +1,31 @@
 # Local command classifier: evaluation and promotion decision
 
-## Decision model (d1-3b)
+## Decision model (smollm2-135m-decision, default)
+
+Date: 2026-10-24. Backend: Metal (macOS), release build, through `shiso-runtime` (`Runtime::open`).
+Model: shiso registry `smollm2-135m-decision` (`q8_0`, Clef head on a Llama backbone, 0.2 GiB), built-in
+decision schema (`schema source: BuiltIn`, `approve_threshold` 0.60). Same set and command as below, with
+`--features ai-testing,local-classifier --ignore-rust-version`. About 23 s of test time (41 s wall with the
+build).
+
+| Class | Commands | Rules only: Run | With model: Run |
+|---|---|---|---|
+| benign | 219 | 195 (89.0 %) | 196 (89.5 %) |
+| needs_approval | 170 | 0 (0.0 %) | 0 (0.0 %) |
+| dangerous | 151 | 0 (0.0 %) | 0 (0.0 %) |
+| adversarial | 472 | 0 (0.0 %) | 0 (0.0 %) |
+
+Model calls: 535, `Unavailable`: 0. Zero false approvals; the benign gain is +0.5 points (195 to 196), so
+the promotion rule below is still not met and the default stays off.
+
+## Decision model (d1-3b), cross-check on shiso-runtime
 
 Date: 2026-10-23. Backend: Metal (macOS), release build. Model: shiso registry `d1-3b` (`q8_0`), asked
 the built-in decision schema (approve / ask / deny, `approve_threshold` 0.60) by `DecisionClassifier`
 with the eval's temp repo as cwd. Set: `tests/fixtures/auto_approve_eval/` (1012 commands), fixtures as
 of commit `35a4853` (unchanged since the DistilBERT run). Command:
 `SHISO_TEST_DECISION_MODEL_DIR=<d1-3b dir> cargo test --release --features local-classifier --test auto_approve_eval model_stage_real -- --ignored --nocapture`
-(about 190 s). Verdict per command is whether the bash tool would `Run` it unattended.
+(about 190 s; 200 s re-measured on `shiso-runtime` on 2026-10-24 with identical numbers and 535 calls, 0 `Unavailable`). Verdict per command is whether the bash tool would `Run` it unattended.
 
 | Class | Commands | Rules only: Run | With model: Run |
 |---|---|---|---|
@@ -29,8 +47,7 @@ an upper bound: the app's `classifier_timeout_ms` (default 2000 ms) can make slo
 2. At least +10 points of benign prompt reduction over rules-only: not met (+0.5 points, 195 to 196).
 
 The default stays **off** (`local_classifier = false`); no settings default changes. d1-3b is a test
-model not trained on this rubric, so these numbers describe d1-3b, not the production model; the
-promotion decision waits for that model.
+model not trained on this rubric; `smollm2-135m-decision` (above) gives the same numbers.
 
 # Earlier evaluation: DistilBERT classifier (superseded)
 

@@ -1,5 +1,7 @@
 # Bash auto-approve: shiso decision models as the local classifier
 
+Superseded by `2026-10-24-shiso-runtime-design.md` (the `shiso-decision` crate is replaced by `shiso-runtime`).
+
 Date: 2026-10-23. Status: approved in conversation (sections 1 and 2); this file is the written spec.
 Supersedes the model parts of `docs/superpowers/plans/2026-10-22-ai-bash-auto-approve.md` (M0, M1, M4):
 the da DistilBERT classifier is dropped (its shiso change was reverted in shiso-llm #49).

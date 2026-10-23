@@ -165,7 +165,7 @@ read it, so treat a remote URL that embeds a token as visible to the agent.
 
 It is **off by default**: with the earlier DistilBERT model the rules alone
 already auto-ran about 89 % of benign commands and the model added one more;
-the decision model on d1-3b gives the same result (see
+the decision models `smollm2-135m-decision` and `d1-3b` give the same result (see
 `docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
 
 - The model is a **decision model**, chosen by its shiso registry name in
