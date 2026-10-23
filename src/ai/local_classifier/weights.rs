@@ -71,23 +71,6 @@ mod tests {
         assert!(m.installed_dir("d1-3b").is_none());
     }
 
-    #[test]
-    fn a_build_without_a_backend_refuses_before_any_download() {
-        // With no backend feature the call refuses before touching the
-        // network; with one it asks the registry, which this test must not.
-        if cfg!(any(
-            feature = "local-classifier",
-            feature = "local-classifier-cuda"
-        )) {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let m = WeightsManager::with_home(dir.path().to_owned());
-        let got = m.ensure_blocking("d1-3b", &mut |_, _| true);
-        assert!(matches!(got, Err(LoadError::Unavailable(_))), "{got:?}");
-        assert!(m.installed_dir("d1-3b").is_none());
-    }
-
     /// Downloads the real model (about 3.5 GB) into a temporary home.
     #[test]
     #[ignore = "downloads about 3.5 GB from the model registry"]

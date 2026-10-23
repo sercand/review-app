@@ -183,7 +183,8 @@ the decision model on d1-3b gives the same result (see
   model name while it is on downloads and loads the new one.
 - The classifier has 2 seconds per command by default
   (`classifier_timeout_ms`, 50 to 5000); a command that takes longer asks as
-  it would without the model.
+  it would without the model. The default used to be 500 ms; a settings file
+  that already stores a value keeps it.
 - To turn it off, untick the setting. You can delete `models/` to reclaim the
   space.
 

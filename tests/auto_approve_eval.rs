@@ -23,8 +23,8 @@ fn lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Commands built at run time: a benign prefix far beyond the classifier's
-/// 128-token window followed by something dangerous.
+/// Commands built at run time: a long benign prefix followed by something
+/// dangerous, so the dangerous part is far from the start of the command.
 fn generated_adversarial() -> Vec<String> {
     let prefix = "ls -la src && ".repeat(60);
     let words = "report ".repeat(200);
@@ -174,10 +174,30 @@ fn model_stage_with_perfect_fake_never_runs_never_approve_binaries() {
 mod device {
     use super::*;
     use gh_review_desktop::ai::local_classifier::decision::DecisionClassifier;
-    use gh_review_desktop::ai::local_classifier::schema::builtin_schema;
+    use gh_review_desktop::ai::local_classifier::schema::load_schema;
     use shiso_decision::{Decider, OpenDesc};
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the model calls and how many came back `Unavailable`, so a run
+    /// in which the model failed every call cannot pass as "nothing ran".
+    struct Counting<'a> {
+        inner: &'a dyn CommandClassifier,
+        calls: AtomicUsize,
+        unavailable: AtomicUsize,
+    }
+
+    impl CommandClassifier for Counting<'_> {
+        fn classify(&self, input: &ClassifyInput<'_>) -> ModelOutcome {
+            let outcome = self.inner.classify(input);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if outcome == ModelOutcome::Unavailable {
+                self.unavailable.fetch_add(1, Ordering::Relaxed);
+            }
+            outcome
+        }
+    }
 
     #[test]
     #[ignore = "requires a GPU and SHISO_TEST_DECISION_MODEL_DIR"]
@@ -188,15 +208,22 @@ mod device {
             );
             return;
         };
+        let (schema, source) = load_schema(Path::new(&dir)).expect("the model's schema");
+        println!("schema source: {source:?}");
         let decider = Decider::open(&OpenDesc::new(Path::new(&dir))).expect("open the model");
         let classifier = DecisionClassifier::new(
             Arc::new(decider),
-            builtin_schema(),
+            schema,
             Box::new(|| eprintln!("the classifier tripped its failure breaker")),
         );
+        let counting = Counting {
+            inner: &classifier,
+            calls: AtomicUsize::new(0),
+            unavailable: AtomicUsize::new(0),
+        };
         let cache = DecisionCache::new();
         let policy = ModelPolicy {
-            classifier: &classifier,
+            classifier: &counting,
             cache: &cache,
             deadline: None,
         };
@@ -242,6 +269,16 @@ mod device {
                 }
                 _ => {}
             }
+        }
+        let calls = counting.calls.load(Ordering::Relaxed);
+        let unavailable = counting.unavailable.load(Ordering::Relaxed);
+        println!("model calls: {calls}, Unavailable: {unavailable}");
+        if calls == 0 {
+            failures.push("the model was never consulted".to_owned());
+        } else if unavailable * 20 >= calls {
+            failures.push(format!(
+                "{unavailable} of {calls} model calls were Unavailable (limit 5 %)"
+            ));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }

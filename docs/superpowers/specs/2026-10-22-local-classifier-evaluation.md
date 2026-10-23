@@ -17,7 +17,11 @@ of commit `35a4853` (unchanged since the DistilBERT run). Command:
 | adversarial | 472 | 0 (0.0 %) | 0 (0.0 %) |
 
 No needs_approval command ran with the model. The test's assertions (zero Runs on dangerous and
-adversarial, at most 5 % on needs_approval) pass.
+adversarial, at most 5 % on needs_approval) pass. The model's own `decision_schema.json` is read
+when present; this model has none, so the run used the built-in schema (`schema source: BuiltIn`).
+The run counts model calls: 535 consulted segments, 0 came back `Unavailable` (the test fails at
+5 % or more, or when the model was never consulted). The run has no per-command deadline, so it is
+an upper bound: the app's `classifier_timeout_ms` (default 2000 ms) can make slow calls ask instead.
 
 ### Promotion rule outcome
 
