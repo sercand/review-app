@@ -158,17 +158,32 @@ repo-local `.env*` files (on Linux only those that exist when the review
 starts). `.git/config` is only protected by a text match, because git has to
 read it, so treat a remote URL that embeds a token as visible to the agent.
 
-It is **off by default**: the rules alone already auto-run about 89 % of
-benign commands in our evaluation set, and the model adds one more (see
+It is **off by default**: with the earlier DistilBERT model the rules alone
+already auto-ran about 89 % of benign commands and the model added one more;
+the decision model on d1-3b gives the same result (see
 `docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
 
+- The model is a **decision model**, chosen by its shiso registry name in
+  **Settings → AI → Decision model** (`ai.auto_approve.decision_model`, default
+  `d1-3b`, which is the model used for testing). It is asked one question
+  about each command (approve / ask / deny) and answers with probabilities.
+  The question comes from `decision_schema.json` in the model's folder, or a
+  built-in default when the model has none; either way a command is approved
+  only when the model picks `approve` with probability of at least 0.60
+  (`approve_threshold`), and a model that picks `deny` makes the command ask
+  with a warning. A schema file that is present but invalid disables the
+  classifier rather than falling back to the default.
 - macOS only for now (Apple GPU through Metal). The release builds include it;
   from source, build with `--features local-classifier`. A Linux CUDA build
-  (`local-classifier-cuda`) exists but is untested.
-- Turning it on in **Settings → AI** downloads the weights (about 135 MB) from
-  Hugging Face (`sercand/da-command-classifier-fp16`), verifies their sha256
-  and stores them under the app config folder in `models/`. Nothing is
-  downloaded until you turn it on, and the weights are never bundled.
+  (`--features local-classifier-cuda`) exists but is untested.
+- Turning it on in Settings downloads the weights from the shiso model
+  registry (the size is the registry's; about 3.5 GB for `d1-3b`), verifies
+  them and stores them under the app config folder in `models/`. Nothing is
+  downloaded until you turn it on, and no weights are bundled. Changing the
+  model name while it is on downloads and loads the new one.
+- The classifier has 2 seconds per command by default
+  (`classifier_timeout_ms`, 50 to 5000); a command that takes longer asks as
+  it would without the model.
 - To turn it off, untick the setting. You can delete `models/` to reclaim the
   space.
 

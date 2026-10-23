@@ -162,6 +162,31 @@ are removed.
 | Busy (another call in flight) or timeout | no-model verdict (cached outcomes still apply while active) |
 | 3 consecutive failures | stage disabled for the session; Settings shows why |
 
+## Planning refinements and later rulings
+
+Decided while planning:
+
+- `Decider` drives the model directly through `shiso_core::Model` (`prefill_last_many`,
+  `decision_readout`, `decision_mut`) on its own worker thread; it does not reuse `shiso-server`'s
+  scheduler, which lives in a crate the library must not depend on.
+- The library serves models that carry a decision readout (LFM2 / d1) or a decision head (Clef).
+  Generic label scoring of plain chat models stays in `shiso-server`, because it needs the server's
+  chat-template prompt renderer. The production SmolLM2 model must therefore ship with a readout or
+  head (the user adds that family).
+- The library's loader covers those families (LFM2 now); `shiso-server`'s `model_factory` keeps its
+  own loading unchanged.
+
+Later rulings:
+
+- The `NotInstalled` classifier state was removed; the states are Off, Downloading, Loading,
+  Ready(schema source), Unavailable, Failed.
+- Errors caused by the input (a refused request such as an over-long command) do not count toward the
+  three-failure breaker; only model or engine failures do.
+- The schema's `question` name is not pinned to `decision`; the classifier looks up the answer by the
+  name in the schema. The choice values must still be exactly `approve`, `ask`, `deny`.
+- Backslashes, control characters and line separators in the cwd and command are escaped, so a command
+  cannot add lines to the model input.
+
 ## Risks
 
 - **d1-3b is large for this job** (3.2 GiB, ≥ 6 GiB RAM, Metal only, multi-hundred-ms first calls are
