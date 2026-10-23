@@ -15,9 +15,9 @@ pub mod hub;
 pub mod incremental;
 pub mod interaction;
 pub mod llm;
-/// Local shiso-backed DistilBERT command classifier (Metal / CUDA); needs the
-/// `local-classifier` feature.
-#[cfg(all(unix, feature = "local-classifier"))]
+/// Local shiso decision-model command classifier (Metal / CUDA); needs the
+/// `local-classifier` or `local-classifier-cuda` feature.
+#[cfg(all(unix, feature = "_classifier"))]
 pub mod local_classifier;
 pub mod model;
 pub mod pipeline;

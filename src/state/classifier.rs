@@ -1,6 +1,6 @@
 //! Where the local command classifier is on its way from "switched on" to
 //! "ready", and how Settings words it. Pure and build-independent: without the
-//! `local-classifier` feature (or off Unix) nothing ever produces a state and
+//! classifier feature (or off Unix) nothing ever produces a state and
 //! [`ClassifierState::text`] says the build has no classifier.
 
 /// Lifecycle of the local classifier.
@@ -25,7 +25,7 @@ pub enum ClassifierState {
 }
 
 /// Whether this build contains the classifier at all.
-pub const COMPILED: bool = cfg!(all(unix, feature = "local-classifier"));
+pub const COMPILED: bool = cfg!(all(unix, feature = "_classifier"));
 
 impl ClassifierState {
     /// The status line Settings shows next to the checkbox.

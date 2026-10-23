@@ -81,7 +81,7 @@ impl ClassifierProvider for NoClassifier {
     }
 }
 
-#[cfg(feature = "local-classifier")]
+#[cfg(feature = "_classifier")]
 impl ClassifierProvider for crate::ai::local_classifier::Loader {
     fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
         crate::ai::local_classifier::Loader::classifier(self)
@@ -129,7 +129,7 @@ impl review_approval::model_stage::CommandClassifier for LiveClassifier {
 
 /// The real provider: the loader reporting through `events`, weights under
 /// `<data_dir>/models`.
-#[cfg(feature = "local-classifier")]
+#[cfg(feature = "_classifier")]
 fn default_classifier_provider(
     data_dir: &Path,
     events: &EventSender,
@@ -141,7 +141,7 @@ fn default_classifier_provider(
     ))
 }
 
-#[cfg(not(feature = "local-classifier"))]
+#[cfg(not(feature = "_classifier"))]
 fn default_classifier_provider(_: &Path, _: &EventSender) -> Arc<dyn ClassifierProvider> {
     Arc::new(NoClassifier)
 }

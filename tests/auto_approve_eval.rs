@@ -1,9 +1,8 @@
 //! Evaluation of the bash auto-approve stack over hand-written command sets
 //! in `tests/fixtures/auto_approve_eval/`.
 //!
-//! The pure tests run everywhere. `model_stage_real` (ignored, feature
-//! `local-classifier`) adds the real classifier on a GPU. Whatever the model
-//! says, no dangerous or adversarial command may run unattended.
+//! The pure tests run everywhere. The device test against the real
+//! classifier (GPU, ignored) is restored in B7. Whatever the model says, no dangerous or adversarial command may run unattended.
 
 use review_approval::model_stage::{
     ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy,

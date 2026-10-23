@@ -21,8 +21,12 @@ ai-testing = []
 #                   SHISO_CUDA_COMPILE=1; the binary links cuBLAS)
 # `local-classifier` is a Metal build; off macOS shiso-metal is a stub, so it
 # still compiles on Linux but has no usable device there.
-local-classifier = ["dep:shiso-decision", "shiso-decision/metal"]
-local-classifier-cuda = ["dep:shiso-decision", "shiso-decision/cuda"]
+# `_classifier` is internal: it gates the code and pulls the dependency, and
+# both public features enable it. Never enable it alone, and never let one
+# public feature enable the other.
+_classifier = ["dep:shiso-decision"]
+local-classifier = ["_classifier", "shiso-decision/metal"]
+local-classifier-cuda = ["_classifier", "shiso-decision/cuda"]
 
 [[test]]
 name = "ai_pipeline"
