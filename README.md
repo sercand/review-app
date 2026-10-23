@@ -29,6 +29,9 @@ and submit your review without the browser.
   are saved to disk, so they survive a quit, a crash or signing out.
 - **Keyboard first.** A command palette (`⌘K`) and single-key shortcuts for
   moving around a PR.
+- **AI review.** A sandboxed agent reviews the PR in your local checkout and
+  drafts findings you can keep, edit or drop. Unix only; see
+  [AI review](#ai-review).
 - **GitHub Enterprise Server** is supported in addition to github.com.
 
 The app doesn't merge or close PRs and doesn't edit code. See the
@@ -89,6 +92,58 @@ app to see the full list.
 
 On Linux and Windows, use `Ctrl` instead of `⌘`.
 
+## AI review
+
+On Unix, the app can run an AI review of an open PR. It checks the PR head
+out into the repo's local folder (stashing your uncommitted changes first),
+runs a pipeline of agents — scout, reviewers, challengers, verifiers,
+assembler — against the checkout, and drafts findings as inline comments in
+the diff. Each draft is Keep / Edit / Drop; keeping one moves it into your
+pending review like any other comment. Nothing is posted to GitHub unless you
+submit it yourself.
+
+### Setup
+
+1. In **Settings → AI**, add a provider (name, API type, base URL, API key)
+   and pick the models to use. Click a row, or "Add provider", to edit it in
+   a dialog; the API key goes to the OS keychain, like the GitHub token, and
+   "Test" works from the dialog before you save.
+2. Link a local folder to the repository, either from a PR's **AI tab** (the
+   Local checkout row) or from the **Local repos** tab on the PR list, where
+   linked repos are listed and their open PRs expand per row. The app reads
+   the folder's git remote to check it is a clone of that repository.
+3. Under the Local checkout row, set the commands the agent may run without
+   asking (e.g. `cargo test`) and the prepare commands it can't run itself.
+   On your first review of a repo, the scout agent proposes these and you
+   confirm them.
+
+Other commands ask for approval in the AI tab, once or for the whole review.
+
+### The sandbox
+
+The guarantee is not command matching, it's that the agent can't reach
+GitHub even if it tries:
+
+- Its shell runs in an OS sandbox (Seatbelt on macOS, bubblewrap on Linux)
+  that can't write to `.git/`, so it can't commit, reset or push.
+- Its environment has no credentials: no `GH_TOKEN` or `SSH_AUTH_SOCK`, and
+  it can't read `~/.ssh`, `~/.config/gh` or the other credential stores.
+- It has no GitHub write tool at all — it reads the PR from a snapshot the
+  app gathered beforehand, and can't comment, approve or merge.
+- Network access is on, so builds and tests work; with a team-only repo the
+  accepted risk is that a build could send the source elsewhere.
+
+### Private dependencies
+
+Because the agent has no credentials, fetching private dependencies from
+inside the sandbox would fail. Each repo therefore has **prepare commands**
+(e.g. `cargo fetch`, `npm ci`) that the app runs *outside* the sandbox, as
+you, right after the checkout. The agent then builds from the filled caches.
+If a build still needs a fetch, the agent can ask to re-run the configured
+prepare commands; you approve, and the app runs the same fixed list.
+
+AI review is Unix-only for now: the sandbox has no Windows backend.
+
 ## Where data is stored
 
 Everything is stored locally in the platform config directory
@@ -97,6 +152,7 @@ Everything is stored locally in the platform config directory
 ```
 settings.toml                                  host, client_id, theme, layout, filters
 sessions/<host>/<owner>/<repo>/<number>.json   viewed files, pending review, drafts
+ai.sqlite                                      AI review sessions, transcripts, findings
 ```
 
 ## Development
@@ -123,15 +179,21 @@ src/
 ├── runtime.rs        tokio runtime; UI ⇄ network via Command/Event channels
 ├── auth/             device flow, token storage (keychain)
 ├── github/           REST + GraphQL client (hand-written over reqwest)
+├── ai/               AI review engine (unix only): agents, tools, SQLite
 ├── model/            domain types
 ├── diff/             patch parser, context expansion, highlighting, image diff
 ├── state/            screen state and reducers, pending review buffer
 ├── persist/          settings and per-PR session files (atomic writes)
 └── ui/               screens, widgets, theme, fonts, icons
+crates/
+├── llm/              Anthropic / OpenAI clients behind neutral types
+└── sandbox/          OS-sandboxed PTY bash and file tools for the agent
 ```
 
 The UI never calls the network directly. It sends a `Command` to the runtime,
 and results come back as `Event`s, so the GUI thread never waits on a request.
+The AI engine follows the same split: it lives in the worker and talks to the
+UI only through AI commands and events.
 
 ## Releasing (macOS)
 

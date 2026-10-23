@@ -4,12 +4,14 @@
 //! ([`crate::auth::store`]); this file holds only non-secret preferences and the
 //! cached account identity used to locate the keychain entry.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
+use crate::state::local_repos::ListTab;
 use crate::ui::theme::Theme;
 
 /// The cached identity of the signed-in account.
@@ -37,8 +39,46 @@ pub struct Layout {
     pub right_pane: f32,
     /// Whether the metadata pane is open.
     pub right_open: bool,
-    /// Which details tab the pane last showed (redesign Task 13).
+    /// Which details tab the pane last showed (redesign Task 13). The AI
+    /// tab is unix-only, so on Windows an `Ai` selection loads as
+    /// `Overview` (Plan 3).
+    #[serde(default, deserialize_with = "load_details_tab")]
     pub details_tab: crate::ui::widgets::metadata_panel::DetailsTab,
+    /// Which PR-list tab the app last showed (AI settings and local repos
+    /// Task 8). The Local tab is unix-only, so on Windows a `Local`
+    /// selection loads as `All` (see [`ListTab::for_platform`]); a file
+    /// written before the field existed loads as `All`.
+    #[serde(default = "default_list_tab", deserialize_with = "load_list_tab")]
+    pub pr_list_tab: ListTab,
+}
+
+/// The default for [`Layout::pr_list_tab`]: a file written before the Local
+/// tab existed opens on the scope-based list.
+fn default_list_tab() -> ListTab {
+    ListTab::All
+}
+
+/// [`Layout`]'s PR-list tab loader: the stored tab as-is on unix, with the
+/// Local tab flattened to `All` on Windows (see [`ListTab::for_platform`]).
+fn load_list_tab<'de, D>(deserializer: D) -> Result<ListTab, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(ListTab::deserialize(deserializer)?.for_platform())
+}
+
+/// [`Layout`]'s tab loader: the stored tab as-is on unix, with the AI tab
+/// flattened to `Overview` on Windows (see
+/// [`DetailsTab::for_platform`](crate::ui::widgets::metadata_panel::DetailsTab::for_platform)).
+fn load_details_tab<'de, D>(
+    deserializer: D,
+) -> Result<crate::ui::widgets::metadata_panel::DetailsTab, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(crate::ui::widgets::metadata_panel::DetailsTab::deserialize(deserializer)?.for_platform())
 }
 
 /// User settings, persisted as `settings.toml` in the config directory.
@@ -76,6 +116,170 @@ pub struct Settings {
     /// The merge method the merge popover starts with, clamped to what the
     /// repository allows.
     pub merge_method: crate::github::merge::MergeMethod,
+    /// The AI review settings (spec §10). API keys are not here; they live in
+    /// the keychain ([`crate::auth::store::llm_key`]).
+    pub ai: AiSettings,
+}
+
+/// The wire protocol a provider speaks (spec §10).
+///
+/// A hand-edited file may name a protocol this build doesn't speak; `#[serde(
+/// other)]` loads it as [`LlmApi::Unsupported`] so the settings file still
+/// parses and the UI can say so instead of resetting everything.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LlmApi {
+    /// The Anthropic Messages API.
+    #[serde(rename = "anthropic-messages")]
+    #[default]
+    AnthropicMessages,
+    /// The OpenAI Responses API.
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
+    /// Anything else: configured, but this build cannot talk to it.
+    #[serde(other)]
+    Unsupported,
+}
+
+/// One configured LLM endpoint. The API key lives in the keychain under the
+/// account `llm:<name>` ([`crate::auth::store::llm_key`]), never here.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderSettings {
+    /// The user-chosen name, e.g. `work`; also the keychain account suffix.
+    pub name: String,
+    /// Which protocol to speak.
+    pub api: LlmApi,
+    /// The endpoint base URL.
+    pub base_url: String,
+    /// Optional extra headers to send with every request.
+    pub headers: BTreeMap<String, String>,
+}
+
+/// How much reasoning effort to ask the model for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningLevel {
+    /// Minimal thinking.
+    Low,
+    /// The model's default effort.
+    Medium,
+    /// Extended thinking.
+    High,
+}
+
+/// A model choice: which provider, which model, and its size limits.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelSettings {
+    /// The [`ProviderSettings::name`] to route through.
+    pub provider: String,
+    /// The model id to request.
+    pub model: String,
+    /// The model's context window in tokens.
+    pub context_window: u32,
+    /// The per-response output cap in tokens.
+    pub max_tokens: u32,
+    /// Optional reasoning effort (spec §10).
+    pub reasoning: Option<ReasoningLevel>,
+}
+
+impl Default for ModelSettings {
+    fn default() -> ModelSettings {
+        ModelSettings {
+            provider: String::new(),
+            model: String::new(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            reasoning: None,
+        }
+    }
+}
+
+/// The model picks: the main reviewer and the optional cheaper helper.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiModels {
+    /// The main review/chat model.
+    pub default: Option<ModelSettings>,
+    /// A cheaper model for lookup helpers, when configured.
+    pub lookup: Option<ModelSettings>,
+}
+
+/// Per-repository AI settings: where the checkout lives and what to run.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoAiSettings {
+    /// The repository key, `host/owner/name` (matched case-insensitively).
+    pub repo: String,
+    /// The local checkout folder.
+    pub path: PathBuf,
+    /// Test/lint commands the agents may run in the sandbox (§8.5).
+    pub commands: Vec<String>,
+    /// Commands run outside the sandbox as the user, e.g. `cargo fetch`.
+    pub prepare: Vec<String>,
+    /// Extra paths the sandbox may write.
+    pub extra_write_paths: Vec<PathBuf>,
+    /// Extra paths the sandbox may not read.
+    pub extra_deny_read: Vec<PathBuf>,
+}
+
+/// The `[ai]` table: providers, models, per-repo settings (§10).
+///
+/// Never put a secret here; API keys live in the keychain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiSettings {
+    /// How many reviewers may run at once.
+    pub max_parallel_reviewers: u32,
+    /// Token budget per run; 0 means unlimited.
+    pub run_token_budget: u64,
+    /// Fraction of the context window that triggers compaction.
+    pub context_threshold: f32,
+    /// Environment variable names the sandbox may pass through.
+    pub extra_env_allow: Vec<String>,
+    /// The configured endpoints.
+    pub providers: Vec<ProviderSettings>,
+    /// The model picks.
+    pub models: AiModels,
+    /// The per-repository settings.
+    pub repos: Vec<RepoAiSettings>,
+}
+
+impl Default for AiSettings {
+    fn default() -> AiSettings {
+        AiSettings {
+            max_parallel_reviewers: 2,
+            run_token_budget: 0,
+            context_threshold: 0.7,
+            extra_env_allow: Vec::new(),
+            providers: Vec::new(),
+            models: AiModels::default(),
+            repos: Vec::new(),
+        }
+    }
+}
+
+impl AiSettings {
+    /// The settings for `host/owner/name`, matched case-insensitively.
+    pub fn repo(&self, host: &str, owner: &str, name: &str) -> Option<&RepoAiSettings> {
+        let key = format!("{host}/{owner}/{name}").to_lowercase();
+        self.repos
+            .iter()
+            .find(|repo| repo.repo.to_lowercase() == key)
+    }
+
+    /// Like [`Self::repo`], but only when the entry names a folder. The
+    /// settings window creates empty rows; a row without a path is not a
+    /// configured checkout, so the AI flow asks for one (spec §4 step 2).
+    pub fn repo_with_folder(&self, host: &str, owner: &str, name: &str) -> Option<&RepoAiSettings> {
+        self.repo(host, owner, name)
+            .filter(|repo| !repo.path.as_os_str().is_empty())
+    }
+
+    /// The provider with this exact `name`.
+    pub fn provider(&self, name: &str) -> Option<&ProviderSettings> {
+        self.providers.iter().find(|p| p.name == name)
+    }
 }
 
 /// The diff layout choices, remembered across PRs and restarts.
@@ -115,12 +319,14 @@ impl Default for Settings {
                 right_pane: 340.0,
                 right_open: false,
                 details_tab: crate::ui::widgets::metadata_panel::DetailsTab::default(),
+                pr_list_tab: ListTab::default(),
             },
             diff: DiffPrefs::default(),
             code_font_size: 13.0,
             recent_constraints: Vec::new(),
             group_by_repo: false,
             merge_method: crate::github::merge::MergeMethod::default(),
+            ai: AiSettings::default(),
         }
     }
 }
@@ -201,6 +407,23 @@ mod tests {
         assert_eq!(
             Settings::load_or_default(dir.path()).layout.details_tab,
             crate::ui::widgets::metadata_panel::DetailsTab::Checks
+        );
+    }
+
+    /// The AI tab is unix-only: on Windows a saved `Ai` selection loads as
+    /// `Overview`, so the pane never opens an empty tab (Plan 3).
+    #[test]
+    #[cfg(not(unix))]
+    fn ai_tab_hidden_on_windows_loads_as_overview() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[layout]\ndetails_tab = \"Ai\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.details_tab,
+            crate::ui::widgets::metadata_panel::DetailsTab::Overview
         );
     }
 
@@ -304,6 +527,134 @@ mod tests {
         assert_eq!(s.recent_constraints.len(), 5);
     }
 
+    /// The `settings.toml` example from spec §10, copied verbatim.
+    const SPEC_EXAMPLE: &str = r#"
+[ai]
+max_parallel_reviewers = 2
+run_token_budget = 0            # 0 = unlimited
+context_threshold = 0.7
+
+[[ai.providers]]
+name = "work"
+api = "anthropic-messages"      # or "openai-responses"
+base_url = "https://llm.example.com"
+headers = {}                    # optional extra headers
+
+[ai.models.default]
+provider = "work"
+model = "model-id"
+context_window = 200000
+max_tokens = 8192
+reasoning = "medium"            # optional: low | medium | high
+
+# optional: a cheaper model for lookup helpers
+# [ai.models.lookup]
+
+[[ai.repos]]
+repo = "github.com/owner/name"
+path = "/Users/me/src/owner/name"
+commands = ["cargo test", "cargo clippy", "cargo fmt --check"]
+prepare = ["cargo fetch"]       # run outside the sandbox as the user (§8.5)
+extra_write_paths = []
+extra_deny_read = []
+"#;
+
+    #[test]
+    fn ai_settings_parse_the_spec_example() {
+        let s: Settings = toml::from_str(SPEC_EXAMPLE).unwrap();
+        assert_eq!(s.ai.max_parallel_reviewers, 2);
+        assert_eq!(s.ai.run_token_budget, 0);
+        assert_eq!(s.ai.context_threshold, 0.7);
+        assert_eq!(s.ai.providers[0].api, LlmApi::AnthropicMessages);
+        assert_eq!(s.ai.providers[0].name, "work");
+        assert_eq!(s.ai.providers[0].base_url, "https://llm.example.com");
+        assert_eq!(
+            s.ai.provider("work").unwrap().api,
+            LlmApi::AnthropicMessages
+        );
+        assert!(s.ai.provider("nope").is_none());
+        let default = s.ai.models.default.as_ref().unwrap();
+        assert_eq!(default.provider, "work");
+        assert_eq!(default.model, "model-id");
+        assert_eq!(default.context_window, 200_000);
+        assert_eq!(default.max_tokens, 8192);
+        assert_eq!(default.reasoning, Some(ReasoningLevel::Medium));
+        assert!(s.ai.models.lookup.is_none());
+        // Repo matching is case-insensitive.
+        let repo = s.ai.repo("GitHub.com", "Owner", "Name").unwrap();
+        assert_eq!(repo.prepare, vec!["cargo fetch"]);
+        assert_eq!(repo.commands.len(), 3);
+        assert!(s.ai.repo("gitlab.com", "Owner", "Name").is_none());
+    }
+
+    #[test]
+    fn an_old_settings_file_without_ai_still_loads() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "host = \"ghe.example.com\"\ncode_font_size = 14.0\n",
+        )
+        .unwrap();
+        let s = Settings::load_or_default(dir.path());
+        assert_eq!(s.ai, AiSettings::default());
+        assert_eq!(s.host, "ghe.example.com");
+        assert_eq!(s.code_font_size, 14.0);
+    }
+
+    #[test]
+    fn an_unknown_api_does_not_reset_the_settings_file() {
+        // A hand-edited `api` value loads as `Unsupported` rather than failing
+        // the whole file, so the rest of the settings survive.
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "theme = \"Dark\"\n\n[[ai.providers]]\nname = \"x\"\napi = \"chat-completions\"\n",
+        )
+        .unwrap();
+        let s = Settings::load_or_default(dir.path());
+        assert_eq!(s.theme, Theme::Dark);
+        assert_eq!(s.ai.providers.len(), 1);
+        assert_eq!(s.ai.providers[0].api, LlmApi::Unsupported);
+    }
+
+    /// A repo row the settings window created but never gave a folder is not
+    /// a configured checkout (Task 4's folder dialog opens instead of
+    /// planning against an empty path).
+    #[test]
+    fn repo_with_folder_ignores_an_empty_path() {
+        let mut s = Settings::default();
+        s.ai.repos.push(RepoAiSettings {
+            repo: "github.com/acme/app".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            s.ai.repo("github.com", "acme", "app").is_some(),
+            "the row exists"
+        );
+        assert!(
+            s.ai.repo_with_folder("github.com", "acme", "app").is_none(),
+            "an empty path is not a folder"
+        );
+
+        s.ai.repos[0].path = PathBuf::from("/src/app");
+        let repo =
+            s.ai.repo_with_folder("GitHub.com", "Acme", "App")
+                .expect("a row with a path is configured");
+        assert_eq!(repo.path, PathBuf::from("/src/app"));
+        assert!(
+            s.ai.repo_with_folder("github.com", "acme", "other")
+                .is_none(),
+            "another repo is still unconfigured"
+        );
+    }
+
+    #[test]
+    fn ai_settings_round_trip() {
+        let s: Settings = toml::from_str(SPEC_EXAMPLE).unwrap();
+        let raw = toml::to_string(&s).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&raw).unwrap(), s);
+    }
+
     #[test]
     fn layout_survives_save_load() {
         let dir = tempdir();
@@ -314,5 +665,37 @@ mod tests {
         let r = Settings::load_or_default(dir.path());
         assert_eq!(r.layout.left_pane, 321.0);
         assert!(!r.layout.right_open);
+    }
+
+    /// A file written before the Local tab existed opens on the All tab,
+    /// and an explicit choice survives a save/load on the platforms that
+    /// show the tab (Windows flattens `Local` to `All` on load).
+    #[test]
+    fn old_settings_file_defaults_the_tab_to_all() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("settings.toml"), "host = \"github.com\"\n").unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.pr_list_tab,
+            ListTab::All
+        );
+        // A `[layout]` table without the key is an old file too.
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[layout]\nleft_pane = 300.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.pr_list_tab,
+            ListTab::All
+        );
+
+        let mut s = Settings::default();
+        s.layout.pr_list_tab = ListTab::Local;
+        s.save(dir.path()).unwrap();
+        let loaded = Settings::load_or_default(dir.path()).layout.pr_list_tab;
+        #[cfg(unix)]
+        assert_eq!(loaded, ListTab::Local);
+        #[cfg(not(unix))]
+        assert_eq!(loaded, ListTab::All);
     }
 }

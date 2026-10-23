@@ -11,12 +11,14 @@ use serde::Deserialize;
 
 use crate::github::client::GithubClient;
 use crate::github::error::GhError;
-use crate::model::pr::CiState;
 use crate::model::RepoRef;
+use crate::model::pr::CiState;
 
 /// One check run, as the check-runs endpoint lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckRun {
+    /// The run's database id, which keys the annotations endpoint.
+    pub id: u64,
     /// The check's name, as its app reports it.
     pub name: String,
     /// `queued`, `in_progress`, or `completed`.
@@ -25,6 +27,29 @@ pub struct CheckRun {
     pub conclusion: Option<String>,
     /// Its web URL, when GitHub has one.
     pub html_url: Option<String>,
+    /// `output.summary`, when GitHub sends one.
+    pub output_summary: Option<String>,
+    /// `output.text`, when GitHub sends one.
+    pub output_text: Option<String>,
+}
+
+/// One annotation a check run attached to a file (the AI review reads these
+/// off failing runs — spec §10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckAnnotation {
+    /// The file the annotation points at.
+    pub path: String,
+    /// The first line it covers.
+    pub start_line: u32,
+    /// The last line it covers; GitHub sends the start line for a single-line
+    /// annotation, and `0` when it has no line at all.
+    pub end_line: u32,
+    /// `notice`, `warning`, or `failure` (`annotation_level`).
+    pub level: String,
+    /// The annotation's title, when it has one.
+    pub title: Option<String>,
+    /// The annotation's message.
+    pub message: String,
 }
 
 /// The legacy combined status of a commit.
@@ -39,16 +64,7 @@ pub struct CombinedStatus {
 /// Parse a `GET /repos/{o}/{r}/commits/{sha}/check-runs` page body.
 pub fn parse_check_runs(body: &str) -> Result<Vec<CheckRun>, GhError> {
     let page: RawCheckRunsPage = serde_json::from_str(body).map_err(decode)?;
-    Ok(page
-        .check_runs
-        .into_iter()
-        .map(|run| CheckRun {
-            name: run.name,
-            status: run.status,
-            conclusion: run.conclusion,
-            html_url: run.html_url,
-        })
-        .collect())
+    Ok(page.check_runs.into_iter().map(to_run).collect())
 }
 
 /// Parse a `GET /repos/{o}/{r}/commits/{sha}/status` body. GitHub sends
@@ -107,15 +123,27 @@ impl GithubClient {
         ));
         while let Some(path) = next {
             let (page, link) = self.get_json::<RawCheckRunsPage>(&path).await?;
-            all.extend(page.check_runs.into_iter().map(|run| CheckRun {
-                name: run.name,
-                status: run.status,
-                conclusion: run.conclusion,
-                html_url: run.html_url,
-            }));
+            all.extend(page.check_runs.into_iter().map(to_run));
             next = link;
         }
         Ok(all)
+    }
+
+    /// Every annotation attached to one check run, following pagination.
+    ///
+    /// The AI review reads these off failing runs (spec §10). The response is
+    /// a bare array, so this pages with [`GithubClient::get_all_pages`].
+    pub async fn check_run_annotations(
+        &self,
+        repo: &RepoRef,
+        check_run_id: u64,
+    ) -> Result<Vec<CheckAnnotation>, GhError> {
+        let path = format!(
+            "/repos/{}/{}/check-runs/{check_run_id}/annotations?per_page=100",
+            repo.owner, repo.name
+        );
+        let raws = self.get_all_pages::<RawCheckAnnotation>(&path).await?;
+        Ok(raws.into_iter().map(to_annotation).collect())
     }
 
     /// The legacy combined status for `sha`.
@@ -141,6 +169,8 @@ struct RawCheckRunsPage {
 #[derive(Deserialize)]
 struct RawCheckRun {
     #[serde(default)]
+    id: u64,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     status: String,
@@ -148,6 +178,62 @@ struct RawCheckRun {
     conclusion: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
+    #[serde(default)]
+    output: Option<RawCheckRunOutput>,
+}
+
+/// The `output` object of a check run; its fields are `null` unless the app
+/// filled them.
+#[derive(Deserialize)]
+struct RawCheckRunOutput {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// One annotation as the annotations endpoint sends it. `end_line` is absent
+/// for a single-line annotation, and `title` is `null` without one.
+#[derive(Deserialize)]
+struct RawCheckAnnotation {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    start_line: Option<u32>,
+    #[serde(default)]
+    end_line: Option<u32>,
+    #[serde(default, rename = "annotation_level")]
+    annotation_level: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message: String,
+}
+
+/// Convert one raw check run; a missing `output` reads as no summary or text.
+fn to_run(raw: RawCheckRun) -> CheckRun {
+    CheckRun {
+        id: raw.id,
+        name: raw.name,
+        status: raw.status,
+        conclusion: raw.conclusion,
+        html_url: raw.html_url,
+        output_summary: raw.output.as_ref().and_then(|o| o.summary.clone()),
+        output_text: raw.output.as_ref().and_then(|o| o.text.clone()),
+    }
+}
+
+/// Convert one raw annotation; a missing line number reads as `0`.
+fn to_annotation(raw: RawCheckAnnotation) -> CheckAnnotation {
+    let start = raw.start_line.unwrap_or(0);
+    CheckAnnotation {
+        path: raw.path,
+        start_line: start,
+        end_line: raw.end_line.unwrap_or(start),
+        level: raw.annotation_level,
+        title: raw.title,
+        message: raw.message,
+    }
 }
 
 /// The combined-status body; `state` is `null` when there are no statuses.
@@ -176,6 +262,24 @@ fn decode(error: serde_json::Error) -> GhError {
 mod tests {
     use super::*;
     use crate::fixture;
+
+    #[test]
+    fn runs_carry_id_and_output_fields() {
+        let runs = parse_check_runs(fixture!("check_runs.json")).unwrap();
+        assert_eq!(runs[0].id, 1);
+        assert_eq!(
+            runs[0].output_summary.as_deref(),
+            Some("cargo build exited 101")
+        );
+        assert_eq!(
+            runs[0].output_text.as_deref(),
+            Some("error[E0308]: mismatched types")
+        );
+        // A `null` output field reads as `None`, not the empty string.
+        assert_eq!(runs[1].id, 2);
+        assert_eq!(runs[1].output_summary, None);
+        assert_eq!(runs[1].output_text, None);
+    }
 
     #[test]
     fn ci_state_prefers_failure_then_pending_and_ignores_empty_status() {

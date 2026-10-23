@@ -11,11 +11,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::diff::annotate::{annotate, place_thread, rows_for_anchor, InlineItem, Placement};
-use crate::diff::expand::{expand, gaps, Expand};
-use crate::diff::image::{image_kind, image_sources, image_uri, ImageBlob, ImageKind};
+use crate::diff::annotate::{InlineItem, Placement, annotate, place_thread, rows_for_anchor};
+use crate::diff::expand::{Expand, expand, gaps};
+use crate::diff::image::{ImageBlob, ImageKind, image_kind, image_sources, image_uri};
 use crate::diff::options::hide_whitespace_only;
-use crate::diff::row_model::{build_one, RowModel, RowRef};
+use crate::diff::row_model::{RowModel, RowRef, build_one};
 use crate::diff::suggestion::suggestion_block;
 use crate::github::checks::{CheckRun, CombinedStatus};
 use crate::github::comments::NewComment;
@@ -24,21 +24,21 @@ use crate::github::conversation::ConversationComment;
 use crate::github::error::GhError;
 use crate::github::files::{FileStatus, LoadedFile, PatchState};
 use crate::github::metadata::PrMetadata;
-use crate::github::reviews::{review_payload, Review, ServerPendingComment};
+use crate::github::reviews::{Review, ServerPendingComment, review_payload};
+use crate::model::RepoRef;
 use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffMode, FileDiff};
 use crate::model::review::{PendingError, PendingReview, ReviewEvent};
 use crate::model::thread::{ReviewThread, SubjectType, ThreadComment};
-use crate::model::RepoRef;
 use crate::persist::session::{self, ComposerDraft, DebouncedWriter, SessionFile};
-use crate::runtime::{Command, Event, SessionId, NO_OPTIMISTIC_BUBBLE};
+use crate::runtime::{Command, Event, NO_OPTIMISTIC_BUBBLE, SessionId};
 use crate::state::composer::{
-    self, can_submit, fallback_comment, interpret_post_error, CommentMode, ComposerMsg,
-    ComposerState, PostOutcome,
+    self, CommentMode, ComposerMsg, ComposerState, PostOutcome, can_submit, fallback_comment,
+    interpret_post_error,
 };
 use crate::state::filters::FilterState;
 use crate::state::viewed::ViewedSet;
-use crate::ui::widgets::review_panel::{review_panel_vm, sha7, PanelInputs};
+use crate::ui::widgets::review_panel::{PanelInputs, review_panel_vm, sha7};
 
 /// How far a session has got through loading its PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +160,10 @@ pub struct PrSession {
     pub merging: bool,
     /// The inline comment composer's state machine (spec §7.1).
     pub composer: ComposerState,
+    /// The ✦ AI tab's state for this PR (spec §12). Unix-only: the AI
+    /// surface has no Windows backend (Plan 3).
+    #[cfg(unix)]
+    pub ai: crate::state::ai_review::AiReviewState,
     /// The live pending-review draft (Phase F submits it), pinned to one
     /// commit while it has comments (spec §7.2). Restored from the session
     /// file on open and saved immediately after every mutation; while it is
@@ -325,6 +329,8 @@ impl PrSession {
             combined_status: None,
             conversation: Vec::new(),
             composer: ComposerState::default(),
+            #[cfg(unix)]
+            ai: crate::state::ai_review::AiReviewState::default(),
             pending,
             fallback: None,
             head_blobs: HashMap::new(),
@@ -419,10 +425,10 @@ impl PrSession {
             Event::PrMetadataLoaded { session, meta } if *session == self.id => {
                 // The head is only "moved" once we have a diff to compare it
                 // against; the first load has nothing to invalidate.
-                if let Some(shown) = &self.diff_head_sha {
-                    if shown != &meta.head_sha {
-                        self.head_moved = true;
-                    }
+                if let Some(shown) = &self.diff_head_sha
+                    && shown != &meta.head_sha
+                {
+                    self.head_moved = true;
                 }
                 self.metadata = Some(meta.clone());
                 self.phase = LoadPhase::Files;
@@ -710,6 +716,61 @@ impl PrSession {
                 self.phase = LoadPhase::Failed;
                 Vec::new()
             }
+            // The assembler's draft is what lands the review's summary and
+            // verdict: an untouched summary is pre-filled from it, once
+            // (Plan 3 Task 6). A draft for a PR the user left is dropped by
+            // the session guard, like every AI event (spec §12).
+            #[cfg(unix)]
+            ev @ Event::AiPipeline {
+                session,
+                event: crate::ai::events::PipelineEvent::DraftReady { .. },
+            } if *session == self.id => {
+                self.ai.apply(ev);
+                if prefill_review(&mut self.pending, self.ai.draft.as_ref()) {
+                    self.save_pending_draft();
+                }
+                Vec::new()
+            }
+            // The ✦ AI tab's events fold into the reducer (Task 2), which
+            // never emits commands of its own. The session guard here is the
+            // stale-event rule: a run keeps going when the PR is left, and
+            // its events must not touch a different PR's tab (spec §12).
+            // `AiUnrestored` is app-wide, not PR-scoped, so it is not here.
+            //
+            // A snapshot replays the latest run's assembler draft (spec
+            // §10.3), so its fold makes the same prefill decision the live
+            // DraftReady fold above does: a run that finished while the user
+            // was on another PR loses DraftReady to the stale-event rule,
+            // and this is the path that still lands its pre-filled review.
+            // The empty-body rule in `prefill_review` is the double-prefill
+            // guard: a draft already written from the live event is not
+            // overwritten.
+            #[cfg(unix)]
+            Event::AiSnapshot { session, .. } if *session == self.id => {
+                self.ai.apply(event);
+                if prefill_review(&mut self.pending, self.ai.draft.as_ref()) {
+                    self.save_pending_draft();
+                }
+                Vec::new()
+            }
+            #[cfg(unix)]
+            Event::AiCheckoutPlanned { session, .. }
+            | Event::AiFindings { session, .. }
+            | Event::AiCheckoutFailed { session, .. }
+            | Event::AiCheckoutHeld { session, .. }
+            | Event::AiNotice { session, .. }
+            | Event::AiPrepareOutput { session, .. }
+            | Event::AiPipeline { session, .. }
+            | Event::AiQuestion { session, .. }
+            | Event::AiApprovalRequest { session, .. }
+            | Event::AiChat { session, .. }
+            | Event::AiRestoreNeedsDecision { session, .. }
+            | Event::AiRestored { session, .. }
+                if *session == self.id =>
+            {
+                self.ai.apply(event);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -808,12 +869,12 @@ impl PrSession {
     /// placeholder thread is gone and its result event has nothing to roll
     /// back.
     fn restore_optimistic_to_composer(&mut self) {
-        if let Some(post) = self.optimistic.take() {
-            if self.composer.body.is_empty() {
-                self.composer.target = Some(post.target);
-                self.composer.body = post.body;
-                self.composer.mode = CommentMode::Immediate;
-            }
+        if let Some(post) = self.optimistic.take()
+            && self.composer.body.is_empty()
+        {
+            self.composer.target = Some(post.target);
+            self.composer.body = post.body;
+            self.composer.mode = CommentMode::Immediate;
         }
     }
 
@@ -915,10 +976,10 @@ impl PrSession {
         );
         let mut heights = measured.into_iter();
         for index in 0..model.rows.len() {
-            if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. }) {
-                if let Some(height) = heights.next() {
-                    model.set_height(index, height);
-                }
+            if matches!(model.rows[index], RowRef::Line { .. } | RowRef::Pair { .. })
+                && let Some(height) = heights.next()
+            {
+                model.set_height(index, height);
             }
         }
         self.row_model = model;
@@ -949,13 +1010,19 @@ impl PrSession {
                 });
             }
         }
-        if let Some(target) = &self.composer.target {
-            if let Some(file) = self.file_of(target) {
-                items.push(InlineItem {
-                    file,
-                    placement: target_placement(target),
-                    row: RowRef::Composer,
-                });
+        if let Some(target) = &self.composer.target
+            && let Some(file) = self.file_of(target)
+        {
+            items.push(InlineItem {
+                file,
+                placement: target_placement(target),
+                row: RowRef::Composer,
+            });
+        }
+        #[cfg(unix)]
+        for finding in self.ai.inline_drafts() {
+            if let Some(item) = crate::diff::annotate::place_ai_draft(finding, &self.files) {
+                items.push(item);
             }
         }
         items
@@ -1190,10 +1257,10 @@ impl PrSession {
                 self.filtered_files.remove(&file);
             }
         } else {
-            if let Some(loaded) = self.files.get_mut(file as usize) {
-                if let Some(diff) = loaded.diff.take() {
-                    self.svg_diffs.insert(file, diff);
-                }
+            if let Some(loaded) = self.files.get_mut(file as usize)
+                && let Some(diff) = loaded.diff.take()
+            {
+                self.svg_diffs.insert(file, diff);
             }
             self.rendered_svg.insert(file);
         }
@@ -1444,6 +1511,8 @@ impl PrSession {
     /// Drop a pending comment from the review.
     pub fn delete_pending(&mut self, local_id: u64, now: Instant) {
         self.pending.delete(local_id);
+        #[cfg(unix)]
+        unlink_pending_finding(self, local_id);
         self.rebuild_rows();
         self.mark_session_dirty(now);
         self.save_pending_draft();
@@ -1465,6 +1534,8 @@ impl PrSession {
         let target = CommentTarget::Line(pending.anchor.clone());
         let body = pending.body.clone();
         self.pending.delete(local_id);
+        #[cfg(unix)]
+        unlink_pending_finding(self, local_id);
         self.open_comment(target);
         self.composer.body = body;
         self.mark_session_dirty(now);
@@ -1644,6 +1715,194 @@ fn wider_expand(a: Expand, b: Expand) -> Expand {
     }
 }
 
+/// The result of keeping one draft finding (Task 5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeepResult {
+    /// The pending comment the finding became; `None` for summary items,
+    /// which only extend the review body.
+    pub pending_local_id: Option<u64>,
+}
+
+/// Why Keep is unavailable right now, or `None` when it is available: the
+/// pending review is pinned to another commit than the diff on screen
+/// (spec §7.2, §12).
+#[cfg(unix)]
+pub fn keep_blocked(session: &PrSession) -> Option<String> {
+    let pinned = session.pending.commit_id.as_deref()?;
+    let head = session.diff_head_sha.as_deref()?;
+    (pinned != head).then(|| pin_blocked_message(pinned))
+}
+
+/// The banner Keep shows while the pending review is pinned elsewhere
+/// (spec §7.2).
+#[cfg(unix)]
+fn pin_blocked_message(pinned: &str) -> String {
+    format!(
+        "Submit or discard your pending review (pinned to {}) before keeping \
+         drafts from the new commit.",
+        sha7(pinned)
+    )
+}
+
+/// How many open (`Draft`) findings each file has, for the tree's ✦ badge
+/// (spec §12). Kept, posted and dropped findings are not open any more.
+#[cfg(unix)]
+pub fn ai_draft_counts(ai: &crate::state::ai_review::AiReviewState) -> HashMap<String, u32> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for finding in ai.findings.values() {
+        if finding.state == crate::ai::review::FindingState::Draft {
+            *counts.entry(finding.anchor.path().to_owned()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Move one AI draft into the local pending review: a line finding becomes a
+/// pending comment carrying its severity, a summary item extends the review
+/// body (spec §5.6, §12).
+#[cfg(unix)]
+pub fn keep_draft(session: &mut PrSession, id: i64) -> Result<KeepResult, String> {
+    if let Some(why) = keep_blocked(session) {
+        return Err(why);
+    }
+    let finding = session
+        .ai
+        .findings
+        .get(&id)
+        .ok_or_else(|| format!("finding #{id} is not loaded"))?
+        .clone();
+    match &finding.anchor {
+        crate::ai::review::FindingAnchor::Line(anchor) => {
+            let body = crate::ai::review::kept_body(finding.severity, &finding.body);
+            match add_pending(session, anchor.clone(), body) {
+                Ok(local_id) => Ok(KeepResult {
+                    pending_local_id: Some(local_id),
+                }),
+                Err(PendingError::PinnedToOtherCommit { pinned }) => {
+                    Err(pin_blocked_message(&pinned))
+                }
+            }
+        }
+        crate::ai::review::FindingAnchor::Summary { path } => {
+            let body = format!("\n\n**{path}:** {} — {}", finding.title, finding.body);
+            session.pending.body.push_str(&body);
+            session.mark_session_dirty(Instant::now());
+            session.save_pending_draft();
+            Ok(KeepResult::default())
+        }
+    }
+}
+
+/// The review event a draft's verdict maps to (spec §5.6, §12): GitHub's
+/// three verdicts, one each.
+#[cfg(unix)]
+pub fn map_verdict(verdict: crate::ai::stages::assemble::Verdict) -> ReviewEvent {
+    use crate::ai::stages::assemble::Verdict;
+
+    match verdict {
+        Verdict::Approve => ReviewEvent::Approve,
+        Verdict::Comment => ReviewEvent::Comment,
+        Verdict::RequestChanges => ReviewEvent::RequestChanges,
+    }
+}
+
+/// Pre-fill the review draft from the assembler's draft (Plan 3 Task 6): the
+/// summary becomes the body and the verdict the event — but only while the
+/// body is still empty, so a summary the reviewer typed is never overwritten
+/// (nor the verdict they picked). Returns whether anything was written.
+#[cfg(unix)]
+pub fn prefill_review(
+    pending: &mut PendingReview,
+    draft: Option<&crate::ai::stages::assemble::ReviewDraft>,
+) -> bool {
+    let Some(draft) = draft else {
+        return false;
+    };
+    if !pending.body.trim().is_empty() {
+        return false;
+    }
+    pending.set_body(draft.summary.clone());
+    pending.set_event(map_verdict(draft.verdict));
+    true
+}
+
+/// Mark the kept findings this submit posted as [`Posted`], returning the
+/// store commands that record it (spec §11, §12).
+///
+/// Runs before the draft is cleared: the submitted comments' local ids are
+/// all there is to go by. Summary items (`pending_local_id: None`) ride the
+/// review body rather than a comment, so they stay kept.
+///
+/// [`Posted`]: crate::ai::review::FindingState::Posted
+#[cfg(unix)]
+fn posted_findings(session: &mut PrSession) -> Vec<Command> {
+    use crate::ai::review::FindingState;
+
+    let submitted: BTreeSet<u64> = session
+        .pending
+        .comments
+        .iter()
+        .map(|comment| comment.local_id)
+        .collect();
+    let key = pr_key(session);
+    let mut commands = Vec::new();
+    for finding in session.ai.findings.values_mut() {
+        let Some(local_id) = finding.pending_local_id else {
+            continue;
+        };
+        if finding.state == FindingState::Kept && submitted.contains(&local_id) {
+            finding.state = FindingState::Posted;
+            commands.push(Command::AiFindingState {
+                session: session.id,
+                key: key.clone(),
+                id: finding.id,
+                state: FindingState::Posted,
+                pending_local_id: Some(local_id),
+            });
+        }
+    }
+    commands
+}
+
+/// The store key for the open PR's AI rows, lowercased like the store's own
+/// session identity.
+#[cfg(unix)]
+pub fn pr_key(session: &PrSession) -> crate::ai::store::PrKey {
+    crate::ai::store::PrKey {
+        host: session.host.to_lowercase(),
+        owner: session.repo.owner.to_lowercase(),
+        repo: session.repo.name.to_lowercase(),
+        number: session.number,
+    }
+}
+
+/// The command that binds the AI review to a freshly opened `session`
+/// (spec §10.2): the hub rebinds a live run's events to this session id and
+/// answers with the stored snapshot.
+#[cfg(unix)]
+pub fn ai_attach_command(session: &PrSession) -> Command {
+    Command::AiAttach {
+        session: session.id,
+        key: pr_key(session),
+    }
+}
+
+/// Forget a deleted pending comment on any Kept AI finding that referenced
+/// it: `PendingReview::clear` resets the local-id counter, so a later draft
+/// reissues the id, and a stale link would falsely mark the unrelated new
+/// comment's finding `Posted` at submit (`posted_findings`). Summary keeps
+/// carry no link, and drafts or dropped findings never consult one.
+#[cfg(unix)]
+fn unlink_pending_finding(session: &mut PrSession, local_id: u64) {
+    use crate::ai::review::FindingState;
+
+    for finding in session.ai.findings.values_mut() {
+        if finding.state == FindingState::Kept && finding.pending_local_id == Some(local_id) {
+            finding.pending_local_id = None;
+        }
+    }
+}
+
 /// Add a pending comment anchored to the diff on screen, persisting the
 /// draft immediately.
 ///
@@ -1695,6 +1954,8 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: None,
         threads: &session.threads,
+        // Submission rules do not read the AI suggestion; the popover does.
+        suggested: None,
     };
     if !review_panel_vm(&inputs).submit_enabled {
         return None;
@@ -1711,22 +1972,27 @@ pub fn start_submit(session: &PrSession) -> Option<Command> {
 /// in memory and on disk — the review is appended, and the threads and
 /// reviews are reloaded so the new comments render anchored (spec §7.2).
 pub fn on_review_submitted(session: &mut PrSession, review: Review) -> Vec<Command> {
+    // The findings this submit posts, decided before the draft is cleared:
+    // their pending comments' local ids are the only link (Plan 3 Task 6).
+    #[cfg(unix)]
+    let mut commands = posted_findings(session);
+    #[cfg(not(unix))]
+    let mut commands: Vec<Command> = Vec::new();
     session.pending.clear();
     session.rebuild_rows();
     session.save_pending_draft();
     session.reviews.push(review);
-    vec![
-        Command::LoadThreads {
-            session: session.id,
-            repo: session.repo.clone(),
-            number: session.number,
-        },
-        Command::LoadReviews {
-            session: session.id,
-            repo: session.repo.clone(),
-            number: session.number,
-        },
-    ]
+    commands.push(Command::LoadThreads {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+    });
+    commands.push(Command::LoadReviews {
+        session: session.id,
+        repo: session.repo.clone(),
+        number: session.number,
+    });
+    commands
 }
 
 /// Fold a failed submit in: the draft is never lost (spec §11), only the
@@ -1908,9 +2174,10 @@ mod tests {
             session: SessionId(1),
             meta: meta("sha1"),
         });
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadPrFiles { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadPrFiles { .. }))
+        );
         s.on_event(&Event::PrFilesPage {
             session: SessionId(1),
             files: vec![loaded("a.rs", "@@ -1 +1 @@\n-a\n+b\n")],
@@ -2083,10 +2350,13 @@ mod tests {
         assert_eq!(s.commits, vec![commit]);
 
         let run = CheckRun {
+            id: 1,
             name: "build".into(),
             status: "completed".into(),
             conclusion: Some("success".into()),
             html_url: None,
+            output_summary: None,
+            output_text: None,
         };
         let combined = CombinedStatus {
             state: "success".into(),
@@ -2178,9 +2448,10 @@ mod tests {
         };
 
         let (mut s, cmds) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadThreads { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. }))
+        );
 
         s.on_event(&Event::ThreadsLoaded {
             session: SessionId(2),
@@ -2256,6 +2527,57 @@ mod tests {
             error: GhError::NotFound,
         });
         assert!(s.error.is_none());
+    }
+
+    /// The AI tab's events fold into `session.ai` — and only the open
+    /// session's do (the stale-event rule, spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn ai_events_fold_into_the_tab_state_and_stale_ones_are_dropped() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::tools::{AgentRef, AgentRole};
+        use crate::state::ai_review::{AiPhase, TimelineEntry};
+
+        let (mut s, _) = PrSession::open(SessionId(1), "github.com".into(), repo(), 7);
+        let agent = AgentRef {
+            id: 1,
+            role: AgentRole::Reviewer,
+            label: "reviewer:g1".to_string(),
+        };
+
+        s.on_event(&Event::AiQuestion {
+            session: SessionId(2),
+            id: 7,
+            agent: agent.clone(),
+            text: "for another PR".to_string(),
+            options: vec![],
+        });
+        assert!(
+            s.ai.timeline.is_empty(),
+            "a question for a PR the user left never reaches this tab"
+        );
+
+        let commands = s.on_event(&Event::AiQuestion {
+            session: SessionId(1),
+            id: 7,
+            agent,
+            text: "is empty input allowed?".to_string(),
+            options: vec![],
+        });
+        assert!(commands.is_empty(), "the reducer never emits commands");
+        assert!(matches!(
+            s.ai.timeline.as_slice(),
+            [TimelineEntry::Question { id: 7, .. }]
+        ));
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::Stage {
+                stage: crate::ai::events::StageKind::Scout,
+                status: crate::ai::events::StageStatus::Started,
+            },
+        });
+        assert_eq!(s.ai.phase, AiPhase::Running);
     }
 
     #[test]
@@ -2417,9 +2739,11 @@ mod tests {
         let id = s.pending.comments[0].local_id;
         s.delete_pending(id, Instant::now());
         assert!(s.pending.commit_id.is_none());
-        assert!(session::load_draft(dir.path(), "github.com", &repo(), 7)
-            .unwrap()
-            .is_none());
+        assert!(
+            session::load_draft(dir.path(), "github.com", &repo(), 7)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A session with one loaded file and a known head SHA, backed by a
@@ -2545,9 +2869,11 @@ mod tests {
             composer::reduce(&mut s.composer, ComposerMsg::SetBody("move this".into()));
             let commands = s.submit_comment(CommentMode::Pending, "me", Instant::now());
             match commands.as_slice() {
-                [Command::AddToServerReview {
-                    review_id, comment, ..
-                }] => {
+                [
+                    Command::AddToServerReview {
+                        review_id, comment, ..
+                    },
+                ] => {
                     assert_eq!(review_id, "PRR_9");
                     assert_eq!(comment.target, target);
                     assert_eq!(comment.body, "move this");
@@ -2576,9 +2902,11 @@ mod tests {
             "the summary went with the review"
         );
         assert_eq!(s.pending.event, ReviewEvent::Comment);
-        assert!(commands
-            .iter()
-            .any(|c| matches!(c, Command::LoadReviews { .. })));
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::LoadReviews { .. }))
+        );
         assert!(
             commands
                 .iter()
@@ -2838,14 +3166,161 @@ mod tests {
         let cmds = on_review_submitted(&mut s, review(ReviewState::Commented));
         assert!(s.pending.is_empty());
         assert_eq!(s.reviews.len(), 1);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadThreads { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadThreads { .. }))
+        );
         assert!(
             session::load_draft(dir.path(), "github.com", &repo(), 7)
                 .unwrap()
                 .is_none(),
             "the persisted copy goes with the draft"
+        );
+    }
+
+    /// Submitting the review posts exactly the kept findings whose pending
+    /// comments went out with it; the ones left out of the draft, and the
+    /// summary items that ride the review body, stay kept (spec §11, §12).
+    #[test]
+    #[cfg(unix)]
+    fn submit_marks_kept_findings_posted() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let first = add_pending(&mut s, line_anchor("a.rs", 1), "**Bug:** one".into()).unwrap();
+        let second = add_pending(&mut s, line_anchor("a.rs", 1), "**Risk:** two".into()).unwrap();
+        for (id, anchor, severity, local_id) in [
+            (
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                Some(first),
+            ),
+            (
+                2,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Risk,
+                Some(second),
+            ),
+            // Kept, but its comment never made it into this draft.
+            (
+                3,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Nit,
+                Some(9),
+            ),
+            // A summary item: it lives in the review body, not a comment.
+            (
+                4,
+                FindingAnchor::Summary {
+                    path: "a.rs".into(),
+                },
+                Severity::Nit,
+                None,
+            ),
+        ] {
+            let mut finding = ai_finding(id, anchor, severity, FindingState::Kept, "title", "body");
+            finding.pending_local_id = local_id;
+            s.ai.findings.insert(id, finding);
+        }
+
+        let commands = on_review_submitted(&mut s, review(ReviewState::Commented));
+
+        for id in [1, 2] {
+            assert_eq!(
+                s.ai.findings[&id].state,
+                FindingState::Posted,
+                "finding #{id} was in the submitted draft"
+            );
+        }
+        for id in [3, 4] {
+            assert_eq!(
+                s.ai.findings[&id].state,
+                FindingState::Kept,
+                "finding #{id} was not posted by this submit"
+            );
+        }
+
+        let mut posted: Vec<i64> = commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::AiFindingState {
+                    id,
+                    state: FindingState::Posted,
+                    ..
+                } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        posted.sort_unstable();
+        assert_eq!(posted, vec![1, 2], "the store hears about the same two");
+    }
+
+    /// Deleting the pending comment a Kept finding points at must clear the
+    /// link: the local-id counter restarts when the draft is cleared, so a
+    /// later submit whose comment reuses the id would otherwise flip the
+    /// unrelated Kept finding to Posted (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn deleting_a_pending_comment_unlinks_the_kept_finding() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "panics on empty input",
+                "line 1 indexes without a length check",
+            ),
+        );
+        // The Keep, as `app.rs` applies it: pending comment plus the link.
+        let kept = keep_draft(&mut s, 1).expect("the draft keeps into the pending review");
+        let local_id = kept
+            .pending_local_id
+            .expect("a line draft becomes a comment");
+        let finding = s.ai.findings.get_mut(&1).expect("the finding");
+        finding.state = FindingState::Kept;
+        finding.pending_local_id = kept.pending_local_id;
+
+        s.delete_pending(local_id, Instant::now());
+
+        assert!(s.pending.comments.is_empty());
+        assert_eq!(
+            s.ai.findings[&1].state,
+            FindingState::Kept,
+            "deleting the comment does not undo the keep"
+        );
+        assert_eq!(
+            s.ai.findings[&1].pending_local_id, None,
+            "the stale link is gone with the comment"
+        );
+
+        // A submit clears the draft (and the counter); the next comment
+        // reuses the id, and its submit must not post the old finding.
+        on_review_submitted(&mut s, review(ReviewState::Commented));
+        let reused = add_pending(&mut s, line_anchor("a.rs", 1), "**Bug:** unrelated".into())
+            .expect("the cleared draft pins to the head on screen");
+        assert_eq!(
+            reused, local_id,
+            "the counter restarted, so the id is reused"
+        );
+        let commands = on_review_submitted(&mut s, review(ReviewState::Commented));
+        assert_eq!(
+            s.ai.findings[&1].state,
+            FindingState::Kept,
+            "the reused id does not falsely mark the old finding Posted"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::AiFindingState { id: 1, .. })),
+            "the store is not told about a post that did not happen"
         );
     }
 
@@ -2973,10 +3448,11 @@ mod tests {
             done: true,
         });
         s.select_file(1);
-        assert!(s
-            .row_model
-            .rows
-            .contains(&RowRef::HunkHeader { file: 1, hunk: 0 }));
+        assert!(
+            s.row_model
+                .rows
+                .contains(&RowRef::HunkHeader { file: 1, hunk: 0 })
+        );
 
         let cmds = s.expand_gap(1, 0, Expand::All);
         assert!(
@@ -3258,10 +3734,11 @@ mod tests {
         }
         assert!(s.image_for(0).is_none());
         assert!(s.image_for(200).is_some());
-        assert!(s
-            .evicted_images
-            .iter()
-            .any(|uri| uri.ends_with("/0/head.png")));
+        assert!(
+            s.evicted_images
+                .iter()
+                .any(|uri| uri.ends_with("/0/head.png"))
+        );
         assert!(
             !s.load_images(0).is_empty(),
             "an evicted file can be requested again"
@@ -3297,17 +3774,17 @@ mod tests {
             "the stashed text diff comes back"
         );
         assert!(!s.wants_images(0));
-        assert!(s
-            .row_model
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowRef::Line { .. })));
+        assert!(
+            s.row_model
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowRef::Line { .. }))
+        );
     }
 
     /// A patch with one whitespace-only hunk and one real hunk, so the
     /// filtered and original forms differ and either can be told apart.
-    const WS_AND_REAL: &str =
-        "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n@@ -4 +4 @@\n-let y = 1;\n+let y = 2;\n";
+    const WS_AND_REAL: &str = "@@ -1,2 +1,2 @@\n fn a() {\n-\tlet x = 1;\n+\tlet x = 1;  \n@@ -4 +4 @@\n-let y = 1;\n+let y = 2;\n";
 
     #[test]
     fn hide_whitespace_off_under_a_rendered_svg_restores_the_original_to_text() {
@@ -3475,12 +3952,14 @@ mod tests {
             },
         });
         assert!(!s.merging);
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadPrMetadata { .. })));
-        assert!(cmds
-            .iter()
-            .any(|c| matches!(c, Command::LoadReviews { .. })));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadPrMetadata { .. }))
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::LoadReviews { .. }))
+        );
     }
 
     #[test]
@@ -3516,5 +3995,430 @@ mod tests {
             s.repo_settings.is_none(),
             "the stale settings must not land"
         );
+    }
+
+    /// A session that neither reads nor writes the real config root, for the
+    /// AI draft tests that assert on the pending review from an empty start.
+    #[cfg(unix)]
+    fn clean_session(files: &[(&str, &str)]) -> (PrSession, tempfile::TempDir) {
+        let dir = tempdir();
+        let (mut s, _) =
+            PrSession::open_at(dir.path(), SessionId(1), "github.com".into(), repo(), 7);
+        s.on_event(&Event::PrMetadataLoaded {
+            session: SessionId(1),
+            meta: meta("sha1"),
+        });
+        let loaded_files = files
+            .iter()
+            .map(|(path, patch)| loaded(path, patch))
+            .collect();
+        s.on_event(&Event::PrFilesPage {
+            session: SessionId(1),
+            files: loaded_files,
+            done: true,
+        });
+        (s, dir)
+    }
+
+    /// Keeping a line draft puts it in the pending review, prefixed with its
+    /// severity, pinned to the diff on screen (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn keep_line_draft_adds_pending_with_severity_prefix() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "panics on empty input",
+                "line 1 indexes without a length check",
+            ),
+        );
+        s.rebuild_rows();
+        assert!(
+            s.row_model.rows.contains(&RowRef::AiDraft { finding: 1 }),
+            "a draft finding shows inline while it is a draft"
+        );
+
+        let kept = keep_draft(&mut s, 1).expect("the draft keeps into the pending review");
+        let local_id = kept
+            .pending_local_id
+            .expect("a line draft becomes a pending comment");
+        assert_eq!(s.pending.comments.len(), 1);
+        let comment = &s.pending.comments[0];
+        assert_eq!(comment.local_id, local_id);
+        assert_eq!(comment.anchor, line_anchor("a.rs", 1));
+        assert_eq!(
+            comment.body, "**Bug:** line 1 indexes without a length check",
+            "the kept body carries its severity"
+        );
+        assert_eq!(
+            s.pending.commit_id.as_deref(),
+            Some("sha1"),
+            "pinned to the commit the diff on screen came from"
+        );
+    }
+
+    /// A draft pinned to another commit blocks Keep before anything is added
+    /// — both the action and the row's disabled state say why (spec §7.2).
+    #[test]
+    #[cfg(unix)]
+    fn keep_is_blocked_while_pending_is_pinned_to_another_commit() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        s.pending
+            .add(
+                line_anchor("a.rs", 2),
+                "written against the old head".into(),
+                "sha0",
+            )
+            .unwrap();
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Risk,
+                FindingState::Draft,
+                "the retry hides a failure",
+                "the warning path swallows the error",
+            ),
+        );
+
+        assert_eq!(
+            keep_draft(&mut s, 1).unwrap_err(),
+            "Submit or discard your pending review (pinned to sha0) before \
+             keeping drafts from the new commit."
+        );
+        assert_eq!(s.pending.comments.len(), 1, "nothing was added");
+        assert!(
+            keep_blocked(&s).is_some_and(|why| why.contains("sha0")),
+            "the row disables Keep for the same reason"
+        );
+
+        // An unpinned draft (or one pinned to this head) does not block.
+        s.pending.clear();
+        assert!(keep_blocked(&s).is_none());
+    }
+
+    /// A whole-file finding has no line to comment on, so Keep appends it to
+    /// the review body instead (spec §5.6, §12).
+    #[test]
+    #[cfg(unix)]
+    fn keep_summary_item_appends_to_review_body() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("logo.png", PATCH)]);
+        s.set_pending_body("Overall this looks right.".into());
+        s.ai.findings.insert(
+            1,
+            ai_finding(
+                1,
+                FindingAnchor::Summary {
+                    path: "logo.png".into(),
+                },
+                Severity::Nit,
+                FindingState::Draft,
+                "regenerate the asset",
+                "it was exported at 1x",
+            ),
+        );
+
+        let kept = keep_draft(&mut s, 1).expect("a summary item keeps into the body");
+        assert_eq!(kept.pending_local_id, None, "no comment to link");
+        assert_eq!(
+            s.pending.body,
+            "Overall this looks right.\n\n**logo.png:** regenerate the asset — it was exported at 1x"
+        );
+        assert!(s.pending.comments.is_empty());
+        assert!(s.pending.commit_id.is_none(), "a summary item pins nothing");
+    }
+
+    /// The assembler's draft pre-fills the review summary and verdict — but
+    /// only while the reviewer has not written a summary of their own
+    /// (spec §12, Plan 3 Task 6).
+    #[test]
+    #[cfg(unix)]
+    fn prefill_only_when_body_empty() {
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
+        let draft = ReviewDraft {
+            summary: "adds the retry loop; one bug in the backoff".into(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".into(),
+            rewrites: Default::default(),
+        };
+
+        let mut pending = PendingReview::default();
+        assert!(
+            !prefill_review(&mut pending, None),
+            "without a draft there is nothing to prefill"
+        );
+        assert!(pending.body.is_empty());
+
+        assert!(
+            prefill_review(&mut pending, Some(&draft)),
+            "an empty body takes the draft's summary"
+        );
+        assert_eq!(pending.body, draft.summary);
+        assert_eq!(pending.event, ReviewEvent::RequestChanges);
+
+        let mut typed = PendingReview::default();
+        typed.set_body("my own summary".into());
+        typed.set_event(ReviewEvent::Comment);
+        assert!(
+            !prefill_review(&mut typed, Some(&draft)),
+            "a body the reviewer typed is never overwritten"
+        );
+        assert_eq!(typed.body, "my own summary");
+        assert_eq!(
+            typed.event,
+            ReviewEvent::Comment,
+            "the verdict they picked stands too"
+        );
+
+        let mut blank = PendingReview::default();
+        blank.set_body("  \n\t".into());
+        assert!(
+            prefill_review(&mut blank, Some(&draft)),
+            "whitespace is an empty body"
+        );
+        assert_eq!(blank.body, draft.summary);
+    }
+
+    /// A snapshot that replays a finished run's draft pre-fills the review
+    /// through the same rule the live DraftReady fold uses — and a re-attach
+    /// never overwrites a summary the reviewer wrote in between (spec §10.3).
+    #[test]
+    #[cfg(unix)]
+    fn snapshot_replay_prefills_the_review_once() {
+        use crate::ai::hub::AiSnapshotData;
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+        use crate::ai::store::RunRecord;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let draft = ReviewDraft {
+            summary: "adds the retry loop; one bug in the backoff".into(),
+            verdict: Verdict::RequestChanges,
+            rationale: "a kept bug blocks the merge".into(),
+            rewrites: Default::default(),
+        };
+        let snapshot = AiSnapshotData {
+            findings: Vec::new(),
+            coverage: Vec::new(),
+            timeline: Vec::new(),
+            brief: None,
+            run: Some(RunRecord {
+                id: 9,
+                kind: "full".into(),
+                base_sha: None,
+                head_sha: "sha1".into(),
+                status: "completed".into(),
+                stop_reason: None,
+            }),
+            checkout: None,
+            bash_disabled: None,
+            last_reviewed_sha: Some("sha1".into()),
+            draft: Some(draft.clone()),
+            usage: (10, 2),
+        };
+
+        s.on_event(&Event::AiSnapshot {
+            session: SessionId(1),
+            snapshot: snapshot.clone(),
+        });
+        assert_eq!(
+            s.pending.body, draft.summary,
+            "the replayed draft prefills the empty body"
+        );
+        assert_eq!(s.pending.event, ReviewEvent::RequestChanges);
+        assert_eq!(s.ai.usage, (10, 2), "the tab shows the run's tokens");
+
+        // A re-attach after the reviewer wrote their own summary: the
+        // empty-body rule stands, nothing is clobbered or doubled.
+        s.set_pending_body("my own summary".into());
+        s.on_event(&Event::AiSnapshot {
+            session: SessionId(1),
+            snapshot,
+        });
+        assert_eq!(s.pending.body, "my own summary");
+    }
+
+    /// A live run's findings reach `session.ai.findings` through
+    /// [`Event::AiFindings`], and a stale session's rows are dropped; the
+    /// draft prefill is untouched by them.
+    #[test]
+    #[cfg(unix)]
+    fn ai_findings_event_fills_session_findings() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let finding = ai_finding(
+            5,
+            FindingAnchor::Line(line_anchor("a.rs", 1)),
+            Severity::Bug,
+            FindingState::Draft,
+            "title",
+            "body",
+        );
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::FindingAdded { id: 5 },
+        });
+        assert!(s.ai.findings.is_empty(), "ids alone carry no row");
+        s.on_event(&Event::AiFindings {
+            session: SessionId(1),
+            findings: vec![finding.clone()],
+            coverage: Vec::new(),
+        });
+        assert_eq!(s.ai.findings.get(&5), Some(&finding));
+
+        s.on_event(&Event::AiFindings {
+            session: SessionId(99),
+            findings: Vec::new(),
+            coverage: Vec::new(),
+        });
+        assert_eq!(s.ai.findings.len(), 1, "a stale session is dropped");
+        assert!(s.pending.body.is_empty(), "no draft, no prefill");
+    }
+
+    /// Opening a PR must bind the AI review to the new session id.
+    #[test]
+    #[cfg(unix)]
+    fn ai_attach_command_targets_the_open_session() {
+        let (s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        match ai_attach_command(&s) {
+            Command::AiAttach { session, key } => {
+                assert_eq!(session, s.id);
+                assert_eq!(key, pr_key(&s));
+            }
+            other => panic!("expected AiAttach, got {other:?}"),
+        }
+    }
+
+    /// The verdict mapping the prefill uses, one-to-one with GitHub's events.
+    #[test]
+    #[cfg(unix)]
+    fn map_verdict_table() {
+        use crate::ai::stages::assemble::Verdict;
+
+        assert_eq!(map_verdict(Verdict::Approve), ReviewEvent::Approve);
+        assert_eq!(map_verdict(Verdict::Comment), ReviewEvent::Comment);
+        assert_eq!(
+            map_verdict(Verdict::RequestChanges),
+            ReviewEvent::RequestChanges
+        );
+    }
+
+    /// A `DraftReady` event is what lands the draft: the fold fills the
+    /// pending review in the same step (Plan 3 Task 6).
+    #[test]
+    #[cfg(unix)]
+    fn draft_ready_prefills_the_pending_review() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::stages::assemble::{ReviewDraft, Verdict};
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let draft = ReviewDraft {
+            summary: "adds retries".into(),
+            verdict: Verdict::Approve,
+            rationale: "clean".into(),
+            rewrites: Default::default(),
+        };
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(2),
+            event: PipelineEvent::DraftReady {
+                draft: draft.clone(),
+            },
+        });
+        assert!(
+            s.pending.body.is_empty(),
+            "a draft for a PR the user left never pre-fills this one"
+        );
+
+        s.on_event(&Event::AiPipeline {
+            session: SessionId(1),
+            event: PipelineEvent::DraftReady { draft },
+        });
+        assert_eq!(s.pending.body, "adds retries");
+        assert_eq!(s.pending.event, ReviewEvent::Approve);
+        assert_eq!(
+            s.ai.draft.as_ref().map(|d| d.summary.as_str()),
+            Some("adds retries")
+        );
+    }
+
+    /// The tree's ✦ badge counts the open (draft) findings per file; kept and
+    /// dropped ones are not open any more (spec §12).
+    #[test]
+    #[cfg(unix)]
+    fn tree_counts_open_ai_drafts() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("src/a.rs", PATCH), ("src/b.rs", PATCH)]);
+        for finding in [
+            ai_finding(
+                1,
+                FindingAnchor::Line(line_anchor("src/a.rs", 1)),
+                Severity::Bug,
+                FindingState::Draft,
+                "one",
+                "b",
+            ),
+            ai_finding(
+                2,
+                FindingAnchor::Summary {
+                    path: "src/a.rs".into(),
+                },
+                Severity::Nit,
+                FindingState::Draft,
+                "two",
+                "b",
+            ),
+            ai_finding(
+                3,
+                FindingAnchor::Line(line_anchor("src/a.rs", 1)),
+                Severity::Risk,
+                FindingState::Kept,
+                "kept",
+                "b",
+            ),
+            ai_finding(
+                4,
+                FindingAnchor::Line(line_anchor("src/b.rs", 1)),
+                Severity::Question,
+                FindingState::Draft,
+                "three",
+                "b",
+            ),
+            ai_finding(
+                5,
+                FindingAnchor::Line(line_anchor("src/b.rs", 1)),
+                Severity::Nit,
+                FindingState::DroppedByVerifier,
+                "dropped",
+                "b",
+            ),
+        ] {
+            s.ai.findings.insert(finding.id, finding);
+        }
+
+        let counts = ai_draft_counts(&s.ai);
+        assert_eq!(counts.get("src/a.rs"), Some(&2), "two open drafts");
+        assert_eq!(counts.get("src/b.rs"), Some(&1), "one open draft");
+        assert_eq!(counts.get("src/c.rs"), None, "no drafts, no badge");
     }
 }

@@ -4,15 +4,22 @@
 //! of the settings ([`SettingsVm`]) and hands the result back as a
 //! [`SettingsAction`] for the app to persist. It is also the only way to
 //! **sign out** — the button rides the app's existing sign-out flow.
+//!
+//! The AI tab (spec §10) is different: its rows are edited and saved one at a
+//! time by their own dialogs, so nothing from it is part of [`SettingsVm`]
+//! and saving General/Appearance never validates or rewrites AI settings.
+
+use std::collections::BTreeMap;
 
 use eframe::egui::{self, Frame, Margin, RichText};
 
-use crate::ui::components::{elided_label, segmented, toggle_chip, Btn, BtnKind, Field, Seg};
-
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
-use crate::persist::settings::Settings;
+use crate::persist::settings::{AiSettings, ModelSettings, ProviderSettings, Settings};
+use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_label, segmented, toggle_chip};
 use crate::ui::theme::Theme;
+#[cfg(unix)]
+use crate::ui::widgets::settings_ai_tab::{self, AiTabAction};
 use crate::ui::widgets::thread_view::avatar;
 use crate::ui::{fonts, icons, theme};
 
@@ -25,10 +32,69 @@ const ALL_SCOPES: [Scope; 5] = [
     Scope::Mentions,
 ];
 
+/// The Settings window's tabs. The AI tab is Unix-only with the LLM stack
+/// (spec §10); Windows offers the other two.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsTab {
+    /// Account, scopes, host.
+    #[default]
+    General,
+    /// Theme, diff layout, code font size.
+    Appearance,
+    /// AI providers (spec §10).
+    #[cfg(unix)]
+    Ai,
+}
+
+impl SettingsTab {
+    /// The tab's label.
+    fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Appearance => "Appearance",
+            #[cfg(unix)]
+            SettingsTab::Ai => "AI",
+        }
+    }
+}
+
+/// Every tab this platform offers, in display order.
+fn all_tabs() -> Vec<SettingsTab> {
+    #[cfg(unix)]
+    {
+        vec![
+            SettingsTab::General,
+            SettingsTab::Appearance,
+            SettingsTab::Ai,
+        ]
+    }
+    #[cfg(not(unix))]
+    {
+        vec![SettingsTab::General, SettingsTab::Appearance]
+    }
+}
+
+/// Whether the selected tab saves through [`SettingsAction::Apply`] (General
+/// and Appearance do; an AI row saves from its own dialog).
+fn has_save_footer(tab: SettingsTab) -> bool {
+    #[cfg(unix)]
+    {
+        tab != SettingsTab::Ai
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tab;
+        true
+    }
+}
+
 /// The window's editable view of the settings.
 ///
 /// `client_id` flattens the settings' `Option<String>`: an empty box means
 /// "use the built-in client id" and applies back as `None`.
+///
+/// The AI settings are deliberately absent: their rows are saved by the AI
+/// tab's dialogs, not by this window's Save button (spec §10).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SettingsVm {
     /// The GitHub host.
@@ -75,6 +141,10 @@ impl SettingsVm {
     ///
     /// Returns `true` when the host changed: the stored token belongs to the
     /// old host, so the app must end the session and ask for sign-in again.
+    ///
+    /// Only the General and Appearance fields are written; the AI table
+    /// (`s.ai`) is never touched here, so an invalid AI row cannot block
+    /// saving the rest (spec §10).
     pub fn apply(self, s: &mut Settings) -> bool {
         let host_changed = self.host != s.host;
         s.host = self.host;
@@ -92,14 +162,24 @@ impl SettingsVm {
 pub struct SettingsWindowState {
     /// Whether the window is showing.
     pub open: bool,
-    /// The working copy being edited.
+    /// The selected tab.
+    pub tab: SettingsTab,
+    /// The working copy being edited (General and Appearance).
     pub vm: SettingsVm,
+    /// The AI tab's dialog and latest test results (spec §10).
+    #[cfg(unix)]
+    pub ai_tab: settings_ai_tab::AiTabState,
 }
 
 impl SettingsWindowState {
-    /// Open the window on a fresh copy of `settings`.
+    /// Open the window on a fresh copy of `settings`, on the General tab.
     pub fn open_with(&mut self, settings: &Settings) {
         self.vm = settings_vm(settings);
+        self.tab = SettingsTab::General;
+        #[cfg(unix)]
+        {
+            self.ai_tab = settings_ai_tab::AiTabState::default();
+        }
         self.open = true;
     }
 
@@ -109,14 +189,116 @@ impl SettingsWindowState {
     }
 }
 
+/// One of the two model roles the AI tab edits (spec §10). The roles are
+/// fixed — every AI feature asks for one of them — so the table always shows
+/// both rows.
+///
+/// Defined here, next to [`SettingsAction`], because the action carries it on
+/// every platform while the tab itself is Unix-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRole {
+    /// The model that runs reviews and chat.
+    Default,
+    /// The optional cheaper model for lookup helpers.
+    Lookup,
+}
+
+impl ModelRole {
+    /// The Role column's text (mockup `ai-settings-tab.html`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelRole::Default => "Review & chat",
+            ModelRole::Lookup => "Lookup helper",
+        }
+    }
+
+    /// This role's model in `ai`, if it is configured.
+    pub fn model(self, ai: &AiSettings) -> Option<&ModelSettings> {
+        match self {
+            ModelRole::Default => ai.models.default.as_ref(),
+            ModelRole::Lookup => ai.models.lookup.as_ref(),
+        }
+    }
+
+    /// Set (or, with `None`, clear) this role's model.
+    pub fn set_model(self, ai: &mut AiSettings, model: Option<ModelSettings>) {
+        match self {
+            ModelRole::Default => ai.models.default = model,
+            ModelRole::Lookup => ai.models.lookup = model,
+        }
+    }
+}
+
 /// What the window asked the app to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingsAction {
-    /// Persist these edited settings (the app saves; a host change ends the
-    /// session).
+    /// Persist these edited General/Appearance settings (the app saves; a host
+    /// change ends the session). AI settings are untouched.
     Apply(SettingsVm),
+    /// Commit one AI model role (spec §10). `None` clears the role (only
+    /// meaningful for the optional lookup helper); no keychain is involved.
+    SaveModel {
+        /// The role being edited.
+        role: ModelRole,
+        /// The model to store, or `None` to clear the role.
+        model: Option<ModelSettings>,
+    },
+    /// Commit one AI provider row (spec §10): a new row, an edit, or a rename.
+    /// `original` is the row's name before the edit; `key` is a key typed in
+    /// the dialog, never a stored one.
+    SaveProvider {
+        /// The row's name before the edit, `None` for a new row.
+        original: Option<String>,
+        /// The edited row.
+        provider: ProviderSettings,
+        /// A key typed this session, for the keychain only.
+        key: Option<String>,
+    },
+    /// Delete the provider called `name`; the app blocks it while a model
+    /// uses it.
+    DeleteProvider {
+        /// The provider to remove.
+        name: String,
+    },
+    /// Run the "Test connection" probe against `provider` with `model`.
+    TestProvider {
+        /// The endpoint to dial.
+        provider: ProviderSettings,
+        /// The model to probe with.
+        model: ModelSettings,
+        /// A key typed in the dialog; wins over the stored one.
+        key: Option<String>,
+    },
     /// Sign out through the app's existing sign-out flow.
     SignOut,
+}
+
+#[cfg(unix)]
+impl From<AiTabAction> for SettingsAction {
+    fn from(action: AiTabAction) -> SettingsAction {
+        match action {
+            AiTabAction::SaveModel { role, model } => SettingsAction::SaveModel { role, model },
+            AiTabAction::SaveProvider {
+                original,
+                provider,
+                key,
+            } => SettingsAction::SaveProvider {
+                original,
+                provider,
+                key,
+            },
+            AiTabAction::DeleteProvider { name } => SettingsAction::DeleteProvider { name },
+            AiTabAction::TestProvider {
+                provider,
+                model,
+                key,
+            } => SettingsAction::TestProvider {
+                provider,
+                model,
+                key,
+            },
+        }
+    }
 }
 
 /// The signed-in account, for the window's Account row.
@@ -131,15 +313,23 @@ pub struct AccountInfo<'a> {
 
 /// Draw the window over the current screen, pushing what the user asked for
 /// onto `actions`.
+///
+/// `ai_settings` is the live `[ai]` table for the AI tab's table and dialog,
+/// and `key_presence` is the app's cached "is a key stored" answer (the
+/// keychain is never read in a frame).
 pub fn render(
     ctx: &egui::Context,
     state: &mut SettingsWindowState,
     account: Option<AccountInfo<'_>>,
+    ai_settings: &AiSettings,
+    key_presence: &BTreeMap<String, bool>,
     actions: &mut Vec<SettingsAction>,
 ) {
     if !state.open {
         return;
     }
+    #[cfg(not(unix))]
+    let _ = (ai_settings, key_presence);
     let p = theme::palette(ctx.theme() == egui::Theme::Dark);
     let mut close = false;
     let mut sign_out = false;
@@ -172,131 +362,165 @@ pub fn render(
             });
             rule(ui);
 
-            setting_row(ui, "Account", |ui| {
-                let Some(account) = &account else {
-                    ui.label(RichText::new("Not signed in").color(p.muted));
-                    return;
-                };
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let out = Btn::new(BtnKind::Danger, "Sign out")
-                            .icon(icons::LOG_OUT)
-                            .show(ui);
-                        if out.clicked() {
-                            sign_out = true;
-                            close = true;
-                        }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            avatar(ui, account.login, 28.0);
-                            ui.add_space(4.0);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 0.0;
-                                ui.label(RichText::new(account.login).font(fonts::semibold(13.0)));
-                                let summary = account_summary(account.host, account.scopes);
-                                let width = ui.available_width();
-                                let line = elided_label(
-                                    ui,
-                                    &summary,
-                                    egui::FontId::proportional(12.0),
-                                    p.muted,
-                                    width,
+            tab_bar(ui, &mut state.tab);
+            rule(ui);
+
+            match state.tab {
+                SettingsTab::General => {
+                    if let Some(account) = &account {
+                        setting_row(ui, "Account", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let out = Btn::new(BtnKind::Danger, "Sign out")
+                                            .icon(icons::LOG_OUT)
+                                            .show(ui);
+                                        if out.clicked() {
+                                            sign_out = true;
+                                            close = true;
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                avatar(ui, account.login, 28.0);
+                                                ui.add_space(4.0);
+                                                ui.vertical(|ui| {
+                                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                                    ui.label(
+                                                        RichText::new(account.login)
+                                                            .font(fonts::semibold(13.0)),
+                                                    );
+                                                    let summary = account_summary(
+                                                        account.host,
+                                                        account.scopes,
+                                                    );
+                                                    let width = ui.available_width();
+                                                    let line = elided_label(
+                                                        ui,
+                                                        &summary,
+                                                        egui::FontId::proportional(12.0),
+                                                        p.muted,
+                                                        width,
+                                                    );
+                                                    if !account.scopes.is_empty() {
+                                                        line.on_hover_text(
+                                                            account.scopes.join(", "),
+                                                        );
+                                                    }
+                                                });
+                                            },
+                                        );
+                                    },
                                 );
-                                if !account.scopes.is_empty() {
-                                    line.on_hover_text(account.scopes.join(", "));
-                                }
                             });
                         });
-                    });
-                });
-            });
+                    } else {
+                        setting_row(ui, "Account", |ui| {
+                            ui.label(RichText::new("Not signed in").color(p.muted));
+                        });
+                    }
 
-            setting_row(ui, "Theme", |ui| {
-                if let Some(theme) = segmented(
-                    ui,
-                    state.vm.theme,
-                    &[
-                        Seg::icon_text(Theme::Dark, icons::MOON, "Dark"),
-                        Seg::icon_text(Theme::Light, icons::SUN, "Light"),
-                        Seg::text(Theme::System, "System"),
-                    ],
-                ) {
-                    state.vm.theme = theme;
-                }
-            });
-
-            setting_row(ui, "Default scopes", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for scope in ALL_SCOPES {
-                        let selected = state.vm.default_scopes.contains(&scope);
-                        let chip = toggle_chip(
-                            ui,
-                            selected,
-                            Some(scope_icon(&scope)),
-                            &scope_label(&scope),
-                            None,
-                        );
-                        if chip.clicked() {
-                            if selected {
-                                state.vm.default_scopes.retain(|s| s != &scope);
-                            } else {
-                                state.vm.default_scopes.push(scope);
+                    setting_row(ui, "Default scopes", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for scope in ALL_SCOPES {
+                                let selected = state.vm.default_scopes.contains(&scope);
+                                let chip = toggle_chip(
+                                    ui,
+                                    selected,
+                                    Some(scope_icon(&scope)),
+                                    &scope_label(&scope),
+                                    None,
+                                );
+                                if chip.clicked() {
+                                    if selected {
+                                        state.vm.default_scopes.retain(|s| s != &scope);
+                                    } else {
+                                        state.vm.default_scopes.push(scope);
+                                    }
+                                }
                             }
+                        });
+                    });
+
+                    setting_row(ui, "Host", |ui| {
+                        Field::new(&mut state.vm.host)
+                            .icon(icons::GLOBE)
+                            .hint("github.com")
+                            .show(ui);
+                    });
+
+                    setting_row(ui, "OAuth client ID", |ui| {
+                        Field::new(&mut state.vm.client_id)
+                            .icon(icons::KEY_ROUND)
+                            .hint("Built-in")
+                            .show(ui);
+                    });
+                }
+                SettingsTab::Appearance => {
+                    setting_row(ui, "Theme", |ui| {
+                        if let Some(theme) = segmented(
+                            ui,
+                            state.vm.theme,
+                            &[
+                                Seg::icon_text(Theme::Dark, icons::MOON, "Dark"),
+                                Seg::icon_text(Theme::Light, icons::SUN, "Light"),
+                                Seg::text(Theme::System, "System"),
+                            ],
+                        ) {
+                            state.vm.theme = theme;
                         }
+                    });
+
+                    setting_row(ui, "Diff layout", |ui| {
+                        if let Some(mode) = segmented(
+                            ui,
+                            state.vm.diff_mode,
+                            &[
+                                Seg::icon_text(DiffMode::Split, icons::COLUMNS_2, "Split"),
+                                Seg::icon_text(DiffMode::Unified, icons::ROWS_2, "Unified"),
+                            ],
+                        ) {
+                            state.vm.diff_mode = mode;
+                        }
+                    });
+
+                    setting_row(ui, "Code font size", |ui| {
+                        if let Some(size) = segmented(
+                            ui,
+                            state.vm.code_font_size as u32,
+                            &[
+                                Seg::text(12, "12"),
+                                Seg::text(13, "13"),
+                                Seg::text(14, "14"),
+                            ],
+                        ) {
+                            state.vm.code_font_size = size as f32;
+                        }
+                    });
+                }
+                #[cfg(unix)]
+                SettingsTab::Ai => {
+                    for action in
+                        settings_ai_tab::render(ui, &mut state.ai_tab, ai_settings, key_presence)
+                    {
+                        actions.push(SettingsAction::from(action));
+                    }
+                }
+            }
+
+            if has_save_footer(state.tab) {
+                rule(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Btn::new(BtnKind::Primary, "Save").show(ui).clicked() {
+                        actions.push(SettingsAction::Apply(state.vm.clone()));
+                        close = true;
+                    }
+                    if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
+                        close = true;
                     }
                 });
-            });
-
-            setting_row(ui, "Diff layout", |ui| {
-                if let Some(mode) = segmented(
-                    ui,
-                    state.vm.diff_mode,
-                    &[
-                        Seg::icon_text(DiffMode::Split, icons::COLUMNS_2, "Split"),
-                        Seg::icon_text(DiffMode::Unified, icons::ROWS_2, "Unified"),
-                    ],
-                ) {
-                    state.vm.diff_mode = mode;
-                }
-            });
-
-            setting_row(ui, "Code font size", |ui| {
-                if let Some(size) = segmented(
-                    ui,
-                    state.vm.code_font_size as u32,
-                    &[
-                        Seg::text(12, "12"),
-                        Seg::text(13, "13"),
-                        Seg::text(14, "14"),
-                    ],
-                ) {
-                    state.vm.code_font_size = size as f32;
-                }
-            });
-
-            setting_row(ui, "Host", |ui| {
-                Field::new(&mut state.vm.host)
-                    .icon(icons::GLOBE)
-                    .hint("github.com")
-                    .show(ui);
-            });
-
-            setting_row(ui, "OAuth client ID", |ui| {
-                Field::new(&mut state.vm.client_id)
-                    .icon(icons::KEY_ROUND)
-                    .hint("Built-in")
-                    .show(ui);
-            });
-
-            rule(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Btn::new(BtnKind::Primary, "Save").show(ui).clicked() {
-                    actions.push(SettingsAction::Apply(state.vm.clone()));
-                    close = true;
-                }
-                if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
-                    close = true;
-                }
-            });
+            }
         });
     if sign_out {
         actions.push(SettingsAction::SignOut);
@@ -304,6 +528,50 @@ pub fn render(
     if close {
         state.open = false;
     }
+}
+
+/// The tab strip: a muted label per tab, the selected one semibold with an
+/// accent underline (mockup `ai-settings-tab.html`).
+fn tab_bar(ui: &mut egui::Ui, selected: &mut SettingsTab) {
+    ui.horizontal(|ui| {
+        for tab in all_tabs() {
+            if tab_button(ui, tab.label(), *selected == tab).clicked() {
+                *selected = tab;
+            }
+        }
+    });
+}
+
+/// One tab label.
+fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let p = theme::palette_of(ui);
+    let mut color = if active { p.text } else { p.muted };
+    let font = if active {
+        fonts::semibold(13.0)
+    } else {
+        egui::FontId::proportional(13.0)
+    };
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(label.len() as f32 * 8.0 + 20.0, 28.0),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        color = p.text;
+    }
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    if active {
+        ui.painter().hline(
+            rect.x_range(),
+            rect.bottom() - 1.0,
+            egui::Stroke::new(2.0, p.accent),
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// One settings row (mockup `.settings-grid`): a 130 pt `muted` label
@@ -370,6 +638,7 @@ fn scope_label(scope: &Scope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::tempdir;
 
     #[test]
     fn account_summary_names_few_scopes_and_counts_many() {
@@ -381,7 +650,6 @@ mod tests {
         let many: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
         assert_eq!(account_summary("github.com", &many), "github.com, 8 scopes");
     }
-    use crate::test_support::tempdir;
 
     #[test]
     fn window_paints_an_idle_frame_without_asking_for_anything() {
@@ -399,6 +667,8 @@ mod tests {
                     host: "github.com",
                     scopes: &["repo".to_owned()],
                 }),
+                &settings.ai,
+                &BTreeMap::new(),
                 &mut actions,
             );
         });
@@ -417,6 +687,7 @@ mod tests {
         assert_eq!(state.vm.host, "ghe.example.com");
         assert_eq!(state.vm.client_id, "cid");
         assert_eq!(state.vm.theme, Theme::System);
+        assert_eq!(state.tab, SettingsTab::General);
     }
 
     #[test]
@@ -436,5 +707,40 @@ mod tests {
             settings.account.is_some(),
             "apply never touches the account"
         );
+    }
+
+    /// Saving General/Appearance must not rewrite the `[ai]` table, and an
+    /// invalid AI row can no longer block it (spec §10).
+    #[test]
+    fn general_save_leaves_the_ai_table_untouched() {
+        use crate::persist::settings::{LlmApi, ProviderSettings};
+
+        let mut settings = Settings::default();
+        settings.ai.providers = vec![ProviderSettings {
+            name: "  not a valid name ".into(),
+            api: LlmApi::AnthropicMessages,
+            ..ProviderSettings::default()
+        }];
+        let before = settings.ai.clone();
+        let mut vm = settings_vm(&settings);
+        vm.host = "ghe.example.com".into();
+        assert!(vm.apply(&mut settings));
+        assert_eq!(
+            settings.ai, before,
+            "the General save neither validates nor rewrites [ai]"
+        );
+    }
+
+    #[test]
+    fn the_ai_tab_is_offered_only_on_unix() {
+        let tabs = all_tabs();
+        assert!(tabs.contains(&SettingsTab::General));
+        assert!(tabs.contains(&SettingsTab::Appearance));
+        #[cfg(unix)]
+        assert!(tabs.contains(&SettingsTab::Ai));
+        assert!(has_save_footer(SettingsTab::General));
+        assert!(has_save_footer(SettingsTab::Appearance));
+        #[cfg(unix)]
+        assert!(!has_save_footer(SettingsTab::Ai));
     }
 }

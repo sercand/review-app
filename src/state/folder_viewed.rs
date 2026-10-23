@@ -7,7 +7,7 @@
 //! files still to be marked.
 
 use crate::github::files::PrFile;
-use crate::state::filters::{matches, without_hide_viewed, FilterState};
+use crate::state::filters::{FilterState, matches, without_hide_viewed};
 use crate::state::viewed::ViewedSet;
 
 /// The three states a folder's viewed checkbox can show.

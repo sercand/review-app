@@ -1,0 +1,35 @@
+[package]
+name = "review-llm"
+description = "LLM clients for Anthropic Messages and OpenAI Responses behind neutral types: image and video input, history trimming, a trace file and tool definitions."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+async-openai = { version = "0.42.2", default-features = false, features = ["responses", "byot", "middleware", "rustls"] }
+base64 = "0.22"
+eventsource-stream = "0.2.3"
+futures = "0.3.34"
+http = "1.5"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+schemars = "1.2.3"
+secrecy = { version = "0.10.3", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["time", "macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", default-features = false }
+url = { version = "2.5", features = ["serde"] }
+
+[dev-dependencies]
+wiremock = "0.6.5"

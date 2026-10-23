@@ -2,8 +2,8 @@ mod common;
 
 use common::client;
 use gh_review_desktop::github::error::GhError;
-use serde_json::{json, Value};
-use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
+use serde_json::{Value, json};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::*};
 
 #[tokio::test]
 async fn me_sends_required_headers_and_reads_scopes() {

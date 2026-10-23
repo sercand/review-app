@@ -1,6 +1,6 @@
 use gh_review_desktop::auth::device_http::*;
 use serde_json::json;
-use wiremock::{matchers::*, Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate, matchers::*};
 
 #[tokio::test]
 async fn device_flow_requests_code_then_polls_until_token() {

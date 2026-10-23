@@ -13,12 +13,12 @@ use eframe::egui;
 use crate::diff::image::ImageMode;
 use crate::github::files::{FileStatus, PrFile};
 use crate::model::diff::DiffMode;
-use crate::ui::components::{pill, segmented, Btn, BtnKind, Seg, Tone};
+use crate::ui::components::{Btn, BtnKind, Seg, Tone, pill, segmented};
 use crate::ui::file_icons::file_icon;
 use crate::ui::fonts::mono_bold;
 use crate::ui::icons::{
-    self, icon_button, icon_toggle, COLUMNS_2, EXTERNAL_LINK, LAYERS, MESSAGE_SQUARE_PLUS, PILCROW,
-    ROWS_2, SEARCH, SQUARE, SQUARE_CHECK, SQUARE_SPLIT_HORIZONTAL, WRAP_TEXT,
+    self, COLUMNS_2, EXTERNAL_LINK, LAYERS, MESSAGE_SQUARE_PLUS, PILCROW, ROWS_2, SEARCH, SQUARE,
+    SQUARE_CHECK, SQUARE_SPLIT_HORIZONTAL, WRAP_TEXT, icon_button, icon_toggle,
 };
 use crate::ui::theme::palette_of;
 
@@ -93,7 +93,7 @@ pub fn file_header_vm(f: &PrFile, viewed: bool) -> FileHeaderVm {
 /// The kind that decides the header's controls: images get the viewer
 /// segments, everything else the diff controls.
 fn header_kind(f: &PrFile) -> HeaderKind {
-    use crate::diff::image::{image_kind, ImageKind};
+    use crate::diff::image::{ImageKind, image_kind};
     use crate::github::files::PatchState;
     match f.patch_state {
         PatchState::Binary => match image_kind(&f.path) {
@@ -354,16 +354,15 @@ fn kind_controls(
     }
     let show_diff_controls = matches!(vm.kind, HeaderKind::Text)
         || (matches!(vm.kind, HeaderKind::Image) && !rendered && is_svg(vm));
-    if is_svg(vm) {
-        if let Some(want_rendered) = segmented(
+    if is_svg(vm)
+        && let Some(want_rendered) = segmented(
             ui,
             rendered,
             &[Seg::text(true, "Rendered"), Seg::text(false, "Text")],
-        ) {
-            if want_rendered != rendered {
-                actions.push(FileHeaderAction::ToggleRendered);
-            }
-        }
+        )
+        && want_rendered != rendered
+    {
+        actions.push(FileHeaderAction::ToggleRendered);
     }
     if show_diff_controls {
         if icon_button(ui, SEARCH, &icons::key_hint("Find in file  ⌘F")).clicked() {
@@ -385,10 +384,9 @@ fn kind_controls(
                 Seg::icon(DiffMode::Unified, ROWS_2, "Unified  U"),
                 Seg::icon(DiffMode::Split, COLUMNS_2, "Split  S"),
             ],
-        ) {
-            if wanted != mode {
-                actions.push(FileHeaderAction::SetMode(wanted));
-            }
+        ) && wanted != mode
+        {
+            actions.push(FileHeaderAction::SetMode(wanted));
         }
     }
 }

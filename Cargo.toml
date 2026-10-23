@@ -1,8 +1,22 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
 [package]
 name = "gh-review-desktop"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.99"
 license = "MIT"
+
+[features]
+# Test doubles for the AI pipeline (`ai::testing`), for integration tests that
+# drive the worker. Unit tests compile them unconditionally.
+ai-testing = []
+
+[[test]]
+name = "ai_pipeline"
+required-features = ["ai-testing"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -30,6 +44,19 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot"] }
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+[target.'cfg(unix)'.dependencies]
+async-trait = "0.1.92"
+futures = "0.3.34"
+globset = "0.4"
+ignore = "0.4"
+review-llm = { path = "crates/llm" }
+review-sandbox = { path = "crates/sandbox" }
+rfd = "0.17.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+secrecy = "0.10.3"
+tokio-util = "0.7"
+url = "2.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.21"

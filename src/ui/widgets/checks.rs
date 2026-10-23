@@ -4,7 +4,7 @@
 
 use eframe::egui::{self, RichText};
 
-use crate::github::checks::{ci_state, CheckRun, CombinedStatus};
+use crate::github::checks::{CheckRun, CombinedStatus, ci_state};
 use crate::model::pr::CiState;
 use crate::ui::{icons, theme};
 

@@ -8,11 +8,11 @@
 
 use std::time::SystemTime;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use reqwest::header::{HeaderValue, ACCEPT};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::header::{ACCEPT, HeaderValue};
 
 use crate::github::client::{GithubClient, READ_BACKOFF};
-use crate::github::error::{classify, GhError, ResponseMeta};
+use crate::github::error::{GhError, ResponseMeta, classify};
 use crate::model::RepoRef;
 
 /// The `Accept` value that asks for the raw blob instead of the JSON metadata.

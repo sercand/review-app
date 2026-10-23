@@ -320,17 +320,21 @@ mod tests {
             e.last(),
             Some(PaletteEntry::File { index: 0, .. })
         ));
-        assert!(palette_entries(&actions, &[], "split")
-            .iter()
-            .all(|x| matches!(x, PaletteEntry::Action(_))));
+        assert!(
+            palette_entries(&actions, &[], "split")
+                .iter()
+                .all(|x| matches!(x, PaletteEntry::Action(_)))
+        );
     }
 
     #[test]
     fn fuzzy_matches_subsequence_and_ranks() {
         let es = registry();
-        assert!(fuzzy_filter(&es, "togview")
-            .iter()
-            .any(|e| e.id == "toggle_viewed"));
+        assert!(
+            fuzzy_filter(&es, "togview")
+                .iter()
+                .any(|e| e.id == "toggle_viewed")
+        );
         assert!(fuzzy_filter(&es, "zzz").is_empty());
     }
 

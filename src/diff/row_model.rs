@@ -87,6 +87,11 @@ pub enum RowRef {
     },
     /// The inline comment composer, inserted by Task 37.
     Composer,
+    /// An AI finding shown inline under its line, inserted by AI Task 5.
+    AiDraft {
+        /// The finding's database row id.
+        finding: i64,
+    },
 }
 
 /// The whole PR as one flat, virtualizable list of rows.
@@ -457,10 +462,12 @@ mod tests {
                 (Some(4), Some(4))
             ]
         );
-        assert!(build_one(&files, Some(0), DiffMode::Unified)
-            .rows
-            .iter()
-            .all(|r| !matches!(r, RowRef::Pair { .. })));
+        assert!(
+            build_one(&files, Some(0), DiffMode::Unified)
+                .rows
+                .iter()
+                .all(|r| !matches!(r, RowRef::Pair { .. }))
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::ui::components::{tone_colors, Tone};
+use crate::ui::components::{Tone, tone_colors};
 
 use crate::model::pr::{CiState, PrSummary, ReviewDecision};
 use crate::ui::{icons, theme};

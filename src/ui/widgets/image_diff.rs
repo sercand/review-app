@@ -16,7 +16,7 @@ use std::sync::Arc;
 use eframe::egui;
 
 use crate::diff::image::{
-    fit_size, image_kind, image_uri, size_delta_label, swipe_split, ImageBlob, ImageKind, ImageMode,
+    ImageBlob, ImageKind, ImageMode, fit_size, image_kind, image_uri, size_delta_label, swipe_split,
 };
 use crate::github::files::PrFile;
 
@@ -172,10 +172,10 @@ pub fn render(
 fn render_fallback(ui: &mut egui::Ui, browser_url: Option<&str>) -> f32 {
     let row = ui.horizontal(|ui| {
         ui.label("Binary file not shown");
-        if let Some(url) = browser_url {
-            if ui.button("Open in browser").clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_owned()));
-            }
+        if let Some(url) = browser_url
+            && ui.button("Open in browser").clicked()
+        {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_owned()));
         }
     });
     row.response.rect.height()
@@ -243,10 +243,10 @@ fn draw_swipe(
         ui.scope_id().with("swipe-divider"),
         egui::Sense::drag(),
     );
-    if response.dragged() {
-        if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
-            *swipe = swipe_split((pointer.x - rect.min.x) / rect.width().max(1.0));
-        }
+    if response.dragged()
+        && let Some(pointer) = ui.input(|i| i.pointer.interact_pos())
+    {
+        *swipe = swipe_split((pointer.x - rect.min.x) / rect.width().max(1.0));
     }
     ui.painter().line_segment(
         [

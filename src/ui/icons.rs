@@ -74,6 +74,7 @@ pub const ROWS_2: char = '\u{e43d}';
 pub const SEARCH: char = '\u{e154}';
 pub const SEND: char = '\u{e155}';
 pub const SETTINGS: char = '\u{e157}';
+pub const SPARKLES: char = '\u{e416}';
 pub const SQUARE: char = '\u{e16a}';
 pub const SQUARE_CHECK: char = '\u{e55d}';
 pub const SQUARE_SPLIT_HORIZONTAL: char = '\u{e3b9}';
@@ -157,6 +158,7 @@ pub const ALL: &[char] = &[
     SEARCH,
     SEND,
     SETTINGS,
+    SPARKLES,
     SQUARE,
     SQUARE_CHECK,
     SQUARE_SPLIT_HORIZONTAL,
@@ -299,6 +301,6 @@ mod tests {
             );
             assert!(seen.insert(c), "{c:?} listed twice");
         }
-        assert_eq!(ALL.len(), 78); // every constant above
+        assert_eq!(ALL.len(), 79); // every constant above
     }
 }

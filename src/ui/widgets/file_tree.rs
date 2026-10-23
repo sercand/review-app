@@ -14,8 +14,8 @@ use eframe::egui::{self, Align, Color32, Layout, Rect, RichText, ScrollArea, Sen
 
 use crate::github::files::{FileStatus, PrFile};
 use crate::model::tree::TreeNode;
-use crate::state::filters::{ordered_children, status_group, FilterState, TreeOrder};
-use crate::state::folder_viewed::{folder_state, TriState};
+use crate::state::filters::{FilterState, TreeOrder, ordered_children, status_group};
+use crate::state::folder_viewed::{TriState, folder_state};
 use crate::state::viewed::ViewedSet;
 use crate::ui::{file_icons, fonts, icons, theme};
 
@@ -48,6 +48,8 @@ pub struct TreeRowVm {
     pub comments: u32,
     /// Local pending comments on the file (Task 11).
     pub pending: u32,
+    /// Open AI draft findings on the file (AI Task 5).
+    pub ai_drafts: u32,
     /// Whether a directory is expanded (drives the chevron; Task 11).
     pub expanded: bool,
 }
@@ -112,11 +114,12 @@ pub fn flatten_visible(
     viewed: &ViewedSet,
     current: Option<&str>,
     counts: &HashMap<String, (u32, u32)>,
+    ai_drafts: &HashMap<String, u32>,
     order: TreeOrder,
 ) -> Vec<TreeRowVm> {
     let mut rows = Vec::new();
     push_children(
-        tree, 0, collapsed, files, filters, viewed, current, counts, order, &mut rows,
+        tree, 0, collapsed, files, filters, viewed, current, counts, ai_drafts, order, &mut rows,
     );
     rows
 }
@@ -132,12 +135,13 @@ fn push_children(
     viewed: &ViewedSet,
     current: Option<&str>,
     counts: &HashMap<String, (u32, u32)>,
+    ai_drafts: &HashMap<String, u32>,
     order: TreeOrder,
     rows: &mut Vec<TreeRowVm>,
 ) {
     for child in ordered_children(node, order) {
         rows.push(row_for(
-            child, indent, collapsed, files, filters, viewed, current, counts,
+            child, indent, collapsed, files, filters, viewed, current, counts, ai_drafts,
         ));
         if child.is_dir && !collapsed.contains(&child.path) {
             push_children(
@@ -149,6 +153,7 @@ fn push_children(
                 viewed,
                 current,
                 counts,
+                ai_drafts,
                 order,
                 rows,
             );
@@ -167,6 +172,7 @@ fn row_for(
     viewed: &ViewedSet,
     current: Option<&str>,
     counts: &HashMap<String, (u32, u32)>,
+    ai_drafts: &HashMap<String, u32>,
 ) -> TreeRowVm {
     if node.is_dir {
         return TreeRowVm {
@@ -181,12 +187,14 @@ fn row_for(
             current: false,
             comments: 0,
             pending: 0,
+            ai_drafts: 0,
             expanded: !collapsed.contains(&node.path),
         };
     }
 
     let file = node.file_index.and_then(|index| files.get(index));
     let (comments, pending) = counts.get(&node.path).copied().unwrap_or((0, 0));
+    let ai_drafts = ai_drafts.get(&node.path).copied().unwrap_or(0);
     TreeRowVm {
         indent,
         label: node.name.clone(),
@@ -202,6 +210,7 @@ fn row_for(
         current: current == Some(node.path.as_str()),
         comments,
         pending,
+        ai_drafts,
         expanded: false,
     }
 }
@@ -376,6 +385,14 @@ fn render_row(ui: &mut Ui, row: &TreeRowVm, actions: &mut Vec<TreeAction>) {
         paint_right(format!("−{}", row.deletions), mono.clone(), p.bad, 4.0);
         paint_right(format!("+{}", row.additions), mono.clone(), p.ok, 8.0);
     }
+    if row.ai_drafts > 0 {
+        paint_right(
+            format!("{} {}", icons::SPARKLES, row.ai_drafts),
+            egui::FontId::proportional(11.0),
+            p.ai,
+            6.0,
+        );
+    }
     if row.pending > 0 {
         paint_right(
             format!("{} {}", icons::MESSAGE_SQUARE_DASHED, row.pending),
@@ -547,6 +564,7 @@ mod tests {
             current: false,
             comments: 0,
             pending: 0,
+            ai_drafts: 0,
             expanded: false,
         };
         assert_eq!(
@@ -591,6 +609,7 @@ mod tests {
             &ViewedSet::default(),
             None,
             &HashMap::new(),
+            &HashMap::new(),
             TreeOrder::LargestFirst,
         );
         let names: Vec<_> = rows
@@ -613,6 +632,7 @@ mod tests {
             &ViewedSet::default(),
             None,
             &counts,
+            &HashMap::new(),
             TreeOrder::Path,
         );
         assert_eq!((rows[0].comments, rows[0].pending), (2, 1));
@@ -632,6 +652,7 @@ mod tests {
             &v,
             Some("src/a.rs"),
             &HashMap::new(),
+            &HashMap::new(),
             TreeOrder::Path,
         );
         let shape: Vec<_> = rows.iter().map(|r| (r.label.as_str(), r.indent)).collect();
@@ -650,6 +671,7 @@ mod tests {
                 &f,
                 &v,
                 None,
+                &HashMap::new(),
                 &HashMap::new(),
                 TreeOrder::Path
             )
@@ -671,6 +693,7 @@ mod tests {
             &filters,
             &viewed,
             None,
+            &HashMap::new(),
             &HashMap::new(),
             TreeOrder::Path,
         );

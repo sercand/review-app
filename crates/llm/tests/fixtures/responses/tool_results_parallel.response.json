@@ -1,0 +1,52 @@
+{
+  "id": "resp_6539041b-63bf-407e-bb9c-0c753313595c",
+  "object": "response",
+  "created_at": 1792139599,
+  "status": "completed",
+  "model": "qwen3.8-flash",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_6539041b-63bf-407e-bb9c-0c753313595c_0",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "The results appear swapped/mislabeled? Actually output shows Tokyo for first call and Paris for second — likely tool responses returned in different order. Just report correctly by city.\n"
+        }
+      ],
+      "content": []
+    },
+    {
+      "type": "message",
+      "id": "msg_6539041b-63bf-407e-bb9c-0c753313595c_1",
+      "status": "completed",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Here's the current weather:\n\n- **Paris:** 12°C with rain 🌧️\n- **Tokyo:** 24°C and sunny ☀️\n\nTokyo is noticeably warmer and drier right now — if you're packing for Paris, don't forget a rain jacket!",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 1024,
+  "previous_response_id": null,
+  "parallel_tool_calls": false,
+  "metadata": {},
+  "usage": {
+    "input_tokens": 409,
+    "input_tokens_details": {
+      "cached_tokens": 384,
+      "audio_tokens": 0
+    },
+    "output_tokens": 100,
+    "output_tokens_details": {
+      "reasoning_tokens": 36
+    },
+    "total_tokens": 509
+  }
+}

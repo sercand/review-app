@@ -16,18 +16,18 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::diff::annotate::{row_coordinate, rows_for_anchor};
-use crate::diff::expand::{gaps, Expand};
-use crate::diff::highlight::{syntax_for_path, HighlightCache, HighlightSpan};
-use crate::diff::image::{image_kind, ImageBlob, ImageKind, ImageMode};
+use crate::diff::expand::{Expand, gaps};
+use crate::diff::highlight::{HighlightCache, HighlightSpan, syntax_for_path};
+use crate::diff::image::{ImageBlob, ImageKind, ImageMode, image_kind};
 use crate::diff::options::{find_matches, next_match, prev_match};
 use crate::diff::row_model::{
-    display_text, pair_indices, RowModel, RowRef, HEADER_H, HUNK_H, ROW_H,
+    HEADER_H, HUNK_H, ROW_H, RowModel, RowRef, display_text, pair_indices,
 };
 use crate::diff::word::word_diff;
-use crate::github::files::{anchor_path, LoadedFile, PatchState, PrFile};
+use crate::github::files::{LoadedFile, PatchState, PrFile, anchor_path};
 use crate::model::comment::{Anchor, CommentTarget};
 use crate::model::diff::{DiffRow, LineKind, Side};
-use crate::state::composer::{anchor_warning, ComposerAction};
+use crate::state::composer::{ComposerAction, anchor_warning};
 use crate::state::pr_detail::{LoadPhase, PrSession};
 use crate::ui::icons::{CHEVRONS_DOWN, CHEVRONS_UP, PLUS, UNFOLD_VERTICAL};
 use crate::ui::theme::palette_of;
@@ -159,6 +159,20 @@ pub enum DiffAction {
         /// The pending comment's local id.
         local_id: u64,
     },
+    /// Keep an inline AI draft: into the pending review (a line finding) or
+    /// the review body (a summary item) (AI Task 5).
+    #[cfg(unix)]
+    AiKeep(i64),
+    /// Save the inline editor's text for finding `id` (AI Task 5). The
+    /// session has already written it to the finding; the app persists it.
+    #[cfg(unix)]
+    AiEdit(i64, String),
+    /// Drop an inline AI draft (AI Task 5).
+    #[cfg(unix)]
+    AiDrop(i64),
+    /// Ask the AI tab why it flagged finding `id` (AI Task 5).
+    #[cfg(unix)]
+    AiWhy(i64),
 }
 
 /// The height one line needs, in points.
@@ -858,7 +872,160 @@ fn render_row(
                 actions.extend(composer_actions.into_iter().map(DiffAction::Composer));
             });
         }
+        RowRef::AiDraft { finding } => {
+            #[cfg(unix)]
+            {
+                let id = *finding;
+                let indent = comment_indent(mode);
+                let width = ctx.full_width;
+                full_width_row(row, ctx, |ui, ctx| {
+                    let Some(finding) = ctx.session.ai.findings.get(&id).cloned() else {
+                        return;
+                    };
+                    let blocked = crate::state::pr_detail::keep_blocked(ctx.session);
+                    render_ai_draft(
+                        ui,
+                        &finding,
+                        ctx.session,
+                        width,
+                        indent,
+                        blocked.as_deref(),
+                        actions,
+                    );
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = finding;
+                blank_all(row, mode);
+            }
+        }
     }
+}
+
+/// Draw one inline AI draft: the ✦ tag, severity and title, its body and
+/// evidence, and the Keep / Edit / Drop / Why? controls (spec §12, AI Task 5).
+#[cfg(unix)]
+fn render_ai_draft(
+    ui: &mut egui::Ui,
+    finding: &crate::ai::review::Finding,
+    session: &mut PrSession,
+    width: f32,
+    indent: f32,
+    blocked: Option<&str>,
+    actions: &mut Vec<DiffAction>,
+) {
+    use crate::ai::review::FindingState;
+
+    let p = palette_of(ui);
+    let color = crate::ui::widgets::ai_panel::severity_color(p, finding.severity);
+    let inner = (width - indent - 28.0).max(180.0);
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(egui::Stroke::new(1.0, p.ai))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(crate::ui::icons::SPARKLES.to_string())
+                        .color(p.ai)
+                        .size(13.0),
+                );
+                ui.label(
+                    egui::RichText::new(finding.severity.label())
+                        .color(color)
+                        .size(11.0)
+                        .strong(),
+                );
+                ui.label(egui::RichText::new(&finding.title).strong().size(12.0));
+                if finding.state == FindingState::DroppedByVerifier {
+                    ui.label(
+                        egui::RichText::new("dropped by verifier")
+                            .color(p.muted)
+                            .size(11.0),
+                    );
+                }
+            });
+            if finding.state == FindingState::DroppedByVerifier
+                && let Some(reason) = &finding.state_reason
+            {
+                ui.label(
+                    egui::RichText::new(reason)
+                        .color(p.muted)
+                        .size(11.5)
+                        .italics(),
+                );
+            }
+            if session.ai.editing(finding.id) {
+                if let Some(buffer) = session.ai.edit_buffer_mut() {
+                    ui.add(
+                        egui::TextEdit::multiline(buffer)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked()
+                        && let Some((id, text)) = session.ai.save_edit()
+                    {
+                        actions.push(DiffAction::AiEdit(id, text));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        session.ai.cancel_edit();
+                    }
+                });
+                return;
+            }
+            ui.label(egui::RichText::new(&finding.body).size(12.0));
+            if !finding.evidence.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("evidence:").color(p.muted).size(11.0));
+                    for evidence in &finding.evidence {
+                        let label = match evidence.line {
+                            Some(line) => format!("{}:{}", evidence.path, line),
+                            None => evidence.path.clone(),
+                        };
+                        match session
+                            .files
+                            .iter()
+                            .position(|loaded| loaded.file.path == evidence.path)
+                        {
+                            Some(index) => {
+                                if ui.link(egui::RichText::new(label).size(11.0)).clicked() {
+                                    actions.push(DiffAction::SelectFile(index as u32));
+                                }
+                            }
+                            None => {
+                                ui.label(egui::RichText::new(label).color(p.muted).size(11.0))
+                                    .on_hover_text(&evidence.note);
+                            }
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if finding.state == FindingState::Draft {
+                    let keep = ui.add_enabled(blocked.is_none(), egui::Button::new("Keep"));
+                    if keep.clicked() {
+                        actions.push(DiffAction::AiKeep(finding.id));
+                    }
+                    if let Some(why) = blocked {
+                        keep.on_disabled_hover_text(why);
+                    }
+                }
+                if ui.button("Edit").clicked() {
+                    session.ai.start_edit(finding.id, finding.body.clone());
+                }
+                if finding.state == FindingState::Draft && ui.button("Drop").clicked() {
+                    actions.push(DiffAction::AiDrop(finding.id));
+                }
+                if ui.button("Why?").clicked() {
+                    actions.push(DiffAction::AiWhy(finding.id));
+                }
+            });
+        });
 }
 
 /// How far a comment row sits in from the table's left edge: past both
@@ -1325,27 +1492,27 @@ fn code_cell(
     // The hover plus button: only while the pointer is over the cell. The
     // cell's rect, not `response.hovered()`, decides: the button takes the
     // hover from the cell, which would hide it again before it is clicked.
-    if ui.rect_contains_pointer(rect) {
-        if let Some(target) = target {
-            let plus = egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 11.0, mid),
-                egui::vec2(18.0, 18.0),
-            );
-            let id = ui.make_persistent_id(("diff-plus", rect.min.x as i32, rect.min.y as i32));
-            let button = ui.interact(plus, id, egui::Sense::click());
-            ui.painter().rect_filled(plus, 4.0, palette.accent);
-            ui.painter().text(
-                plus.center(),
-                egui::Align2::CENTER_CENTER,
-                PLUS.to_string(),
-                egui::FontId::proportional(12.0),
-                palette.accent_ink,
-            );
-            let clicked = button.clicked();
-            button.on_hover_text("Comment on line");
-            if clicked {
-                return Some(target);
-            }
+    if ui.rect_contains_pointer(rect)
+        && let Some(target) = target
+    {
+        let plus = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 11.0, mid),
+            egui::vec2(18.0, 18.0),
+        );
+        let id = ui.make_persistent_id(("diff-plus", rect.min.x as i32, rect.min.y as i32));
+        let button = ui.interact(plus, id, egui::Sense::click());
+        ui.painter().rect_filled(plus, 4.0, palette.accent);
+        ui.painter().text(
+            plus.center(),
+            egui::Align2::CENTER_CENTER,
+            PLUS.to_string(),
+            egui::FontId::proportional(12.0),
+            palette.accent_ink,
+        );
+        let clicked = button.clicked();
+        button.on_hover_text("Comment on line");
+        if clicked {
+            return Some(target);
         }
     }
     None
@@ -1925,15 +2092,19 @@ mod tests {
         session.open_comment(CommentTarget::File {
             path: "src/a.rs".into(),
         });
-        assert!(session
-            .row_model
-            .rows
-            .contains(&RowRef::Thread { thread: 0 }));
-        assert!(session
-            .row_model
-            .rows
-            .iter()
-            .any(|r| matches!(r, RowRef::Pending { .. })));
+        assert!(
+            session
+                .row_model
+                .rows
+                .contains(&RowRef::Thread { thread: 0 })
+        );
+        assert!(
+            session
+                .row_model
+                .rows
+                .iter()
+                .any(|r| matches!(r, RowRef::Pending { .. }))
+        );
         assert!(session.row_model.rows.contains(&RowRef::Composer));
 
         let mut cache = HighlightCache::new(16, Box::new(SyntectHighlighter::new(true)));

@@ -1,0 +1,78 @@
+{
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is the weather in Paris and in Tokyo?",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "call_paris",
+          "input": {
+            "city": "Paris"
+          },
+          "name": "get_weather",
+          "type": "tool_use"
+        },
+        {
+          "id": "call_tokyo",
+          "input": {
+            "city": "Tokyo"
+          },
+          "name": "get_weather",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": [
+            {
+              "text": "Tokyo: 24°C, sunny",
+              "type": "text"
+            }
+          ],
+          "tool_use_id": "call_tokyo",
+          "type": "tool_result"
+        },
+        {
+          "content": [
+            {
+              "text": "Paris: 12°C, rain",
+              "type": "text"
+            }
+          ],
+          "tool_use_id": "call_paris",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-flash",
+  "tools": [
+    {
+      "description": "Get the current weather for one city.",
+      "input_schema": {
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ],
+        "type": "object"
+      },
+      "name": "get_weather"
+    }
+  ]
+}

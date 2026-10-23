@@ -11,7 +11,11 @@ use egui::{Popup, PopupCloseBehavior, RichText, UiBuilder};
 
 use crate::github::search::{Scope, ScopeConstraint, Sort};
 use crate::model::RepoRef;
-use crate::state::pr_list::{counter_label, visible_items, PrListMsg, PrListState};
+#[cfg(unix)]
+use crate::state::local_repos::ListTab;
+use crate::state::pr_list::{PrListMsg, PrListState, counter_label, visible_items};
+#[cfg(unix)]
+use crate::ui::widgets::local_repos::LocalReposAction;
 use crate::ui::widgets::pr_row;
 use crate::ui::{icons, theme};
 
@@ -47,6 +51,10 @@ pub enum PrListAction {
     Palette,
     /// Switch between the dark and light themes.
     ToggleTheme,
+    /// Show one of the screen's tabs (AI settings Task 9). The Local tab is
+    /// unix-only, so on Windows the enum has no tab actions at all.
+    #[cfg(unix)]
+    SetTab(ListTab),
 }
 
 /// The list's title bar (mockup `prs.html` `.titlebar`): the screen's name,
@@ -83,6 +91,76 @@ pub fn render_title_bar(
             }
         });
     });
+}
+
+/// The screen's tab strip (AI settings Task 9, mockup
+/// `ai-settings/local-repos-accordion.html`): `All PRs | Local repos` with
+/// the active tab underlined, and on the Local tab the "+ Add local repo…"
+/// button on the right. Unix-only: on Windows the screen has no tabs (a
+/// saved `Local` loads as `All`, see [`ListTab::for_platform`]).
+#[cfg(unix)]
+pub fn render_tabs(
+    ui: &mut egui::Ui,
+    tab: ListTab,
+    actions: &mut Vec<PrListAction>,
+    local_actions: &mut Vec<LocalReposAction>,
+) {
+    let pal = theme::palette_of(ui);
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(16, 0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(18.0, 0.0);
+                for (value, label) in [(ListTab::All, "All PRs"), (ListTab::Local, "Local repos")] {
+                    let response = tab_label(ui, tab == value, label);
+                    if tab != value && response.clicked() {
+                        actions.push(PrListAction::SetTab(value));
+                    }
+                }
+                if tab == ListTab::Local {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let button = crate::ui::components::Btn::new(
+                            crate::ui::components::BtnKind::Default,
+                            "Add local repo…",
+                        )
+                        .icon(icons::PLUS)
+                        .show(ui);
+                        if button.clicked() {
+                            local_actions.push(LocalReposAction::AddRepo);
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter()
+                .hline(rect.x_range(), rect.center().y, (1.0, pal.line));
+            ui.add_space(10.0);
+        });
+}
+
+/// One tab of [`render_tabs`]: muted when inactive, semibold over an accent
+/// underline when active (mockup `.subtitle` strip).
+#[cfg(unix)]
+fn tab_label(ui: &mut egui::Ui, active: bool, label: &str) -> egui::Response {
+    let pal = theme::palette_of(ui);
+    let font = if active {
+        crate::ui::fonts::semibold(13.0)
+    } else {
+        egui::FontId::proportional(13.0)
+    };
+    let color = if active { pal.text } else { pal.muted };
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let size = egui::vec2(galley.size().x, galley.size().y + 8.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    ui.painter()
+        .galley(egui::pos2(rect.left(), rect.top()), galley, color);
+    if active {
+        ui.painter()
+            .hline(rect.x_range(), rect.bottom(), (2.0, pal.accent));
+    }
+    response
 }
 
 /// The dropdown label for a sort.
@@ -259,19 +337,20 @@ fn handle_shortcuts(
         form.sort_open = false;
         ui.memory_mut(|mem| mem.request_focus(filter_id));
     }
-    if enter && !form.repo_open && !form.sort_open && focused != Some(filter_id) {
-        if let Some((repo_id, number)) = state.selected.clone() {
-            if let Some(pr) = state
-                .items
-                .iter()
-                .find(|pr| pr.repo.id() == repo_id && pr.number == number)
-            {
-                actions.push(PrListAction::Open {
-                    repo: pr.repo.clone(),
-                    number,
-                });
-            }
-        }
+    if enter
+        && !form.repo_open
+        && !form.sort_open
+        && focused != Some(filter_id)
+        && let Some((repo_id, number)) = state.selected.clone()
+        && let Some(pr) = state
+            .items
+            .iter()
+            .find(|pr| pr.repo.id() == repo_id && pr.number == number)
+    {
+        actions.push(PrListAction::Open {
+            repo: pr.repo.clone(),
+            number,
+        });
     }
 }
 

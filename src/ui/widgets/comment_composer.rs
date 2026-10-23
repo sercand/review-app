@@ -10,8 +10,8 @@ use eframe::egui;
 
 use crate::model::comment::CommentTarget;
 use crate::model::diff::Side;
-use crate::state::composer::{can_submit, mode_buttons, ComposerAction, ComposerState};
-use crate::ui::icons::{icon_button, BOLD, CODE, FILE_DIFF, HARD_DRIVE, LINK};
+use crate::state::composer::{ComposerAction, ComposerState, can_submit, mode_buttons};
+use crate::ui::icons::{BOLD, CODE, FILE_DIFF, HARD_DRIVE, LINK, icon_button};
 use crate::ui::theme::palette_of;
 use crate::ui::widgets::markdown;
 
@@ -332,7 +332,7 @@ fn side_label(side: Side) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::composer::{reduce, CommentMode, ComposerMsg};
+    use crate::state::composer::{CommentMode, ComposerMsg, reduce};
     use crate::test_support::line_anchor;
 
     /// The widget must paint the composer for a line target — text edit,

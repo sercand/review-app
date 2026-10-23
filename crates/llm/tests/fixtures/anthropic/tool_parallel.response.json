@@ -1,0 +1,36 @@
+{
+  "id": "msg_8567867a-62c5-4df6-981e-9bf41116d73f",
+  "type": "message",
+  "role": "assistant",
+  "model": "qwen3.8-flash",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "We need to respond to user: \"What is the weather in Paris and in Tokyo? Call get_weather once for each city, in parallel, in this turn.\"\n\nNeed call get_weather twice in parallel in same block. Then final answer after tool results. Ensure no extra text? We can just tool call.\n"
+    },
+    {
+      "type": "tool_use",
+      "id": "call_00000000000001f8_0",
+      "name": "get_weather",
+      "input": {
+        "city": "Paris"
+      }
+    },
+    {
+      "type": "tool_use",
+      "id": "call_00000000000001f8_1",
+      "name": "get_weather",
+      "input": {
+        "city": "Tokyo"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 332,
+    "output_tokens": 118,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}

@@ -6,8 +6,8 @@ mod common;
 
 use common::client;
 use gh_review_desktop::github::reviews::ReviewState;
-use gh_review_desktop::model::review::ReviewEvent;
 use gh_review_desktop::model::RepoRef;
+use gh_review_desktop::model::review::ReviewEvent;
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

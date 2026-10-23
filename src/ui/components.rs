@@ -11,7 +11,7 @@ use eframe::egui::{self, Color32, FontId, Rect, Response, Sense, Stroke, StrokeK
 
 use crate::ui::fonts::semibold;
 use crate::ui::icons::key_hint;
-use crate::ui::theme::{palette_of, Palette};
+use crate::ui::theme::{Palette, palette_of};
 
 /// The height of a button, a field, and a toolbar chip.
 pub const CONTROL_H: f32 = 28.0;

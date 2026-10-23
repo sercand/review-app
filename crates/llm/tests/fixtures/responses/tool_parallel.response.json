@@ -1,0 +1,55 @@
+{
+  "id": "resp_7941c083-5a36-4c79-9e6d-b54e94fb5e76",
+  "object": "response",
+  "created_at": 1792139594,
+  "status": "completed",
+  "model": "qwen3.8-flash",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_7941c083-5a36-4c79-9e6d-b54e94fb5e76_0",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "We need to respond to user: \"What is the weather in Paris and in Tokyo? Call get_weather once for each city, in parallel, in this turn.\"\n\nNeed call get_weather twice in parallel in same block. Then final answer after tool results. Ensure no extra text? We can just tool call.\n"
+        }
+      ],
+      "content": []
+    },
+    {
+      "type": "function_call",
+      "id": "fc_7941c083-5a36-4c79-9e6d-b54e94fb5e76_1",
+      "call_id": "call_00000000000001ff_0",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Paris\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call",
+      "id": "fc_7941c083-5a36-4c79-9e6d-b54e94fb5e76_2",
+      "call_id": "call_00000000000001ff_1",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Tokyo\"}",
+      "status": "completed"
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 1024,
+  "previous_response_id": null,
+  "parallel_tool_calls": false,
+  "metadata": {},
+  "usage": {
+    "input_tokens": 332,
+    "input_tokens_details": {
+      "cached_tokens": 320,
+      "audio_tokens": 0
+    },
+    "output_tokens": 118,
+    "output_tokens_details": {
+      "reasoning_tokens": 65
+    },
+    "total_tokens": 450
+  }
+}

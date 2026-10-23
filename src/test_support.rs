@@ -35,6 +35,31 @@ pub fn tempdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("failed to create a temporary directory")
 }
 
+/// A [`crate::ai::review::RunState`] over a fresh in-memory store with one
+/// session and one full run, for `ToolCx` test contexts. The event receiver
+/// is dropped at once, so the state's sends fail and are ignored.
+#[cfg(unix)]
+pub fn ai_run_state() -> std::sync::Arc<crate::ai::review::RunState> {
+    use crate::ai::review::RunState;
+    use crate::ai::store::{PrKey, RunKind, Store};
+    use std::sync::Arc;
+
+    let store = Arc::new(Store::open_in_memory().expect("in-memory store"));
+    let session = store
+        .session_id(&PrKey {
+            host: "github.com".to_string(),
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            number: 7,
+        })
+        .expect("session row");
+    let run = store
+        .run_begin(session, RunKind::Full, None, "sha_head")
+        .expect("run row");
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    Arc::new(RunState::new(store, session, run, tx))
+}
+
 /// A repository reference in the `o/r` every unit test uses.
 pub fn repo() -> crate::model::RepoRef {
     crate::model::RepoRef::new("o", "r")
@@ -123,6 +148,37 @@ pub fn loaded(path: &str, patch: &str) -> crate::github::files::LoadedFile {
 /// Parse a test patch, panicking on a malformed one.
 fn parse(patch: &str) -> Vec<crate::model::diff::Hunk> {
     crate::diff::parse::parse_patch(patch).expect("the test patch should parse")
+}
+
+/// An [`crate::ai::review::Finding`] in `state`, anchored to `anchor`, from
+/// the run's first reviewer.
+#[cfg(unix)]
+pub fn ai_finding(
+    id: i64,
+    anchor: crate::ai::review::FindingAnchor,
+    severity: crate::ai::review::Severity,
+    state: crate::ai::review::FindingState,
+    title: &str,
+    body: &str,
+) -> crate::ai::review::Finding {
+    crate::ai::review::Finding {
+        id,
+        run_id: 1,
+        agent: crate::ai::tools::AgentRef {
+            id: 1,
+            role: crate::ai::tools::AgentRole::Reviewer,
+            label: "reviewer:g1".to_owned(),
+        },
+        anchor,
+        severity,
+        title: title.to_owned(),
+        body: body.to_owned(),
+        evidence: Vec::new(),
+        checklist_item: None,
+        state,
+        state_reason: None,
+        pending_local_id: None,
+    }
 }
 
 /// A single-line [`crate::model::comment::Anchor`] on the RIGHT side of `path`

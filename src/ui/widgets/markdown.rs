@@ -384,19 +384,19 @@ impl Builder {
                 }
             }
             TagEnd::TableCell => {
-                if let Some(cell) = self.cell.take() {
-                    if let Some(row) = self.row.as_mut() {
-                        row.push(cell.trim().to_owned());
-                    }
+                if let Some(cell) = self.cell.take()
+                    && let Some(row) = self.row.as_mut()
+                {
+                    row.push(cell.trim().to_owned());
                 }
             }
             TagEnd::TableRow | TagEnd::TableHead => {
                 // Tables have no block of their own: each row becomes a
                 // paragraph of `cell | cell`.
-                if let Some(row) = self.row.take() {
-                    if !row.is_empty() {
-                        self.blocks.push(MdBlock::Paragraph(row.join(" | ")));
-                    }
+                if let Some(row) = self.row.take()
+                    && !row.is_empty()
+                {
+                    self.blocks.push(MdBlock::Paragraph(row.join(" | ")));
                 }
             }
             _ => {}
@@ -458,20 +458,23 @@ mod tests {
     #[test]
     fn drops_raw_html() {
         let doc = to_doc("<script>alert(1)</script>\n\nhi");
-        assert!(doc
-            .blocks
-            .iter()
-            .all(|b| !matches!(b, MdBlock::Paragraph(p) if p.contains("script"))));
-        assert!(doc
-            .blocks
-            .iter()
-            .any(|b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi"))));
+        assert!(
+            doc.blocks
+                .iter()
+                .all(|b| !matches!(b, MdBlock::Paragraph(p) if p.contains("script")))
+        );
+        assert!(
+            doc.blocks
+                .iter()
+                .any(|b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi")))
+        );
         // Inline HTML is dropped too: the tag markup must not survive.
         let doc = to_doc("hi <b>there</b>");
-        assert!(doc
-            .blocks
-            .iter()
-            .any(|b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi") && !p.contains("<b>"))));
+        assert!(
+            doc.blocks.iter().any(
+                |b| matches!(b, MdBlock::Paragraph(p) if p.contains("hi") && !p.contains("<b>"))
+            )
+        );
     }
 
     #[test]

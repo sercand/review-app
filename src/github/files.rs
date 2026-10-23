@@ -132,7 +132,7 @@ impl From<WireFile> for PrFile {
 ///
 /// `diff` is `None` unless GitHub sent a patch ([`PatchState::Present`]) and it
 /// parsed cleanly; a binary or too-large file has no diff to show.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoadedFile {
     /// The file, as the files API described it.
     pub file: PrFile,

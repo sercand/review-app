@@ -1,0 +1,47 @@
+{
+  "id": "resp_12657f1b-abc0-4587-8083-90e9aee66f38",
+  "object": "response",
+  "created_at": 1792139593,
+  "status": "completed",
+  "model": "qwen3.8-flash",
+  "output": [
+    {
+      "type": "reasoning",
+      "id": "rs_12657f1b-abc0-4587-8083-90e9aee66f38_0",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "The user wants me to tap the Play button with id `btn_play`.\n"
+        }
+      ],
+      "content": []
+    },
+    {
+      "type": "function_call",
+      "id": "fc_12657f1b-abc0-4587-8083-90e9aee66f38_1",
+      "call_id": "call_00000000000001fe_0",
+      "name": "tap",
+      "arguments": "{\"id\":\"btn_play\"}",
+      "status": "completed"
+    }
+  ],
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 512,
+  "previous_response_id": null,
+  "parallel_tool_calls": false,
+  "metadata": {},
+  "usage": {
+    "input_tokens": 376,
+    "input_tokens_details": {
+      "cached_tokens": 320,
+      "audio_tokens": 0
+    },
+    "output_tokens": 43,
+    "output_tokens_details": {
+      "reasoning_tokens": 17
+    },
+    "total_tokens": 419
+  }
+}

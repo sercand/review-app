@@ -5,7 +5,7 @@
 mod common;
 
 use common::client;
-use gh_review_desktop::github::threads::{resolve_vars, RESOLVE_MUTATION, UNRESOLVE_MUTATION};
+use gh_review_desktop::github::threads::{RESOLVE_MUTATION, UNRESOLVE_MUTATION, resolve_vars};
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,10 +23,12 @@ async fn resolve_sends_thread_id_and_reads_state() {
             {"data": {"resolveReviewThread": {"thread": {"isResolved": true}}}})))
         .mount(&server)
         .await;
-    assert!(client(&server.uri())
-        .set_thread_resolved("PRRT_kwDOA", true)
-        .await
-        .unwrap());
+    assert!(
+        client(&server.uri())
+            .set_thread_resolved("PRRT_kwDOA", true)
+            .await
+            .unwrap()
+    );
 }
 
 #[test]

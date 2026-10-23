@@ -4,18 +4,28 @@
     {
       "id": 1,
       "name": "build",
-      "head_sha": "c0ffee0000000000000000000000000000000001",
+      "head_sha": "c0ffee00000000000000000000000001",
       "status": "completed",
       "conclusion": "failure",
-      "html_url": "https://github.com/o/r/actions/runs/1/job/1"
+      "html_url": "https://github.com/o/r/actions/runs/1/job/1",
+      "output": {
+        "title": "Build failed",
+        "summary": "cargo build exited 101",
+        "text": "error[E0308]: mismatched types"
+      }
     },
     {
       "id": 2,
       "name": "test",
-      "head_sha": "c0ffee0000000000000000000000000000000001",
+      "head_sha": "c0ffee00000000000000000000000001",
       "status": "completed",
       "conclusion": "success",
-      "html_url": "https://github.com/o/r/actions/runs/2/job/2"
+      "html_url": "https://github.com/o/r/actions/runs/2/job/2",
+      "output": {
+        "title": "Tests passed",
+        "summary": null,
+        "text": null
+      }
     }
   ]
 }

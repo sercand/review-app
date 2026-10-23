@@ -139,7 +139,7 @@ mod native {
     use eframe::egui;
     use muda::{AboutMetadata, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
-    use super::{Entry, APP_MENU, MENUS};
+    use super::{APP_MENU, Entry, MENUS};
 
     /// The installed menu bar and the channel its clicks arrive on.
     pub struct NativeMenu {

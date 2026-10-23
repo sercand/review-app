@@ -11,17 +11,17 @@ use eframe::egui;
 use std::time::Instant;
 
 use crate::diff::highlight::HighlightCache;
-use crate::diff::row_model::{display_text, RowRef, ROW_H};
+use crate::diff::row_model::{ROW_H, RowRef, display_text};
 use crate::github::client::endpoints_for;
 use crate::github::files::PrFile;
 use crate::model::tree::build_tree;
-use crate::state::filters::{matches, without_hide_viewed, FilterState};
+use crate::state::filters::{FilterState, matches, without_hide_viewed};
 use crate::state::folder_viewed::toggle_folder_viewed;
-use crate::state::pr_detail::{head_moved_since_pin, viewer_is_author, PrSession};
+use crate::state::pr_detail::{PrSession, head_moved_since_pin, viewer_is_author};
 use crate::state::viewed::ViewedSet;
 use crate::ui::widgets::diff_view::{self, DiffAction, DiffViewState};
 use crate::ui::widgets::file_header::{self, FileHeaderAction, FooterAction as FileFooterAction};
-use crate::ui::widgets::file_tree::{self, flatten_visible, TreeAction};
+use crate::ui::widgets::file_tree::{self, TreeAction, flatten_visible};
 use crate::ui::widgets::filter_bar;
 use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::metadata_panel;
@@ -63,6 +63,9 @@ pub enum PrDetailAction {
     FileHeader(FileHeaderAction),
     /// A control in the file footer bar (Task 7).
     FileFooter(FileFooterAction),
+    /// A control in the ✦ AI tab (spec §12). Unix-only with the AI surface.
+    #[cfg(unix)]
+    Ai(crate::ui::widgets::ai_panel::AiPanelAction),
 }
 
 /// The screen's own layout state, owned across frames by the app.
@@ -133,6 +136,17 @@ pub struct ScreenInputs<'a> {
     pub theme: crate::ui::theme::Theme,
     /// Whether the OS is dark right now, same reason.
     pub system_dark: bool,
+    /// Whether the AI surface is on (`settings.ai.models.default` is set),
+    /// which decides whether the top bar shows its ✦ AI review button.
+    pub ai_configured: bool,
+    /// The Local checkout row above the ✦ AI tab's controls (AI settings
+    /// Task 7); `None` hides the row.
+    #[cfg(unix)]
+    pub local_checkout: Option<&'a crate::ui::widgets::ai_panel::LocalCheckoutVm>,
+    /// The repo's AI settings entry for the row's commands summary; `None`
+    /// when the repo has no entry yet.
+    #[cfg(unix)]
+    pub repo_ai: Option<&'a crate::persist::settings::RepoAiSettings>,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -151,6 +165,9 @@ pub fn render(
     let write_blocked = inputs.write_blocked;
     let mut actions = Vec::new();
     let mut tree_actions = Vec::new();
+    // The ✦ AI tab's controls, reported through `PrDetailAction::Ai`.
+    #[cfg(unix)]
+    let mut ai_actions: Vec<crate::ui::widgets::ai_panel::AiPanelAction> = Vec::new();
 
     // The file tree and the summary work from `PrFile`s; the session keeps the
     // loaded files. Built once per frame and shared by the tree build, the row
@@ -159,6 +176,15 @@ pub fn render(
 
     // The review view-model is read by the top bar's popover and the banner
     // strip; computed once per frame before either borrows the session.
+    // The AI draft's suggestion line rides in as an input (Plan 3 Task 6).
+    #[cfg(unix)]
+    let suggested = session
+        .ai
+        .draft
+        .as_ref()
+        .map(|draft| review_panel::suggestion_line(draft.verdict, &draft.rationale));
+    #[cfg(not(unix))]
+    let suggested: Option<String> = None;
     let panel_inputs = review_panel::PanelInputs {
         pending: &session.pending,
         viewer_is_author: viewer_is_author(session, login),
@@ -166,6 +192,7 @@ pub fn render(
         head_moved_since_pin: head_moved_since_pin(session),
         write_blocked: write_blocked.map(str::to_owned),
         threads: &session.threads,
+        suggested: suggested.as_deref(),
     };
     let review_vm = review_panel::review_panel_vm(&panel_inputs);
 
@@ -180,7 +207,7 @@ pub fn render(
 
     // The top bar: back, state pill, repo/title, CI, tools, and the Review
     // button whose popover replaced the bottom review panel (Task 12).
-    let bar_vm = top_bar::top_bar_vm(session);
+    let bar_vm = top_bar::top_bar_vm(session, inputs.ai_configured);
     let mut bar_actions = Vec::new();
     let mut review_actions = Vec::new();
     let mut merge_actions = Vec::new();
@@ -221,6 +248,20 @@ pub fn render(
             top_bar::TopBarAction::Settings => actions.push(PrDetailAction::OpenSettings),
             top_bar::TopBarAction::ToggleDetails => state.right_open = !state.right_open,
             top_bar::TopBarAction::OpenInBrowser => actions.push(PrDetailAction::OpenInBrowser),
+            // The ✦ AI review button rides the tab's own actions (spec §4
+            // step 2), so the top bar and the tab share one path.
+            #[cfg(unix)]
+            top_bar::TopBarAction::AiStart => {
+                actions.push(PrDetailAction::Ai(
+                    crate::ui::widgets::ai_panel::AiPanelAction::Start,
+                ));
+            }
+            #[cfg(unix)]
+            top_bar::TopBarAction::AiContinue => {
+                actions.push(PrDetailAction::Ai(
+                    crate::ui::widgets::ai_panel::AiPanelAction::Continue,
+                ));
+            }
         }
     }
     if review_actions.iter().any(review_panel::closes_popover) {
@@ -258,33 +299,57 @@ pub fn render(
         .default_size(state.right_pane)
         .show_collapsible(ui, &mut state.right_open, |ui| {
             // The whole right pane is the tabbed details panel: Overview,
-            // Conversation, Commits, and Checks (Tasks 50, 51, and 13).
+            // Conversation, Commits, Checks, and the ✦ AI tab (Tasks 50,
+            // 51, 13, and Plan 3).
             let web = endpoints_for(&session.host).web;
             let counts = metadata_panel::tab_counts(session);
-            metadata_panel::render(
-                ui,
-                metadata_panel::PanelInputs {
-                    metadata: session.metadata.as_ref(),
-                    commits: &session.commits,
-                    check_runs: &session.check_runs,
-                    combined: session.combined_status.as_ref(),
-                    reviews: &session.reviews,
-                    conversation: &session.conversation,
-                    web: &web,
-                    repo: &session.repo,
-                },
-                &mut state.details_tab,
-                counts,
-            );
+            let meta_inputs = metadata_panel::PanelInputs {
+                metadata: session.metadata.as_ref(),
+                commits: &session.commits,
+                check_runs: &session.check_runs,
+                combined: session.combined_status.as_ref(),
+                reviews: &session.reviews,
+                conversation: &session.conversation,
+                web: &web,
+                repo: &session.repo,
+            };
+            metadata_panel::render_tab_strip(ui, &mut state.details_tab, counts);
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("metadata-panel")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    #[cfg(unix)]
+                    if state.details_tab == metadata_panel::DetailsTab::Ai {
+                        // The AI tab reads the session's reducer state and
+                        // reports its own actions (spec §12); the Local
+                        // checkout row rides in through the screen inputs
+                        // (AI settings Task 7).
+                        let ai_inputs = crate::ui::widgets::ai_panel::PanelInputs {
+                            checkout: inputs.local_checkout,
+                            repo: inputs.repo_ai,
+                        };
+                        ai_actions = crate::ui::widgets::ai_panel::render(
+                            ui,
+                            &session.ai,
+                            &ai_inputs,
+                            session.ai.show_dropped,
+                        );
+                        return;
+                    }
+                    metadata_panel::render_body(ui, &meta_inputs, state.details_tab);
+                });
         });
     // Only capture while open: the close animation slides the panel through
     // every smaller width on its way out, and none of those are the size the
     // user chose.
-    if state.right_open {
-        if let Some(right) = right {
-            state.right_pane = right.response.rect.width();
-        }
+    if state.right_open
+        && let Some(right) = right
+    {
+        state.right_pane = right.response.rect.width();
     }
+    #[cfg(unix)]
+    actions.extend(ai_actions.into_iter().map(PrDetailAction::Ai));
 
     // The review draft is edited and submitted from the top bar's popover
     // now (Task 12); the banners it used to carry moved to the strip above
@@ -423,6 +488,10 @@ fn render_files_pane(
     let include = |f: &PrFile| matches(f, &session.filters, &session.viewed);
     let tree = build_tree(pr_files, &include);
     let counts = crate::state::pr_detail::comment_counts(&session.threads, &session.pending);
+    #[cfg(unix)]
+    let ai_drafts = crate::state::pr_detail::ai_draft_counts(&session.ai);
+    #[cfg(not(unix))]
+    let ai_drafts = std::collections::HashMap::new();
     let rows = flatten_visible(
         &tree,
         &session.collapsed_dirs,
@@ -431,6 +500,7 @@ fn render_files_pane(
         &session.viewed,
         session.last_opened_file.as_deref(),
         &counts,
+        &ai_drafts,
         session.tree_order,
     );
 
@@ -643,6 +713,11 @@ mod tests {
                     write_blocked: None,
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
+                    ai_configured: false,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
         });
@@ -697,6 +772,11 @@ mod tests {
                     write_blocked: None,
                     theme: crate::ui::theme::Theme::default(),
                     system_dark: false,
+                    ai_configured: false,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
         });

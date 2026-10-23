@@ -60,6 +60,55 @@ impl TokenStore for KeyringStore {
     }
 }
 
+/// The keychain host for LLM API keys: the account becomes `llm:<provider>`.
+const LLM_HOST: &str = "llm";
+
+/// The stored API key for the LLM provider `name`, or `None` when unset.
+///
+/// Keys live only in the keychain — never in `settings.toml` or logs (§10).
+pub fn llm_key(store: &dyn TokenStore, provider: &str) -> anyhow::Result<Option<String>> {
+    store.get(LLM_HOST, provider)
+}
+
+/// Store (or replace) the API key for the LLM provider `name`.
+pub fn set_llm_key(store: &dyn TokenStore, provider: &str, key: &str) -> anyhow::Result<()> {
+    store.set(LLM_HOST, provider, key)
+}
+
+/// Remove the API key for the LLM provider `name`. Clearing an absent key
+/// succeeds.
+pub fn clear_llm_key(store: &dyn TokenStore, provider: &str) -> anyhow::Result<()> {
+    store.clear(LLM_HOST, provider)
+}
+
+/// Copy the API key for the LLM provider `from` to `to`, leaving `from` in
+/// place.
+///
+/// A supplied `key` wins over whatever `from` holds, so a dialog that renames
+/// and re-keys at once stores the typed key under the new name. A rename is
+/// only a copy here: the caller removes `from` (with [`clear_llm_key`]) once
+/// the settings write naming `to` succeeds, and deletes `to` again if that
+/// write fails, so the keychain never holds a name `settings.toml` lost.
+///
+/// When `from` has no stored key and none is supplied there is nothing to
+/// copy, and the copy succeeds: a provider without a key renames like any
+/// other.
+pub fn copy_llm_key(
+    store: &dyn TokenStore,
+    from: &str,
+    to: &str,
+    key: Option<&str>,
+) -> anyhow::Result<()> {
+    let key = match key {
+        Some(key) => Some(key.to_owned()),
+        None => llm_key(store, from)?,
+    };
+    match key {
+        Some(key) => set_llm_key(store, to, &key),
+        None => Ok(()),
+    }
+}
+
 /// An in-memory [`TokenStore`] for tests.
 #[derive(Default)]
 pub struct MemoryStore {
@@ -104,5 +153,42 @@ mod tests {
         s.clear("github.com", "me").unwrap();
         s.clear("github.com", "me").unwrap(); // clearing twice is fine
         assert_eq!(s.get("github.com", "me").unwrap(), None);
+    }
+
+    #[test]
+    fn llm_keys_use_the_llm_account() {
+        let s = MemoryStore::default();
+        assert_eq!(llm_key(&s, "work").unwrap(), None);
+        set_llm_key(&s, "work", "k").unwrap();
+        // The key lands under the `llm:work` account, not a GitHub one.
+        assert_eq!(s.get("llm", "work").unwrap().as_deref(), Some("k"));
+        assert_eq!(s.get("github.com", "work").unwrap(), None);
+        assert_eq!(llm_key(&s, "work").unwrap().as_deref(), Some("k"));
+        clear_llm_key(&s, "work").unwrap();
+        clear_llm_key(&s, "work").unwrap(); // clearing twice is fine
+        assert_eq!(llm_key(&s, "work").unwrap(), None);
+    }
+
+    #[test]
+    fn copy_llm_key_keeps_the_source_and_prefers_a_supplied_key() {
+        let s = MemoryStore::default();
+        // Nothing to copy and nothing supplied: the copy is a no-op.
+        copy_llm_key(&s, "work", "work-renamed", None).unwrap();
+        assert_eq!(llm_key(&s, "work-renamed").unwrap(), None);
+
+        set_llm_key(&s, "work", "stored").unwrap();
+        copy_llm_key(&s, "work", "work-renamed", None).unwrap();
+        assert_eq!(
+            llm_key(&s, "work-renamed").unwrap().as_deref(),
+            Some("stored")
+        );
+        assert_eq!(llm_key(&s, "work").unwrap().as_deref(), Some("stored"));
+
+        copy_llm_key(&s, "work", "work-renamed", Some("typed")).unwrap();
+        assert_eq!(
+            llm_key(&s, "work-renamed").unwrap().as_deref(),
+            Some("typed")
+        );
+        assert_eq!(llm_key(&s, "work").unwrap().as_deref(), Some("stored"));
     }
 }

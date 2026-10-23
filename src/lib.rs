@@ -8,6 +8,8 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+#[cfg(unix)]
+pub mod ai;
 pub mod app;
 pub mod auth;
 pub mod diff;

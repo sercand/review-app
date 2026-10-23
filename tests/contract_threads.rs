@@ -6,7 +6,7 @@ mod common;
 
 use common::client;
 use gh_review_desktop::model::RepoRef;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

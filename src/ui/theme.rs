@@ -52,6 +52,9 @@ pub struct Palette {
     pub accent: egui::Color32,
     pub accent_ink: egui::Color32,
     pub accent_soft: egui::Color32,
+    /// The ✦ AI accent (spec §12): the purple of the mockup's AI tab and
+    /// draft rows, kept apart from `accent` so AI surfaces read as one family.
+    pub ai: egui::Color32,
     pub pending: egui::Color32,
     pub pending_soft: egui::Color32,
     pub ok: egui::Color32,
@@ -91,6 +94,7 @@ pub const DARK: Palette = Palette {
     accent: egui::Color32::from_rgb(0x7a, 0xa2, 0xf7),
     accent_ink: egui::Color32::from_rgb(0x0f, 0x18, 0x30),
     accent_soft: egui::Color32::from_rgba_unmultiplied_const(122, 162, 247, 41),
+    ai: egui::Color32::from_rgb(0xbb, 0x9a, 0xf7),
     pending: egui::Color32::from_rgb(0xe0, 0xa9, 0x40),
     pending_soft: egui::Color32::from_rgba_unmultiplied_const(224, 169, 64, 36),
     ok: egui::Color32::from_rgb(0x4a, 0xc2, 0x6b),
@@ -128,6 +132,7 @@ pub const LIGHT: Palette = Palette {
     accent: egui::Color32::from_rgb(0x3b, 0x63, 0xd6),
     accent_ink: egui::Color32::from_rgb(0xff, 0xff, 0xff),
     accent_soft: egui::Color32::from_rgba_unmultiplied_const(59, 99, 214, 31),
+    ai: egui::Color32::from_rgb(0x82, 0x50, 0xdf),
     pending: egui::Color32::from_rgb(0xb7, 0x79, 0x1f),
     pending_soft: egui::Color32::from_rgba_unmultiplied_const(183, 121, 31, 31),
     ok: egui::Color32::from_rgb(0x1f, 0x8f, 0x3f),
@@ -153,11 +158,7 @@ pub const LIGHT: Palette = Palette {
 
 /// The palette for a dark-mode flag.
 pub fn palette(dark: bool) -> &'static Palette {
-    if dark {
-        &DARK
-    } else {
-        &LIGHT
-    }
+    if dark { &DARK } else { &LIGHT }
 }
 
 /// The eight avatar fills (redesign mockup `.avatar`), indexed by login.
@@ -268,7 +269,7 @@ mod tests {
     use super::*;
     use crate::github::search::Scope;
     use crate::persist::settings::Settings;
-    use crate::ui::widgets::settings_window::{settings_vm, SettingsVm};
+    use crate::ui::widgets::settings_window::{SettingsVm, settings_vm};
 
     #[test]
     fn theme_resolves_system_and_vm_round_trips() {

@@ -1,0 +1,52 @@
+{
+  "max_tokens": 512,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "The screen shows a Play button with id `btn_play`. Start the game.",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-flash",
+  "tool_choice": {
+    "disable_parallel_tool_use": true,
+    "name": "tap",
+    "type": "tool"
+  },
+  "tools": [
+    {
+      "description": "Tap an on-screen element by its id.",
+      "input_schema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "tap"
+    },
+    {
+      "description": "Finish the step.",
+      "input_schema": {
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "name": "done"
+    }
+  ]
+}
