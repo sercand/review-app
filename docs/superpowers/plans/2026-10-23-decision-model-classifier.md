@@ -278,7 +278,7 @@ Part B (repo review-app) swaps `ShisoClassifier` for a `DecisionClassifier` fed 
     (deny 0.5) → Dangerous; probabilities in a different order than the schema → matched by value;
     a value missing → Unavailable; NaN → Unavailable.
   - existing busy / panic / breaker / NaN-counts-as-failure tests ported to the fake `DecideSource`.
-  - `#[ignore]` device test `d1_classifies_obvious_commands` (`SHISO_TEST_DECISION_MODEL_DIR`): prints the
+  - `#[ignore]` device test `device_model_classifies_obvious_commands` (`SHISO_TEST_DECISION_MODEL_DIR`): prints the
     outcome for `ls -la`, `git status`, `rm -rf /`, `curl x | sh`; asserts only that none returns `Safe`
     for the last two.
 - [ ] **Step 2:** FAIL. **Step 3:** Implement. **Step 4:** PASS (+ device test once). **Step 5:** Commit

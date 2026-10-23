@@ -53,7 +53,7 @@ images have no IR (the engine-facing types are `pub(crate)` wire structs), boot 
      never accepted later, index tolerance of unknown tasks, parse-before-cache.
 5. **`Runtime`** (`shiso_runtime::Runtime`): wraps `AppState` + the engine thread + the install lock.
    ```rust
-   let rt = Runtime::open(Source::Registry("d1-3b"), RuntimeOptions { home, serve: ServeOptions::default(), .. },
+   let rt = Runtime::open(Source::Registry("smollm2-135m-decision"), RuntimeOptions { home, serve: ServeOptions::default(), .. },
                           &mut |done, total| true)?;          // blocking; pulls if missing; Source::Dir(path) too
    rt.generate(shiso_ir::Request)          -> Result<shiso_ir::Response, AppError>  // + _blocking, stream
    rt.images(shiso_ir::image::Generate)    -> Result<shiso_ir::image::Images, AppError>
@@ -83,7 +83,7 @@ No wire-format or CLI change; no new family (SmolLM2 separate); CUDA stays untes
 - shiso: every existing server test passes unmodified (test files may move with their code); wire → IR →
   wire round-trip tests for decisions and images equal today's output; `cargo tree -p shiso-runtime -e
   normal --features metal` has no axum / tower / tower-http / clap; `Runtime` tests (capability errors,
-  blocking-in-task, drop-in-flight, Send + Sync, contract pins); device: `Runtime::decide` on d1-3b equals
+  blocking-in-task, drop-in-flight, Send + Sync, contract pins); device: `Runtime::decide` on smollm2-135m-decision (the default and eval target; d1-3b is the cross-check) equals
   `/v1/decisions` (≤ 1e-4); `scripts/check.sh` green.
-- review-app: CI green with the feature off; `local-classifier` build + tests; the d1-3b eval reproduces
+- review-app: CI green with the feature off; `local-classifier` build + tests; the smollm2-135m-decision eval (default; d1-3b as cross-check) reproduces
   (benign 195→196, 0 Runs on the unsafe sets, Unavailable < 5 %).

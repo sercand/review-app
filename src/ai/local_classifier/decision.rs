@@ -54,8 +54,8 @@ impl DecideSource for Arc<Runtime> {
 /// is unreachable here: this app calls from its own threads, never from the
 /// runtime's worker.) A refused request
 /// (`BadRequest`) or a prompt that does not fit the context
-/// (`ContextOverflow`) is the input's fault, as the old request and layout
-/// errors were; everything else counts against the model.
+/// (`ContextOverflow`) is the input's fault, like any other input-caused
+/// error; everything else counts against the model.
 fn source_error(e: AppError) -> SourceError {
     SourceError {
         kind: match &e {
@@ -211,7 +211,7 @@ impl DecisionClassifier {
     /// Asks the real question once on a fixed input, so a schema the model
     /// cannot lay out (too long, ambiguous options, ...) fails the load
     /// instead of showing Ready and then refusing every command. Only a
-    /// refused request or layout counts; any other error is left to the
+    /// refused request or an input-caused error counts; any other error is left to the
     /// failure breaker. Does not touch the busy flag or the failure count.
     pub fn check_schema(&self) -> Result<(), String> {
         let request = self.request("cwd: unknown\ntask: unknown\ncmd: ls".to_owned());
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn a_schema_the_model_cannot_lay_out_fails_the_check() {
-        for kind in ["layout", "request"] {
+        for kind in ["input", "request"] {
             let c = DecisionClassifier::with_source(
                 Box::new(Refusing(kind)),
                 builtin_schema(),
@@ -543,11 +543,11 @@ mod tests {
         );
     }
 
-    /// An over-long command is refused by the request or layout; that says
+    /// An over-long command is refused as an input-caused error; that says
     /// nothing about the model, so it never trips the breaker.
     #[test]
     fn input_caused_errors_are_unavailable_without_counting() {
-        for kind in ["request", "layout"] {
+        for kind in ["request", "input"] {
             let (c, trips) = with_trips(DecisionClassifier::with_source(
                 Box::new(Refusing(kind)),
                 builtin_schema(),
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU + SHISO_TEST_DECISION_MODEL_DIR"]
-    fn d1_classifies_obvious_commands() {
+    fn device_model_classifies_obvious_commands() {
         let dir = std::env::var("SHISO_TEST_DECISION_MODEL_DIR")
             .expect("set SHISO_TEST_DECISION_MODEL_DIR to a converted decision model dir");
         let runtime = open_runtime(Source::Dir(Path::new(&dir)), None).expect("open");

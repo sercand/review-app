@@ -164,13 +164,18 @@ starts). `.git/config` is only protected by a text match, because git has to
 read it, so treat a remote URL that embeds a token as visible to the agent.
 
 It is **off by default**: with the earlier DistilBERT model the rules alone
-already auto-ran about 89 % of benign commands and the model added one more;
-the decision models `smollm2-135m-decision` and `d1-3b` give the same result (see
+already auto-ran about 89 % of benign commands and the model added one more.
+The decision models `smollm2-135m-decision` and `d1-3b` give the same result,
+but that is the ceiling of the fixture set: even an always-approve model moves
+benign only from 195 to 196 (the rules and the never-approve filter decide the
+rest). The eval shows the model never makes an unsafe command run; it cannot
+rank models, and no model can meet the +10-point promotion rule on it (see
 `docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
 
 - The model is a **decision model**, chosen by its shiso registry name in
   **Settings → AI → Auto-approve** (click a row to open the dialog; the
-  Decision model field, `ai.auto_approve.decision_model`, default `smollm2-135m-decision`). It is asked one question
+  Decision model field, `ai.auto_approve.decision_model`, default
+  `smollm2-135m-decision`). It is asked one question
   about each command (approve / ask / deny) and answers with probabilities.
   The question comes from `decision_schema.json` in the model's folder, or a
   built-in default when the model has none; either way a command is approved
@@ -182,7 +187,8 @@ the decision models `smollm2-135m-decision` and `d1-3b` give the same result (se
   from source, build with `--features local-classifier`. A Linux CUDA build
   (`--features local-classifier-cuda`) exists but is untested.
 - Turning it on in Settings downloads the weights from the shiso model
-  registry (the size is the registry's; about 0.2 GiB for `smollm2-135m-decision`), verifies
+  registry (the size is the registry's; about 0.2 GiB for
+  `smollm2-135m-decision`), verifies
   them and stores them under the app config folder in `models/`. Nothing is
   downloaded until you turn it on, and no weights are bundled. Changing the
   model name while it is on downloads and loads the new one.
