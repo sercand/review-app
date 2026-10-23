@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -58,6 +58,107 @@ use review_sandbox::{
     EnvInput, Launch, LocalHost, SandboxOps, SandboxPolicy, SandboxUnavailable, agent_env,
     default_deny_read, default_write_paths, sandboxed_launch,
 };
+
+/// Where the hub gets the local command classifier from, and how it is
+/// switched. The real one is the shiso-backed loader (feature
+/// `local-classifier` or `local-classifier-cuda`); builds without it use
+/// [`NoClassifier`]. A trait so the hub is testable without a GPU.
+pub trait ClassifierProvider: Send + Sync {
+    /// The classifier, only while it is ready.
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>>;
+    /// Switch the classifier on (download if needed, then load) or off.
+    fn set_enabled(&self, _enabled: bool) {}
+    /// Fetch the weights again after a failure.
+    fn download(&self) {}
+    /// Use another registry model: while on, the old model's download or
+    /// load is abandoned and the new one fetched and loaded.
+    fn set_model(&self, _model: &str) {}
+}
+
+/// The provider of builds without the local classifier.
+pub struct NoClassifier;
+
+impl ClassifierProvider for NoClassifier {
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        None
+    }
+}
+
+#[cfg(feature = "_classifier")]
+impl ClassifierProvider for crate::ai::local_classifier::Loader {
+    fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        crate::ai::local_classifier::Loader::classifier(self)
+    }
+    fn set_enabled(&self, enabled: bool) {
+        crate::ai::local_classifier::Loader::set_enabled(self, enabled);
+    }
+    fn download(&self) {
+        crate::ai::local_classifier::Loader::download(self);
+    }
+    fn set_model(&self, model: &str) {
+        crate::ai::local_classifier::Loader::set_model(self, model);
+    }
+}
+
+/// What a run holds as its classifier: every call asks the provider for the
+/// model that is ready *now* and answers `Unavailable` when there is none or
+/// the setting has been switched off since the run began. So a review started
+/// while the model is still loading picks it up when it is ready, and
+/// switching the setting off stops model use at once. `Unavailable` is never
+/// cached by the approval engine, so nothing sticks.
+struct LiveClassifier {
+    /// Looked up on every call: the provider may not exist yet when the run
+    /// starts (it is created by the first enable command).
+    provider: Arc<OnceLock<Arc<dyn ClassifierProvider>>>,
+    enabled: Arc<AtomicBool>,
+    /// Bumped when the requested model changes ([`AiHub::classifier_generation`]).
+    generation: Arc<AtomicU64>,
+}
+
+impl review_approval::model_stage::CommandClassifier for LiveClassifier {
+    fn classify(
+        &self,
+        input: &review_approval::model_stage::ClassifyInput<'_>,
+    ) -> review_approval::model_stage::ModelOutcome {
+        use review_approval::model_stage::ModelOutcome;
+        if !self.enabled.load(Ordering::SeqCst) {
+            return ModelOutcome::Unavailable;
+        }
+        match self.provider.get().and_then(|p| p.classifier()) {
+            Some(classifier) => classifier.classify(input),
+            None => ModelOutcome::Unavailable,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+/// The real provider: the loader for registry model `model`, reporting
+/// through `events`, weights under `<data_dir>/models`.
+#[cfg(feature = "_classifier")]
+fn default_classifier_provider(
+    data_dir: &Path,
+    model: &str,
+    events: &EventSender,
+) -> Arc<dyn ClassifierProvider> {
+    let events = events.clone();
+    Arc::new(crate::ai::local_classifier::Loader::new(
+        crate::ai::local_classifier::WeightsManager::new(data_dir),
+        model,
+        Arc::new(move |state| events.send(Event::ClassifierState(state))),
+    ))
+}
+
+#[cfg(not(feature = "_classifier"))]
+fn default_classifier_provider(_: &Path, _: &str, _: &EventSender) -> Arc<dyn ClassifierProvider> {
+    Arc::new(NoClassifier)
+}
 
 /// How the hub starts the sandboxed shell; a test seam (spec §8.2).
 pub type SandboxLauncher = Arc<
@@ -335,6 +436,27 @@ pub struct AiHub {
     unrestored: Mutex<Option<Vec<CheckoutRecord>>>,
     /// Sequence for agent temp dir names.
     tmp_seq: AtomicU64,
+    /// Where the classifier weights live (`<data_dir>/models`).
+    data_dir: PathBuf,
+    /// The local classifier, created on the first classifier command because
+    /// its state callback needs the worker's [`EventSender`].
+    classifier: Arc<OnceLock<Arc<dyn ClassifierProvider>>>,
+    /// The live `local_classifier` value: updated by settings changes and by
+    /// [`Self::classifier_request`], read by every [`LiveClassifier`] call.
+    classifier_enabled: Arc<AtomicBool>,
+    /// Counts model switches: a run's cached verdicts are dropped when it
+    /// changes, so an old model's "safe" never applies to the new one.
+    classifier_generation: Arc<AtomicU64>,
+    /// The last enabled/disabled and model the user asked for (`None`: never
+    /// asked), with the sequence number of the request that set it.
+    classifier_desired: Mutex<(u64, Option<(bool, String)>)>,
+    /// Serialises applying the desired value, so commands that overtake each
+    /// other cannot leave the provider in a stale state.
+    classifier_apply: Mutex<()>,
+    /// The classifier handed to the latest run (test observation).
+    #[cfg(test)]
+    run_classifier_seen:
+        Mutex<Option<Option<Arc<dyn review_approval::model_stage::CommandClassifier>>>>,
 }
 
 impl AiHub {
@@ -360,7 +482,9 @@ impl AiHub {
                 Arc::new(Store::open_in_memory().expect("an in-memory AI store always opens"))
             }
         };
-        AiHub::new(store, tokens)
+        let mut hub = AiHub::new(store, tokens);
+        hub.data_dir = config_root.to_path_buf();
+        hub
     }
 
     /// A hub with injected seams, for tests.
@@ -393,12 +517,141 @@ impl AiHub {
             llms,
             unrestored: Mutex::new(Some(unrestored)),
             tmp_seq: AtomicU64::new(0),
+            data_dir: config_root(),
+            classifier: Arc::new(OnceLock::new()),
+            classifier_enabled: Arc::new(AtomicBool::new(false)),
+            classifier_generation: Arc::new(AtomicU64::new(0)),
+            classifier_desired: Mutex::new((0, None)),
+            classifier_apply: Mutex::new(()),
+            #[cfg(test)]
+            run_classifier_seen: Mutex::new(None),
         }
+    }
+
+    /// A hub whose classifier is `provider`, for tests.
+    #[cfg(test)]
+    fn with_classifier(self, provider: Arc<dyn ClassifierProvider>) -> AiHub {
+        self.set_classifier_provider(provider);
+        self
+    }
+
+    /// Install `provider` unless one exists already.
+    #[cfg(test)]
+    fn set_classifier_provider(&self, provider: Arc<dyn ClassifierProvider>) {
+        let _ = self.classifier.set(provider);
+    }
+
+    /// The provider, created on first use for `model` (the one wanted when
+    /// the user first asked, so the first load is of that model).
+    fn classifier_provider(
+        &self,
+        model: &str,
+        events: &EventSender,
+    ) -> &Arc<dyn ClassifierProvider> {
+        self.classifier
+            .get_or_init(|| default_classifier_provider(&self.data_dir, model, events))
+    }
+
+    /// Record what the user last asked for ([`Command::ClassifierSetEnabled`])
+    /// and flip the live flag at once, so model use stops immediately on off.
+    /// `seq` is stamped by the UI in send order; a request older than the
+    /// newest one seen is ignored, so commands that overtake each other on
+    /// the worker cannot undo a later one. Cheap and synchronous;
+    /// [`Self::classifier_apply_desired`] does the work.
+    ///
+    /// [`Command::ClassifierSetEnabled`]: crate::runtime::Command::ClassifierSetEnabled
+    pub fn classifier_request(&self, enabled: bool, model: &str, seq: u64) {
+        let mut desired = self
+            .classifier_desired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seq < desired.0 {
+            return;
+        }
+        if desired.1.as_ref().is_some_and(|(_, was)| was != model) {
+            self.classifier_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        *desired = (seq, Some((enabled, model.to_owned())));
+        self.classifier_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Apply the latest requested value to the provider (blocking: switching
+    /// off can free a GPU model). Whichever caller runs last applies the
+    /// newest value, so the last request wins however the commands interleave.
+    /// A loader is never created just to switch it off.
+    pub fn classifier_apply_desired(&self, events: &EventSender) {
+        let _serial = self
+            .classifier_apply
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let desired = self
+            .classifier_desired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .clone();
+        match desired {
+            Some((true, model)) => {
+                let provider = self.classifier_provider(&model, events);
+                // The model first: a switch while on restarts the load, and
+                // an enable after it starts the right one.
+                provider.set_model(&model);
+                provider.set_enabled(true);
+            }
+            Some((false, _)) => {
+                // Only switch off: setting the model would start a load while
+                // the user is turning the classifier off. The next enable
+                // carries the model.
+                if let Some(provider) = self.classifier.get() {
+                    provider.set_enabled(false);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Retry the classifier download ([`Command::ClassifierDownload`]).
+    ///
+    /// [`Command::ClassifierDownload`]: crate::runtime::Command::ClassifierDownload
+    pub fn classifier_download(&self, events: &EventSender) {
+        // Retry needs a request to have named the model; with none there is
+        // nothing to retry.
+        let model = self
+            .classifier_desired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .as_ref()
+            .map(|(_, model)| model.clone());
+        if let Some(model) = model {
+            self.classifier_provider(&model, events).download();
+        }
+    }
+
+    /// The classifier a run starting now gets: with the setting on, a
+    /// [`LiveClassifier`] that asks the provider (looked up lazily, it may not
+    /// exist yet) on every call, so the model is used as soon as it is ready
+    /// and not at all once the setting goes off. With the setting off at run
+    /// start the run gets none, and keeps none if it is switched on later.
+    fn run_classifier(
+        &self,
+        settings: &AiSettings,
+    ) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+        if !settings.auto_approve.local_classifier {
+            return None;
+        }
+        Some(Arc::new(LiveClassifier {
+            provider: self.classifier.clone(),
+            enabled: self.classifier_enabled.clone(),
+            generation: self.classifier_generation.clone(),
+        }))
     }
 
     /// Replace the AI settings every later run reads (the app calls this at
     /// startup and whenever the user saves them).
     pub fn set_settings(&self, settings: AiSettings) {
+        self.classifier_enabled
+            .store(settings.auto_approve.local_classifier, Ordering::SeqCst);
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
     }
 
@@ -933,6 +1186,14 @@ impl AiHub {
             repo_settings.prepare.clone(),
         );
         let elide_threshold = f64::from(settings.context_threshold);
+        let classifier = self.run_classifier(&settings);
+        #[cfg(test)]
+        {
+            *self
+                .run_classifier_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(classifier.clone());
+        }
         let (control, mut rx, pipeline) = start_pipeline(PipelineInputs {
             store: self.store.clone(),
             session_id: ai_session_id,
@@ -946,6 +1207,7 @@ impl AiHub {
             interaction: interaction.clone() as Arc<dyn Interaction>,
             mode,
             bash_disabled: bash_disabled.clone(),
+            classifier,
         });
         if let Err(error) = self.store.checkout_set_state(rec.id, CheckoutState::Active) {
             tracing::warn!(%error, "ai hub: marking the checkout active failed");
@@ -1620,6 +1882,7 @@ fn default_llm_factory(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::ai::checkout::RestoreOutcome;
     use crate::ai::events::{StageKind, StageStatus};
@@ -1636,6 +1899,352 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A provider the test flips between ready and not.
+    #[derive(Default)]
+    struct FakeProvider {
+        ready: AtomicBool,
+        enabled_calls: Mutex<Vec<bool>>,
+        /// Every `set_model`, and every `set_enabled`, in call order.
+        calls: Mutex<Vec<String>>,
+        classify_calls: AtomicU64,
+    }
+
+    struct SafeClassifier(Arc<FakeProvider>);
+    impl review_approval::model_stage::CommandClassifier for SafeClassifier {
+        fn classify(
+            &self,
+            _: &review_approval::model_stage::ClassifyInput<'_>,
+        ) -> review_approval::model_stage::ModelOutcome {
+            self.0.classify_calls.fetch_add(1, Ordering::SeqCst);
+            review_approval::model_stage::ModelOutcome::Safe
+        }
+    }
+
+    /// `FakeProvider` is shared as `Arc<FakeProvider>`; this wraps it so the
+    /// classifier it hands out can count calls on it.
+    struct SharedProvider(Arc<FakeProvider>);
+    impl ClassifierProvider for SharedProvider {
+        fn classifier(&self) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
+            self.0
+                .ready
+                .load(Ordering::SeqCst)
+                .then(|| Arc::new(SafeClassifier(self.0.clone())) as Arc<_>)
+        }
+        fn set_enabled(&self, enabled: bool) {
+            self.0.enabled_calls.lock().unwrap().push(enabled);
+            self.0
+                .calls
+                .lock()
+                .unwrap()
+                .push(format!("enabled {enabled}"));
+            self.0.ready.store(enabled, Ordering::SeqCst);
+        }
+        fn set_model(&self, model: &str) {
+            self.0.calls.lock().unwrap().push(format!("model {model}"));
+        }
+    }
+
+    fn plain_hub() -> AiHub {
+        AiHub::new(
+            Arc::new(Store::open_in_memory().unwrap()),
+            Arc::new(MemoryStore::default()),
+        )
+    }
+
+    fn hub_with(provider: &Arc<FakeProvider>) -> AiHub {
+        plain_hub().with_classifier(Arc::new(SharedProvider(provider.clone())))
+    }
+
+    fn settings_with_classifier(on: bool) -> AiSettings {
+        let mut s = AiSettings::default();
+        s.auto_approve.local_classifier = on;
+        s
+    }
+
+    fn classify(c: &Arc<dyn review_approval::model_stage::CommandClassifier>) -> ModelOutcome {
+        c.classify(&review_approval::model_stage::ClassifyInput {
+            segment: "pr -t x",
+            cwd: None,
+        })
+    }
+
+    use review_approval::model_stage::ModelOutcome;
+
+    #[test]
+    fn run_gets_a_live_classifier_only_when_the_setting_is_on() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        assert!(
+            hub.run_classifier(&settings_with_classifier(false))
+                .is_none()
+        );
+        assert!(
+            hub.run_classifier(&settings_with_classifier(true))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn live_classifier_picks_up_a_model_that_becomes_ready_mid_run() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        hub.set_settings(settings_with_classifier(true));
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        // Still loading: no model, and nothing is called.
+        assert_eq!(classify(&live), ModelOutcome::Unavailable);
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 0);
+        // The load finishes while the run is going: the next call uses it.
+        provider.ready.store(true, Ordering::SeqCst);
+        assert_eq!(classify(&live), ModelOutcome::Safe);
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn live_classifier_stops_at_once_when_the_flag_goes_off() {
+        let provider = Arc::new(FakeProvider::default());
+        provider.ready.store(true, Ordering::SeqCst);
+        let hub = hub_with(&provider);
+        hub.set_settings(settings_with_classifier(true));
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        assert_eq!(classify(&live), ModelOutcome::Safe);
+        // Settings saved with the checkbox off.
+        hub.set_settings(settings_with_classifier(false));
+        assert_eq!(classify(&live), ModelOutcome::Unavailable);
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+        // And a request to switch off does the same.
+        hub.classifier_request(true, "d1-3b", 1);
+        assert_eq!(classify(&live), ModelOutcome::Safe);
+        hub.classifier_request(false, "d1-3b", 2);
+        assert_eq!(classify(&live), ModelOutcome::Unavailable);
+    }
+
+    #[test]
+    fn live_classifier_is_inactive_when_off_so_cached_outcomes_are_ignored() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        hub.classifier_request(true, "d1-3b", 1);
+        assert!(live.active());
+        hub.classifier_request(false, "d1-3b", 2);
+        assert!(!live.active());
+    }
+
+    #[test]
+    fn a_cached_safe_stops_applying_when_the_model_is_switched_off_mid_run() {
+        use review_approval::model_stage::{DecisionCache, ModelPolicy};
+        use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+        let provider = Arc::new(FakeProvider::default());
+        provider.ready.store(true, Ordering::SeqCst);
+        let hub = hub_with(&provider);
+        hub.classifier_request(true, "d1-3b", 1);
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let cache = DecisionCache::new();
+        let verdict = |cmd: &str| {
+            let policy = ModelPolicy {
+                classifier: live.as_ref(),
+                cache: &cache,
+                deadline: None,
+            };
+            let extra: [&dyn SegmentPolicy; 1] = [&policy];
+            classify(
+                cmd,
+                &ApprovalConfig {
+                    allowed: &[],
+                    deny_paths: &[],
+                    cwd: None,
+                    extra: &extra,
+                },
+            )
+        };
+        let cmd = "/usr/bin/pr -t file.txt";
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        hub.classifier_request(false, "d1-3b", 2);
+        assert!(matches!(verdict(cmd), Verdict::Ask { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_cached_safe_from_the_old_model_does_not_outlive_a_model_switch() {
+        use review_approval::model_stage::{DecisionCache, ModelPolicy};
+        use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+        let provider = Arc::new(FakeProvider::default());
+        provider.ready.store(true, Ordering::SeqCst);
+        let hub = hub_with(&provider);
+        hub.classifier_request(true, "d1-3b", 1);
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let cache = DecisionCache::new();
+        let verdict = |cmd: &str| {
+            let policy = ModelPolicy {
+                classifier: live.as_ref(),
+                cache: &cache,
+                deadline: None,
+            };
+            let extra: [&dyn SegmentPolicy; 1] = [&policy];
+            classify(
+                cmd,
+                &ApprovalConfig {
+                    allowed: &[],
+                    deny_paths: &[],
+                    cwd: None,
+                    extra: &extra,
+                },
+            )
+        };
+        let cmd = "/usr/bin/pr -t file.txt";
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1, "cached");
+        // Same model again: the cache stays.
+        hub.classifier_request(true, "d1-3b", 2);
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+        // Another model: the old verdict is gone and the new model is asked.
+        hub.classifier_request(true, "other", 3);
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_run_started_before_the_provider_exists_still_gets_the_model_later() {
+        let hub = plain_hub();
+        hub.set_settings(settings_with_classifier(true));
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        assert_eq!(
+            classify(&live),
+            ModelOutcome::Unavailable,
+            "no provider yet"
+        );
+        let provider = Arc::new(FakeProvider::default());
+        provider.ready.store(true, Ordering::SeqCst);
+        hub.set_classifier_provider(Arc::new(SharedProvider(provider)));
+        assert_eq!(classify(&live), ModelOutcome::Safe);
+    }
+
+    #[test]
+    fn an_older_request_is_ignored() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        // Sent on, off; the worker delivers off first, then the older on.
+        hub.classifier_request(false, "d1-3b", 2);
+        hub.classifier_request(true, "d1-3b", 1);
+        assert!(!hub.classifier_enabled.load(Ordering::SeqCst));
+        hub.classifier_apply_desired(&events);
+        assert!(!provider.ready.load(Ordering::SeqCst));
+        assert!(provider.enabled_calls.lock().unwrap().iter().all(|on| !on));
+    }
+
+    #[test]
+    fn toggle_off_clears_provider() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        hub.classifier_request(true, "d1-3b", 1);
+        hub.classifier_apply_desired(&events);
+        assert!(provider.ready.load(Ordering::SeqCst));
+        hub.classifier_request(false, "d1-3b", 2);
+        hub.classifier_apply_desired(&events);
+        assert!(!provider.ready.load(Ordering::SeqCst));
+        assert_eq!(*provider.enabled_calls.lock().unwrap(), [true, false]);
+    }
+
+    /// A changed model name travels the same seq-stamped path as enabling:
+    /// the newest request wins and the model is set before the enable.
+    #[test]
+    fn a_model_change_reaches_the_provider_and_the_newest_request_wins() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        hub.classifier_request(true, "d1-3b", 1);
+        hub.classifier_apply_desired(&events);
+        hub.classifier_request(true, "d1-7b", 2);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            ["model d1-3b", "enabled true", "model d1-7b", "enabled true"]
+        );
+        // The older request (still on the old model) arrives late: ignored.
+        hub.classifier_request(true, "d1-3b", 1);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            provider.calls.lock().unwrap().last().unwrap(),
+            "enabled true"
+        );
+        assert_eq!(provider.calls.lock().unwrap().len(), 6);
+        let models: Vec<_> = provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with("model"))
+            .cloned()
+            .collect();
+        assert_eq!(models, ["model d1-3b", "model d1-7b", "model d1-7b"]);
+    }
+
+    /// One save that turns the classifier off and changes the model must
+    /// only switch it off: no model change reaches the provider (which would
+    /// start a load).
+    #[test]
+    fn switching_off_with_a_model_change_only_switches_off() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        hub.classifier_request(true, "a", 1);
+        hub.classifier_apply_desired(&events);
+        hub.classifier_request(false, "b", 2);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            *provider.calls.lock().unwrap(),
+            ["model a", "enabled true", "enabled false"]
+        );
+        // The next enable carries the new model.
+        hub.classifier_request(true, "b", 3);
+        hub.classifier_apply_desired(&events);
+        assert_eq!(
+            provider.calls.lock().unwrap()[3..],
+            ["model b", "enabled true"]
+        );
+    }
+
+    #[test]
+    fn download_without_a_request_is_a_no_op() {
+        let hub = plain_hub();
+        let (events, _rx) = event_channel();
+        hub.classifier_download(&events);
+        assert!(hub.classifier.get().is_none());
+    }
+
+    #[test]
+    fn switching_off_never_creates_a_loader() {
+        // No provider was seeded: if switching off created one, it would
+        // build the real loader.
+        let hub = plain_hub();
+        let (events, _rx) = event_channel();
+        hub.classifier_request(false, "d1-3b", 1);
+        hub.classifier_apply_desired(&events);
+        assert!(hub.classifier.get().is_none());
+    }
+
+    #[test]
+    fn the_last_request_wins_when_applies_run_late() {
+        let provider = Arc::new(FakeProvider::default());
+        let hub = hub_with(&provider);
+        let (events, _rx) = event_channel();
+        // Two commands arrive back to back; their blocking tasks run after
+        // both, in either order: each applies the newest request.
+        hub.classifier_request(true, "d1-3b", 1);
+        hub.classifier_request(false, "d1-3b", 2);
+        hub.classifier_apply_desired(&events);
+        hub.classifier_apply_desired(&events);
+        assert!(!provider.ready.load(Ordering::SeqCst));
+        assert!(
+            provider.enabled_calls.lock().unwrap().iter().all(|on| !on),
+            "never switched on: {:?}",
+            provider.enabled_calls.lock().unwrap()
+        );
+    }
 
     #[test]
     fn only_finding_and_coverage_events_refresh_the_rows() {
@@ -2089,6 +2698,34 @@ mod tests {
     }
 
     // --- the tests ---
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_hands_the_run_a_live_classifier_only_when_the_setting_is_on() {
+        for on in [true, false] {
+            let fx = harness(clean_scripts(), host_launcher()).await;
+            let provider = Arc::new(FakeProvider::default());
+            fx.hub
+                .set_classifier_provider(Arc::new(SharedProvider(provider.clone())));
+            let mut settings = fx.hub.settings();
+            settings.auto_approve.local_classifier = on;
+            fx.hub.set_settings(settings);
+            fx.start();
+            wait_for(&fx.events, |e| matches!(e, Event::AiSnapshot { .. }));
+            let seen = fx
+                .hub
+                .run_classifier_seen
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("start reached the pipeline");
+            assert_eq!(seen.is_some(), on);
+            if let Some(live) = seen {
+                assert_eq!(classify(&live), ModelOutcome::Unavailable, "still loading");
+                provider.ready.store(true, Ordering::SeqCst);
+                assert_eq!(classify(&live), ModelOutcome::Safe, "ready mid-run");
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn start_checks_out_runs_and_forwards_events_with_the_session() {

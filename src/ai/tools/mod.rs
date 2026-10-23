@@ -185,7 +185,7 @@ pub struct ToolCx {
     /// Exact, whitespace-normalized command lines the user approved "for this
     /// review".
     ///
-    /// `bash` checks this list **before** [`review_sandbox::classify`], so an
+    /// `bash` checks this list **before** the approval engine (`review_approval::classify`), so an
     /// approved line runs without asking again for the rest of the run. It is
     /// deliberately never prefix-matched: approving `touch a` does not grant
     /// `touch a b`, `/usr/bin/env sh proxy`, or an extended `find … -exec`. A
@@ -230,10 +230,12 @@ pub struct ToolCx {
     /// `None` when the repo has no prepare commands configured; the tool
     /// then returns an error rather than running nothing silently.
     pub prepare: Option<Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>>,
+    /// Settings for the bash approval engine (`review_approval`).
+    pub approval: Arc<crate::ai::approval_setup::ApprovalSetup>,
 }
 
 impl ToolCx {
-    /// A copy of [`ToolCx::allowed`], for [`review_sandbox::classify`].
+    /// A copy of [`ToolCx::allowed`], for `review_approval::classify`.
     pub fn allowed_snapshot(&self) -> Vec<String> {
         allowed_lock(&self.allowed).clone()
     }

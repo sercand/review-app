@@ -144,6 +144,61 @@ prepare commands; you approve, and the app runs the same fixed list.
 
 AI review is Unix-only for now: the sandbox has no Windows backend.
 
+### Local command classifier
+
+An optional on-device model that helps decide which shell commands the agent
+may run without asking. It only sees commands the built-in rules could not
+vouch for, and it is advisory: it can let a harmless command through, but it
+never approves a program on the never-approve list (network tools,
+interpreters, scripts from the PR, shell builtins that change what later
+commands mean such as `alias` or `trap`, and tools that load and run the
+repo's own config or plugins such as `eslint`, `tsc`, `terraform`), and if it
+is missing, loading or failing, you are asked exactly as without it. A tool
+that is not on the list may still be approved by the model; that part is
+advisory. Command text never leaves your machine.
+
+Rules, not the model, keep repo secrets out of reach: searches that recurse
+or look at hidden, ignored or untracked files ask, and the sandbox cannot read
+repo-local `.env*` files (on Linux only those that exist when the review
+starts). `.git/config` is only protected by a text match, because git has to
+read it, so treat a remote URL that embeds a token as visible to the agent.
+
+It is **off by default**: with the earlier DistilBERT model the rules alone
+already auto-ran about 89 % of benign commands and the model added one more.
+The decision models `smollm2-135m-decision` and `d1-3b` give the same result,
+but that is the ceiling of the fixture set: even an always-approve model moves
+benign only from 195 to 196 (the rules and the never-approve filter decide the
+rest). The eval shows the model never makes an unsafe command run; it cannot
+rank models, and no model can meet the +10-point promotion rule on it (see
+`docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
+
+- The model is a **decision model**, chosen by its shiso registry name in
+  **Settings → AI → Auto-approve** (click a row to open the dialog; the
+  Decision model field, `ai.auto_approve.decision_model`, default
+  `smollm2-135m-decision`). It is asked one question
+  about each command (approve / ask / deny) and answers with probabilities.
+  The question comes from `decision_schema.json` in the model's folder, or a
+  built-in default when the model has none; either way a command is approved
+  only when the model picks `approve` with probability of at least 0.60
+  (`approve_threshold`), and a model that picks `deny` makes the command ask
+  with a warning. A schema file that is present but invalid disables the
+  classifier rather than falling back to the default.
+- macOS only for now (Apple GPU through Metal). The release builds include it;
+  from source, build with `--features local-classifier`. A Linux CUDA build
+  (`--features local-classifier-cuda`) exists but is untested.
+- Turning it on in Settings downloads the weights from the shiso model
+  registry (the size is the registry's; about 0.2 GiB for
+  `smollm2-135m-decision`), verifies
+  them and stores them under the app config folder in `models/`. Nothing is
+  downloaded until you turn it on, and no weights are bundled. Changing the
+  model name while it is on downloads and loads the new one.
+- The classifier has 2 seconds per command by default
+  (`classifier_timeout_ms`, 50 to 5000); a command that takes longer asks as
+  it would without the model. The default used to be 500 ms; a settings file
+  that already stores a value keeps it.
+- To turn it off, untick the setting. You can delete `models/` to reclaim the
+  space.
+
 ## Where data is stored
 
 Everything is stored locally in the platform config directory

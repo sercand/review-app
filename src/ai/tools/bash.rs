@@ -1,11 +1,13 @@
 //! `bash`: one command in the sandbox's persistent shell, gated by the
-//! classifier (spec §8.1): commands proven read-only or explicitly allowed run
-//! silently, everything else waits for the user's approval, and a denied
-//! command never reaches the shell.
+//! approval engine (`review_approval`, spec §8.1): commands it can prove safe
+//! or the repo explicitly allows run silently, commands touching secret paths
+//! are blocked without asking, everything else waits for the user's approval,
+//! and a refused command never reaches the shell.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use review_sandbox::Verdict;
+use review_approval::model_stage::ModelPolicy;
+use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -29,8 +31,8 @@ impl Tool for Bash {
         definition(
             "bash",
             "Run a bash command and return its combined output and exit code. It runs from the \
-             checkout root; pass paths to the command instead of using 'cd'. Use it for builds, \
-             tests, inspecting files and running tools.",
+             checkout root; pass paths to the command rather than 'cd'-ing; a leading 'cd' is fine but \
+             rarely needed. Use it for builds, tests, inspecting files and running tools.",
             json!({
                 "type": "object",
                 "properties": {
@@ -38,7 +40,8 @@ impl Tool for Bash {
                         "type": "string",
                         "description": "The bash command to run in the persistent shell (pipes, \
                             redirection and globbing work); it runs from the checkout root: pass \
-                            paths to the command instead of using 'cd'. Environment and shell \
+                            paths to the command rather than 'cd'-ing (a leading 'cd' is fine but \
+                            rarely needed). Environment and shell \
                             variables persist across calls. Combined stdout+stderr is returned; \
                             large output is truncated."
                     },
@@ -93,7 +96,7 @@ impl Tool for Bash {
     }
 }
 
-/// Asks the user about `command` when the classifier requires it.
+/// Asks the user about `command` when the approval engine requires it.
 ///
 /// Returns `None` when the command may run (silently, approved once, or the
 /// exact line was approved earlier in this review) and `Some(error)` when it
@@ -102,16 +105,26 @@ impl Tool for Bash {
 /// "For this review" memory is the exact line, whitespace-normalized and
 /// otherwise verbatim: approving `touch a` never grants `touch a b`, and
 /// approving a line with a wrapper in it never grants that wrapper. It is
-/// checked before [`review_sandbox::classify`], so the approved line runs even
-/// if the classifier would ask again.
+/// checked before [`classify`], so the approved line runs even if the engine
+/// would ask again. A command the engine denies (secret paths) never reaches
+/// the user: it is blocked outright.
 async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     let line = normalized_line(command);
     if cx.for_review_contains(&line) {
         return None;
     }
-    let reason = match review_sandbox::classify(command, &cx.allowed_snapshot()) {
-        Verdict::Run => return None,
+    let verdict = decide(command, cx).await;
+    let reason = match verdict {
+        Verdict::Run { source } => {
+            tracing::debug!(source, command, "bash command auto-approved");
+            return None;
+        }
         Verdict::Ask { reason } => reason,
+        Verdict::Deny { reason } => {
+            return Some(ToolOutput::error(format!(
+                "the command was blocked: {reason}"
+            )));
+        }
     };
     match cx
         .interaction
@@ -132,6 +145,114 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
             Some(ToolOutput::error(text))
         }
     }
+}
+
+/// The engine's verdict for `command` under the run's [`ApprovalSetup`].
+///
+/// Without a classifier the engine is pure and fast, so it runs inline. With
+/// one, the model may block (a GPU call, a lock), so the whole classification
+/// runs on a blocking thread under [`ApprovalSetup::timeout`]; on a timeout or
+/// a panicked thread only cached model outcomes apply and no new model call
+/// is made. The slow thread is detached, never awaited past the timeout, and
+/// the in-flight guard keeps later commands off the model until it finishes.
+///
+/// With auto-approve off, no rule policy or model is consulted: a `Deny`
+/// (secret paths) still applies, and anything that would have run asks.
+///
+/// [`ApprovalSetup`]: crate::ai::approval_setup::ApprovalSetup
+/// [`ApprovalSetup::timeout`]: crate::ai::approval_setup::ApprovalSetup::timeout
+async fn decide(command: &str, cx: &ToolCx) -> Verdict {
+    let setup = cx.approval.clone();
+    let allowed = cx.allowed_snapshot();
+    let deny_paths = setup.effective_deny_paths();
+    let repo_root = cx.repo_root.clone();
+    let run = move |command: &str, deadline: Option<Instant>| {
+        classify_with(command, &setup, &allowed, &deny_paths, &repo_root, deadline)
+    };
+    // At most one model classification runs at a time: a hung one keeps its
+    // thread, and more of them would starve tokio's shared blocking pool.
+    let guard = if cx.approval.enabled && cx.approval.classifier.is_some() {
+        cx.approval.try_begin_model()
+    } else {
+        None
+    };
+    let verdict = if let Some(guard) = guard {
+        let owned = command.to_string();
+        let timeout = cx.approval.timeout;
+        let deadline = Instant::now() + timeout;
+        let blocking = {
+            let run = run.clone();
+            tokio::task::spawn_blocking(move || {
+                // Released when the model call really ends, not at the timeout.
+                let _guard = guard;
+                run(&owned, Some(deadline))
+            })
+        };
+        match tokio::time::timeout(timeout, blocking).await {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "command classifier thread failed; asking");
+                run(command, Some(Instant::now()))
+            }
+            Err(_) => {
+                tracing::warn!(?timeout, "command classifier timed out; asking");
+                run(command, Some(Instant::now()))
+            }
+        }
+    } else {
+        // Another model call is in flight, none is installed, or auto-approve
+        // is off (the guard is only taken when it is on): an expired deadline
+        // keeps cached outcomes in play but starts no new call.
+        run(command, Some(Instant::now()))
+    };
+    match verdict {
+        Verdict::Run { .. } if !cx.approval.enabled => Verdict::Ask {
+            reason: "auto-approve is off".to_string(),
+        },
+        other => other,
+    }
+}
+
+/// One synchronous `classify` run: rule policies, the opt-in capabilities and
+/// (when `model_deadline` is given, and a classifier is installed) the model
+/// last, consulted only until that deadline.
+fn classify_with(
+    command: &str,
+    setup: &crate::ai::approval_setup::ApprovalSetup,
+    allowed: &[String],
+    deny_paths: &[String],
+    repo_root: &std::path::Path,
+    model_deadline: Option<Instant>,
+) -> Verdict {
+    // With auto-approve off nothing may vouch for the command; only the deny
+    // list and the repo's own allowed lines (which `Run` is mapped away from
+    // by the caller) are left.
+    let mut extra: Vec<&dyn SegmentPolicy> = Vec::new();
+    if setup.enabled {
+        for policy in &setup.capabilities {
+            extra.push(*policy);
+        }
+    }
+    let model = match (&setup.classifier, model_deadline.is_some() && setup.enabled) {
+        (Some(classifier), true) => Some(ModelPolicy {
+            classifier: classifier.as_ref(),
+            cache: &setup.cache,
+            deadline: model_deadline,
+        }),
+        _ => None,
+    };
+    if let Some(model) = &model {
+        extra.push(model);
+    }
+    classify(
+        command,
+        &ApprovalConfig {
+            allowed,
+            deny_paths,
+            cwd: Some(repo_root),
+            extra: &extra,
+        },
+    )
 }
 
 /// The line "for this review" remembers.

@@ -610,6 +610,17 @@ conservative: anything it can't classify asks. **Always** (persist for the
 repo) is just adding the command to the repo's configured commands in
 settings **[call]**.
 
+The classifier is the `review-approval` crate (`crates/approval`), a tree-sitter
+bash parser plus a rule engine ported from `da`. `classify(command, config)`
+returns `Run`, `Ask` or `Deny`: parse, then deny paths (`.env*`, `.ssh`, ...;
+a text match on the command's words that stops naive reads, not a guarantee:
+recursive greps, PR symlinks and run-time splices get past it, so the OS
+deny-read list in §8.2 is what actually protects credentials),
+then the rule policies (read-only commands, read-only `git`, the repo's
+configured commands, `mkdir` in the checkout), then ask. It fails closed:
+anything the parser or a policy can't account for asks. `Deny` is returned to
+the agent as a tool error without prompting.
+
 ### 8.2 Sandbox (the actual guarantee)
 
 Every bash command runs inside an OS sandbox:
@@ -626,7 +637,7 @@ Profile:
 | Network | **allowed** |
 | Write | the repo working tree **except `.git/`**; a per-run temp dir (exported as `TMPDIR`); package/build caches: `~/.cargo/registry`, `~/.cargo/git`, `~/.npm`, `~/.cache`, `~/Library/Caches`, `~/go/pkg/mod`, `~/.gradle`, plus a user-editable list in settings |
 | Read | everything except the denied paths below |
-| Read denied | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`, `~/.docker/config.json`, keychain databases, the app's own config dir, plus a user-editable list |
+| Read denied | `~/.ssh`, `~/.config/gh`, `~/.git-credentials`, `~/.netrc`, `~/.aws`, `~/.npmrc`, `~/.pypirc`, `~/.kube`, `~/.gnupg`, `~/.docker`, keychain databases, the app's own config dir, plus a user-editable list |
 
 ### 8.3 Clean environment
 
@@ -638,7 +649,9 @@ the user can extend, with:
 - `GH_CONFIG_DIR` pointing at an empty temp dir
 - `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`
 - `GIT_CONFIG_GLOBAL` pointing at a generated config that copies `user.name`
-  and `user.email` but sets `credential.helper=` (empty)
+  and `user.email` but sets `credential.helper=` (empty) and
+  `safe.bareRepository=explicit` (a PR can commit a bare-repo layout as plain
+  files; git must not discover it from `cd DIR && git status`)
 
 ### 8.4 Why this holds
 
@@ -775,12 +788,33 @@ commands = ["cargo test", "cargo clippy", "cargo fmt --check"]
 prepare = ["cargo fetch"]       # run outside the sandbox as the user (§8.5)
 extra_write_paths = []
 extra_deny_read = []
+
+[ai.auto_approve]               # bash approval engine (§8.1)
+enabled = true                  # rules auto-run commands proven read-only
+local_classifier = false        # model stage; off until the classifier is evaluated
+classifier_timeout_ms = 500     # clamped to 50..=5000; on timeout the command asks
+deny_paths = []                 # extra deny patterns: path components or `a/b`; trailing `*` = prefix, leading `*` = suffix; case-insensitive
+capabilities = []               # opt-in: git:add git:commit git:restore-staged git:tag cargo:local help-bypass
 ```
 
 API keys: keychain service `gh-review-desktop`, account `llm:<provider name>`.
 
 **Settings → AI** page: providers (add/edit/remove, "Test connection" makes
-one tiny request), model selection, per-repo folders and commands.
+one tiny request), model selection, per-repo folders and commands, and the
+"Auto-approve bash commands" section (the `[ai.auto_approve]` keys above). The
+classifier checkbox is disabled while no classifier is available; the model
+can approve a segment only if the never-approve filter allows it: the command
+is a bare name or an absolute system path (`/bin`, `/usr/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin`, `/sbin`, `/usr/sbin`), its basename (case-insensitive, with
+version suffixes such as `python3.12` or `node-18`) is not in the table of
+network, interpreter, shell, exec-wrapper, script-capable (`awk`, `sed`, `tar`,
+`sqlite3`, editors), installer and data-changing binaries, no later argument
+word (split on characters outside `[A-Za-z0-9._+-]`) names a table binary, it
+writes nowhere but `/dev/null`, and it sets no risky environment variable.
+Anything else asks. The timeout is one deadline per bash command, shared by all
+its segments, not per model call; after it, or while an earlier classification
+is still running, the remaining segments are decided without the model. Any
+failure falls back to the rule engine's verdict.
 
 ## 11. Storage (SQLite)
 

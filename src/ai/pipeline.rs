@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::ai::agent::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
+use crate::ai::approval_setup::ApprovalSetup;
 use crate::ai::context::load_repo_context;
 use crate::ai::events::{PipelineEvent, StageKind, StageStatus};
 use crate::ai::incremental::{IncrementalScope, commits_since, incremental_files};
@@ -90,6 +91,9 @@ pub struct PipelineInputs {
     pub mode: RunMode,
     /// Why `bash` is unavailable (spec §8.2); see [`StageInputs`].
     pub bash_disabled: Option<String>,
+    /// The local command classifier for bash approval, if one is installed;
+    /// used only when `settings.auto_approve.local_classifier` is on.
+    pub classifier: Option<Arc<dyn review_approval::model_stage::CommandClassifier>>,
 }
 
 /// Where one review group is in the scheduler.
@@ -751,6 +755,12 @@ pub fn start_pipeline(
             assigned: Arc::new(Vec::new()),
             spawner: None,
             prepare: None,
+            // One setup per run, so the classifier's cache spans the run and
+            // every agent (the scout, reviewers, chat) shares it.
+            approval: Arc::new(ApprovalSetup::from_settings(
+                &inputs.settings.auto_approve,
+                inputs.classifier.clone(),
+            )),
         },
         llm: inputs.llm.clone(),
         ctl: ctl.unregistered_ctl(),

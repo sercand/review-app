@@ -296,6 +296,7 @@ fn start_in(
         interaction,
         mode,
         bash_disabled,
+        classifier: None,
     });
     Started {
         control,

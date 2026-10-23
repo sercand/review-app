@@ -1104,6 +1104,7 @@ fn shots() {
             let scopes_for_dialog = scopes_ai.clone();
             let scopes_for_models = scopes_ai.clone();
             let scopes_for_model_dialog = scopes_ai.clone();
+            let scopes_for_auto_approve = scopes_ai.clone();
             let h = harness_sized(dark, SIZE, move |ui| {
                 pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -1248,6 +1249,48 @@ fn shots() {
                 );
             });
             save_after(h, &format!("settings-ai-model-dialog-{t}"), 8);
+
+            // The Auto-approve dialog over the AI tab, with a failed classifier
+            // download so the status line and Retry show.
+            let mut auto_approve = SettingsWindowState::default();
+            auto_approve.open_with(&ai_settings);
+            auto_approve.tab = SettingsTab::Ai;
+            auto_approve.set_classifier_state(crate::state::classifier::ClassifierState::Failed(
+                "network unreachable".to_owned(),
+            ));
+            auto_approve
+                .ai_tab
+                .edit_auto_approve(&ai_settings.ai, &auto_approve.classifier_state);
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut auto_approve,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_auto_approve,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-auto-approve-dialog-{t}"), 8);
         }
     }
 }

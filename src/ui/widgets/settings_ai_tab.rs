@@ -1,5 +1,7 @@
-//! The Settings window's AI tab: the providers table and its edit dialog, and
-//! the Models table with its model dialog (spec §10, Tasks 5–6).
+//! The Settings window's AI tab: the providers table and its edit dialog,
+//! the Models table with its model dialog (spec §10, Tasks 5–6), and the
+//! Auto-approve table with its dialog (bash auto-approve and the local
+//! classifier).
 //!
 //! Like the other widgets this never mutates the app's settings: a dialog
 //! reports a [`AiTabAction`] and `app.rs` applies it (patching the settings,
@@ -16,8 +18,10 @@ use eframe::egui::{self, Frame, Margin, RichText};
 
 use crate::ai::presets::{ModelPreset, presets as model_presets};
 use crate::persist::settings::{
-    AiSettings, LlmApi, ModelSettings, ProviderSettings, ReasoningLevel,
+    AiSettings, AutoApproveSettings, DEFAULT_DECISION_MODEL, LlmApi, ModelSettings,
+    ProviderSettings, ReasoningLevel, valid_decision_model,
 };
+use crate::state::classifier::{self, ClassifierState};
 use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_galley, segmented};
 use crate::ui::widgets::settings_window::ModelRole;
 use crate::ui::{fonts, icons, theme};
@@ -354,6 +358,213 @@ pub fn reasoning_label(level: Option<ReasoningLevel>) -> &'static str {
     }
 }
 
+/// The opt-in approval capabilities the dialog offers, with their one-line
+/// descriptions. The names are the `[ai.auto_approve].capabilities` values
+/// (mapped to rule policies in `ai::approval_setup`).
+pub const AUTO_APPROVE_CAPABILITIES: [(&str, &str); 6] = [
+    ("git:add", "stage files with git add (any path)"),
+    (
+        "git:commit",
+        "git commit (not --amend, --no-verify or --no-gpg-sign)",
+    ),
+    ("git:restore-staged", "unstage with git restore --staged"),
+    ("git:tag", "create, list and delete local tags"),
+    (
+        "cargo:local",
+        "cargo build/test/run/fmt/update and other local subcommands (runs project code)",
+    ),
+    (
+        "help-bypass",
+        "run any binary with only --help, -h, --version, -V, help or version",
+    ),
+];
+
+/// The auto-approve dialog's working copy of `[ai.auto_approve]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoApproveVm {
+    /// Rule-based auto-approval.
+    pub enabled: bool,
+    /// Whether the local classifier is consulted.
+    pub local_classifier: bool,
+    /// Whether this build has a classifier at all. Filled by the caller;
+    /// while `false` the checkbox is disabled and saving leaves the stored
+    /// `local_classifier` as it is.
+    pub classifier_available: bool,
+    /// Where the classifier is on its way to ready; drives the status line and
+    /// the Retry button. Filled by the caller.
+    pub classifier_state: ClassifierState,
+    /// The classifier timeout in milliseconds, as typed.
+    pub timeout_ms: String,
+    /// The registry name of the decision model, as typed. Blank saves as the
+    /// default model.
+    pub decision_model: String,
+    /// The extra deny patterns, one per line.
+    pub deny_paths_text: String,
+    /// Every capability with its on/off state. Names the dialog does not
+    /// know (from a newer settings file) are kept, so saving never drops them.
+    pub capabilities: Vec<(String, bool)>,
+}
+
+impl Default for AutoApproveVm {
+    fn default() -> Self {
+        AutoApproveVm::from_settings(&AutoApproveSettings::default())
+    }
+}
+
+impl AutoApproveVm {
+    /// The working copy of `s`; `classifier_available` starts `false`.
+    pub fn from_settings(s: &AutoApproveSettings) -> AutoApproveVm {
+        let mut capabilities: Vec<(String, bool)> = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .map(|(name, _)| ((*name).to_owned(), s.capabilities.iter().any(|c| c == name)))
+            .collect();
+        for unknown in &s.capabilities {
+            if !capabilities.iter().any(|(name, _)| name == unknown) {
+                capabilities.push((unknown.clone(), true));
+            }
+        }
+        AutoApproveVm {
+            enabled: s.enabled,
+            local_classifier: s.local_classifier,
+            classifier_available: false,
+            classifier_state: ClassifierState::Off,
+            timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
+            decision_model: s.decision_model.clone(),
+            deny_paths_text: s.deny_paths.join("\n"),
+            capabilities,
+        }
+    }
+
+    /// Show `state`: the checkbox is editable unless this build has no
+    /// classifier or the device is unusable.
+    pub fn set_classifier_state(&mut self, state: ClassifierState) {
+        self.set_classifier_state_for(state, classifier::COMPILED);
+    }
+
+    fn set_classifier_state_for(&mut self, state: ClassifierState, compiled: bool) {
+        self.classifier_available = state.available(compiled);
+        self.classifier_state = state;
+    }
+
+    /// The deny patterns: trimmed, empty lines dropped.
+    fn deny_paths(&self) -> Vec<String> {
+        self.deny_paths_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Reject what [`Self::write_to`] cannot store: a timeout that is not
+    /// 50..=5000 ms, a decision model that is not a registry name, and deny
+    /// patterns containing whitespace (`/` is fine: `Library/Keychains` is a
+    /// built-in).
+    pub fn validate(&self) -> Result<(), String> {
+        match self.timeout_ms.trim().parse::<u64>() {
+            Ok(ms) if (50..=5000).contains(&ms) => {}
+            _ => return Err("classifier timeout must be 50 to 5000 ms".to_owned()),
+        }
+        let model = self.decision_model.trim();
+        if !model.is_empty() && !valid_decision_model(model) {
+            return Err(
+                "decision model must be a registry name: lowercase letters, digits, . _ -"
+                    .to_owned(),
+            );
+        }
+        for pattern in self.deny_paths() {
+            if pattern.chars().any(char::is_whitespace) {
+                return Err(format!("deny pattern \"{pattern}\" contains whitespace"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the validated copy into `s`. The classifier flag is only written
+    /// while a classifier is available; otherwise the stored value stays.
+    fn write_to(&self, s: &mut AutoApproveSettings) {
+        s.enabled = self.enabled;
+        // Not editable while unavailable: keep what is stored (M4), except
+        // that it can be switched off but never on.
+        if self.classifier_available {
+            s.local_classifier = self.local_classifier;
+        } else {
+            s.local_classifier &= self.local_classifier;
+        }
+        s.classifier_timeout_ms = self
+            .timeout_ms
+            .trim()
+            .parse()
+            .unwrap_or(s.classifier_timeout_ms);
+        s.decision_model = match self.decision_model.trim() {
+            "" => DEFAULT_DECISION_MODEL.to_owned(),
+            model => model.to_owned(),
+        };
+        s.deny_paths = self.deny_paths();
+        s.capabilities = self
+            .capabilities
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
+
+    /// The table the dialog's Save commits: `stored` with the edits written
+    /// over it, or why it cannot be saved (nothing is written then).
+    pub fn saved(&self, stored: &AutoApproveSettings) -> Result<AutoApproveSettings, String> {
+        self.validate()?;
+        let mut next = stored.clone();
+        self.write_to(&mut next);
+        Ok(next)
+    }
+}
+
+/// One row of the Auto-approve table: a stage, whether it is on, and a short
+/// detail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoApproveRowVm {
+    /// The stage's name.
+    pub stage: &'static str,
+    /// `on` or `off`.
+    pub state: &'static str,
+    /// What the stage is configured with, or where the classifier stands.
+    pub detail: String,
+}
+
+/// The Auto-approve table's two rows: the rules and the local classifier.
+pub fn auto_approve_rows(
+    aa: &AutoApproveSettings,
+    classifier_state: &ClassifierState,
+) -> Vec<AutoApproveRowVm> {
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    vec![
+        AutoApproveRowVm {
+            stage: "Rules",
+            state: on_off(aa.enabled),
+            detail: format!(
+                "{}, {}",
+                plural(aa.capabilities.len(), "capability", "capabilities"),
+                plural(
+                    aa.deny_paths.len(),
+                    "extra deny pattern",
+                    "extra deny patterns"
+                ),
+            ),
+        },
+        AutoApproveRowVm {
+            stage: "Local classifier",
+            state: on_off(aa.local_classifier),
+            detail: format!(
+                "{} · {}",
+                aa.decision_model,
+                classifier_state.text(classifier::COMPILED)
+            ),
+        },
+    ]
+}
+
 /// The model dialog's working copy: the fields are the dialog's own, so a
 /// preset fill or a typed id never touches the settings until Save.
 #[derive(Clone, Debug, PartialEq)]
@@ -506,6 +717,8 @@ pub struct AiTabState {
     pub model_dialog: Option<ModelDialog>,
     /// The latest connection-test outcome per provider name.
     pub test_results: BTreeMap<String, Result<String, String>>,
+    /// The auto-approve dialog, when one is open.
+    pub auto_approve: Option<AutoApproveVm>,
 }
 
 impl AiTabState {
@@ -513,6 +726,7 @@ impl AiTabState {
     /// one dialog shows at a time: the model dialog closes.
     pub fn edit_provider(&mut self, ai: &AiSettings, index: usize) {
         self.model_dialog = None;
+        self.auto_approve = None;
         self.dialog = ai.providers.get(index).map(ProviderDialog::for_provider);
     }
 
@@ -520,7 +734,18 @@ impl AiTabState {
     /// one dialog shows at a time: the provider dialog closes.
     pub fn edit_model(&mut self, ai: &AiSettings, role: ModelRole) {
         self.dialog = None;
+        self.auto_approve = None;
         self.model_dialog = Some(ModelDialog::new(role, ai));
+    }
+
+    /// Open the auto-approve dialog on the stored table, showing the
+    /// classifier's latest state. Only one dialog shows at a time.
+    pub fn edit_auto_approve(&mut self, ai: &AiSettings, classifier_state: &ClassifierState) {
+        self.dialog = None;
+        self.model_dialog = None;
+        let mut vm = AutoApproveVm::from_settings(&ai.auto_approve);
+        vm.set_classifier_state(classifier_state.clone());
+        self.auto_approve = Some(vm);
     }
 }
 
@@ -561,13 +786,18 @@ pub enum AiTabAction {
         /// A key typed in the dialog; wins over the stored one.
         key: Option<String>,
     },
+    /// Commit the `[ai.auto_approve]` table (validated by the dialog).
+    SaveAutoApprove(AutoApproveSettings),
+    /// Fetch the classifier weights again (the Retry button).
+    ClassifierDownload,
 }
 
-/// Draw the providers table, the Models table, and, when open, a dialog.
-/// Returns what the user asked for this frame.
+/// Draw the providers table, the Models table, the Auto-approve table, and,
+/// when open, a dialog. Returns what the user asked for this frame.
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AiTabState,
+    classifier_state: &ClassifierState,
     ai: &AiSettings,
     keys: &KeyPresence,
 ) -> Vec<AiTabAction> {
@@ -600,8 +830,13 @@ pub fn render(
         state.edit_model(ai, role);
     }
 
+    if auto_approve_section(ui, ai, classifier_state, &mut actions) {
+        state.edit_auto_approve(ai, classifier_state);
+    }
+
     render_dialog(ui.ctx(), state, ai, keys, &mut actions);
     render_model_dialog(ui.ctx(), state, ai, &mut actions);
+    render_auto_approve_dialog(ui.ctx(), state, ai, &mut actions);
     actions
 }
 
@@ -617,6 +852,7 @@ fn heading(ui: &mut egui::Ui, ai: &AiSettings, state: &mut AiTabState) {
             {
                 // Only one dialog shows at a time (final review).
                 state.model_dialog = None;
+                state.auto_approve = None;
                 state.dialog = Some(ProviderDialog::blank(unique_name(&ai.providers)));
             }
         });
@@ -1199,6 +1435,225 @@ fn render_model_dialog(
     }
 }
 
+/// The Auto-approve table's column widths: Stage, State, Detail.
+const AUTO_APPROVE_COLUMNS: [f32; 3] = [0.25, 0.12, 0.63];
+
+/// The Auto-approve section: a heading, the rules and classifier rows, and a
+/// Retry button while a download or load failed. Returns whether the user
+/// clicked a row (which opens the dialog).
+fn auto_approve_section(
+    ui: &mut egui::Ui,
+    ai: &AiSettings,
+    classifier_state: &ClassifierState,
+    actions: &mut Vec<AiTabAction>,
+) -> bool {
+    ui.add_space(12.0);
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new("Auto-approve bash commands").font(fonts::semibold(13.0)));
+    ui.add_space(2.0);
+
+    let width = ui.available_width();
+    let lefts = column_lefts(width, &AUTO_APPROVE_COLUMNS);
+    header_row(ui, width, &lefts, &["Stage", "State", "Detail"]);
+
+    let mut open = false;
+    for row in auto_approve_rows(&ai.auto_approve, classifier_state) {
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, p.hover);
+        }
+        let cell_width = |column: usize| width * AUTO_APPROVE_COLUMNS[column] - 8.0;
+        cell(
+            ui,
+            rect,
+            lefts[0],
+            row.stage,
+            cell_width(0),
+            p.text,
+            egui::FontId::proportional(12.5),
+        );
+        cell(
+            ui,
+            rect,
+            lefts[1],
+            row.state,
+            cell_width(1),
+            if row.state == "on" { p.ok } else { p.muted },
+            egui::FontId::proportional(12.0),
+        );
+        cell(
+            ui,
+            rect,
+            lefts[2],
+            &row.detail,
+            cell_width(2),
+            p.muted,
+            egui::FontId::proportional(12.0),
+        );
+        ui.painter()
+            .hline(rect.x_range(), rect.bottom(), (1.0, p.line_soft));
+        if response.on_hover_text("edit auto-approve").clicked() {
+            open = true;
+        }
+    }
+    // Only a failed download or load can be retried.
+    if classifier_state.can_download(classifier::COMPILED) {
+        ui.add_space(4.0);
+        if Btn::new(BtnKind::Default, "Retry classifier download")
+            .show(ui)
+            .clicked()
+        {
+            actions.push(AiTabAction::ClassifierDownload);
+        }
+    }
+    open
+}
+
+/// M5: the checkbox also gates the repo's own allowed commands (`decide`
+/// turns every `Run` into an ask while it is off), so the copy says so.
+const AUTO_APPROVE_LABEL: &str =
+    "Run commands the rules prove read-only, or the repo allows, without asking";
+const AUTO_APPROVE_HINT: &str = "Off: every command asks, including the repo's allowed commands. Secret paths stay blocked either way.";
+
+/// The auto-approve dialog's fields: rule-based approval, the optional
+/// classifier, extra deny patterns and the opt-in capabilities.
+fn auto_approve_fields(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<AiTabAction>) {
+    let p = theme::palette_of(ui);
+    ui.checkbox(&mut vm.enabled, AUTO_APPROVE_LABEL);
+    ui.label(RichText::new(AUTO_APPROVE_HINT).size(12.0).color(p.muted));
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(vm.classifier_available || vm.local_classifier, |ui| {
+            ui.checkbox(
+                &mut vm.local_classifier,
+                "Also ask the local classifier (experimental)",
+            );
+        });
+        ui.label(
+            RichText::new(vm.classifier_state.text(classifier::COMPILED))
+                .size(12.0)
+                .color(p.faint),
+        );
+        // Only a failed download or load can be retried.
+        if vm.classifier_state.can_download(classifier::COMPILED)
+            && Btn::new(BtnKind::Default, "Retry").show(ui).clicked()
+        {
+            actions.push(AiTabAction::ClassifierDownload);
+        }
+    });
+    // The model is a registry name; its weights download when the classifier is on.
+    field_label(ui, "Decision model");
+    ui.add_enabled(
+        vm.classifier_available,
+        egui::TextEdit::singleline(&mut vm.decision_model)
+            .hint_text(DEFAULT_DECISION_MODEL)
+            .desired_width(160.0),
+    );
+    ui.label(
+        RichText::new(
+            "Advisory only. A \"safe\" answer never approves a listed network, interpreter, install, delete or wrapper program, a program outside the system bin directories (PR code), a pager or viewer, a shell builtin that changes later commands (`alias`, `trap`, `hash`, ...), a tool that loads and runs the repo's config or plugins (`eslint`, `tsc`, `terraform`, ...), a command naming one or passing it a working-tree path or a program-running option; those still ask. Unlisted programs can be approved. The sandbox remains the security boundary.",
+        )
+        .size(12.0)
+        .color(p.muted),
+    );
+    field_label(ui, "Classifier timeout (ms)");
+    ui.add(egui::TextEdit::singleline(&mut vm.timeout_ms).desired_width(80.0));
+    field_label(
+        ui,
+        "Never let the agent touch (one pattern per line, * at the end matches a prefix, * at the start a suffix, case-insensitive)",
+    );
+    ui.add(
+        egui::TextEdit::multiline(&mut vm.deny_paths_text)
+            .hint_text(
+                "path components, may contain / (for example: secrets, .env*, Library/Keychains)",
+            )
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    );
+    field_label(ui, "Capabilities");
+    for (name, on) in &mut vm.capabilities {
+        let description = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .find(|(known, _)| known == name)
+            .map_or("", |(_, description)| *description);
+        ui.checkbox(on, format!("{name}  {description}"));
+    }
+}
+
+/// The auto-approve dialog, shown only while [`AiTabState::auto_approve`] is
+/// set. Save commits the whole `[ai.auto_approve]` table.
+fn render_auto_approve_dialog(
+    ctx: &egui::Context,
+    state: &mut AiTabState,
+    ai: &AiSettings,
+    actions: &mut Vec<AiTabAction>,
+) {
+    let Some(vm) = state.auto_approve.as_mut() else {
+        return;
+    };
+    let p = theme::palette(ctx.theme() == egui::Theme::Dark);
+    let mut close = false;
+    let title = "Auto-approve bash commands";
+    egui::Window::new(title)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .frame(
+            Frame::new()
+                .fill(p.surface)
+                .corner_radius(10.0)
+                .stroke((1.0, p.line))
+                .inner_margin(Margin::symmetric(16, 12)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).font(fonts::semibold(14.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::icon_button(ui, icons::X, "Close  Esc").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            rule(ui);
+
+            egui::ScrollArea::vertical()
+                .max_height((ctx.viewport_rect().height() - 220.0).clamp(160.0, 520.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| auto_approve_fields(ui, vm, actions));
+
+            let saved = vm.saved(&ai.auto_approve);
+            if let Err(error) = &saved {
+                ui.label(RichText::new(error).size(12.0).color(p.bad));
+            }
+            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save = Btn::new(BtnKind::Primary, "Save")
+                    .enabled(saved.is_ok())
+                    .show(ui);
+                let save = if saved.is_ok() {
+                    save
+                } else {
+                    save.on_hover_text("fix the auto-approve settings before saving")
+                };
+                if save.clicked()
+                    && let Ok(next) = saved
+                {
+                    actions.push(AiTabAction::SaveAutoApprove(next));
+                    close = true;
+                }
+                if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
+                    close = true;
+                }
+            });
+        });
+    if close {
+        state.auto_approve = None;
+    }
+}
+
 /// The model dialog's provider dropdown: the providers the file names.
 fn provider_combo(ui: &mut egui::Ui, provider: &mut String, ai: &AiSettings) {
     let p = theme::palette_of(ui);
@@ -1661,5 +2116,271 @@ mod tests {
             "the provider dialog closes the model dialog"
         );
         assert!(state.dialog.is_some());
+    }
+    /// The auto-approve dialog closes the other two, and they close it.
+    #[test]
+    fn the_auto_approve_dialog_is_exclusive_too() {
+        let ai = ai_with_provider();
+        let mut state = AiTabState::default();
+        state.edit_model(&ai, ModelRole::Default);
+        state.edit_auto_approve(&ai, &ClassifierState::Off);
+        assert!(state.model_dialog.is_none() && state.dialog.is_none());
+        assert!(state.auto_approve.is_some());
+        state.edit_provider(&ai, 0);
+        assert!(state.auto_approve.is_none());
+        state.edit_auto_approve(&ai, &ClassifierState::Off);
+        state.edit_model(&ai, ModelRole::Default);
+        assert!(state.auto_approve.is_none());
+    }
+
+    /// Save writes the dialog's copy over the stored table (the old Apply).
+    fn apply(vm: &AutoApproveVm, s: &mut AutoApproveSettings) -> Result<(), String> {
+        *s = vm.saved(s)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vm_round_trips_settings() {
+        let mut settings = AutoApproveSettings {
+            enabled: false,
+            local_classifier: false,
+            classifier_timeout_ms: 1234,
+            deny_paths: vec!["secrets".into(), ".env*".into()],
+            capabilities: vec![
+                "git:add".into(),
+                "cargo:local".into(),
+                "future:thing".into(),
+            ],
+            decision_model: "d1-7b".into(),
+        };
+        let before = settings.clone();
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "1234");
+        assert_eq!(vm.deny_paths_text, "secrets\n.env*");
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn vm_round_trips_decision_model() {
+        let mut settings = AutoApproveSettings {
+            decision_model: "d1-7b".into(),
+            ..AutoApproveSettings::default()
+        };
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.decision_model, "d1-7b");
+        vm.decision_model = " smol.v2_x ".into();
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.decision_model, "smol.v2_x");
+    }
+
+    #[test]
+    fn a_blank_decision_model_saves_as_the_default() {
+        for blank in ["", "   "] {
+            let mut settings = AutoApproveSettings {
+                decision_model: "d1-7b".into(),
+                ..AutoApproveSettings::default()
+            };
+            let mut vm = AutoApproveVm::from_settings(&settings);
+            vm.decision_model = blank.into();
+            assert!(vm.validate().is_ok(), "{blank:?}");
+            apply(&vm, &mut settings).unwrap();
+            assert_eq!(settings.decision_model, DEFAULT_DECISION_MODEL);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_model_name() {
+        for bad in ["D1", "a b", "a/b", "../x", "d1:3b"] {
+            let vm = AutoApproveVm {
+                decision_model: bad.into(),
+                ..AutoApproveVm::default()
+            };
+            assert!(vm.validate().is_err(), "{bad:?}");
+        }
+        assert!(AutoApproveVm::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_timeout_and_patterns() {
+        let ok = AutoApproveVm::default();
+        assert!(ok.validate().is_ok());
+        for bad in ["", "abc", "49", "5001", "-1"] {
+            let vm = AutoApproveVm {
+                timeout_ms: bad.into(),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "timeout {bad:?}");
+        }
+        for bad in ["a b", "a\tb"] {
+            let vm = AutoApproveVm {
+                deny_paths_text: format!("fine\n{bad}"),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "pattern {bad:?}");
+        }
+        let vm = AutoApproveVm {
+            timeout_ms: "50".into(),
+            deny_paths_text: "\n  secrets* \n\n".into(),
+            ..ok
+        };
+        assert!(vm.validate().is_ok());
+    }
+
+    // M5: the copy must say the repo's allowed commands are gated too.
+    #[test]
+    fn auto_approve_copy_mentions_repo_allowed_commands() {
+        assert!(AUTO_APPROVE_LABEL.contains("repo allows"));
+        assert!(AUTO_APPROVE_HINT.contains("repo's allowed commands"));
+    }
+
+    #[test]
+    fn apply_writes_settings() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.enabled = false;
+        vm.timeout_ms = "800".into();
+        vm.deny_paths_text = " secrets \n\n.env*\n".into();
+        for (name, on) in &mut vm.capabilities {
+            *on = name == "git:commit" || name == "help-bypass";
+        }
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.classifier_timeout_ms, 800);
+        assert_eq!(settings.deny_paths, vec!["secrets", ".env*"]);
+        assert_eq!(settings.capabilities, vec!["git:commit", "help-bypass"]);
+    }
+
+    #[test]
+    fn invalid_auto_approve_blocks_apply_without_writing() {
+        let mut settings = AutoApproveSettings::default();
+        let before = settings.clone();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.timeout_ms = "0".into();
+        vm.enabled = false;
+        assert!(apply(&vm, &mut settings).is_err());
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn classifier_checkbox_forced_off_when_unavailable() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        assert!(!vm.classifier_available);
+        vm.local_classifier = true;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+        vm.classifier_available = true;
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+    }
+
+    #[test]
+    fn opening_the_dialog_gates_the_checkbox_by_the_classifier_state() {
+        let ai = ai_with_provider();
+        let mut state = AiTabState::default();
+        state.edit_auto_approve(&ai, &ClassifierState::Downloading { done: 1, total: 2 });
+        let aa = state.auto_approve.as_ref().unwrap();
+        assert_eq!(
+            aa.classifier_state,
+            ClassifierState::Downloading { done: 1, total: 2 }
+        );
+        assert_eq!(aa.classifier_available, classifier::COMPILED);
+    }
+
+    #[test]
+    fn an_unavailable_classifier_can_be_switched_off_but_never_on() {
+        let mut settings = AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        };
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        // Untouched: the stored true stays.
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+        // Unchecked: it goes off.
+        vm.local_classifier = false;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+        // Checking it while unavailable does not stick.
+        vm.local_classifier = true;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+    }
+
+    #[test]
+    fn unavailable_or_uncompiled_classifier_is_not_editable() {
+        let mut aa = AutoApproveVm::default();
+        aa.set_classifier_state_for(ClassifierState::Failed("offline".into()), true);
+        assert!(aa.classifier_available, "editable while Failed");
+        aa.set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        assert!(!aa.classifier_available);
+        aa.set_classifier_state_for(ClassifierState::Off, false);
+        assert!(!aa.classifier_available);
+    }
+
+    // M4: a hand-set `local_classifier = true` survives saving while the
+    // checkbox was not editable (no classifier available).
+    #[test]
+    fn save_keeps_hand_set_local_classifier_while_unavailable() {
+        let mut settings = AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        };
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert!(!vm.classifier_available);
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+    }
+
+    #[test]
+    fn stored_out_of_range_timeout_and_slash_pattern_do_not_block_save() {
+        let mut settings = AutoApproveSettings {
+            classifier_timeout_ms: 0,
+            deny_paths: vec!["Library/Keychains".into()],
+            ..AutoApproveSettings::default()
+        };
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "50");
+        assert!(vm.validate().is_ok());
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.classifier_timeout_ms, 50);
+        assert_eq!(settings.deny_paths, ["Library/Keychains"]);
+        settings.classifier_timeout_ms = 10_000;
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "5000");
+    }
+
+    #[test]
+    fn crlf_deny_paths_are_split_cleanly() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.deny_paths_text = "a\r\nb\r\n".into();
+        assert!(vm.validate().is_ok());
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.deny_paths, ["a", "b"]);
+    }
+
+    #[test]
+    fn auto_approve_rows_summarise_rules_and_classifier() {
+        let aa = AutoApproveSettings {
+            capabilities: vec!["git:add".into()],
+            deny_paths: vec!["a".into(), "b".into()],
+            ..AutoApproveSettings::default()
+        };
+        let rows = auto_approve_rows(&aa, &ClassifierState::Failed("offline".into()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].stage, "Rules");
+        assert_eq!(rows[0].state, "on");
+        assert_eq!(rows[0].detail, "1 capability, 2 extra deny patterns");
+        assert_eq!(rows[1].stage, "Local classifier");
+        assert_eq!(rows[1].state, "off");
+        assert!(rows[1].detail.starts_with(DEFAULT_DECISION_MODEL));
+        assert!(
+            rows[1]
+                .detail
+                .ends_with(&ClassifierState::Failed("offline".into()).text(classifier::COMPILED))
+        );
     }
 }

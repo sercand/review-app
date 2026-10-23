@@ -37,7 +37,7 @@ bins=()
 dsyms=()
 for target in $TARGETS; do
     log "building $BIN_NAME $VERSION ($BUILD_NUMBER) for $target"
-    cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --target "$target" --bin "$BIN_NAME"
+    cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --target "$target" --bin "$BIN_NAME" --features local-classifier
     bins+=("$ROOT/target/$target/release/$BIN_NAME")
     dsyms+=("$ROOT/target/$target/release/$BIN_NAME.dSYM")
 done

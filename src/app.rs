@@ -336,6 +336,10 @@ pub struct ReviewApp {
     palette: PaletteState,
     help_open: bool,
     settings_window: SettingsWindowState,
+    /// Whether the once-per-start classifier enable went out (first frame).
+    classifier_startup_done: bool,
+    /// Stamps `ClassifierSetEnabled` in send order (the worker may reorder).
+    classifier_seq: u64,
     settings_writer: DebouncedWriter,
     applied_theme: Option<egui::Theme>,
     settings: Settings,
@@ -444,6 +448,29 @@ fn quit_close_needs_intercept(close_requested: bool, self_triggered: bool) -> bo
     close_requested && !self_triggered
 }
 
+/// Fold [`Event::ClassifierState`] into the Settings window (`handle_event`'s
+/// arm; `ReviewApp` itself cannot be built without a window, so the arm is
+/// this function).
+fn apply_classifier_event(
+    window: &mut SettingsWindowState,
+    state: crate::state::classifier::ClassifierState,
+) {
+    window.set_classifier_state(state);
+}
+
+/// Whether the worker must be told about a settings change: the classifier
+/// was switched on or off, or it is on and its model changed (a model change
+/// while off is picked up by the next enable, which carries the model).
+fn classifier_changed(was_on: bool, on: bool, was_model: &str, model: &str) -> bool {
+    on != was_on || (on && was_model != model)
+}
+
+/// True exactly once, on the first call, and only when the classifier setting
+/// is on: the app then sends `ClassifierSetEnabled(true)`.
+fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
+    !std::mem::replace(done, true) && setting_on
+}
+
 /// Accept the OS folder picker's answer only while the PR it was opened for
 /// is still the open one (AI settings Task 7): a late answer for another
 /// repository is dropped rather than linking a folder behind the user's back.
@@ -549,6 +576,8 @@ impl ReviewApp {
             palette: PaletteState::default(),
             help_open: false,
             settings_window: SettingsWindowState::default(),
+            classifier_startup_done: false,
+            classifier_seq: 0,
             settings_writer: DebouncedWriter::default(),
             applied_theme: None,
             settings,
@@ -763,6 +792,10 @@ impl ReviewApp {
                 }
                 #[cfg(not(unix))]
                 let _ = (provider, result);
+            }
+            // App-global (no SessionId, never stale): Settings shows it.
+            Event::ClassifierState(state) => {
+                apply_classifier_event(&mut self.settings_window, state)
             }
             // The folder probe's answer (AI settings Task 7): matched back
             // to the repo the pick was for by token; the verdict lands in
@@ -1209,6 +1242,16 @@ impl ReviewApp {
         }
     }
 
+    /// Ask the worker to switch the classifier on or off, newest wins.
+    fn send_classifier_enabled(&mut self, enabled: bool) {
+        self.classifier_seq += 1;
+        self.worker.send(Command::ClassifierSetEnabled {
+            enabled,
+            model: self.settings.ai.auto_approve.decision_model.clone(),
+            seq: self.classifier_seq,
+        });
+    }
+
     /// Persist settings, reporting a failure as a toast.
     fn save_settings(&mut self, now: Instant) {
         if let Err(error) = self.settings.save(&self.config_dir) {
@@ -1291,6 +1334,14 @@ impl ReviewApp {
                         key,
                     });
                 }
+                SettingsAction::ClassifierDownload => {
+                    self.worker.send(Command::ClassifierDownload);
+                }
+                // Not Unix-gated, so `classifier_changed` is used everywhere;
+                // off Unix the tab that sends it does not exist.
+                SettingsAction::SaveAutoApprove(auto_approve) => {
+                    self.save_auto_approve(auto_approve, now);
+                }
                 // The AI tab is Unix-only, so these never arise elsewhere.
                 #[cfg(not(unix))]
                 SettingsAction::SaveModel { .. }
@@ -1317,6 +1368,32 @@ impl ReviewApp {
         let mut candidate = self.settings.clone();
         role.set_model(&mut candidate.ai, model);
         self.try_save_settings(candidate, now);
+    }
+
+    /// Commit the `[ai.auto_approve]` table from the AI tab's auto-approve
+    /// dialog, and tell the worker when the classifier was switched on or off
+    /// or its model changed while on.
+    fn save_auto_approve(
+        &mut self,
+        auto_approve: crate::persist::settings::AutoApproveSettings,
+        now: Instant,
+    ) {
+        let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
+        let model_was = self.settings.ai.auto_approve.decision_model.clone();
+        let mut candidate = self.settings.clone();
+        candidate.ai.auto_approve = auto_approve;
+        if !self.try_save_settings(candidate, now) {
+            return;
+        }
+        let classifier_on = self.settings.ai.auto_approve.local_classifier;
+        if classifier_changed(
+            classifier_was_on,
+            classifier_on,
+            &model_was,
+            &self.settings.ai.auto_approve.decision_model,
+        ) {
+            self.send_classifier_enabled(classifier_on);
+        }
     }
 
     /// Commit one AI provider row (spec §10).
@@ -3689,6 +3766,14 @@ impl eframe::App for ReviewApp {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
+        // The first frame is up: only now start the classifier download/load
+        // (never in `new`), and only if the user switched it on.
+        if classifier_startup_due(
+            &mut self.classifier_startup_done,
+            self.settings.ai.auto_approve.local_classifier,
+        ) {
+            self.send_classifier_enabled(true);
+        }
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
@@ -3990,6 +4075,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(key_check_blocker(&no_provider, &keys), None);
+    }
+
+    #[test]
+    fn a_model_change_is_sent_only_while_the_classifier_is_on() {
+        assert!(classifier_changed(false, true, "a", "a"));
+        assert!(classifier_changed(true, false, "a", "a"));
+        assert!(classifier_changed(true, true, "a", "b"));
+        assert!(!classifier_changed(true, true, "a", "a"));
+        assert!(!classifier_changed(false, false, "a", "b"));
+    }
+
+    #[test]
+    fn classifier_startup_fires_once_and_only_when_on() {
+        let mut done = false;
+        assert!(classifier_startup_due(&mut done, true));
+        assert!(!classifier_startup_due(&mut done, true), "only once");
+        let mut done = false;
+        assert!(!classifier_startup_due(&mut done, false));
+        assert!(done, "the first frame is spent even when off");
+    }
+
+    #[test]
+    fn classifier_event_updates_the_settings_window_vm() {
+        use crate::state::classifier::ClassifierState;
+        let mut window = SettingsWindowState::default();
+        // An open auto-approve dialog follows the event as well.
+        #[cfg(unix)]
+        window
+            .ai_tab
+            .edit_auto_approve(&Settings::default().ai, &ClassifierState::Off);
+        apply_classifier_event(&mut window, ClassifierState::Failed("offline".into()));
+        assert_eq!(
+            window.classifier_state,
+            ClassifierState::Failed("offline".into())
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            window
+                .ai_tab
+                .auto_approve
+                .as_ref()
+                .unwrap()
+                .classifier_state,
+            ClassifierState::Failed("offline".into())
+        );
     }
 
     #[test]
