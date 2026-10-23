@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
+use crate::state::local_repos::ListTab;
 use crate::ui::theme::Theme;
 
 /// The cached identity of the signed-in account.
@@ -43,6 +44,28 @@ pub struct Layout {
     /// `Overview` (Plan 3).
     #[serde(default, deserialize_with = "load_details_tab")]
     pub details_tab: crate::ui::widgets::metadata_panel::DetailsTab,
+    /// Which PR-list tab the app last showed (AI settings and local repos
+    /// Task 8). The Local tab is unix-only, so on Windows a `Local`
+    /// selection loads as `All` (see [`ListTab::for_platform`]); a file
+    /// written before the field existed loads as `All`.
+    #[serde(default = "default_list_tab", deserialize_with = "load_list_tab")]
+    pub pr_list_tab: ListTab,
+}
+
+/// The default for [`Layout::pr_list_tab`]: a file written before the Local
+/// tab existed opens on the scope-based list.
+fn default_list_tab() -> ListTab {
+    ListTab::All
+}
+
+/// [`Layout`]'s PR-list tab loader: the stored tab as-is on unix, with the
+/// Local tab flattened to `All` on Windows (see [`ListTab::for_platform`]).
+fn load_list_tab<'de, D>(deserializer: D) -> Result<ListTab, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(ListTab::deserialize(deserializer)?.for_platform())
 }
 
 /// [`Layout`]'s tab loader: the stored tab as-is on unix, with the AI tab
@@ -357,6 +380,7 @@ impl Default for Settings {
                 right_pane: 340.0,
                 right_open: false,
                 details_tab: crate::ui::widgets::metadata_panel::DetailsTab::default(),
+                pr_list_tab: ListTab::default(),
             },
             diff: DiffPrefs::default(),
             code_font_size: 13.0,
@@ -818,5 +842,37 @@ extra_deny_read = []
         let r = Settings::load_or_default(dir.path());
         assert_eq!(r.layout.left_pane, 321.0);
         assert!(!r.layout.right_open);
+    }
+
+    /// A file written before the Local tab existed opens on the All tab,
+    /// and an explicit choice survives a save/load on the platforms that
+    /// show the tab (Windows flattens `Local` to `All` on load).
+    #[test]
+    fn old_settings_file_defaults_the_tab_to_all() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("settings.toml"), "host = \"github.com\"\n").unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.pr_list_tab,
+            ListTab::All
+        );
+        // A `[layout]` table without the key is an old file too.
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[layout]\nleft_pane = 300.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_or_default(dir.path()).layout.pr_list_tab,
+            ListTab::All
+        );
+
+        let mut s = Settings::default();
+        s.layout.pr_list_tab = ListTab::Local;
+        s.save(dir.path()).unwrap();
+        let loaded = Settings::load_or_default(dir.path()).layout.pr_list_tab;
+        #[cfg(unix)]
+        assert_eq!(loaded, ListTab::Local);
+        #[cfg(not(unix))]
+        assert_eq!(loaded, ListTab::All);
     }
 }

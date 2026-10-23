@@ -104,9 +104,82 @@ pub fn folder_status(path: &Path) -> FolderStatus {
     }
 }
 
+/// What still stands between the user and Start, in the order the PR AI tab
+/// shows them: a model to run, a provider that serves it with a stored key,
+/// and a local folder to review in.
+///
+/// `has_key` is injected rather than read here: the keychain is a blocking
+/// call, and the panel asks this every frame from a cached probe. The only I/O
+/// this function does is [`folder_status`], which is filesystem-only by design
+/// (see its docs). The repository key is matched case-insensitively like
+/// [`link_repo`].
+///
+/// A `LlmApi::Unsupported` provider is not called out separately: it is
+/// configured, so the model pre-check passes, and the provider's connection
+/// test is what reports that the build cannot talk to it.
+pub fn start_blockers(
+    ai: &AiSettings,
+    repo_key: &str,
+    has_key: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+
+    match ai.models.default.as_ref() {
+        None => blockers.push("Choose a default model in Settings → AI.".to_string()),
+        Some(model) => match ai.provider(&model.provider) {
+            None => blockers.push(format!(
+                "The default model's provider \"{}\" is not configured.",
+                model.provider
+            )),
+            Some(provider) => {
+                if !has_key(&provider.name) {
+                    blockers.push(format!(
+                        "The API key for provider \"{}\" is missing.",
+                        provider.name
+                    ));
+                }
+            }
+        },
+    }
+
+    let linked = ai
+        .repos
+        .iter()
+        .find(|entry| entry.repo.to_lowercase() == repo_key.to_lowercase())
+        .filter(|entry| !entry.path.as_os_str().is_empty());
+    match linked {
+        None => blockers.push(format!("Link a local folder for {repo_key}.")),
+        Some(entry) => match folder_status(&entry.path) {
+            FolderStatus::Ok => {}
+            FolderStatus::Missing => {
+                blockers.push(format!("The linked folder for {repo_key} is missing."));
+            }
+            FolderStatus::NotARepo => blockers.push(format!(
+                "The linked folder for {repo_key} is not a git repository."
+            )),
+        },
+    }
+
+    blockers
+}
+
+/// The provider whose stored key gates Start: the one serving the default
+/// model, when both a default model and that provider are configured.
+///
+/// [`start_blockers`] reports a *missing* key; the app uses this to tell a
+/// missing key from one whose presence the probe has not answered yet — the
+/// keychain read blocks, so presence arrives from a cached probe, and a name
+/// the probe has not answered is unknown, not missing.
+pub fn key_gated_provider(ai: &AiSettings) -> Option<String> {
+    let model = ai.models.default.as_ref()?;
+    ai.provider(&model.provider)
+        .map(|provider| provider.name.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persist::settings::{AiModels, LlmApi, ModelSettings, ProviderSettings};
     use crate::test_support::tempdir;
 
     fn remote(host: &str, owner: &str, name: &str) -> RemoteRepo {
@@ -240,5 +313,144 @@ mod tests {
             .expect("git on PATH");
         assert!(status.status.success(), "git init failed");
         assert_eq!(folder_status(&clone), FolderStatus::Ok);
+    }
+
+    fn provider(name: &str) -> ProviderSettings {
+        ProviderSettings {
+            name: name.to_string(),
+            api: LlmApi::AnthropicMessages,
+            ..Default::default()
+        }
+    }
+
+    fn default_model(provider: &str) -> ModelSettings {
+        ModelSettings {
+            provider: provider.to_string(),
+            model: "claude-test".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Every missing piece is named, in the order the Start pre-check shows
+    /// them: model, provider, key, link, folder.
+    #[test]
+    fn start_blockers_lists_each_missing_piece() {
+        let dir = tempdir();
+        let key = "GitHub.com/Acme/Widgets";
+        let no_key = |_: &str| false;
+        let has_key = |_: &str| true;
+
+        // Nothing configured: no default model to check a provider or key for,
+        // and nothing linked.
+        let mut ai = AiSettings::default();
+        let blockers = start_blockers(&ai, key, &no_key);
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        assert!(blockers[0].contains("default model"), "{blockers:?}");
+        assert!(blockers[1].contains("local folder"), "{blockers:?}");
+
+        // A default model whose provider is not in `ai.providers`.
+        ai.models = AiModels {
+            default: Some(default_model("work")),
+            ..Default::default()
+        };
+        let blockers = start_blockers(&ai, key, &no_key);
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        assert!(blockers[0].contains("\"work\""), "{blockers:?}");
+        assert!(blockers[0].contains("not configured"), "{blockers:?}");
+
+        // The provider exists but has no stored key.
+        ai.providers.push(provider("work"));
+        let blockers = start_blockers(&ai, key, &no_key);
+        assert_eq!(blockers.len(), 2, "{blockers:?}");
+        assert!(blockers[0].contains("API key"), "{blockers:?}");
+        assert!(blockers[0].contains("\"work\""), "{blockers:?}");
+
+        // Key stored, but no entry for the repository at all.
+        let blockers = start_blockers(&ai, key, &has_key);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("Link a local folder"), "{blockers:?}");
+        assert!(blockers[0].contains(key), "{blockers:?}");
+
+        // The entry's key is matched case-insensitively, and its folder can be
+        // gone or not a repository.
+        ai.repos
+            .push(entry("github.com/Acme/Widgets", dir.path().join("gone")));
+        let blockers = start_blockers(&ai, key, &has_key);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("is missing"), "{blockers:?}");
+
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        ai.repos[0].path = plain;
+        let blockers = start_blockers(&ai, key, &has_key);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("not a git repository"), "{blockers:?}");
+
+        // An entry whose path was cleared is not linked, even with commands.
+        ai.repos[0].path = PathBuf::new();
+        let blockers = start_blockers(&ai, key, &has_key);
+        assert_eq!(blockers.len(), 1, "{blockers:?}");
+        assert!(blockers[0].contains("Link a local folder"), "{blockers:?}");
+    }
+
+    /// A configured model, key and clone leave nothing to fix.
+    #[test]
+    fn start_blockers_empty_when_ready() {
+        let dir = tempdir();
+        let clone = dir.path().join("widgets");
+        std::fs::create_dir_all(&clone).unwrap();
+        let status = std::process::Command::new("git")
+            .current_dir(&clone)
+            .args(["init", "-b", "main"])
+            .output()
+            .expect("git on PATH");
+        assert!(status.status.success(), "git init failed");
+
+        let ai = AiSettings {
+            providers: vec![provider("work")],
+            models: AiModels {
+                default: Some(default_model("work")),
+                ..Default::default()
+            },
+            repos: vec![entry("github.com/acme/widgets", clone.clone())],
+            ..Default::default()
+        };
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let has_key = |name: &str| {
+            seen.borrow_mut().push(name.to_string());
+            name == "work"
+        };
+        assert!(
+            start_blockers(&ai, "github.com/acme/widgets", &has_key).is_empty(),
+            "a configured model, key and clone start cleanly"
+        );
+        assert_eq!(
+            seen.into_inner(),
+            vec!["work".to_string()],
+            "the key is asked for the configured provider's name"
+        );
+    }
+
+    /// The key gate names the provider serving the default model, and nothing
+    /// when either is missing: the app uses it to tell "no key" from "the
+    /// probe has not answered yet".
+    #[test]
+    fn key_gated_provider_names_the_default_models_provider() {
+        let mut ai = AiSettings::default();
+        assert_eq!(key_gated_provider(&ai), None, "no default model");
+
+        ai.models = AiModels {
+            default: Some(default_model("work")),
+            ..Default::default()
+        };
+        assert_eq!(
+            key_gated_provider(&ai),
+            None,
+            "the default model's provider is not configured"
+        );
+
+        ai.providers.push(provider("work"));
+        assert_eq!(key_gated_provider(&ai).as_deref(), Some("work"));
     }
 }

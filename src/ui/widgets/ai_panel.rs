@@ -8,13 +8,18 @@
 //! returns an [`AiPanelAction`] for `app.rs` to turn into a worker
 //! [`crate::runtime::Command`]. Unix-only with [`crate::ai`].
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui::{self, Color32, Frame, Margin, RichText};
 
 use crate::ai::events::{StageKind, StageStatus};
 use crate::ai::interaction::ApprovalDecision;
+use crate::ai::repo_link::{FolderStatus, folder_status, start_blockers};
+use crate::ai::store::CheckoutRecord;
 use crate::ai::tools::AgentRole;
 use crate::ai::ui_interaction::ApprovalKind;
-use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+use crate::persist::settings::{AiSettings, RepoAiSettings};
+use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry, change_blocked};
 use crate::ui::widgets::markdown;
 use crate::ui::{fonts, icons, theme};
 
@@ -69,6 +74,84 @@ pub enum AiPanelAction {
     /// User clicked "Add to settings" on the suggested-commands card
     /// (task 4): copy the brief's commands into the repo's AI settings.
     AddSuggestedCommands,
+    /// Choose or change this repo's local folder: the app opens the OS
+    /// picker and probes the answer (AI settings Task 7). The row's
+    /// "Choose folder…" and "Change…" buttons.
+    ChooseFolder,
+    /// Unlink the repo's local folder; the commands, prepare commands and
+    /// extra paths stay for a relink (AI settings Task 7).
+    UnlinkFolder,
+    /// Open the repo-commands dialog from the row's edit affordance
+    /// (AI settings Task 7).
+    EditRepoCommands,
+}
+
+/// The Local checkout row's view-model (AI settings Task 7): what the
+/// folder is, whether it is usable, and what stands between the user and
+/// Start. `app.rs` builds it per frame from the settings and the cached
+/// keychain probe; the only I/O in the build is [`folder_status`],
+/// filesystem-only by design (the clone check itself ran on the worker
+/// when the folder was picked, and its complaint rides in as `error`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalCheckoutVm {
+    /// `owner/name`, the row's title.
+    pub repo: String,
+    /// The linked folder; `None` when the repo has no folder yet.
+    pub path: Option<PathBuf>,
+    /// Whether the folder is still there and still a repository.
+    pub status: FolderStatus,
+    /// Why the last folder choice was refused — a probe failure or a clone
+    /// of another repository — shown in the row, never a toast.
+    pub error: Option<String>,
+    /// Why Start is disabled, in display order; empty means Start is live.
+    pub blockers: Vec<String>,
+    /// Why Change… / Unlink are disabled, or `None` when the link can move.
+    pub change_blocked: Option<String>,
+}
+
+/// Window-level data the tab displays but does not own.
+#[derive(Clone, Copy, Default)]
+pub struct PanelInputs<'a> {
+    /// The Local checkout row above everything else; `None` hides the row
+    /// (a tab painted without repo context, as in some tests).
+    pub checkout: Option<&'a LocalCheckoutVm>,
+    /// The repo's AI settings entry, for the commands summary; `None`
+    /// when the repo has no entry yet.
+    pub repo: Option<&'a RepoAiSettings>,
+}
+
+/// Build the Local checkout row's view-model for `repo_key`
+/// (`host/owner/name`, matched case-insensitively like [`start_blockers`]).
+///
+/// `has_key` answers whether a provider's API key is stored: the app fills
+/// it from its cached probe, never from the keychain, which blocks.
+/// `error` is the app's complaint about the last folder choice, if any.
+pub fn local_checkout_vm(
+    ai: &AiSettings,
+    repo_key: &str,
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    has_key: &dyn Fn(&str) -> bool,
+    error: Option<String>,
+) -> LocalCheckoutVm {
+    let path = ai
+        .repos
+        .iter()
+        .find(|entry| entry.repo.eq_ignore_ascii_case(repo_key))
+        .map(|entry| entry.path.clone())
+        .filter(|path| !path.as_os_str().is_empty());
+    let status = folder_status(path.as_deref().unwrap_or(Path::new("")));
+    LocalCheckoutVm {
+        repo: repo_key
+            .split_once('/')
+            .map_or(repo_key, |(_, slug)| slug)
+            .to_string(),
+        path,
+        status,
+        error,
+        blockers: start_blockers(ai, repo_key, has_key),
+        change_blocked: change_blocked(ai_state, unrestored, repo_key),
+    }
 }
 
 /// The display name of a pipeline stage.
@@ -207,11 +290,21 @@ pub fn chat_enabled(phase: &AiPhase) -> bool {
     matches!(phase, AiPhase::Running | AiPhase::Paused | AiPhase::Done)
 }
 
-/// Paint the tab; `show_dropped` reveals the verifier-dropped findings.
-pub fn render(ui: &mut egui::Ui, st: &AiReviewState, show_dropped: bool) -> Vec<AiPanelAction> {
+/// Paint the tab; `inputs` carries the Local checkout row and the repo's
+/// settings entry, `show_dropped` reveals the verifier-dropped findings.
+pub fn render(
+    ui: &mut egui::Ui,
+    st: &AiReviewState,
+    inputs: &PanelInputs,
+    show_dropped: bool,
+) -> Vec<AiPanelAction> {
     let mut actions = Vec::new();
+    if let Some(vm) = inputs.checkout {
+        render_local_checkout(ui, vm, inputs.repo, &mut actions);
+        ui.separator();
+    }
     render_stage_strip(ui, st);
-    render_phase(ui, st, &mut actions);
+    render_phase(ui, st, inputs.checkout, &mut actions);
     render_suggestions(ui, st, &mut actions);
     ui.separator();
     for (index, entry) in st.timeline.iter().enumerate() {
@@ -223,6 +316,124 @@ pub fn render(ui: &mut egui::Ui, st: &AiReviewState, show_dropped: bool) -> Vec<
     render_chat(ui, st, &mut actions);
     render_run_controls(ui, st, &mut actions);
     actions
+}
+
+/// The Local checkout row at the top of the tab (spec: AI settings —
+/// "PR → AI tab: Local checkout row"): the folder, the clone-check result,
+/// the Choose… / Change… / Unlink controls, the probe's complaint, and the
+/// repo's commands with an edit affordance. Shown before a review starts
+/// and kept visible afterwards.
+fn render_local_checkout(
+    ui: &mut egui::Ui,
+    vm: &LocalCheckoutVm,
+    repo: Option<&RepoAiSettings>,
+    actions: &mut Vec<AiPanelAction>,
+) {
+    let p = theme::palette_of(ui);
+    card(ui, |ui| {
+        ui.label(
+            RichText::new(format!("Local checkout for {}", vm.repo)).font(fonts::semibold(12.5)),
+        );
+        let blocked = vm.change_blocked.is_some();
+        match &vm.path {
+            Some(path) => {
+                ui.horizontal_wrapped(|ui| {
+                    // A long path is one unbreakable-ish token: truncate,
+                    // full text on hover, so the row cannot widen the pane.
+                    let shown = path.display().to_string();
+                    ui.add(
+                        egui::Label::new(RichText::new(&shown).monospace().size(11.5)).truncate(),
+                    )
+                    .on_hover_text(shown);
+                    match vm.status {
+                        FolderStatus::Ok => {
+                            ui.colored_label(
+                                p.ok,
+                                format!("{} clone of {}", icons::CHECK, vm.repo),
+                            );
+                        }
+                        FolderStatus::Missing => {
+                            ui.colored_label(p.bad, "folder is missing");
+                        }
+                        FolderStatus::NotARepo => {
+                            ui.colored_label(p.bad, "not a git repository");
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(!blocked, |ui| {
+                            if ui.button("Unlink").clicked() {
+                                actions.push(AiPanelAction::UnlinkFolder);
+                            }
+                            if ui.button("Change…").clicked() {
+                                actions.push(AiPanelAction::ChooseFolder);
+                            }
+                        });
+                    });
+                });
+            }
+            None => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("No folder yet — Start stays disabled until one is linked.");
+                    ui.add_enabled_ui(!blocked, |ui| {
+                        if ui.button("Choose folder…").clicked() {
+                            actions.push(AiPanelAction::ChooseFolder);
+                        }
+                    });
+                });
+            }
+        }
+        if let Some(reason) = &vm.change_blocked {
+            ui.colored_label(p.pending, reason);
+        }
+        if let Some(error) = &vm.error {
+            ui.colored_label(p.bad, error);
+        }
+        render_commands_summary(ui, repo, actions);
+    });
+}
+
+/// The repo's allowed commands and prepare commands with the edit
+/// affordance (they moved here from Settings; the dialog edits the entry
+/// even before a folder is linked).
+fn render_commands_summary(
+    ui: &mut egui::Ui,
+    repo: Option<&RepoAiSettings>,
+    actions: &mut Vec<AiPanelAction>,
+) {
+    let p = theme::palette_of(ui);
+    ui.horizontal_wrapped(|ui| {
+        match repo.filter(|repo| !repo.commands.is_empty()) {
+            Some(repo) => {
+                ui.label(
+                    RichText::new("Commands agents may run:")
+                        .color(p.muted)
+                        .size(11.5),
+                );
+                ui.label(
+                    RichText::new(repo.commands.join(", "))
+                        .monospace()
+                        .size(11.5),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new("No commands yet — agents ask before running anything.")
+                        .color(p.muted)
+                        .size(11.5),
+                );
+            }
+        }
+        if let Some(repo) = repo.filter(|repo| !repo.prepare.is_empty()) {
+            ui.label(
+                RichText::new(format!("· Prepare: {}", repo.prepare.join(", ")))
+                    .color(p.muted)
+                    .size(11.5),
+            );
+        }
+        if ui.link("edit").clicked() {
+            actions.push(AiPanelAction::EditRepoCommands);
+        }
+    });
 }
 
 /// The compact strip above the timeline: one chip per announced stage.
@@ -248,8 +459,15 @@ fn render_stage_strip(ui: &mut egui::Ui, st: &AiReviewState) {
     });
 }
 
-/// The phase line and the Start / Continue entry points.
-fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanelAction>) {
+/// The phase line and the Start / Continue entry points. Start (and
+/// Continue) stay disabled while the Local checkout row lists blockers —
+/// the reasons are stated right under the buttons (AI settings Task 7).
+fn render_phase(
+    ui: &mut egui::Ui,
+    st: &AiReviewState,
+    checkout: Option<&LocalCheckoutVm>,
+    actions: &mut Vec<AiPanelAction>,
+) {
     let p = theme::palette_of(ui);
     let mut can_start = false;
     match &st.phase {
@@ -288,22 +506,40 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
             can_start = true;
         }
     }
+    // What stands between the user and a run; no row (no repo context)
+    // means nothing here is known to block the start.
+    let blockers: &[String] = checkout.map_or(&[], |vm| vm.blockers.as_slice());
     ui.horizontal_wrapped(|ui| {
-        if can_start && ui.button("Start AI review").clicked() {
-            actions.push(AiPanelAction::Start);
+        if can_start {
+            let start = ui
+                .add_enabled_ui(blockers.is_empty(), |ui| ui.button("Start AI review"))
+                .inner;
+            let start = if blockers.is_empty() {
+                start
+            } else {
+                start.on_hover_text(blockers.join("\n"))
+            };
+            if start.clicked() {
+                actions.push(AiPanelAction::Start);
+            }
         }
         // The head comparison behind a re-review (`can_continue`) needs the
         // PR head, which the tab cannot see; offering Continue whenever a
         // completed review exists and nothing is in flight is the tab's
         // half, and `app.rs` gates the click on `can_continue` (Task 4).
+        // The same blockers that stop Start stop a re-review too.
         if st.last_reviewed_sha.is_some()
             && matches!(
                 st.phase,
                 AiPhase::Idle | AiPhase::Done | AiPhase::Finished | AiPhase::Failed(_)
             )
-            && ui.button("Continue review").clicked()
         {
-            actions.push(AiPanelAction::Continue);
+            let cont = ui
+                .add_enabled_ui(blockers.is_empty(), |ui| ui.button("Continue review"))
+                .inner;
+            if cont.clicked() {
+                actions.push(AiPanelAction::Continue);
+            }
         }
         // A plan waiting for confirmation can be abandoned from here too:
         // the confirm dialog is the usual path, but a dialog that never
@@ -313,6 +549,11 @@ fn render_phase(ui: &mut egui::Ui, st: &AiReviewState, actions: &mut Vec<AiPanel
             actions.push(AiPanelAction::Cancel);
         }
     });
+    if can_start {
+        for reason in blockers {
+            ui.colored_label(p.pending, reason);
+        }
+    }
 }
 
 /// The suggested-commands card: the scout's proposals for a repo with no
@@ -1044,7 +1285,7 @@ mod tests {
             painted.phase = phase;
             egui::__run_test_ui(|ui| {
                 assert!(
-                    render(ui, &painted, show_dropped).is_empty(),
+                    render(ui, &painted, &PanelInputs::default(), show_dropped).is_empty(),
                     "painting alone reports no actions"
                 );
             });
@@ -1059,10 +1300,173 @@ mod tests {
                 move |ui, actions: &mut Vec<AiPanelAction>| {
                     // Accumulate: kittest runs a follow-up frame after the
                     // click, and that frame reports nothing.
-                    actions.extend(render(ui, &st, false));
+                    actions.extend(render(ui, &st, &PanelInputs::default(), false));
                 },
                 Vec::new(),
             )
+    }
+
+    /// [`panel_harness`] with the Local checkout row and the repo's
+    /// settings entry painted above the tab (AI settings Task 7).
+    fn panel_harness_row(
+        st: AiReviewState,
+        vm: LocalCheckoutVm,
+        repo: Option<RepoAiSettings>,
+    ) -> egui_kittest::Harness<'static, Vec<AiPanelAction>> {
+        egui_kittest::Harness::builder()
+            .with_size([420.0, 900.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, actions: &mut Vec<AiPanelAction>| {
+                    let inputs = PanelInputs {
+                        checkout: Some(&vm),
+                        repo: repo.as_ref(),
+                    };
+                    actions.extend(render(ui, &st, &inputs, false));
+                },
+                Vec::new(),
+            )
+    }
+
+    /// A row with no folder: Start is disabled and every blocker is stated
+    /// in the tab (never a toast), while the row's Choose… still reports
+    /// its action (AI settings Task 7).
+    #[test]
+    fn start_disabled_with_reason_when_not_linked() {
+        use egui_kittest::kittest::Queryable;
+
+        let vm = LocalCheckoutVm {
+            repo: "acme/widgets".to_string(),
+            path: None,
+            status: FolderStatus::Missing,
+            error: None,
+            blockers: vec!["Link a local folder for github.com/acme/widgets.".to_string()],
+            change_blocked: None,
+        };
+        let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
+        harness.get_by_label("Start AI review").click();
+        harness.run();
+        assert!(
+            harness.state().is_empty(),
+            "a blocked Start reports nothing: {:?}",
+            harness.state()
+        );
+        harness.get_by_label("Link a local folder for github.com/acme/widgets.");
+        harness.get_by_label("Choose folder…").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::ChooseFolder],
+            "the row's only control while unlinked is the picker"
+        );
+    }
+
+    /// The linked row reports Change…, Unlink, and the commands summary's
+    /// edit affordance (spec: AI settings — the row owns the link and the
+    /// commands moved here from Settings).
+    #[test]
+    fn the_linked_row_reports_change_unlink_and_edit() {
+        use egui_kittest::kittest::Queryable;
+        use std::path::PathBuf;
+
+        let vm = LocalCheckoutVm {
+            repo: "acme/widgets".to_string(),
+            path: Some(PathBuf::from("/src/widgets")),
+            status: FolderStatus::Ok,
+            error: None,
+            blockers: Vec::new(),
+            change_blocked: None,
+        };
+        let repo = RepoAiSettings {
+            repo: "github.com/acme/widgets".to_string(),
+            path: PathBuf::from("/src/widgets"),
+            commands: vec!["cargo test".to_string()],
+            prepare: vec!["cargo fetch".to_string()],
+            extra_write_paths: Vec::new(),
+            extra_deny_read: Vec::new(),
+        };
+
+        let mut harness = panel_harness_row(AiReviewState::default(), vm.clone(), Some(repo));
+        harness.get_by_label("Change…").click();
+        harness.run();
+        assert_eq!(*harness.state(), vec![AiPanelAction::ChooseFolder]);
+
+        let mut harness = panel_harness_row(AiReviewState::default(), vm.clone(), None);
+        harness.get_by_label("Unlink").click();
+        harness.run();
+        assert_eq!(*harness.state(), vec![AiPanelAction::UnlinkFolder]);
+
+        let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
+        harness.get_by_label("edit").click();
+        harness.run();
+        assert_eq!(*harness.state(), vec![AiPanelAction::EditRepoCommands]);
+    }
+
+    /// Change… and Unlink are disabled with the reason while a run for the
+    /// repo is live or one of its checkouts is unrestored: the restore
+    /// logic depends on the path.
+    #[test]
+    fn change_and_unlink_stay_disabled_while_blocked() {
+        use egui_kittest::kittest::Queryable;
+        use std::path::PathBuf;
+
+        let vm = LocalCheckoutVm {
+            repo: "acme/widgets".to_string(),
+            path: Some(PathBuf::from("/src/widgets")),
+            status: FolderStatus::Ok,
+            error: None,
+            blockers: Vec::new(),
+            change_blocked: Some(
+                "An AI review is running for this repository — finish it before changing the folder."
+                    .to_string(),
+            ),
+        };
+        let mut harness = panel_harness_row(
+            AiReviewState {
+                phase: AiPhase::Running,
+                ..AiReviewState::default()
+            },
+            vm,
+            None,
+        );
+        harness.get_by_label("Unlink").click();
+        harness.get_by_label("Change…").click();
+        // The Running phase's spinner repaints forever, so `run` would
+        // never settle: a few steps is all the clicks need.
+        harness.run_steps(4);
+        assert!(
+            harness.state().is_empty(),
+            "blocked controls report nothing: {:?}",
+            harness.state()
+        );
+        harness.get_by_label(
+            "An AI review is running for this repository — finish it before changing the folder.",
+        );
+    }
+
+    /// The row's error — the probe's complaint about the last folder
+    /// choice — is shown in the row, not a toast.
+    #[test]
+    fn the_row_shows_the_probe_error() {
+        use egui_kittest::kittest::Queryable;
+        use std::path::PathBuf;
+
+        let vm = LocalCheckoutVm {
+            repo: "acme/widgets".to_string(),
+            path: Some(PathBuf::from("/src/other")),
+            status: FolderStatus::Ok,
+            error: Some(
+                "that folder is a clone of github.com/acme/api, not github.com/acme/widgets"
+                    .to_string(),
+            ),
+            blockers: Vec::new(),
+            change_blocked: None,
+        };
+        let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
+        harness.run();
+        harness.get_by_label(
+            "that folder is a clone of github.com/acme/api, not github.com/acme/widgets",
+        );
     }
 
     /// The suggested-commands card offers "Add to settings" (task 4), and a
@@ -1173,7 +1577,7 @@ mod tests {
                             .id_salt("metadata-panel")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                let _ = render(ui, &st, false);
+                                let _ = render(ui, &st, &PanelInputs::default(), false);
                                 *c.borrow_mut() = ui.min_rect();
                                 *k.borrow_mut() = ui.clip_rect();
                             });

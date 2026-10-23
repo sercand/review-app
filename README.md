@@ -104,13 +104,18 @@ submit it yourself.
 
 ### Setup
 
-In **Settings → AI**:
-
-1. Add a provider (name, API type, base URL, API key) and pick a model. The
-   key goes to the OS keychain, like the GitHub token.
-2. Per repository, set the local folder and the commands the agent may run
-   without asking (e.g. `cargo test`). On your first review of a repo, the
-   scout agent proposes these and you confirm them.
+1. In **Settings → AI**, add a provider (name, API type, base URL, API key)
+   and pick the models to use. Click a row, or "Add provider", to edit it in
+   a dialog; the API key goes to the OS keychain, like the GitHub token, and
+   "Test" works from the dialog before you save.
+2. Link a local folder to the repository, either from a PR's **AI tab** (the
+   Local checkout row) or from the **Local repos** tab on the PR list, where
+   linked repos are listed and their open PRs expand per row. The app reads
+   the folder's git remote to check it is a clone of that repository.
+3. Under the Local checkout row, set the commands the agent may run without
+   asking (e.g. `cargo test`) and the prepare commands it can't run itself.
+   On your first review of a repo, the scout agent proposes these and you
+   confirm them.
 
 Other commands ask for approval in the AI tab, once or for the whole review.
 
@@ -164,8 +169,9 @@ the decision model on d1-3b gives the same result (see
 `docs/superpowers/specs/2026-10-22-local-classifier-evaluation.md`).
 
 - The model is a **decision model**, chosen by its shiso registry name in
-  **Settings → AI → Decision model** (`ai.auto_approve.decision_model`, default
-  `d1-3b`, which is the model used for testing). It is asked one question
+  **Settings → AI → Auto-approve** (click a row to open the dialog; the
+  Decision model field, `ai.auto_approve.decision_model`, default `d1-3b`,
+  which is the model used for testing). It is asked one question
   about each command (approve / ask / deny) and answers with probabilities.
   The question comes from `decision_schema.json` in the model's folder, or a
   built-in default when the model has none; either way a command is approved

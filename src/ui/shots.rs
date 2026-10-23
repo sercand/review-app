@@ -20,7 +20,11 @@ use crate::state::pr_detail::PrSession;
 use crate::state::pr_list::PrListState;
 use crate::test_support::{line_anchor, loaded, meta, pr_summary, repo};
 use crate::ui::screens::{login, pr_detail, pr_list};
+#[cfg(unix)]
+use crate::ui::widgets::settings_ai_tab::{ModelDialog, ProviderDialog};
 use crate::ui::widgets::settings_window::{self, AccountInfo, SettingsWindowState};
+#[cfg(unix)]
+use crate::ui::widgets::settings_window::{ModelRole, SettingsTab};
 use crate::ui::{fonts, theme};
 
 const SIZE: [f32; 2] = [1440.0, 900.0];
@@ -355,6 +359,10 @@ fn detail(mode: DiffMode, dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: false,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -696,6 +704,10 @@ fn ai_detail_pane(
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -771,6 +783,10 @@ fn ai_inline_draft(dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
     });
@@ -786,7 +802,7 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
 
     let mut s = session(DiffMode::Split);
     let dialog = AiDialog::ConfirmCheckout(CheckoutPlan {
-        repo_path: std::path::PathBuf::from("/Users/sercand/Developer/otsimo/web"),
+        repo_path: std::path::PathBuf::from("/Users/dev/Developer/otsimo/web"),
         remote: "origin".to_string(),
         original: OriginalRef::Branch("main".to_string()),
         dirty: true,
@@ -825,6 +841,10 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
+                #[cfg(unix)]
+                local_checkout: None,
+                #[cfg(unix)]
+                repo_ai: None,
             },
         );
         ai_dialogs::render(
@@ -833,12 +853,84 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
             &DialogInputs {
                 pr: Some(&pr),
                 prepare: &prepare,
-                error: None,
             },
             &mut Vec::new(),
         );
     });
     save_after(h, name, 8);
+}
+
+/// The Local checkout row at the top of the PR AI tab (AI settings Task 7)
+/// in its three states: `linked` shows a usable folder (the app's own
+/// checkout, so the clone check is real), otherwise the folder is absent —
+/// `missing` names one that was linked and has since gone, unlinked shows
+/// the Start-gating reason.
+#[cfg(unix)]
+fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
+    use crate::ai::repo_link::FolderStatus;
+    use crate::persist::settings::RepoAiSettings;
+    use crate::ui::widgets::ai_panel::LocalCheckoutVm;
+
+    let path = if linked {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    } else if missing {
+        std::path::PathBuf::from("/Users/dev/Developer/src/widgets")
+    } else {
+        std::path::PathBuf::new()
+    };
+    let vm = LocalCheckoutVm {
+        repo: "acme/widgets".to_string(),
+        path: (!path.as_os_str().is_empty()).then(|| path.clone()),
+        status: match (linked, missing) {
+            (true, _) => FolderStatus::Ok,
+            (false, true) => FolderStatus::Missing,
+            (false, false) => FolderStatus::Missing,
+        },
+        error: None,
+        blockers: if linked {
+            Vec::new()
+        } else if missing {
+            vec!["The linked folder for github.com/acme/widgets is missing.".to_string()]
+        } else {
+            vec!["Link a local folder for github.com/acme/widgets.".to_string()]
+        },
+        change_blocked: None,
+    };
+    let repo = RepoAiSettings {
+        repo: "github.com/acme/widgets".to_string(),
+        path,
+        commands: vec!["cargo test".to_string(), "cargo clippy".to_string()],
+        prepare: vec!["cargo fetch".to_string()],
+        ..Default::default()
+    };
+
+    let mut s = session(DiffMode::Split);
+    let mut state = pr_detail::PrDetailState {
+        right_open: true,
+        ..Default::default()
+    };
+    state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
+    let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
+    let h = harness(dark, move |ui| {
+        let mut diff_actions = Vec::new();
+        pr_detail::render(
+            ui,
+            &mut s,
+            &mut state,
+            &mut cache,
+            &mut diff_actions,
+            pr_detail::ScreenInputs {
+                login: "sercand",
+                write_blocked: None,
+                theme: theme::Theme::Dark,
+                system_dark: dark,
+                ai_configured: true,
+                local_checkout: Some(&vm),
+                repo_ai: Some(&repo),
+            },
+        );
+    });
+    save_after(h, name, 10);
 }
 
 #[test]
@@ -883,6 +975,55 @@ fn shots() {
             );
             ai_inline_draft(dark, &format!("pr-ai-inline-draft-{t}"));
             ai_checkout_dialog(dark, &format!("pr-checkout-dialog-{t}"));
+            // The Local checkout row in its three states (AI settings Task 7).
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-linked-{t}"),
+                true,
+                false,
+            );
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-unlinked-{t}"),
+                false,
+                false,
+            );
+            ai_local_checkout(
+                dark,
+                &format!("pr-ai-local-checkout-missing-{t}"),
+                false,
+                true,
+            );
+            // The Local repos tab (AI settings Task 9): collapsed, one
+            // expanded, empty, and a missing folder.
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-{t}"),
+                false,
+                false,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-expanded-{t}"),
+                true,
+                false,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-empty-{t}"),
+                false,
+                true,
+                false,
+            );
+            local_repos_shot(
+                dark,
+                &format!("pr-list-local-repos-missing-{t}"),
+                false,
+                false,
+                true,
+            );
         }
 
         let settings = Settings::default();
@@ -896,7 +1037,7 @@ fn shots() {
         save(h, &format!("login-{t}"));
 
         let mut win = SettingsWindowState::default();
-        win.open_with(&settings, &|_| false);
+        win.open_with(&settings);
         let scopes: Vec<String> = [
             "admin:org",
             "gist",
@@ -912,6 +1053,7 @@ fn shots() {
         .collect();
         let mut list = pr_list_state();
         let mut form = pr_list::PrListForm::default();
+        let settings_for_shot = settings.clone();
         let h = harness(dark, move |ui| {
             pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
             egui::CentralPanel::default().show(ui, |ui| {
@@ -932,25 +1074,38 @@ fn shots() {
                     host: "github.com",
                     scopes: &scopes,
                 }),
+                &settings_for_shot.ai,
+                &std::collections::BTreeMap::new(),
                 &mut Vec::new(),
             );
         });
         save(h, &format!("settings-{t}"));
 
-        // The AI section (spec §10), rendered only on Unix like the feature.
+        // The AI tab's providers table and provider dialog (spec §10, Task 5),
+        // rendered only on Unix like the feature.
         #[cfg(unix)]
         {
-            let mut ai = SettingsWindowState::default();
-            ai.open_with(&ai_shot_settings(), &|name| name == "work");
-            ai.vm
-                .ai
-                .test_results
-                .insert("work".to_owned(), Ok("model-id".to_owned()));
-            let mut list = pr_list_state();
-            let mut form = pr_list::PrListForm::default();
+            let ai_settings = ai_shot_settings();
+            let keys = ai_shot_keys();
             let scopes_ai: Vec<String> =
                 ["repo", "read:org"].iter().map(|s| s.to_string()).collect();
-            let h = harness_sized(dark, [1440.0, 1200.0], move |ui| {
+
+            let mut providers = SettingsWindowState::default();
+            providers.open_with(&ai_settings);
+            providers.tab = SettingsTab::Ai;
+            providers
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = keys.clone();
+            let scopes_for_dialog = scopes_ai.clone();
+            let scopes_for_models = scopes_ai.clone();
+            let scopes_for_model_dialog = scopes_ai.clone();
+            let scopes_for_auto_approve = scopes_ai.clone();
+            let h = harness_sized(dark, SIZE, move |ui| {
                 pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
                 egui::CentralPanel::default().show(ui, |ui| {
                     pr_list::render(
@@ -964,16 +1119,178 @@ fn shots() {
                 });
                 settings_window::render(
                     ui.ctx(),
-                    &mut ai,
+                    &mut providers,
                     Some(AccountInfo {
                         login: "sercand",
                         host: "github.com",
                         scopes: &scopes_ai,
                     }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
                     &mut Vec::new(),
                 );
             });
-            save_after(h, &format!("settings-ai-{t}"), 10);
+            save_after(h, &format!("settings-ai-providers-{t}"), 8);
+
+            let mut dialog = SettingsWindowState::default();
+            dialog.open_with(&ai_settings);
+            dialog.tab = SettingsTab::Ai;
+            dialog
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            if let Some(provider) = ai_settings.ai.providers.first() {
+                dialog.ai_tab.dialog = Some(ProviderDialog::for_provider(provider));
+            }
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = keys;
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut dialog,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_dialog,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-provider-dialog-{t}"), 8);
+
+            // The Models table below the providers (spec §10, Task 6): two
+            // fixed roles, both filled like the approved mockup.
+            let mut models = SettingsWindowState::default();
+            models.open_with(&ai_settings);
+            models.tab = SettingsTab::Ai;
+            models
+                .ai_tab
+                .test_results
+                .insert("work".to_owned(), Ok("claude-sonnet-5-5".to_owned()));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut models,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_models,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-models-{t}"), 8);
+
+            // The model dialog over the Models table, editing the default role.
+            let mut model_dialog = SettingsWindowState::default();
+            model_dialog.open_with(&ai_settings);
+            model_dialog.tab = SettingsTab::Ai;
+            model_dialog.ai_tab.model_dialog =
+                Some(ModelDialog::new(ModelRole::Default, &ai_settings.ai));
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut model_dialog,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_model_dialog,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-model-dialog-{t}"), 8);
+
+            // The Auto-approve dialog over the AI tab, with a failed classifier
+            // download so the status line and Retry show.
+            let mut auto_approve = SettingsWindowState::default();
+            auto_approve.open_with(&ai_settings);
+            auto_approve.tab = SettingsTab::Ai;
+            auto_approve.set_classifier_state(crate::state::classifier::ClassifierState::Failed(
+                "network unreachable".to_owned(),
+            ));
+            auto_approve
+                .ai_tab
+                .edit_auto_approve(&ai_settings.ai, &auto_approve.classifier_state);
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut auto_approve,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_auto_approve,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-auto-approve-dialog-{t}"), 8);
         }
     }
 }
@@ -1023,6 +1340,10 @@ fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
                     theme: theme::Theme::Dark,
                     system_dark: true,
                     ai_configured: true,
+                    #[cfg(unix)]
+                    local_checkout: None,
+                    #[cfg(unix)]
+                    repo_ai: None,
                 },
             );
             *w.borrow_mut() = state.right_pane;
@@ -1037,33 +1358,145 @@ fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
     );
 }
 
-/// The settings the AI shot opens with: one provider, a default model and one
-/// repository.
+/// The settings the AI shots open with: three providers (two with a stored key
+/// in [`ai_shot_keys`]) and both model roles, like the approved mockup.
 #[cfg(unix)]
 fn ai_shot_settings() -> Settings {
-    use crate::persist::settings::{
-        LlmApi, ModelSettings, ProviderSettings, ReasoningLevel, RepoAiSettings,
-    };
+    use crate::persist::settings::{LlmApi, ModelSettings, ProviderSettings, ReasoningLevel};
     let mut settings = Settings::default();
-    settings.ai.providers = vec![ProviderSettings {
-        name: "work".into(),
-        api: LlmApi::AnthropicMessages,
-        base_url: "https://llm.example.com".into(),
-        headers: Default::default(),
-    }];
+    settings.ai.providers = vec![
+        ProviderSettings {
+            name: "work".into(),
+            api: LlmApi::AnthropicMessages,
+            base_url: String::new(),
+            headers: Default::default(),
+        },
+        ProviderSettings {
+            name: "openai-eu".into(),
+            api: LlmApi::OpenaiResponses,
+            base_url: "api.openai.com".into(),
+            headers: Default::default(),
+        },
+        ProviderSettings {
+            name: "local".into(),
+            api: LlmApi::OpenaiResponses,
+            base_url: "localhost:11434".into(),
+            headers: Default::default(),
+        },
+    ];
     settings.ai.models.default = Some(ModelSettings {
         provider: "work".into(),
-        model: "model-id".into(),
+        model: "claude-sonnet-5-5".into(),
         context_window: 200_000,
-        max_tokens: 8192,
+        max_tokens: 16_384,
         reasoning: Some(ReasoningLevel::Medium),
     });
-    settings.ai.repos = vec![RepoAiSettings {
-        repo: "github.com/owner/name".into(),
-        path: "/Users/me/src/owner/name".into(),
-        commands: vec!["cargo test".into(), "cargo clippy --all-targets".into()],
-        prepare: vec!["cargo fetch".into()],
-        ..RepoAiSettings::default()
-    }];
+    settings.ai.models.lookup = Some(ModelSettings {
+        provider: "work".into(),
+        model: "claude-haiku-5-5".into(),
+        context_window: 200_000,
+        max_tokens: 8_192,
+        reasoning: None,
+    });
     settings
+}
+
+/// The keychain presence the AI shots show: `work` and `openai-eu` have a
+/// key, `local` does not (mockup: "✓ stored" / "no key").
+#[cfg(unix)]
+fn ai_shot_keys() -> std::collections::BTreeMap<String, bool> {
+    [
+        ("work".to_owned(), true),
+        ("openai-eu".to_owned(), true),
+        ("local".to_owned(), false),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The Local repos tab (AI settings Task 9) in its four shapes: rows
+/// collapsed, one row expanded over its PRs, nothing linked, and a linked
+/// folder that has gone missing (its PRs still listed).
+#[cfg(unix)]
+fn local_repos_shot(dark: bool, name: &str, expanded: bool, empty: bool, missing_first: bool) {
+    use crate::persist::settings::{AiSettings, RepoAiSettings};
+    use crate::state::local_repos::{ListTab, LocalReposState, RepoPrs};
+    use crate::ui::widgets::local_repos;
+
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let gone = std::path::PathBuf::from("/Users/dev/Developer/acme/infra");
+    let ai = if empty {
+        AiSettings::default()
+    } else {
+        AiSettings {
+            repos: vec![
+                RepoAiSettings {
+                    repo: "github.com/acme/widgets".to_string(),
+                    path: if missing_first {
+                        gone.clone()
+                    } else {
+                        manifest.clone()
+                    },
+                    ..Default::default()
+                },
+                RepoAiSettings {
+                    repo: "github.com/acme/api".to_string(),
+                    path: manifest,
+                    ..Default::default()
+                },
+                RepoAiSettings {
+                    repo: "github.com/acme/infra".to_string(),
+                    path: gone,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    };
+    let mut state = LocalReposState::default();
+    if !empty {
+        let pr = |number: u64, title: &str| {
+            let mut s = pr_summary(number, title, 0);
+            s.repo = crate::model::RepoRef::new("acme", "widgets");
+            s
+        };
+        state.repos.insert(
+            "github.com/acme/widgets".to_string(),
+            RepoPrs::Loaded {
+                total: 3,
+                items: vec![
+                    pr(412, "Fix flaky retry in uploader"),
+                    pr(409, "Add CSV export"),
+                    pr(401, "Bump deps"),
+                ],
+            },
+        );
+        state.repos.insert(
+            "github.com/acme/api".to_string(),
+            RepoPrs::Loaded {
+                total: 7,
+                items: Vec::new(),
+            },
+        );
+        if expanded {
+            state.expanded.insert("github.com/acme/widgets".to_string());
+        }
+    }
+    let blocked = |_: &str| None;
+    let h = harness(dark, move |ui| {
+        pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+        egui::CentralPanel::default().show(ui, |ui| {
+            pr_list::render_tabs(ui, ListTab::Local, &mut Vec::new(), &mut Vec::new());
+            local_repos::render(
+                ui,
+                &ai,
+                "github.com",
+                &state,
+                &blocked,
+                "2026-10-20T00:00:00Z",
+                &mut Vec::new(),
+            );
+        });
+    });
+    save(h, name);
 }

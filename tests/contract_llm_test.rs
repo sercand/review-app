@@ -7,9 +7,13 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use gh_review_desktop::ai::llm::{build_client, test_connection};
+use gh_review_desktop::auth::store::{MemoryStore, set_llm_key};
 use gh_review_desktop::persist::settings::{LlmApi, ModelSettings, ProviderSettings};
+use gh_review_desktop::runtime::{Command, Event, ExecCtx, event_channel, execute};
 use secrecy::SecretString;
 use serde_json::json;
 use wiremock::matchers::{body_partial_json, header, method, path};
@@ -136,4 +140,84 @@ fn unsupported_api_is_rejected() {
     )
     .unwrap_err();
     assert_eq!(error.to_string(), "provider work uses an unsupported API");
+}
+
+/// Run the worker's "Test connection" command to completion and return its
+/// answer.
+async fn test_provider(
+    store: Arc<MemoryStore>,
+    provider: ProviderSettings,
+    key: Option<String>,
+) -> Result<String, String> {
+    let ctx = Arc::new(ExecCtx::new(store));
+    let (tx, rx) = event_channel();
+    execute(
+        ctx,
+        Command::AiTestProvider {
+            provider,
+            model: model(),
+            key,
+        },
+        tx,
+    )
+    .await;
+    let Some(Event::AiProviderTested {
+        provider: answered,
+        result,
+    }) = rx.recv_timeout(Duration::from_secs(10))
+    else {
+        panic!("expected the provider test's answer");
+    };
+    assert_eq!(answered, "work");
+    result
+}
+
+/// The key typed into the Settings dialog is the one dialed — the keychain
+/// is not consulted, and its older key never reaches the wire.
+#[tokio::test]
+async fn test_connection_prefers_the_typed_key() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "typed-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_reply()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    set_llm_key(&*store, "work", "stored-key").unwrap();
+    let result = test_provider(
+        store,
+        provider(LlmApi::AnthropicMessages, format!("{}/v1", server.uri())),
+        Some("typed-key".into()),
+    )
+    .await;
+
+    assert_eq!(result.unwrap(), "qwen3.8-flash");
+}
+
+/// With no typed key (the Settings window's current call), the stored key is
+/// used, so an already-saved provider still tests.
+#[tokio::test]
+async fn test_connection_falls_back_to_the_keychain() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "stored-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_reply()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let store = Arc::new(MemoryStore::default());
+    set_llm_key(&*store, "work", "stored-key").unwrap();
+    let result = test_provider(
+        store,
+        provider(LlmApi::AnthropicMessages, format!("{}/v1", server.uri())),
+        None,
+    )
+    .await;
+
+    assert_eq!(result.unwrap(), "qwen3.8-flash");
 }

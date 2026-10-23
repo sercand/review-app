@@ -5,6 +5,7 @@
 //! goes to the worker (see [`crate::runtime::execute`]), which wakes the UI via
 //! `EventSender::with_repaint`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -25,12 +26,18 @@ use crate::model::review::ReviewEvent;
 use crate::persist::config_root;
 use crate::persist::session::DebouncedWriter;
 #[cfg(unix)]
-use crate::persist::settings::RepoAiSettings;
+use crate::persist::settings::ProviderSettings;
 use crate::persist::settings::Settings;
+#[cfg(unix)]
+use crate::persist::settings::{ModelSettings, RepoAiSettings};
+#[cfg(unix)]
+use crate::runtime::KeyOp;
 use crate::runtime::{
     Command, Event, EventReceiver, ExecCtx, SessionId, Worker, event_channel, execute, spawn_worker,
 };
 use crate::state::composer::{self, ComposerAction};
+#[cfg(unix)]
+use crate::state::local_repos::{ListTab, LocalReposMsg, LocalReposState};
 use crate::state::pr_detail::{PrSession, start_submit, viewer_is_author};
 use crate::state::pr_list::{PrListMsg, PrListState, load_more, reduce};
 use crate::ui::command::{self, KeyPress, next_index};
@@ -41,8 +48,14 @@ use crate::ui::theme;
 use crate::ui::widgets::command_palette::{self, PaletteState};
 use crate::ui::widgets::diff_view::{DiffAction, DiffMode, DiffViewState};
 use crate::ui::widgets::file_header::{FileHeaderAction, FooterAction as FileFooterAction};
+#[cfg(unix)]
+use crate::ui::widgets::local_repos::{self, LocalPicker, LocalReposAction};
 use crate::ui::widgets::merge_panel;
 use crate::ui::widgets::review_panel::ReviewAction;
+#[cfg(unix)]
+use crate::ui::widgets::settings_ai_tab;
+#[cfg(unix)]
+use crate::ui::widgets::settings_window::ModelRole;
 use crate::ui::widgets::settings_window::{self, SettingsAction, SettingsWindowState};
 use crate::ui::widgets::thread_view::ThreadAction;
 use crate::ui::widgets::title_bar;
@@ -186,6 +199,46 @@ fn repo_has_commands(repo: Option<&RepoAiSettings>) -> bool {
     repo.is_some_and(|repo| !repo.commands.is_empty() || !repo.prepare.is_empty())
 }
 
+/// Why the Local repos tab must disable Change folder / Unlink for
+/// `repo_key` (AI settings Task 9, reusing Task 7's `change_blocked`): a
+/// live run only concerns the open PR's repository, so for any other row
+/// only the app-wide unrestored check applies.
+#[cfg(unix)]
+fn local_change_blocked(
+    session: Option<&PrSession>,
+    unrestored: &[crate::ai::store::CheckoutRecord],
+    repo_key: &str,
+) -> Option<String> {
+    use crate::state::ai_review::change_blocked;
+    let holds_repo = session.is_some_and(|session| {
+        format!(
+            "{}/{}/{}",
+            session.host, session.repo.owner, session.repo.name
+        )
+        .eq_ignore_ascii_case(repo_key)
+    });
+    match session {
+        Some(session) if holds_repo => change_blocked(&session.ai, unrestored, repo_key),
+        _ => change_blocked(&Default::default(), unrestored, repo_key),
+    }
+}
+
+/// The blocker line for a default-model provider whose key presence the
+/// probe has not answered yet: unknown is not "missing", so the row keeps
+/// Start disabled and says the keychain is being checked rather than
+/// claiming the key is gone (AI settings final review). `None` when the
+/// answer is known either way, or when no configured provider gates Start
+/// (`start_blockers` names those reasons itself).
+#[cfg(unix)]
+fn key_check_blocker(
+    ai: &crate::persist::settings::AiSettings,
+    keys: &BTreeMap<String, bool>,
+) -> Option<String> {
+    let name = crate::ai::repo_link::key_gated_provider(ai)?;
+    (!keys.contains_key(&name))
+        .then(|| format!("Checking the keychain for provider \"{name}\"'s API key…"))
+}
+
 /// The error an event carries, if it carries one. Every such event toasts
 /// it, so this is where the app notices a write-blocking failure.
 fn event_error(event: &Event) -> Option<&GhError> {
@@ -208,6 +261,56 @@ fn account_login(settings: &Settings) -> String {
         .unwrap_or_default()
 }
 
+/// The follow-up one in-flight [`Command::AiKeyOp`] needs when its reply
+/// arrives. Replies are matched by token, so a late answer for an op the app
+/// no longer tracks is dropped (the non-PR-scoped stale rule).
+#[cfg(unix)]
+#[derive(Debug)]
+enum AiKeyOpKind {
+    /// A rename: the key was copied to `to`, and once the settings naming
+    /// `to` are written `from` is removed (or the copy is undone if the write
+    /// fails).
+    Rename {
+        /// The old provider name the settings file still holds.
+        from: String,
+        /// The new provider name the file will hold.
+        to: String,
+        /// The edited row to write once the copy succeeded.
+        provider: ProviderSettings,
+        /// A key typed in the dialog, which wins over the stored one when
+        /// the presence cache is updated.
+        key: Option<String>,
+    },
+    /// A key typed for a provider whose name did not change; the settings
+    /// row is already written.
+    Store {
+        /// The provider the key belongs to.
+        name: String,
+    },
+    /// An old provider account to clear after its row left the settings.
+    Remove {
+        /// The provider name to clear.
+        name: String,
+    },
+    /// Delete the copy of a rename whose settings write failed.
+    Undo {
+        /// The new provider name whose copied key must go.
+        name: String,
+    },
+}
+
+/// What an in-flight folder probe is for. The PR AI tab's pick (AI settings
+/// Task 7) is accepted only while its PR is still open; a Local repos pick
+/// (Task 9) answers an Add or Change intent instead, which no PR owns.
+#[cfg(unix)]
+#[derive(Debug)]
+enum FolderProbeTarget {
+    /// The ✦ AI tab's Local checkout row for this PR.
+    Pr(crate::ai::store::PrKey),
+    /// The Local repos tab's "+ Add local repo…" or "Change folder".
+    Local(LocalPicker),
+}
+
 /// The root app: owns settings, the worker bridge, and every piece of UI state.
 pub struct ReviewApp {
     screen: ScreenKind,
@@ -218,6 +321,13 @@ pub struct ReviewApp {
     login_form: LoginForm,
     pr_list: PrListState,
     pr_list_form: PrListForm,
+    /// Which PR-list tab the screen shows (AI settings Task 9); persisted
+    /// in [`Settings::layout`]. Unix-only: Windows has no Local tab.
+    #[cfg(unix)]
+    pr_list_tab: ListTab,
+    /// The Local repos tab's loading state (AI settings Task 9).
+    #[cfg(unix)]
+    local_repos: LocalReposState,
     pr_detail: PrDetailState,
     highlight_cache: HighlightCache,
     session: Option<PrSession>,
@@ -240,6 +350,21 @@ pub struct ReviewApp {
     write_blocked_until: Option<SystemTime>,
     config_dir: PathBuf,
     store: Arc<dyn TokenStore>,
+    /// Whether the keychain holds an API key per provider name, probed by the
+    /// worker at startup and kept current by the key ops below. The cache
+    /// means the Settings AI tab never reads the keychain in a frame.
+    llm_keys: BTreeMap<String, bool>,
+    /// The token the next non-PR-scoped keychain op carries.
+    #[cfg(unix)]
+    next_ai_key_token: u64,
+    /// The keychain ops this app is still waiting for, by token.
+    #[cfg(unix)]
+    ai_key_ops: BTreeMap<u64, AiKeyOpKind>,
+    /// In-flight presence probes, by token, with the provider they asked
+    /// about. A reply whose token is gone (superseded by a key write, or the
+    /// row deleted) is stale and dropped.
+    #[cfg(unix)]
+    ai_key_probes: BTreeMap<u64, String>,
     exec: Arc<ExecCtx>,
     worker: Worker,
     events: EventReceiver,
@@ -248,13 +373,37 @@ pub struct ReviewApp {
     /// The AI dialog open over the screens (Task 4); `None` shows none.
     #[cfg(unix)]
     ai_dialog: Option<crate::ui::widgets::ai_dialogs::AiDialog>,
-    /// The folder-validation error the pick dialog shows (Task 4).
+    /// The repo-commands dialog open over the screens (AI settings Task 7);
+    /// `None` shows none.
     #[cfg(unix)]
-    ai_dialog_error: Option<String>,
-    /// The in-flight OS folder picker's answer, polled once per frame
-    /// (Task 4); `None` when no picker is open.
+    ai_repo_dialog: Option<crate::ui::widgets::ai_repo_dialog::RepoCommandsDialog>,
+    /// The in-flight OS folder picker: what the pick was for and its answer,
+    /// polled once per frame (AI settings Task 7, widened to Local repos
+    /// picks by Task 9); `None` when no picker is open. A PR pick whose PR
+    /// the user has left is dropped instead of linking the wrong repository.
     #[cfg(unix)]
-    folder_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    folder_picker: Option<(
+        FolderProbeTarget,
+        std::sync::mpsc::Receiver<Option<PathBuf>>,
+    )>,
+    /// The token the next folder probe carries (AI settings Task 7): the
+    /// answer to the OS picker is verified off the GUI thread and matched
+    /// back by token, like the keychain probes above.
+    #[cfg(unix)]
+    next_ai_probe_token: u64,
+    /// Folder probes still awaiting their verdict, by token, with what the
+    /// pick was for. A reply whose token is gone is stale.
+    #[cfg(unix)]
+    ai_folder_probes: BTreeMap<u64, FolderProbeTarget>,
+    /// The last folder-probe verdict the Local checkout row must show:
+    /// (repo key, message). Row-scoped, never a toast (AI settings Task 7).
+    #[cfg(unix)]
+    ai_row_error: Option<(String, String)>,
+    /// Unrestored checkouts the hub reported at startup (spec §7.3): the
+    /// Local checkout row blocks folder changes for a repository whose
+    /// checkout still waits to be restored (AI settings Task 7).
+    #[cfg(unix)]
+    ai_unrestored: Vec<crate::ai::store::CheckoutRecord>,
     /// A window close the app is holding open (Task 8, spec §7.3): the hub
     /// reported runs still holding checkouts, the Finish flow is running
     /// for them, and the window closes once the hub answers
@@ -322,6 +471,25 @@ fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
     !std::mem::replace(done, true) && setting_on
 }
 
+/// Accept the OS folder picker's answer only while the PR it was opened for
+/// is still the open one (AI settings Task 7): a late answer for another
+/// repository is dropped rather than linking a folder behind the user's back.
+/// The link is per repository, so a different PR of the same repository still
+/// accepts the pick.
+#[cfg(unix)]
+fn picker_answer(
+    stored: &crate::ai::store::PrKey,
+    open: Option<&crate::ai::store::PrKey>,
+    answer: Option<PathBuf>,
+) -> Option<(crate::ai::store::PrKey, PathBuf)> {
+    let path = answer?;
+    let open = open?;
+    let same_repo = stored.host.eq_ignore_ascii_case(&open.host)
+        && stored.owner.eq_ignore_ascii_case(&open.owner)
+        && stored.repo.eq_ignore_ascii_case(&open.repo);
+    same_repo.then(|| (stored.clone(), path))
+}
+
 impl ReviewApp {
     /// Build the app: load settings, restore any token, and start the worker.
     pub fn new(cc: &eframe::CreationContext<'_>) -> ReviewApp {
@@ -345,6 +513,12 @@ impl ReviewApp {
                 None
             }
         };
+
+        // The AI tab's Key column reads this cache, never the keychain: a
+        // keychain read blocks, and no frame may block. The worker probes the
+        // configured providers once the app is up and replies late; the cache
+        // is kept current by those replies and by the key ops below.
+        let llm_keys = BTreeMap::new();
 
         // The AI hub opens the persisted AI database beside the settings;
         // its settings snapshot is replaced whenever the user saves (Task 1).
@@ -383,13 +557,17 @@ impl ReviewApp {
             }
         }
 
-        ReviewApp {
+        let mut app = ReviewApp {
             screen: initial_screen(restored.is_some()),
             auth_state: AuthState::Idle,
             login_started: None,
             login_form: LoginForm::for_settings(&settings),
             pr_list,
             pr_list_form: PrListForm::default(),
+            #[cfg(unix)]
+            pr_list_tab: settings.layout.pr_list_tab.for_platform(),
+            #[cfg(unix)]
+            local_repos: LocalReposState::default(),
             pr_detail: PrDetailState::default(),
             highlight_cache: HighlightCache::new(2048, Box::new(SyntectHighlighter::new(true))),
             session: None,
@@ -406,6 +584,13 @@ impl ReviewApp {
             write_blocked_until: None,
             config_dir,
             store,
+            llm_keys,
+            #[cfg(unix)]
+            next_ai_key_token: 1,
+            #[cfg(unix)]
+            ai_key_ops: BTreeMap::new(),
+            #[cfg(unix)]
+            ai_key_probes: BTreeMap::new(),
             exec,
             worker,
             events: receiver,
@@ -413,9 +598,17 @@ impl ReviewApp {
             #[cfg(unix)]
             ai_dialog: None,
             #[cfg(unix)]
-            ai_dialog_error: None,
+            ai_repo_dialog: None,
             #[cfg(unix)]
             folder_picker: None,
+            #[cfg(unix)]
+            next_ai_probe_token: 1,
+            #[cfg(unix)]
+            ai_folder_probes: BTreeMap::new(),
+            #[cfg(unix)]
+            ai_row_error: None,
+            #[cfg(unix)]
+            ai_unrestored: Vec::new(),
             #[cfg(unix)]
             quit_pending: false,
             #[cfg(unix)]
@@ -428,7 +621,19 @@ impl ReviewApp {
             quit_close_sent: false,
             #[cfg(unix)]
             ai_continue_since: None,
+        };
+        // The probes go to the worker after the app is built: the keychain
+        // read never runs on the GUI thread, and the Key column shows unknown
+        // until the replies land.
+        #[cfg(unix)]
+        app.probe_key_presence();
+        // A saved Local tab opens on fresh counts, like the tab switch does
+        // (AI settings Task 9).
+        #[cfg(unix)]
+        if app.pr_list_tab == ListTab::Local && restored.is_some() {
+            app.refresh_local_repos();
         }
+        app
     }
 
     /// Apply one event to the app state.
@@ -566,10 +771,9 @@ impl ReviewApp {
             // The session folds the conversation into its timeline input
             // through `apply_session_event` above (Task 51).
             Event::ConversationLoaded { .. } => {}
-            // Spec §10: the Settings window's AI section shows the outcome.
-            // The VM outlives a closed window, so the result lands there
-            // without stealing the window back over whatever screen the user
-            // moved on to; a closed window gets a toast instead.
+            // Spec §10: the Settings window's AI tab shows the outcome when it
+            // is still open; a window the user closed while the test ran gets a
+            // toast instead, and reopening the window starts from a clean tab.
             Event::AiProviderTested { provider, result } => {
                 let window_open = self.settings_window.open;
                 if !window_open {
@@ -579,16 +783,41 @@ impl ReviewApp {
                     };
                     self.toasts.push(format!("{provider} test: {outcome}"), now);
                 }
-                self.settings_window
-                    .vm
-                    .ai
-                    .test_results
-                    .insert(provider, result);
+                #[cfg(unix)]
+                {
+                    self.settings_window
+                        .ai_tab
+                        .test_results
+                        .insert(provider, result);
+                }
+                #[cfg(not(unix))]
+                let _ = (provider, result);
             }
             // App-global (no SessionId, never stale): Settings shows it.
             Event::ClassifierState(state) => {
                 apply_classifier_event(&mut self.settings_window, state)
             }
+            // The folder probe's answer (AI settings Task 7): matched back
+            // to the repo the pick was for by token; the verdict lands in
+            // the Local checkout row, never a toast.
+            #[cfg(unix)]
+            Event::AiFolderProbed {
+                token,
+                path,
+                result,
+            } => self.on_ai_folder_probed(token, path, result, now),
+            // The keychain op's answer (spec §10): matched by token, so a
+            // reply for an op the app no longer tracks is dropped.
+            #[cfg(unix)]
+            Event::AiKeyOpDone { token, result } => self.on_ai_key_op_done(token, result, now),
+            // The presence probe's answer (spec §10): fills the Key column's
+            // cache; a superseded token is dropped like any stale reply.
+            #[cfg(unix)]
+            Event::AiKeyPresenceDone {
+                token,
+                name,
+                result,
+            } => self.on_ai_key_presence(token, name, result),
             // The AI tab's events fold into the open session's reducer
             // through `apply_session_event` (the stale-event rule lives in
             // `PrSession::on_event`); a failed start also toasts (Task 1).
@@ -614,7 +843,6 @@ impl ReviewApp {
                 self.ai_dialog = Some(crate::ui::widgets::ai_dialogs::AiDialog::ConfirmCheckout(
                     plan,
                 ));
-                self.ai_dialog_error = None;
             }
             #[cfg(unix)]
             Event::AiCheckoutHeld {
@@ -683,6 +911,9 @@ impl ReviewApp {
             }
             #[cfg(unix)]
             Event::AiUnrestored(records) => {
+                // The row blocks folder changes for a repository whose
+                // checkout still waits to be restored (AI settings Task 7).
+                self.ai_unrestored = records.clone();
                 if !records.is_empty() {
                     self.ai_dialog =
                         Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(records));
@@ -701,6 +932,34 @@ impl ReviewApp {
             | Event::AiChat { .. }
             | Event::AiRestoreNeedsDecision { .. }
             | Event::AiRestored { .. } => {}
+            // The Local tab's repo search answered (AI settings Task 9):
+            // folded into the tab's reducer, which drops a reply whose
+            // generation the last refresh superseded. A failure stays on the
+            // row — no toast — but a 401 ends the session like anywhere else.
+            #[cfg(unix)]
+            Event::RepoPrsLoaded {
+                generation,
+                repo,
+                result,
+            } => {
+                let unauthorized = matches!(&result, Err(GhError::Unauthorized));
+                let msg = match result {
+                    Ok(page) => LocalReposMsg::Loaded {
+                        generation,
+                        repo,
+                        page,
+                    },
+                    Err(error) => LocalReposMsg::Failed {
+                        generation,
+                        repo,
+                        error,
+                    },
+                };
+                self.apply_local_repos(msg);
+                if unauthorized {
+                    self.on_unauthorized(now);
+                }
+            }
             // The session also rolls a failed post back into the composer;
             // the toast covers the reply case, which has no other surface.
             Event::CommentFailed { error, .. } => {
@@ -714,9 +973,14 @@ impl ReviewApp {
         }
 
         // Entering the list — a restored token or a fresh sign-in — starts its
-        // first search.
+        // first search, and the Local tab's counts when that tab is the open
+        // one (AI settings Task 9).
         if self.screen == ScreenKind::PrList && previous != ScreenKind::PrList {
             self.apply_pr_list(PrListMsg::Refresh, now);
+            #[cfg(unix)]
+            if self.pr_list_tab == ListTab::Local {
+                self.refresh_local_repos();
+            }
         }
     }
 
@@ -769,6 +1033,93 @@ impl ReviewApp {
         self.pr_list.recent_constraints = self.settings.recent_constraints.clone();
         self.pr_list.group_by_repo = self.settings.group_by_repo;
         self.pr_list_form = PrListForm::default();
+        // The Local tab's rows belong to the old account's host too.
+        #[cfg(unix)]
+        {
+            self.local_repos = LocalReposState::default();
+        }
+    }
+
+    /// Fold one Local-repos message into the tab's state and send whatever
+    /// commands it produced (AI settings Task 9). The reducer enforces the
+    /// four-search cap and drops stale-generation replies.
+    #[cfg(unix)]
+    fn apply_local_repos(&mut self, msg: LocalReposMsg) {
+        for command in crate::state::local_repos::reduce(&mut self.local_repos, msg) {
+            self.worker.send(command);
+        }
+    }
+
+    /// Restart the Local tab's searches for exactly the repositories linked
+    /// on the signed-in host (opening the tab, refreshing, or changing a
+    /// link).
+    #[cfg(unix)]
+    fn refresh_local_repos(&mut self) {
+        let keys = crate::ai::repo_link::linked_repos(&self.settings.ai, &self.settings.host)
+            .into_iter()
+            .map(|entry| entry.repo.clone())
+            .collect();
+        self.apply_local_repos(LocalReposMsg::Refresh(keys));
+    }
+
+    /// Open the OS folder picker for a Local repos Add/Change intent. Like
+    /// the PR row's picker (Task 7), `rfd` blocks its calling thread, so the
+    /// pick runs on a plain thread and `poll_folder_picker` reads the answer.
+    #[cfg(unix)]
+    fn open_local_picker(&mut self, picker: LocalPicker) {
+        if self.folder_picker.is_some() {
+            return; // one picker at a time
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.folder_picker = Some((FolderProbeTarget::Local(picker), receiver));
+        std::thread::spawn(move || {
+            let _ = sender.send(rfd::FileDialog::new().pick_folder());
+        });
+    }
+
+    /// Apply one Local repos tab action (AI settings Task 9).
+    #[cfg(unix)]
+    fn apply_local_repos_action(&mut self, action: LocalReposAction, now: Instant) {
+        use crate::ai::repo_link::unlink_repo;
+        match action {
+            LocalReposAction::Toggle(key) => self.apply_local_repos(LocalReposMsg::Toggle(key)),
+            LocalReposAction::OpenPr { repo, number } => {
+                if let Some(repo) = local_repos::repo_ref_from_key(&repo) {
+                    self.open_pr(repo, number);
+                }
+            }
+            LocalReposAction::AddRepo => self.open_local_picker(LocalPicker::Add),
+            LocalReposAction::ChangeFolder(key) => {
+                // The menu disables the item with the reason; this is the
+                // stale-frame backstop.
+                if local_change_blocked(
+                    self.session.as_ref(),
+                    &self.ai_unrestored,
+                    &key.to_lowercase(),
+                )
+                .is_some()
+                {
+                    return;
+                }
+                self.open_local_picker(LocalPicker::Change(key));
+            }
+            LocalReposAction::Unlink(key) => {
+                if local_change_blocked(
+                    self.session.as_ref(),
+                    &self.ai_unrestored,
+                    &key.to_lowercase(),
+                )
+                .is_some()
+                {
+                    return;
+                }
+                // Unlinking clears only the path: the repo's commands,
+                // prepare commands and extra paths stay for a relink.
+                unlink_repo(&mut self.settings.ai, &key);
+                self.save_settings(now);
+                self.refresh_local_repos();
+            }
+        }
     }
 
     /// Write any debounced session change before the session is dropped or
@@ -810,7 +1161,9 @@ impl ReviewApp {
 
     /// Close the PR-scoped AI dialogs. The crash-recovery dialog belongs to
     /// no PR (its records name their own repositories), so it survives
-    /// navigation the way it survives `open_pr`.
+    /// navigation the way it survives `open_pr`. The repo-commands dialog
+    /// edits the open PR's repository, so it closes with the PR too
+    /// (AI settings Task 7).
     #[cfg(unix)]
     fn close_ai_flow_dialog(&mut self) {
         if !self
@@ -819,8 +1172,8 @@ impl ReviewApp {
             .is_some_and(crate::ui::widgets::ai_dialogs::survives_navigation)
         {
             self.ai_dialog = None;
-            self.ai_dialog_error = None;
         }
+        self.ai_repo_dialog = None;
         // A Continue plan that never reached the screen must not leak its
         // incremental mode into the next Start (Task 8); the quit flow's
         // dialog routing dies with its dialog too.
@@ -913,26 +1266,17 @@ impl ReviewApp {
 
     /// Open the settings window on a fresh copy of the current settings.
     ///
-    /// The AI section's "stored" marks come from a pure keychain probe:
-    /// whether a key exists, never what it is.
+    /// The AI tab's "stored" marks come from [`Self::llm_keys`], the cache the
+    /// worker probes at startup: a frame never reads the keychain.
     fn open_settings(&mut self) {
-        let store = self.store.clone();
-        self.settings_window.open_with(&self.settings, &|provider| {
-            crate::auth::store::llm_key(store.as_ref(), provider)
-                .ok()
-                .flatten()
-                .is_some()
-        });
+        self.settings_window.open_with(&self.settings);
     }
 
-    /// Fold the settings window's actions in: Save persists (and a host
-    /// change ends the session, since the stored token belongs to the old
-    /// host), a typed AI key goes to the keychain, Test connection asks the
-    /// worker, and Sign out rides the existing sign-out flow (RULING R10).
-    ///
-    /// Save is emitted before any key action: a rejected apply stops the loop,
-    /// so a key is never stored for settings that were not saved. A successful
-    /// apply also clears the keys of removed/renamed providers.
+    /// Fold the settings window's actions in: General/Appearance Save persists
+    /// (and a host change ends the session, since the stored token belongs to
+    /// the old host), an AI provider row is written and its key moved on the
+    /// worker, Test connection asks the worker, and Sign out rides the
+    /// existing sign-out flow (RULING R10).
     fn apply_settings_actions(
         &mut self,
         actions: Vec<SettingsAction>,
@@ -942,63 +1286,8 @@ impl ReviewApp {
         for action in actions {
             match action {
                 SettingsAction::Apply(vm) => {
-                    // A removed or renamed provider must not leave its key
-                    // behind in the keychain (§10), or re-adding the name
-                    // would silently reuse a stale credential.
-                    let old_names: Vec<String> = self
-                        .settings
-                        .ai
-                        .providers
-                        .iter()
-                        .map(|provider| provider.name.clone())
-                        .collect();
-                    let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
-                    let model_was = self.settings.ai.auto_approve.decision_model.clone();
-                    let host_changed = match vm.apply(&mut self.settings) {
-                        Ok(host_changed) => host_changed,
-                        Err(error) => {
-                            // The window keeps Save disabled on invalid input,
-                            // so this is the defensive path; still say why
-                            // nothing was saved. Stop here: nothing is
-                            // persisted, so no key in a later action may be
-                            // stored either.
-                            self.toasts
-                                .push(format!("settings not saved: {error}"), now);
-                            return;
-                        }
-                    };
+                    let host_changed = vm.apply(&mut self.settings);
                     self.save_settings(now);
-                    let classifier_on = self.settings.ai.auto_approve.local_classifier;
-                    if classifier_changed(
-                        classifier_was_on,
-                        classifier_on,
-                        &model_was,
-                        &self.settings.ai.auto_approve.decision_model,
-                    ) {
-                        self.send_classifier_enabled(classifier_on);
-                    }
-                    let new_names: Vec<String> = self
-                        .settings
-                        .ai
-                        .providers
-                        .iter()
-                        .map(|provider| provider.name.clone())
-                        .collect();
-                    // Best-effort, exactly like storing a key: the settings
-                    // are already saved, so a keychain failure is a toast.
-                    for name in settings_window::removed_provider_names(&old_names, &new_names) {
-                        if let Err(error) =
-                            crate::auth::store::clear_llm_key(self.store.as_ref(), &name)
-                        {
-                            tracing::warn!(
-                                %error,
-                                %name,
-                                "could not clear the removed LLM API key"
-                            );
-                            self.toasts
-                                .push(format!("could not clear the key for {name}: {error}"), now);
-                        }
-                    }
                     // The code font size lives in the styles; re-register
                     // both so the next frame picks it up (Task 14).
                     theme::install(ctx, self.settings.code_font_size);
@@ -1017,29 +1306,512 @@ impl ReviewApp {
                             .push("host changed, please sign in again".to_owned(), now);
                     }
                 }
-                // Spec §10: API keys live only in the keychain. The key is
-                // never logged and never written to `settings.toml`.
-                SettingsAction::SetLlmKey { provider, key } => {
-                    if let Err(error) =
-                        crate::auth::store::set_llm_key(self.store.as_ref(), &provider, &key)
-                    {
-                        tracing::warn!(%error, %provider, "could not store the LLM API key");
-                        self.toasts.push(
-                            format!("could not store the key for {provider}: {error}"),
-                            now,
-                        );
-                    }
+                // Spec §10: AI rows are saved by their own dialogs, so this
+                // action carries one row and its typed key only.
+                #[cfg(unix)]
+                SettingsAction::SaveModel { role, model } => {
+                    self.save_model(role, model, now);
                 }
-                SettingsAction::TestProvider { provider, model } => {
-                    self.worker
-                        .send(Command::AiTestProvider { provider, model });
+                #[cfg(unix)]
+                SettingsAction::SaveProvider {
+                    original,
+                    provider,
+                    key,
+                } => self.save_provider(original, provider, key, now),
+                #[cfg(unix)]
+                SettingsAction::DeleteProvider { name } => self.delete_provider(&name, now),
+                #[cfg(unix)]
+                SettingsAction::TestProvider {
+                    provider,
+                    model,
+                    key,
+                } => {
+                    // A typed key is used for this probe only; the dialog's
+                    // Test works before Save (spec §10).
+                    self.worker.send(Command::AiTestProvider {
+                        provider,
+                        model,
+                        key,
+                    });
                 }
                 SettingsAction::ClassifierDownload => {
                     self.worker.send(Command::ClassifierDownload);
                 }
+                // Not Unix-gated, so `classifier_changed` is used everywhere;
+                // off Unix the tab that sends it does not exist.
+                SettingsAction::SaveAutoApprove(auto_approve) => {
+                    self.save_auto_approve(auto_approve, now);
+                }
+                // The AI tab is Unix-only, so these never arise elsewhere.
+                #[cfg(not(unix))]
+                SettingsAction::SaveModel { .. }
+                | SettingsAction::SaveProvider { .. }
+                | SettingsAction::DeleteProvider { .. }
+                | SettingsAction::TestProvider { .. } => {}
                 SettingsAction::SignOut => self.perform_sign_out(now),
             }
         }
+    }
+
+    /// Commit one AI model role (spec §10). Nothing here touches the keychain:
+    /// a model names a provider the user already configured.
+    #[cfg(unix)]
+    fn save_model(&mut self, role: ModelRole, model: Option<ModelSettings>, now: Instant) {
+        if let Some(model) = &model
+            && let Err(error) = settings_ai_tab::validate_model(&self.settings.ai, model)
+        {
+            // The dialog keeps Save disabled on invalid input, so this is the
+            // defensive path.
+            self.toasts.push(format!("model not saved: {error}"), now);
+            return;
+        }
+        let mut candidate = self.settings.clone();
+        role.set_model(&mut candidate.ai, model);
+        self.try_save_settings(candidate, now);
+    }
+
+    /// Commit the `[ai.auto_approve]` table from the AI tab's auto-approve
+    /// dialog, and tell the worker when the classifier was switched on or off
+    /// or its model changed while on.
+    fn save_auto_approve(
+        &mut self,
+        auto_approve: crate::persist::settings::AutoApproveSettings,
+        now: Instant,
+    ) {
+        let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
+        let model_was = self.settings.ai.auto_approve.decision_model.clone();
+        let mut candidate = self.settings.clone();
+        candidate.ai.auto_approve = auto_approve;
+        if !self.try_save_settings(candidate, now) {
+            return;
+        }
+        let classifier_on = self.settings.ai.auto_approve.local_classifier;
+        if classifier_changed(
+            classifier_was_on,
+            classifier_on,
+            &model_was,
+            &self.settings.ai.auto_approve.decision_model,
+        ) {
+            self.send_classifier_enabled(classifier_on);
+        }
+    }
+
+    /// Commit one AI provider row (spec §10).
+    ///
+    /// A rename copies the keychain entry on the worker first and writes the
+    /// settings only once the copy succeeded (then removes the old entry); an
+    /// unchanged name writes the row now and stores a typed key in parallel.
+    #[cfg(unix)]
+    fn save_provider(
+        &mut self,
+        original: Option<String>,
+        provider: ProviderSettings,
+        key: Option<String>,
+        now: Instant,
+    ) {
+        if let Err(error) = settings_ai_tab::validate_provider(
+            &self.settings.ai.providers,
+            original.as_deref(),
+            &provider,
+        ) {
+            // The dialog keeps Save disabled on invalid input, so this is the
+            // defensive path.
+            self.toasts
+                .push(format!("provider not saved: {error}"), now);
+            return;
+        }
+
+        // The identity changed, so any earlier probe of either name would be
+        // answering about a different row.
+        self.supersede_key_probes(&provider.name);
+        if let Some(from) = &original {
+            self.supersede_key_probes(from);
+        }
+
+        if let Some(from) = original
+            .as_deref()
+            .filter(|from| *from != provider.name)
+            .map(str::to_owned)
+        {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Rename {
+                    from: from.clone(),
+                    to: provider.name.clone(),
+                    provider: provider.clone(),
+                    key: key.clone(),
+                },
+            );
+            // Copy only: `Remove { from }` follows once the settings naming
+            // `to` are on disk (spec §10).
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Move {
+                    from,
+                    to: provider.name,
+                    key,
+                },
+            });
+            return;
+        }
+
+        // The name did not change, so the row is written first and the key is
+        // stored only once it landed: no key may outlive settings that failed
+        // to save.
+        let mut candidate = self.settings.clone();
+        settings_ai_tab::put_provider(&mut candidate.ai, original.as_deref(), provider.clone());
+        if !self.try_save_settings(candidate, now) {
+            return;
+        }
+        if let Some(key) = key {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Store {
+                    name: provider.name.clone(),
+                },
+            );
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Store {
+                    name: provider.name,
+                    key,
+                },
+            });
+        } else {
+            // A new row (or an edited one) with no typed key: ask the worker
+            // once, so a provider with no key settles to "no key" instead of
+            // staying unknown forever.
+            self.probe_key(&provider.name);
+        }
+    }
+
+    /// Remove one AI provider row (spec §10). A model that routes through it
+    /// blocks the delete; its keychain entry is cleared once the settings no
+    /// longer name it.
+    #[cfg(unix)]
+    fn delete_provider(&mut self, name: &str, now: Instant) {
+        if let Some(model) = settings_ai_tab::provider_delete_blocker(&self.settings.ai, name) {
+            self.toasts.push(
+                format!("{name} is used by the model {model}; change that model first"),
+                now,
+            );
+            return;
+        }
+        // The row is leaving, so a probe still in flight for it must not
+        // repopulate the cache when its reply lands.
+        self.supersede_key_probes(name);
+        let mut candidate = self.settings.clone();
+        candidate
+            .ai
+            .providers
+            .retain(|provider| provider.name != name);
+        if self.try_save_settings(candidate, now) {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops.insert(
+                token,
+                AiKeyOpKind::Remove {
+                    name: name.to_owned(),
+                },
+            );
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Remove {
+                    name: name.to_owned(),
+                },
+            });
+        }
+    }
+
+    /// The next token for a non-PR-scoped keychain op.
+    #[cfg(unix)]
+    fn ai_key_op_token(&mut self) -> u64 {
+        let token = self.next_ai_key_token;
+        self.next_ai_key_token = self.next_ai_key_token.wrapping_add(1);
+        token
+    }
+
+    /// Ask the worker whether each configured provider has a key. Called once
+    /// at startup; the replies fill the cache late, so the Key column shows
+    /// unknown until they land.
+    #[cfg(unix)]
+    fn probe_key_presence(&mut self) {
+        let names: Vec<String> = self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .map(|provider| provider.name.clone())
+            .collect();
+        for name in names {
+            self.probe_key(&name);
+        }
+    }
+
+    /// Ask the worker whether `name` has a key. A keychain read may block or
+    /// prompt, so it never runs here on the GUI thread.
+    #[cfg(unix)]
+    fn probe_key(&mut self, name: &str) {
+        let token = self.ai_key_op_token();
+        self.ai_key_probes.insert(token, name.to_owned());
+        self.worker.send(Command::AiKeyPresence {
+            token,
+            name: name.to_owned(),
+        });
+    }
+
+    /// Drop in-flight probes for `name`: a key write or a delete is about to
+    /// answer the question, so an older probe's reply would be stale.
+    #[cfg(unix)]
+    fn supersede_key_probes(&mut self, name: &str) {
+        self.ai_key_probes.retain(|_, probed| probed != name);
+    }
+
+    /// Fold one presence probe's reply in. A token this app no longer tracks
+    /// is stale and dropped, and a row deleted while the probe ran must not
+    /// repopulate the cache.
+    #[cfg(unix)]
+    fn on_ai_key_presence(&mut self, token: u64, name: String, result: Result<bool, String>) {
+        let Some(probed) = self.ai_key_probes.remove(&token) else {
+            tracing::debug!(token, "dropping a stale keychain presence reply");
+            return;
+        };
+        debug_assert_eq!(probed, name, "the reply echoes the probed name");
+        if !self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .any(|provider| provider.name == name)
+        {
+            return;
+        }
+        match result {
+            Ok(present) => {
+                self.llm_keys.insert(name, present);
+            }
+            // Unknown stays unknown rather than claiming "no key".
+            Err(error) => {
+                tracing::debug!(%error, %name, "could not probe the LLM key presence");
+            }
+        }
+    }
+
+    /// Fold one folder probe's verdict in (AI settings Task 7, widened to
+    /// Local repos picks by Task 9). A token this app no longer tracks is a
+    /// stale reply and is dropped. A PR pick that is a clone of the
+    /// repository the pick was for links; anything else leaves the settings
+    /// alone and lands in that repo's Local checkout row — never a toast, so
+    /// the complaint stays beside the folder it names. A Local repos pick
+    /// folds through [`local_repos::apply_folder_answer`]: a clean link
+    /// saves, anything else toasts the reason.
+    #[cfg(unix)]
+    fn on_ai_folder_probed(
+        &mut self,
+        token: u64,
+        path: PathBuf,
+        result: Result<crate::ai::checkout::RemoteRepo, String>,
+        now: Instant,
+    ) {
+        use crate::ai::repo_link::link_repo;
+
+        let Some(target) = self.ai_folder_probes.remove(&token) else {
+            tracing::debug!(token, "dropping a stale folder-probe reply");
+            return;
+        };
+        match target {
+            // The PR row's verdict lands in that repo's Local checkout row,
+            // never a toast (Task 7).
+            FolderProbeTarget::Pr(key) => {
+                let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
+                match result {
+                    Ok(remote) if remote.key().eq_ignore_ascii_case(&repo_key) => {
+                        link_repo(&mut self.settings.ai, &remote, path);
+                        // Only this repo's complaint goes away; another
+                        // repo's row keeps its own (final review).
+                        self.ai_row_error.take_if(|(key, _)| *key == repo_key);
+                        self.save_settings(now);
+                    }
+                    Ok(remote) => {
+                        self.ai_row_error = Some((
+                            repo_key.clone(),
+                            format!("that folder is a clone of {}, not {repo_key}", remote.key()),
+                        ))
+                    }
+                    Err(reason) => self.ai_row_error = Some((repo_key, reason)),
+                }
+            }
+            // The Local tab's verdict (Task 9): a clean link saves and
+            // reloads the counts; anything else toasts the reason and
+            // changes nothing.
+            FolderProbeTarget::Local(picker) => {
+                match local_repos::apply_folder_answer(
+                    &mut self.settings.ai,
+                    &self.settings.host,
+                    &picker,
+                    path,
+                    result,
+                ) {
+                    Some(message) => self.toasts.push(message, now),
+                    None => {
+                        self.save_settings(now);
+                        self.refresh_local_repos();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fold one keychain op's reply in. A token this app no longer tracks is
+    /// a stale reply and is dropped.
+    #[cfg(unix)]
+    fn on_ai_key_op_done(&mut self, token: u64, result: Result<(), String>, now: Instant) {
+        let Some(kind) = self.ai_key_ops.remove(&token) else {
+            tracing::debug!(token, "dropping a stale keychain reply");
+            return;
+        };
+        match kind {
+            AiKeyOpKind::Rename {
+                from,
+                to,
+                provider,
+                key,
+            } => match result {
+                // The copy landed: write the settings naming `to`, then clear
+                // `from` (or undo the copy if the write fails).
+                Ok(()) => self.finish_rename(from, to, provider, key, now),
+                Err(error) => self
+                    .toasts
+                    .push(format!("could not move the key for {from}: {error}"), now),
+            },
+            AiKeyOpKind::Store { name } => match result {
+                Ok(()) => {
+                    self.llm_keys.insert(name, true);
+                }
+                Err(error) => self
+                    .toasts
+                    .push(format!("could not store the key for {name}: {error}"), now),
+            },
+            AiKeyOpKind::Remove { name } => match result {
+                Ok(()) => {
+                    self.llm_keys.remove(&name);
+                }
+                Err(error) => self.toasts.push(
+                    format!("could not remove the old key for {name}: {error}"),
+                    now,
+                ),
+            },
+            AiKeyOpKind::Undo { name } => {
+                if let Err(error) = result {
+                    self.toasts.push(
+                        format!("could not undo the key move for {name}: {error}"),
+                        now,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Write the settings a successful key move was for, then remove the old
+    /// keychain account; a failed write deletes the copy again, so the
+    /// keychain never holds a name the settings file lost (spec §10).
+    #[cfg(unix)]
+    fn finish_rename(
+        &mut self,
+        from: String,
+        to: String,
+        provider: ProviderSettings,
+        key: Option<String>,
+        now: Instant,
+    ) {
+        // The settings may have moved on while the keychain worked (it can
+        // prompt): the row was deleted, or another row took the new name.
+        // Either way `to` must not land, so the copy is undone.
+        if !self
+            .settings
+            .ai
+            .providers
+            .iter()
+            .any(|row| row.name == from)
+        {
+            self.undo_key_copy(to, now, format!("{from} was removed meanwhile"));
+            return;
+        }
+        if self.settings.ai.providers.iter().any(|row| row.name == to) {
+            let reason = format!("another provider is now called {to}");
+            self.undo_key_copy(to, now, reason);
+            return;
+        }
+
+        let mut candidate = self.settings.clone();
+        settings_ai_tab::rename_provider(&mut candidate.ai, &from, provider);
+        if !self.try_save_settings(candidate, now) {
+            let token = self.ai_key_op_token();
+            self.ai_key_ops
+                .insert(token, AiKeyOpKind::Undo { name: to.clone() });
+            self.worker.send(Command::AiKeyOp {
+                token,
+                op: KeyOp::Undo { name: to },
+            });
+            return;
+        }
+
+        let token = self.ai_key_op_token();
+        self.ai_key_ops
+            .insert(token, AiKeyOpKind::Remove { name: from.clone() });
+        self.worker.send(Command::AiKeyOp {
+            token,
+            op: KeyOp::Remove { name: from.clone() },
+        });
+
+        // The presence cache follows the key: a typed key means `to` has one;
+        // otherwise it inherits whatever `from` had. With neither, ask the
+        // worker rather than leave a new name unknown forever.
+        let old = self.llm_keys.remove(&from);
+        let known = if key.is_some() {
+            self.llm_keys.insert(to.clone(), true);
+            true
+        } else if let Some(present) = old {
+            self.llm_keys.insert(to.clone(), present);
+            true
+        } else {
+            false
+        };
+        if !known {
+            self.probe_key(&to);
+        }
+    }
+
+    /// Delete the key copy a rename made after the rename could not land,
+    /// and say why.
+    #[cfg(unix)]
+    fn undo_key_copy(&mut self, to: String, now: Instant, reason: String) {
+        self.toasts
+            .push(format!("could not rename the provider: {reason}"), now);
+        let token = self.ai_key_op_token();
+        self.ai_key_ops
+            .insert(token, AiKeyOpKind::Undo { name: to.clone() });
+        self.worker.send(Command::AiKeyOp {
+            token,
+            op: KeyOp::Undo { name: to },
+        });
+    }
+
+    /// Save a candidate settings value, adopting it only when the write
+    /// succeeded. Returns whether it landed; failures toast.
+    fn try_save_settings(&mut self, candidate: Settings, now: Instant) -> bool {
+        if let Err(error) = candidate.save(&self.config_dir) {
+            tracing::warn!(%error, "could not save settings");
+            self.toasts
+                .push(format!("could not save settings: {error}"), now);
+            return false;
+        }
+        self.settings = candidate;
+        // The worker's AI hub reads its settings from its own copy (Task 1).
+        #[cfg(unix)]
+        self.exec.ai.set_settings(self.settings.ai.clone());
+        true
     }
 
     /// Flip between dark and light from a title bar's theme button, and
@@ -1185,9 +1957,31 @@ impl ReviewApp {
     fn render_pr_list(&mut self, ui: &mut egui::Ui, now: Instant) {
         let mut msgs = Vec::new();
         let mut actions = Vec::new();
+        #[cfg(unix)]
+        let mut local_actions = Vec::new();
         let wall = crate::ui::widgets::pr_row::now_iso();
         pr_list::render_title_bar(ui, &mut msgs, &mut actions);
         egui::CentralPanel::default().show(ui, |ui| {
+            // The tab strip is unix-only; on Windows the screen is the All
+            // PRs list unchanged (AI settings Task 9).
+            #[cfg(unix)]
+            {
+                pr_list::render_tabs(ui, self.pr_list_tab, &mut actions, &mut local_actions);
+                if self.pr_list_tab == ListTab::Local {
+                    local_repos::render(
+                        ui,
+                        &self.settings.ai,
+                        &self.settings.host,
+                        &self.local_repos,
+                        &|key| {
+                            local_change_blocked(self.session.as_ref(), &self.ai_unrestored, key)
+                        },
+                        &wall,
+                        &mut local_actions,
+                    );
+                    return;
+                }
+            }
             pr_list::render(
                 ui,
                 &mut self.pr_list,
@@ -1198,8 +1992,24 @@ impl ReviewApp {
             );
         });
 
+        #[cfg(unix)]
+        let refresh_requested = msgs.iter().any(|msg| matches!(msg, PrListMsg::Refresh));
+        #[cfg(unix)]
+        let local_tab = self.pr_list_tab == ListTab::Local;
         for msg in msgs {
+            // The title bar's refresh reloads whichever tab is open (Task 9):
+            // on the Local tab the tab's own reload below is the whole
+            // refresh, and the All search must not re-run behind it.
+            #[cfg(unix)]
+            if local_tab && matches!(msg, PrListMsg::Refresh) {
+                continue;
+            }
             self.apply_pr_list(msg, now);
+        }
+        // The title bar's refresh reloads whichever tab is open (Task 9).
+        #[cfg(unix)]
+        if refresh_requested && local_tab {
+            self.refresh_local_repos();
         }
         for action in actions {
             match action {
@@ -1212,7 +2022,21 @@ impl ReviewApp {
                 PrListAction::Settings => self.open_settings(),
                 PrListAction::Palette => self.palette.open_now(),
                 PrListAction::ToggleTheme => self.toggle_theme(ui.ctx(), now),
+                // The tab choice is a durable preference, like the scopes.
+                #[cfg(unix)]
+                PrListAction::SetTab(tab) => {
+                    self.pr_list_tab = tab;
+                    self.settings.layout.pr_list_tab = tab;
+                    self.save_settings(now);
+                    if tab == ListTab::Local {
+                        self.refresh_local_repos();
+                    }
+                }
             }
+        }
+        #[cfg(unix)]
+        for action in local_actions {
+            self.apply_local_repos_action(action, now);
         }
     }
 
@@ -1319,6 +2143,42 @@ impl ReviewApp {
 
         let mut diff_actions = Vec::new();
         let system_dark = ui.ctx().system_theme() == Some(egui::Theme::Dark);
+        // The Local checkout row's view-model (AI settings Task 7), built
+        // before the screen takes the session: the row is painted from the
+        // repo's settings, the run state, and the app-wide unrestored list.
+        #[cfg(unix)]
+        let local_checkout = {
+            let key = crate::state::pr_detail::pr_key(session);
+            let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
+            let error = self
+                .ai_row_error
+                .as_ref()
+                .filter(|(key, _)| *key == repo_key)
+                .map(|(_, message)| message.clone());
+            // Unknown (the probe has not answered) must not read as
+            // "missing": `start_blockers` stays silent for it and
+            // `key_check_blocker` adds the checking line instead.
+            let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(true);
+            let mut vm = crate::ui::widgets::ai_panel::local_checkout_vm(
+                &self.settings.ai,
+                &repo_key,
+                &session.ai,
+                &self.ai_unrestored,
+                &has_key,
+                error,
+            );
+            if let Some(reason) = key_check_blocker(&self.settings.ai, &self.llm_keys) {
+                vm.blockers.push(reason);
+            }
+            Some(vm)
+        };
+        // The repo's settings entry for the commands summary; taken before
+        // the call moves `session` into the screen.
+        #[cfg(unix)]
+        let repo_ai = self
+            .settings
+            .ai
+            .repo(&session.host, &session.repo.owner, &session.repo.name);
         let actions = pr_detail::render(
             ui,
             session,
@@ -1331,8 +2191,13 @@ impl ReviewApp {
                 theme: self.settings.theme,
                 system_dark,
                 // The ✦ AI review button appears once a model is configured
-                // (spec §4 step 1); the folder is picked on first use.
+                // (spec §4 step 1); the folder is linked in the tab itself
+                // (AI settings Task 7).
                 ai_configured: self.settings.ai.models.default.is_some(),
+                #[cfg(unix)]
+                local_checkout: local_checkout.as_ref(),
+                #[cfg(unix)]
+                repo_ai,
             },
         );
 
@@ -1645,8 +2510,13 @@ impl ReviewApp {
         action: crate::ui::widgets::ai_panel::AiPanelAction,
         now: Instant,
     ) {
+        use crate::ai::repo_link::{start_blockers, unlink_repo};
         use crate::ai::store::PrKey;
-        use crate::ui::widgets::ai_panel::{self, AiPanelAction};
+        use crate::state::ai_review::change_blocked;
+        use crate::ui::widgets::{
+            ai_panel::{self, AiPanelAction},
+            ai_repo_dialog::RepoCommandsDialog,
+        };
 
         let Some(session) = &mut self.session else {
             return;
@@ -1658,23 +2528,27 @@ impl ReviewApp {
             repo: session.repo.name.to_lowercase(),
             number: session.number,
         };
+        // The Local checkout row's and Start's shared view of this repo.
+        let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
+        // Unknown key presence must not read as "missing" (final review):
+        // `start_blockers` stays silent for it and `key_check_blocker`
+        // carries the checking line instead.
+        let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(true);
         match action {
             AiPanelAction::Start => {
                 // A fresh Full review: any Continue mode left over from an
                 // abandoned re-review must not ride along (Task 8).
                 self.ai_continue_since = None;
-                // No folder for this repo: ask for one now (Task 4). The
-                // pick dialog validates the choice, saves it, and plans the
-                // checkout right away (spec §4 step 2).
-                if self
-                    .settings
-                    .ai
-                    .repo_with_folder(&session.host, &session.repo.owner, &session.repo.name)
-                    .is_none()
-                {
-                    self.ai_dialog =
-                        Some(crate::ui::widgets::ai_dialogs::AiDialog::PickFolder { key });
-                    self.ai_dialog_error = None;
+                // The row keeps Start disabled while anything stands in the
+                // way (AI settings Task 7); this is the backstop for a stale
+                // frame: toast the first reason instead of a doomed run.
+                let blocked = start_blockers(&self.settings.ai, &repo_key, &has_key)
+                    .into_iter()
+                    .next()
+                    .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
+                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                if let Some(reason) = blocked {
+                    self.toasts.push(reason, now);
                     return;
                 }
                 let Some(pr) = ai_target(session) else {
@@ -1693,17 +2567,16 @@ impl ReviewApp {
                 });
             }
             AiPanelAction::Continue => {
-                if self
-                    .settings
-                    .ai
-                    .repo_with_folder(&session.host, &session.repo.owner, &session.repo.name)
-                    .is_none()
-                {
-                    self.toasts.push(
-                        "no AI checkout folder for this repository — pick one in Settings → AI"
-                            .to_owned(),
-                        now,
-                    );
+                // Same gate as Start (AI settings Task 7): the row disables
+                // Continue with the reasons listed, and a stale click gets
+                // the first reason as a toast.
+                let blocked = start_blockers(&self.settings.ai, &repo_key, &has_key)
+                    .into_iter()
+                    .next()
+                    .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
+                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                if let Some(reason) = blocked {
+                    self.toasts.push(reason, now);
                     return;
                 }
                 // The tab offers Continue whenever a completed review
@@ -1925,18 +2798,66 @@ impl ReviewApp {
                 session.ai.suggestions = None;
                 self.save_settings(now);
             }
+            // The row's folder controls (AI settings Task 7): the OS picker
+            // answer is probed and linked by `poll_folder_picker` and
+            // `on_ai_folder_probed`; unlinking keeps the repo's commands.
+            AiPanelAction::ChooseFolder => {
+                if self.folder_picker.is_some() {
+                    return; // one picker at a time
+                }
+                // The row disables the pickers while a run or an unrestored
+                // checkout holds the repo; this is the stale-frame backstop.
+                if change_blocked(&session.ai, &self.ai_unrestored, &repo_key).is_some() {
+                    return;
+                }
+                // `rfd` blocks its calling thread (on macOS it dispatches
+                // the panel to the main thread and waits), so the GUI
+                // thread must not call it; the answer arrives over the
+                // channel `poll_folder_picker` reads, tied to this PR.
+                let (sender, receiver) = std::sync::mpsc::channel();
+                self.folder_picker = Some((FolderProbeTarget::Pr(key), receiver));
+                std::thread::spawn(move || {
+                    let _ = sender.send(rfd::FileDialog::new().pick_folder());
+                });
+            }
+            AiPanelAction::UnlinkFolder => {
+                // The row disables Unlink while a run or an unrestored
+                // checkout holds the repo; this is the stale-frame backstop.
+                if change_blocked(&session.ai, &self.ai_unrestored, &repo_key).is_some() {
+                    return;
+                }
+                unlink_repo(&mut self.settings.ai, &repo_key);
+                // Only this repo's complaint goes away; another repo's row
+                // keeps its own (final review).
+                self.ai_row_error.take_if(|(key, _)| *key == repo_key);
+                self.save_settings(now);
+            }
+            AiPanelAction::EditRepoCommands => {
+                // The dialog edits the repo's entry even when no folder is
+                // linked yet, so it opens for any repo the tab can name.
+                let entry = self
+                    .settings
+                    .ai
+                    .repos
+                    .iter()
+                    .find(|entry| entry.repo.eq_ignore_ascii_case(&repo_key));
+                self.ai_repo_dialog = Some(RepoCommandsDialog::open(&repo_key, entry));
+            }
         }
     }
 
-    /// Collect the OS folder picker's answer once per frame (Task 4). The
-    /// picker runs on a plain thread because `rfd` blocks; a cancelled
-    /// picker leaves the pick dialog open for another try.
+    /// Collect the OS folder picker's answer once per frame (AI settings
+    /// Task 7, widened to Local repos picks by Task 9). The picker runs on a
+    /// plain thread because `rfd` blocks; a cancelled picker, and a PR pick
+    /// for a PR the user has left, are both dropped, and an accepted answer
+    /// goes to the worker for the clone check — the verdict arrives as
+    /// `Event::AiFolderProbed`, matched back by token.
     #[cfg(unix)]
-    fn poll_folder_picker(&mut self, now: Instant) {
+    fn poll_folder_picker(&mut self) {
         use std::sync::mpsc::TryRecvError;
 
         let answer = match &self.folder_picker {
-            Some(receiver) => match receiver.try_recv() {
+            Some((_, receiver)) => match receiver.try_recv() {
                 Ok(answer) => Some(answer),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(None),
@@ -1944,19 +2865,34 @@ impl ReviewApp {
             None => return,
         };
         let Some(answer) = answer else { return };
-        self.folder_picker = None;
-        if let Some(path) = answer {
-            self.apply_ai_dialog_action(
-                crate::ui::widgets::ai_dialogs::AiDialogAction::FolderChosen(path),
-                now,
-            );
-        }
+        let Some((stored, _)) = self.folder_picker.take() else {
+            return;
+        };
+        // A PR pick stands or falls with its PR (Task 7); a Local repos pick
+        // answers its Add/Change intent directly (Task 9).
+        let (target, path) = match stored {
+            FolderProbeTarget::Pr(stored) => {
+                let open = self.session.as_ref().map(crate::state::pr_detail::pr_key);
+                match picker_answer(&stored, open.as_ref(), answer) {
+                    Some((key, path)) => (FolderProbeTarget::Pr(key), path),
+                    None => return,
+                }
+            }
+            FolderProbeTarget::Local(picker) => match answer {
+                Some(path) => (FolderProbeTarget::Local(picker), path),
+                None => return,
+            },
+        };
+        let token = self.next_ai_probe_token;
+        self.next_ai_probe_token += 1;
+        self.ai_folder_probes.insert(token, target);
+        self.worker.send(Command::AiProbeFolder { token, path });
     }
 
     /// Paint the open AI dialog over every screen, like the settings
     /// window (Task 4).
     #[cfg(unix)]
-    fn render_ai_dialog(&mut self, ctx: &egui::Context, now: Instant) {
+    fn render_ai_dialog(&mut self, ctx: &egui::Context) {
         use crate::ui::widgets::ai_dialogs::{self, DialogInputs};
 
         let Some(dialog) = self.ai_dialog.clone() else {
@@ -1979,77 +2915,61 @@ impl ReviewApp {
         let inputs = DialogInputs {
             pr: pr.as_ref(),
             prepare: &prepare,
-            error: self.ai_dialog_error.as_deref(),
         };
         ai_dialogs::render(ctx, &dialog, &inputs, &mut actions);
         for action in actions {
-            self.apply_ai_dialog_action(action, now);
+            self.apply_ai_dialog_action(action);
         }
     }
 
-    /// Apply one AI dialog answer (Task 4): the pick dialog validates and
-    /// saves the folder then plans the checkout, the confirm dialog starts
-    /// the run, the restore dialog answers the finish, and the recovery
-    /// dialog restores stored checkouts one at a time.
+    /// Paint the open repo-commands dialog and apply its answer (AI settings
+    /// Task 7): Save patches the repo's entry and persists it, Cancel drops
+    /// the buffers. The dialog state owns the text buffers between frames.
     #[cfg(unix)]
-    fn apply_ai_dialog_action(
-        &mut self,
-        action: crate::ui::widgets::ai_dialogs::AiDialogAction,
-        now: Instant,
-    ) {
+    fn render_ai_repo_dialog(&mut self, ctx: &egui::Context, now: Instant) {
+        use crate::ui::widgets::ai_repo_dialog::{self, RepoDialogAction};
+
+        if self.ai_repo_dialog.is_none() {
+            return;
+        }
+        let mut actions = Vec::new();
+        if let Some(dialog) = &mut self.ai_repo_dialog {
+            ai_repo_dialog::render(ctx, dialog, &mut actions);
+        }
+        for action in actions {
+            match action {
+                RepoDialogAction::Save => {
+                    if let Some(dialog) = &self.ai_repo_dialog {
+                        let lists = dialog.lists();
+                        ai_repo_dialog::put_repo_commands(
+                            &mut self.settings.ai,
+                            &dialog.repo,
+                            &lists,
+                        );
+                    }
+                    self.save_settings(now);
+                    // Commands of its own retire the tab's suggestion card
+                    // (spec §4 step 1), same as any other path that names
+                    // them.
+                    self.retire_ai_suggestions();
+                    self.ai_repo_dialog = None;
+                }
+                RepoDialogAction::Cancel => self.ai_repo_dialog = None,
+            }
+        }
+    }
+
+    /// Apply one AI dialog answer (Task 4): the confirm dialog starts the
+    /// run, the restore dialog answers the finish, and the recovery dialog
+    /// restores stored checkouts one at a time.
+    #[cfg(unix)]
+    fn apply_ai_dialog_action(&mut self, action: crate::ui::widgets::ai_dialogs::AiDialogAction) {
         use crate::ai::hub::SnapshotInputs;
         use crate::ai::pipeline::RunMode;
         use crate::ai::store::PrKey;
-        use crate::ui::widgets::ai_dialogs::{self, AiDialog, AiDialogAction};
+        use crate::ui::widgets::ai_dialogs::{AiDialog, AiDialogAction};
 
         match action {
-            AiDialogAction::PickFolder => {
-                if self.folder_picker.is_some() {
-                    return; // one picker at a time
-                }
-                // `rfd` blocks its calling thread (on macOS it dispatches
-                // the panel to the main thread and waits), so the GUI
-                // thread must not call it; the answer arrives over the
-                // channel `poll_folder_picker` reads.
-                let (sender, receiver) = std::sync::mpsc::channel();
-                self.folder_picker = Some(receiver);
-                std::thread::spawn(move || {
-                    let _ = sender.send(rfd::FileDialog::new().pick_folder());
-                });
-            }
-            AiDialogAction::FolderChosen(path) => {
-                let Some(AiDialog::PickFolder { key }) = self.ai_dialog.clone() else {
-                    return;
-                };
-                if let Some(error) = ai_dialogs::folder_error(&path, &key) {
-                    self.ai_dialog_error = Some(error);
-                    return;
-                }
-                ai_dialogs::save_folder(&mut self.settings.ai, &key, path);
-                self.save_settings(now);
-                self.ai_dialog = None;
-                self.ai_dialog_error = None;
-                // The pick was asked for by this PR's Start: plan the
-                // checkout right away (spec §4 step 2).
-                let open_matches = self.session.as_ref().is_some_and(|open| {
-                    open.number == key.number
-                        && open.host.eq_ignore_ascii_case(&key.host)
-                        && open.repo.owner.eq_ignore_ascii_case(&key.owner)
-                        && open.repo.name.eq_ignore_ascii_case(&key.repo)
-                });
-                if !open_matches {
-                    return;
-                }
-                let session = self.session.as_mut().expect("checked above");
-                let Some(pr) = ai_target(session) else {
-                    return; // no metadata yet: nothing to check out
-                };
-                self.worker.send(Command::AiPlanCheckout {
-                    session: session.id,
-                    key,
-                    pr,
-                });
-            }
             AiDialogAction::ConfirmCheckout => {
                 self.ai_dialog = None;
                 // A Continue's confirmation starts Incremental against the
@@ -2091,7 +3011,6 @@ impl ReviewApp {
                 // nothing else.
                 let was_confirm = matches!(self.ai_dialog, Some(AiDialog::ConfirmCheckout(_)));
                 self.ai_dialog = None;
-                self.ai_dialog_error = None;
                 self.ai_continue_since = None;
                 self.quit_restore = None;
                 if was_confirm && let Some(session) = &mut self.session {
@@ -2132,6 +3051,10 @@ impl ReviewApp {
             }
             AiDialogAction::RecoverRestore(id) => {
                 self.worker.send(Command::AiRecoverRestore { id });
+                // The hub reports unrestored checkouts once at startup, so
+                // the app keeps its own copy for the Local checkout row in
+                // step with the dialog (AI settings Task 7).
+                self.ai_unrestored.retain(|record| record.id != id);
                 // Drop the restored row from the recovery list (closing it
                 // when the last one goes), and close a Held dialog — the
                 // restore it offered is on its way and the toast reports
@@ -2480,7 +3403,7 @@ impl ReviewApp {
             "find" => self.pr_detail.find_open = true,
             "settings" => self.open_settings(),
             "help" => self.help_open = !self.help_open,
-            "close" => self.dispatch_close(now),
+            "close" => self.dispatch_close(),
             "next_file" => self.step_file(true, now),
             "prev_file" => self.step_file(false, now),
             "next_hunk" => self.step_hunk(true),
@@ -2565,7 +3488,7 @@ impl ReviewApp {
     /// hidden session's open composer must not swallow the `Esc` that was
     /// meant for the visible screen. Leaving for the list flushes the
     /// session's debounced writes (spec §11).
-    fn dispatch_close(&mut self, now: Instant) {
+    fn dispatch_close(&mut self) {
         if self.palette.open {
             self.palette.close();
             return;
@@ -2578,13 +3501,22 @@ impl ReviewApp {
             self.settings_window.close();
             return;
         }
+        // The repo-commands dialog floats over the screen and owns `Esc`
+        // after the palette, help and settings surfaces and before the AI
+        // flow dialogs: closing it must not also dismiss a flow dialog or
+        // leave the PR behind it (AI settings Task 7).
+        #[cfg(unix)]
+        if self.ai_repo_dialog.is_some() {
+            self.ai_repo_dialog = None;
+            return;
+        }
         // An AI dialog floats over the screen and owns `Esc` before it: the
         // key answers the dialog (or is refused by the restore decision) and
         // must never also leave the PR behind it (Task 4 review finding 1).
         #[cfg(unix)]
         if let Some(dialog) = self.ai_dialog.clone() {
             if let Some(action) = crate::ui::widgets::ai_dialogs::dismiss_action(&dialog) {
-                self.apply_ai_dialog_action(action, now);
+                self.apply_ai_dialog_action(action);
             }
             return;
         }
@@ -2848,7 +3780,7 @@ impl eframe::App for ReviewApp {
         // The OS folder picker answers on a background thread (Task 4);
         // collect it once per frame like the worker's events.
         #[cfg(unix)]
-        self.poll_folder_picker(now);
+        self.poll_folder_picker();
 
         // Spec §13: the rate-limit window is over once its reset instant
         // passes; check every frame so the write surfaces wake up on their
@@ -2947,12 +3879,17 @@ impl eframe::App for ReviewApp {
             &ctx,
             &mut self.settings_window,
             account,
+            &self.settings.ai,
+            &self.llm_keys,
             &mut settings_actions,
         );
         self.apply_settings_actions(settings_actions, &ctx, now);
         // The AI dialogs float above every screen too (Task 4).
         #[cfg(unix)]
-        self.render_ai_dialog(&ctx, now);
+        self.render_ai_dialog(&ctx);
+        // So does the repo-commands dialog (AI settings Task 7).
+        #[cfg(unix)]
+        self.render_ai_repo_dialog(&ctx, now);
         command_palette::render_help(&ctx, &mut self.help_open, &entries);
 
         self.toasts.render(ui, now);
@@ -3041,6 +3978,105 @@ mod tests {
         );
     }
 
+    /// The picker's answer is accepted only while the PR it was opened for
+    /// is still the open one: a late answer for another repository is
+    /// dropped, and a cancelled picker never links anything
+    /// (AI settings Task 7).
+    #[cfg(unix)]
+    #[test]
+    fn a_late_picker_answer_for_another_repo_is_ignored() {
+        use crate::ai::store::PrKey;
+
+        let stored = PrKey {
+            host: "github.com".to_string(),
+            owner: "acme".to_string(),
+            repo: "widgets".to_string(),
+            number: 7,
+        };
+        let path = PathBuf::from("/src/widgets");
+
+        // The same PR is still open: the answer is accepted.
+        assert_eq!(
+            picker_answer(&stored, Some(&stored), Some(path.clone())),
+            Some((stored.clone(), path.clone())),
+        );
+
+        // Another PR of the same repository: the link is per repository,
+        // so the answer still counts.
+        let same_repo = PrKey {
+            number: 8,
+            ..stored.clone()
+        };
+        assert_eq!(
+            picker_answer(&stored, Some(&same_repo), Some(path.clone())),
+            Some((stored.clone(), path.clone())),
+        );
+
+        // Another repository: the answer is dropped.
+        let other = PrKey {
+            repo: "api".to_string(),
+            ..stored.clone()
+        };
+        assert_eq!(picker_answer(&stored, Some(&other), Some(path)), None);
+
+        // The user left the PR entirely, or cancelled the picker.
+        assert_eq!(
+            picker_answer(&stored, None, Some(PathBuf::from("/x"))),
+            None
+        );
+        assert_eq!(picker_answer(&stored, Some(&stored), None), None);
+    }
+
+    /// A provider whose key presence the probe has not answered gets the
+    /// checking line, never a "missing" claim; a known answer either way —
+    /// or no configured model/provider to gate — gets none, because
+    /// `start_blockers` names those reasons itself (AI settings final review).
+    #[cfg(unix)]
+    #[test]
+    fn an_unprobed_key_checks_the_keychain_instead_of_claiming_missing() {
+        use crate::persist::settings::{AiModels, AiSettings};
+
+        let ai = AiSettings {
+            providers: vec![ProviderSettings {
+                name: "work".to_string(),
+                ..Default::default()
+            }],
+            models: AiModels {
+                default: Some(ModelSettings {
+                    provider: "work".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // The probe has not answered: unknown, not missing.
+        let mut keys = BTreeMap::new();
+        let reason = key_check_blocker(&ai, &keys).expect("an unprobed name is unknown");
+        assert!(reason.contains("keychain"), "{reason}");
+        assert!(reason.contains("\"work\""), "{reason}");
+
+        // Either known answer clears the line.
+        keys.insert("work".to_string(), true);
+        assert_eq!(key_check_blocker(&ai, &keys), None, "a stored key");
+        keys.insert("work".to_string(), false);
+        assert_eq!(
+            key_check_blocker(&ai, &keys),
+            None,
+            "a known-missing key is start_blockers' missing line, not this one"
+        );
+
+        // No default model, or a model whose provider is not configured:
+        // the gate is not about a key at all.
+        assert_eq!(key_check_blocker(&AiSettings::default(), &keys), None);
+        let no_provider = AiSettings {
+            models: ai.models.clone(),
+            ..Default::default()
+        };
+        assert_eq!(key_check_blocker(&no_provider, &keys), None);
+    }
+
     #[test]
     fn a_model_change_is_sent_only_while_the_classifier_is_on() {
         assert!(classifier_changed(false, true, "a", "a"));
@@ -3064,9 +4100,24 @@ mod tests {
     fn classifier_event_updates_the_settings_window_vm() {
         use crate::state::classifier::ClassifierState;
         let mut window = SettingsWindowState::default();
+        // An open auto-approve dialog follows the event as well.
+        #[cfg(unix)]
+        window
+            .ai_tab
+            .edit_auto_approve(&Settings::default().ai, &ClassifierState::Off);
         apply_classifier_event(&mut window, ClassifierState::Failed("offline".into()));
         assert_eq!(
-            window.vm.ai.auto_approve.classifier_state,
+            window.classifier_state,
+            ClassifierState::Failed("offline".into())
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            window
+                .ai_tab
+                .auto_approve
+                .as_ref()
+                .unwrap()
+                .classifier_state,
             ClassifierState::Failed("offline".into())
         );
     }

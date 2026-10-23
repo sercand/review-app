@@ -21,6 +21,7 @@ pub mod llm;
 pub mod local_classifier;
 pub mod model;
 pub mod pipeline;
+pub mod presets;
 pub mod prompts;
 pub mod repo_link;
 pub mod review;

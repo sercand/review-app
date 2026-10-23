@@ -10,8 +10,15 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
 use tokio::task::JoinError;
 
+#[cfg(unix)]
+use crate::ai::checkout::RemoteRepo;
+#[cfg(unix)]
+use crate::ai::repo_link::{FolderStatus, folder_status};
 #[cfg(unix)]
 use secrecy::SecretString;
 
@@ -44,6 +51,49 @@ use crate::model::thread::{ReviewThread, ThreadComment};
 /// rule).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionId(pub u64);
+
+/// One keychain change for a configured LLM provider.
+///
+/// Keys live only in the OS keychain under `llm:<name>`; a [`KeyOp`] carries a
+/// key only when the user typed a new one, and the reply never echoes it.
+#[cfg(unix)]
+// Beware the derived `Debug`: it prints [`KeyOp::Store`]'s key verbatim, so
+// never log a `KeyOp` (or a [`Command`] carrying one) whole — the key would
+// land in the log.
+#[derive(Debug)]
+pub enum KeyOp {
+    /// Store (or replace) the key for `name`.
+    Store {
+        /// The provider the key belongs to.
+        name: String,
+        /// The key as typed, in this command only.
+        key: String,
+    },
+    /// Copy the key for `from` to `to`, leaving `from` in place.
+    ///
+    /// The app sends [`KeyOp::Remove`] for `from` only after the settings
+    /// write that names `to` succeeds, and [`KeyOp::Undo`] for `to` if it
+    /// fails, so the keychain never holds a name the settings file lost.
+    Move {
+        /// The provider name the key is stored under now.
+        from: String,
+        /// The provider name to copy it to.
+        to: String,
+        /// A key the user just typed; wins over the stored one.
+        key: Option<String>,
+    },
+    /// Remove the key for `name`. Removing an absent key succeeds.
+    Remove {
+        /// The provider name to clear.
+        name: String,
+    },
+    /// Delete the key a [`KeyOp::Move`] copied to `name`, after the settings
+    /// write it was made for failed.
+    Undo {
+        /// The provider name the failed rename copied to.
+        name: String,
+    },
+}
 
 /// A unit of work handed from the UI to the worker.
 ///
@@ -78,6 +128,21 @@ pub enum Command {
         query: String,
         /// The `endCursor` to fetch the page after, when paging.
         after: Option<String>,
+    },
+    /// Search one repository's open PRs for the PR list's Local tab.
+    ///
+    /// Not PR-scoped: the reply is [`Event::RepoPrsLoaded`], keyed by the
+    /// generation and repo key. Unix-only with [`crate::ai`], whose linked
+    /// checkouts the tab lists.
+    #[cfg(unix)]
+    SearchRepoPrs {
+        /// The Local-repos generation that issued this search.
+        generation: u64,
+        /// The repo key, lowercased `host/owner/name`, echoed by the reply.
+        repo: String,
+        /// The search query, composed by the reducer:
+        /// `is:pr is:open repo:owner/name`.
+        query: String,
     },
     /// Load a PR's changed files, one page at a time.
     LoadPrFiles {
@@ -330,6 +395,47 @@ pub enum Command {
         provider: crate::persist::settings::ProviderSettings,
         /// The model to probe with.
         model: crate::persist::settings::ModelSettings,
+        /// A key the user just typed; `None` reads the keychain instead.
+        ///
+        /// A typed key wins, so a not-yet-saved provider still tests.
+        key: Option<String>,
+    },
+    /// Change one LLM provider's keychain entry (spec §10).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiKeyOpDone`], keyed by
+    /// `token` so an answer for a dialog the user has left can be dropped.
+    /// The keychain is blocking I/O, so the executor runs the op on the
+    /// blocking pool — never on the UI thread.
+    #[cfg(unix)]
+    AiKeyOp {
+        /// The requesting dialog's token, echoed by the reply.
+        token: u64,
+        /// The change to make.
+        op: KeyOp,
+    },
+    /// Ask whether a provider has a key in the keychain (spec §10).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiKeyPresenceDone`],
+    /// keyed by `token`. This is the worker-side probe the Settings AI tab's
+    /// Key column reads through a cache: a keychain read blocks, so it never
+    /// runs on the UI thread.
+    #[cfg(unix)]
+    AiKeyPresence {
+        /// The requesting probe's token, echoed by the reply.
+        token: u64,
+        /// The provider name to look up.
+        name: String,
+    },
+    /// Probe what repository a local folder is a clone of (spec §4 step 2).
+    ///
+    /// Not PR-scoped: the result arrives as [`Event::AiFolderProbed`], keyed
+    /// by `token` so an answer for a dialog the user has left can be dropped.
+    #[cfg(unix)]
+    AiProbeFolder {
+        /// The requesting dialog's token, echoed by the reply.
+        token: u64,
+        /// The folder to probe.
+        path: PathBuf,
     },
     /// Switch the local command classifier on or off. On starts the weights
     /// download if they are absent, then the GPU load; progress arrives as
@@ -556,6 +662,18 @@ pub enum Event {
         /// The classified failure.
         error: GhError,
     },
+    /// A repo PR search answered: `Ok` carries the page, `Err` the failure.
+    /// The reply to [`Command::SearchRepoPrs`]; not PR-scoped, so the
+    /// generation and repo key identify it.
+    #[cfg(unix)]
+    RepoPrsLoaded {
+        /// The generation the search was issued at.
+        generation: u64,
+        /// The repo key the search was for, echoed from the command.
+        repo: String,
+        /// The page, or why the search failed.
+        result: Result<SearchPage, GhError>,
+    },
     /// One page of a PR's changed files arrived.
     PrFilesPage {
         /// The session that asked for the files.
@@ -746,6 +864,43 @@ pub enum Event {
     /// stale-event rule never drops it (leaving a PR must not hide the
     /// download progress or a failure from Settings).
     ClassifierState(crate::state::classifier::ClassifierState),
+    /// The result of a [`Command::AiProbeFolder`]: the repository the folder is
+    /// a clone of, or the reason it cannot be one (safe to show).
+    #[cfg(unix)]
+    AiFolderProbed {
+        /// The token of the [`Command::AiProbeFolder`] that asked.
+        token: u64,
+        /// The folder that was probed.
+        path: PathBuf,
+        /// The repository, or why the folder names none.
+        result: Result<RemoteRepo, String>,
+    },
+    /// The result of a [`Command::AiKeyOp`]: `Ok` once the keychain reflects
+    /// the op, `Err` a display-safe message.
+    ///
+    /// The key itself is never part of the event — only whether the change
+    /// landed.
+    #[cfg(unix)]
+    AiKeyOpDone {
+        /// The token of the [`Command::AiKeyOp`] that asked.
+        token: u64,
+        /// The outcome, safe to show.
+        result: Result<(), String>,
+    },
+    /// The result of a [`Command::AiKeyPresence`]: whether the keychain holds
+    /// a key for `name`.
+    ///
+    /// A keychain read may prompt or block, which is why it happens on the
+    /// worker; the reply carries no key material.
+    #[cfg(unix)]
+    AiKeyPresenceDone {
+        /// The token of the [`Command::AiKeyPresence`] that asked.
+        token: u64,
+        /// The provider that was probed.
+        name: String,
+        /// `true` when a key is stored, `Err` a display-safe reason.
+        result: Result<bool, String>,
+    },
     /// A PR's full AI state, replayed on attach and after a run starts
     /// (spec §10.3).
     #[cfg(unix)]
@@ -1141,6 +1296,31 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 }),
                 Err(error) => events.send(Event::PrSearchFailed { request, error }),
             }
+        }
+        #[cfg(unix)]
+        Command::SearchRepoPrs {
+            generation,
+            repo,
+            query,
+        } => {
+            // Not PR-scoped: the generation and repo key identify the reply,
+            // and the reducer drops stale ones. A read, so the client's
+            // read-retry applies; the query is the reducer's, composed from
+            // the key via `ScopeConstraint::Repo`.
+            let Some(client) = ctx.client() else {
+                events.send(Event::RepoPrsLoaded {
+                    generation,
+                    repo,
+                    result: Err(GhError::Unauthorized),
+                });
+                return;
+            };
+            let result = client.search_prs(&query, None).await;
+            events.send(Event::RepoPrsLoaded {
+                generation,
+                repo,
+                result,
+            });
         }
         Command::LoadPrFiles {
             session,
@@ -1593,21 +1773,24 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
                 Err(error) => events.send(Event::MergeFailed { session, error }),
             }
         }
-        Command::AiTestProvider { provider, model } => {
+        Command::AiTestProvider {
+            provider,
+            model,
+            key,
+        } => {
             // Not PR-scoped, so no SessionId: the event names the provider.
             // Reads only, and the client applies its own retry policy.
             let name = provider.name.clone();
             #[cfg(unix)]
             {
-                let result = match crate::auth::store::llm_key(&*ctx.store, &name) {
-                    Ok(Some(key)) => {
+                let result = match provider_key(ctx.store.clone(), &name, key).await {
+                    Ok(key) => {
                         match crate::ai::llm::build_client(&provider, SecretString::from(key)) {
                             Ok(client) => crate::ai::llm::test_connection(&client, &model).await,
                             Err(error) => Err(error.to_string()),
                         }
                     }
-                    Ok(None) => Err(format!("no API key stored for {name}")),
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => Err(error),
                 };
                 events.send(Event::AiProviderTested {
                     provider: name,
@@ -1618,7 +1801,7 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             // command still answers so the Settings UI never hangs.
             #[cfg(not(unix))]
             {
-                let _ = (provider, model);
+                let _ = (provider, model, key);
                 events.send(Event::AiProviderTested {
                     provider: name,
                     result: Err("AI review is not available on this platform".to_owned()),
@@ -1649,6 +1832,61 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
         // No AI (and no classifier) off Unix; the Settings window says so.
         #[cfg(not(unix))]
         Command::ClassifierSetEnabled { .. } | Command::ClassifierDownload => {}
+        #[cfg(unix)]
+        Command::AiKeyOp { token, op } => {
+            // Not PR-scoped: no SessionId, the token names the request. The
+            // keychain blocks (it may prompt), so the op runs on the blocking
+            // pool and never occupies an async worker thread.
+            let store = ctx.store.clone();
+            let result = match tokio::task::spawn_blocking(move || run_key_op(&*store, op)).await {
+                Ok(result) => result,
+                // The blocking pool lost the task (it panicked): the dialog
+                // still needs an answer.
+                Err(error) => Err(format!("the keychain change failed: {error}")),
+            };
+            events.send(Event::AiKeyOpDone { token, result });
+        }
+        #[cfg(unix)]
+        Command::AiKeyPresence { token, name } => {
+            // Not PR-scoped: the token names the request. The keychain blocks
+            // (it may prompt), so the probe runs on the blocking pool like a
+            // key op, never on the worker's async threads.
+            let store = ctx.store.clone();
+            let probe = name.clone();
+            let result = match tokio::task::spawn_blocking(move || {
+                crate::auth::store::llm_key(&*store, &probe)
+                    .map(|key| key.is_some())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(format!("the keychain probe failed: {error}")),
+            };
+            events.send(Event::AiKeyPresenceDone {
+                token,
+                name,
+                result,
+            });
+        }
+        #[cfg(unix)]
+        Command::AiProbeFolder { token, path } => {
+            // Not PR-scoped: no SessionId, the token names the request. `git`
+            // runs as a child process, so the probe goes to the blocking pool
+            // and never occupies an async worker thread.
+            let folder = path.clone();
+            let result = match tokio::task::spawn_blocking(move || probe_folder(&folder)).await {
+                Ok(result) => result,
+                // The blocking pool lost the task (it panicked): the dialog
+                // still needs an answer.
+                Err(error) => Err(format!("the folder probe failed: {error}")),
+            };
+            events.send(Event::AiFolderProbed {
+                token,
+                path,
+                result,
+            });
+        }
         #[cfg(unix)]
         Command::AiAttach { session, key } => {
             ctx.ai.attach(session, key, &events);
@@ -1906,6 +2144,64 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
 /// GitHub's own context width for the patches it sends.
 const LOCAL_DIFF_CONTEXT: usize = 3;
 
+/// The key to dial `name` with: the one the user just typed when present, else
+/// the keychain's. Blocking (the keychain may prompt), so it runs on the
+/// blocking pool; the error is safe to show and never contains a key.
+#[cfg(unix)]
+async fn provider_key(
+    store: Arc<dyn TokenStore>,
+    name: &str,
+    typed: Option<String>,
+) -> Result<String, String> {
+    if let Some(key) = typed {
+        return Ok(key);
+    }
+    let provider = name.to_owned();
+    match tokio::task::spawn_blocking(move || crate::auth::store::llm_key(&*store, &provider)).await
+    {
+        Ok(Ok(Some(key))) => Ok(key),
+        Ok(Ok(None)) => Err(format!("no API key stored for {name}")),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(format!("the keychain read failed: {error}")),
+    }
+}
+
+/// Apply one [`KeyOp`] to the keychain. Blocking — [`Command::AiKeyOp`] calls
+/// it on `spawn_blocking` — and the error is safe to show.
+#[cfg(unix)]
+fn run_key_op(store: &dyn TokenStore, op: KeyOp) -> Result<(), String> {
+    use crate::auth::store::{clear_llm_key, copy_llm_key, set_llm_key};
+
+    let result = match op {
+        KeyOp::Store { name, key } => set_llm_key(store, &name, &key),
+        // A rename is a non-destructive copy: `Remove` follows a successful
+        // settings write, `Undo` deletes the copy when that write failed.
+        KeyOp::Move { from, to, key } => copy_llm_key(store, &from, &to, key.as_deref()),
+        KeyOp::Remove { name } | KeyOp::Undo { name } => clear_llm_key(store, &name),
+    };
+    result.map_err(|error| error.to_string())
+}
+
+/// What repository `path` is a clone of, or the reason it names none (safe to
+/// show). Blocking — [`crate::ai::checkout::read_origin_repo`] runs `git` as a
+/// child process — so [`Command::AiProbeFolder`] calls it on
+/// `spawn_blocking`.
+#[cfg(unix)]
+fn probe_folder(path: &Path) -> Result<RemoteRepo, String> {
+    // `read_origin_repo` reaches the same answers through `git`, but its
+    // failures read like a git invocation ("`git rev-parse ...` failed: ...").
+    // The folder check is filesystem-only and cheap, so answer the two obvious
+    // cases plainly and leave the rest to the clone check.
+    match folder_status(path) {
+        FolderStatus::Ok => {}
+        FolderStatus::Missing => return Err(format!("{} does not exist", path.display())),
+        FolderStatus::NotARepo => {
+            return Err(format!("{} is not a git repository", path.display()));
+        }
+    }
+    crate::ai::checkout::read_origin_repo(path).map_err(|error| error.to_string())
+}
+
 /// Fetch one side of an image diff, capped at [`MAX_IMAGE_BYTES`].
 ///
 /// Over the cap the blob was never buffered and becomes `TooLarge`; a
@@ -1988,6 +2284,301 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)),
             Some(Event::WorkerPanicked(_))
         ));
+    }
+
+    /// Run `git` in `dir`, panicking on failure: the probe tests need a real
+    /// repository, and CI has `git` on PATH.
+    #[cfg(unix)]
+    fn gitx(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The folder probe names the repository a clone belongs to — echoing the
+    /// request token for the consumer to match — and says why a plain or
+    /// missing folder cannot be one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_folder_reports_remote_and_reason() {
+        let dir = crate::test_support::tempdir();
+        let clone = dir.path().join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        gitx(&clone, &["init", "-b", "main"]);
+        gitx(
+            &clone,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Acme/Widgets.git",
+            ],
+        );
+
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let ctx = Arc::new(ExecCtx::new(Arc::new(
+            crate::auth::store::MemoryStore::default(),
+        )));
+        let (tx, rx) = event_channel();
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 7,
+                path: clone.clone(),
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed {
+            token,
+            path,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 7, "the token is echoed for the consumer to match");
+        assert_eq!(path, clone);
+        assert_eq!(result.unwrap().key(), "github.com/acme/widgets");
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 8,
+                path: plain,
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed { token, result, .. }) =
+            rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 8);
+        let reason = result.expect_err("a plain directory is not a clone");
+        assert!(
+            reason.contains("not a git repository"),
+            "the reason should say why: {reason}"
+        );
+
+        execute(
+            ctx.clone(),
+            Command::AiProbeFolder {
+                token: 9,
+                path: dir.path().join("gone"),
+            },
+            tx.clone(),
+        )
+        .await;
+        let Some(Event::AiFolderProbed { token, result, .. }) =
+            rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the probe's answer");
+        };
+        assert_eq!(token, 9);
+        let reason = result.expect_err("a missing folder is no clone");
+        assert!(
+            reason.contains("does not exist"),
+            "the reason should say why: {reason}"
+        );
+    }
+
+    /// Send one [`Command::AiKeyOp`] through the real executor and return its
+    /// answer, checking the request token is echoed.
+    #[cfg(unix)]
+    async fn apply_key_op(
+        store: &Arc<crate::auth::store::MemoryStore>,
+        token: u64,
+        op: KeyOp,
+    ) -> Result<(), String> {
+        let ctx = Arc::new(ExecCtx::new(store.clone()));
+        let (tx, rx) = event_channel();
+        execute(ctx, Command::AiKeyOp { token, op }, tx).await;
+        let Some(Event::AiKeyOpDone {
+            token: answered,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the key op's answer");
+        };
+        assert_eq!(
+            answered, token,
+            "the token is echoed for the consumer to match"
+        );
+        result
+    }
+
+    /// Send one [`Command::AiKeyPresence`] through the real executor and
+    /// return whether the keychain holds a key, checking the echoed token and
+    /// name.
+    #[cfg(unix)]
+    async fn apply_key_presence(
+        store: &Arc<crate::auth::store::MemoryStore>,
+        token: u64,
+        name: &str,
+    ) -> Result<bool, String> {
+        let ctx = Arc::new(ExecCtx::new(store.clone()));
+        let (tx, rx) = event_channel();
+        execute(
+            ctx,
+            Command::AiKeyPresence {
+                token,
+                name: name.to_owned(),
+            },
+            tx,
+        )
+        .await;
+        let Some(Event::AiKeyPresenceDone {
+            token: answered,
+            name: answered_name,
+            result,
+        }) = rx.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("expected the presence probe's answer");
+        };
+        assert_eq!(answered, token, "the token is echoed for the consumer");
+        assert_eq!(answered_name, name, "the probed name is echoed");
+        result
+    }
+
+    /// The presence probe reports a stored key as present and an absent one
+    /// as `false` (not an error); it never returns the key itself.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presence_probe_reports_stored_and_absent_keys() {
+        use crate::auth::store::{MemoryStore, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+
+        assert!(
+            apply_key_presence(&store, 21, "work").await.unwrap(),
+            "a stored key is present"
+        );
+        assert!(
+            !apply_key_presence(&store, 22, "home").await.unwrap(),
+            "an absent key is absent, not a failure"
+        );
+    }
+
+    /// A rename copies the key to the new name and leaves the old entry in
+    /// place: the app removes it only after the settings write succeeds.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_copies_without_deleting_the_old_key() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+
+        apply_key_op(
+            &store,
+            11,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-work"),
+            "the old entry stays until the settings write succeeds"
+        );
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap().as_deref(),
+            Some("sk-work")
+        );
+    }
+
+    /// A typed key wins over whatever the old name holds, so renaming and
+    /// re-keying in one dialog stores the typed key under the new name.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_with_supplied_key_stores_that_key() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-old").unwrap();
+
+        apply_key_op(
+            &store,
+            12,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: Some("sk-typed".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap().as_deref(),
+            Some("sk-typed"),
+            "the supplied key is the one stored under the new name"
+        );
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-old"),
+            "a supplied key does not disturb the old entry"
+        );
+    }
+
+    /// Undo deletes the copied entry only; the old name keeps working.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn undo_removes_only_the_new_entry() {
+        use crate::auth::store::{MemoryStore, llm_key, set_llm_key};
+
+        let store = Arc::new(MemoryStore::default());
+        set_llm_key(&*store, "work", "sk-work").unwrap();
+        apply_key_op(
+            &store,
+            13,
+            KeyOp::Move {
+                from: "work".into(),
+                to: "work-renamed".into(),
+                key: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        apply_key_op(
+            &store,
+            14,
+            KeyOp::Undo {
+                name: "work-renamed".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            llm_key(&*store, "work-renamed").unwrap(),
+            None,
+            "the copied entry is gone"
+        );
+        assert_eq!(
+            llm_key(&*store, "work").unwrap().as_deref(),
+            Some("sk-work"),
+            "the old entry is untouched"
+        );
     }
 
     #[test]
