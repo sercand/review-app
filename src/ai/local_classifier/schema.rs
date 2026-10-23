@@ -26,14 +26,7 @@ pub struct DecisionSchema {
     pub approve_threshold: f32,
 }
 
-/// Where a loaded schema came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaSource {
-    /// The model's own `decision_schema.json`.
-    Model,
-    /// The built-in default; the model has no schema file.
-    BuiltIn,
-}
+pub use crate::state::classifier::SchemaSource;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

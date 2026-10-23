@@ -309,6 +309,13 @@ fn apply_classifier_event(
     window.set_classifier_state(state);
 }
 
+/// Whether the worker must be told about a settings change: the classifier
+/// was switched on or off, or it is on and its model changed (a model change
+/// while off is picked up by the next enable, which carries the model).
+fn classifier_changed(was_on: bool, on: bool, was_model: &str, model: &str) -> bool {
+    on != was_on || (on && was_model != model)
+}
+
 /// True exactly once, on the first call, and only when the classifier setting
 /// is on: the app then sends `ClassifierSetEnabled(true)`.
 fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
@@ -887,6 +894,7 @@ impl ReviewApp {
         self.classifier_seq += 1;
         self.worker.send(Command::ClassifierSetEnabled {
             enabled,
+            model: self.settings.ai.auto_approve.decision_model.clone(),
             seq: self.classifier_seq,
         });
     }
@@ -945,6 +953,7 @@ impl ReviewApp {
                         .map(|provider| provider.name.clone())
                         .collect();
                     let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
+                    let model_was = self.settings.ai.auto_approve.decision_model.clone();
                     let host_changed = match vm.apply(&mut self.settings) {
                         Ok(host_changed) => host_changed,
                         Err(error) => {
@@ -960,7 +969,12 @@ impl ReviewApp {
                     };
                     self.save_settings(now);
                     let classifier_on = self.settings.ai.auto_approve.local_classifier;
-                    if classifier_on != classifier_was_on {
+                    if classifier_changed(
+                        classifier_was_on,
+                        classifier_on,
+                        &model_was,
+                        &self.settings.ai.auto_approve.decision_model,
+                    ) {
                         self.send_classifier_enabled(classifier_on);
                     }
                     let new_names: Vec<String> = self
@@ -3025,6 +3039,15 @@ mod tests {
             !quit_close_needs_intercept(false, false),
             "no close, nothing to intercept"
         );
+    }
+
+    #[test]
+    fn a_model_change_is_sent_only_while_the_classifier_is_on() {
+        assert!(classifier_changed(false, true, "a", "a"));
+        assert!(classifier_changed(true, false, "a", "a"));
+        assert!(classifier_changed(true, true, "a", "b"));
+        assert!(!classifier_changed(true, true, "a", "a"));
+        assert!(!classifier_changed(false, false, "a", "b"));
     }
 
     #[test]

@@ -336,6 +336,9 @@ pub enum Command {
     /// [`Event::ClassifierState`]. App-global, so no `SessionId`.
     ClassifierSetEnabled {
         enabled: bool,
+        /// The registry name of the decision model to use. A name that
+        /// differs from the loaded one restarts the load for the new model.
+        model: String,
         /// Stamped by the UI in send order; the hub ignores a request older
         /// than one it has seen, since the worker may run commands out of
         /// order.
@@ -1623,12 +1626,16 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             }
         }
         #[cfg(unix)]
-        Command::ClassifierSetEnabled { enabled, seq } => {
+        Command::ClassifierSetEnabled {
+            enabled,
+            model,
+            seq,
+        } => {
             // Commands run as separate tasks and may overtake each other, so
             // order comes from `seq` (stamped by the UI in send order): the
             // hub drops a request older than one it has recorded, and the
             // blocking task applies the newest recorded value.
-            ctx.ai.classifier_request(enabled, seq);
+            ctx.ai.classifier_request(enabled, &model, seq);
             // Switching off can free a GPU model, which is slow: keep it off
             // the async worker.
             let ctx = ctx.clone();

@@ -6,37 +6,61 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use review_approval::model_stage::CommandClassifier;
+use shiso_decision::error::DecideError;
+use shiso_decision::{Decider, OpenDesc};
 
+use super::decision::DecisionClassifier;
+use super::schema::{SchemaSource, load_schema};
 use super::weights::WeightsManager;
 
 pub use crate::state::classifier::ClassifierState;
 
 /// Where the weights come from; a fake in tests.
 pub trait WeightsSource: Send + Sync {
-    /// The verified install, without touching the network.
-    fn installed_dir(&self) -> Option<PathBuf>;
+    /// The install of `model` known to be complete, without touching the
+    /// network. `None` does not mean it is absent, only that this source
+    /// cannot tell cheaply: `ensure` then returns at once if it is there.
+    fn installed_dir(&self, model: &str) -> Option<PathBuf>;
     /// Blocking download + verify + install; call from a job thread.
     /// `progress(done, total)` returns `false` to cancel: the download stops
     /// (keeping partial files for resume) and `ensure` returns an error.
-    fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String>;
+    fn ensure(
+        &self,
+        model: &str,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<PathBuf, LoadError>;
 }
 
 impl WeightsSource for WeightsManager {
-    fn installed_dir(&self) -> Option<PathBuf> {
-        WeightsManager::installed_dir(self)
+    fn installed_dir(&self, model: &str) -> Option<PathBuf> {
+        WeightsManager::installed_dir(self, model)
     }
-    fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String> {
-        self.ensure_blocking(progress)
+    fn ensure(
+        &self,
+        model: &str,
+        progress: &mut dyn FnMut(u64, u64) -> bool,
+    ) -> Result<PathBuf, LoadError> {
+        self.ensure_blocking(model, progress)
     }
 }
 
 /// Why the engine could not produce a classifier.
 #[derive(Debug)]
 pub enum LoadError {
-    /// The device cannot be used (backend creation failed).
+    /// The device cannot be used (backend creation failed), or the model's
+    /// schema is unusable.
     Unavailable(String),
-    /// The model failed to load.
+    /// The download or the model load failed.
     Failed(String),
+}
+
+/// Maps a shiso error to the state it should show. A missing device is
+/// `Unavailable`; everything else is retryable.
+pub(super) fn load_error(error: DecideError) -> LoadError {
+    match error {
+        DecideError::NoDevice(why) => LoadError::Unavailable(format!("no usable GPU: {why}")),
+        other => LoadError::Failed(other.to_string()),
+    }
 }
 
 /// The compute side; a fake in tests.
@@ -50,25 +74,36 @@ pub trait Engine: Send + Sync {
         &self,
         dir: &Path,
         on_trip: Box<dyn Fn() + Send + Sync>,
-    ) -> Result<Arc<dyn CommandClassifier>, LoadError>;
+    ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError>;
 }
 
-/// The real engine. Compile-only stand-in until Task B4 opens a
-/// `shiso_decision::Decider` here: with no backend, nothing is available.
+/// The real engine: the model's schema, then a `shiso_decision::Decider`.
+///
+/// There is no cheap device probe in shiso, so the check before the download
+/// is only whether this build has a backend at all. On a machine whose
+/// device is unusable the download therefore still happens and the failure
+/// shows at open time (`NoDevice` becomes `Unavailable`).
 struct ShisoEngine;
 
 impl Engine for ShisoEngine {
     fn gpu_available(&self) -> bool {
-        false
+        cfg!(any(
+            feature = "local-classifier",
+            feature = "local-classifier-cuda"
+        ))
     }
+
     fn load(
         &self,
-        _dir: &Path,
-        _on_trip: Box<dyn Fn() + Send + Sync>,
-    ) -> Result<Arc<dyn CommandClassifier>, LoadError> {
-        Err(LoadError::Unavailable(
-            "the decision-model backend is not implemented yet".into(),
-        ))
+        dir: &Path,
+        on_trip: Box<dyn Fn() + Send + Sync>,
+    ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError> {
+        // An unreadable schema is never replaced by the default: the model
+        // was shipped with a question this build cannot ask.
+        let (schema, source) = load_schema(dir).map_err(LoadError::Unavailable)?;
+        let decider = Decider::open(&OpenDesc::new(dir)).map_err(load_error)?;
+        let classifier = DecisionClassifier::new(Arc::new(decider), schema, on_trip);
+        Ok((Arc::new(classifier), source))
     }
 }
 
@@ -76,6 +111,8 @@ type OnState = Arc<dyn Fn(ClassifierState) + Send + Sync>;
 
 struct Inner {
     enabled: bool,
+    /// The registry name of the model wanted now.
+    model: String,
     state: ClassifierState,
     classifier: Option<Arc<dyn CommandClassifier>>,
     /// A job thread is running; at most one at a time.
@@ -102,18 +139,21 @@ struct Shared {
 pub struct Loader(Arc<Shared>);
 
 impl Loader {
-    pub fn new(manager: WeightsManager, on_state: OnState) -> Loader {
-        Loader::with_parts(Arc::new(manager), Arc::new(ShisoEngine), on_state)
+    /// A loader for the registry model `model`.
+    pub fn new(manager: WeightsManager, model: &str, on_state: OnState) -> Loader {
+        Loader::with_parts(Arc::new(manager), Arc::new(ShisoEngine), model, on_state)
     }
 
     fn with_parts(
         source: Arc<dyn WeightsSource>,
         engine: Arc<dyn Engine>,
+        model: &str,
         on_state: OnState,
     ) -> Loader {
         Loader(Arc::new(Shared {
             inner: Mutex::new(Inner {
                 enabled: false,
+                model: model.to_owned(),
                 state: ClassifierState::Off,
                 classifier: None,
                 job_running: false,
@@ -147,7 +187,7 @@ impl Loader {
                 drop(inner);
                 (self.0.on_state)(phase);
             } else {
-                self.start_job(inner);
+                self.start_job(inner, None);
             }
         } else {
             let dropped = inner.classifier.take();
@@ -159,15 +199,42 @@ impl Loader {
         }
     }
 
+    /// Switches to another registry model. While enabled, a running job for
+    /// the old model is cancelled (its download stops) and the new model is
+    /// downloaded and loaded; the old classifier is dropped at once and never
+    /// handed out again, even by a job that was already finishing. While
+    /// disabled the name is only remembered for the next enable.
+    pub fn set_model(&self, model: &str) {
+        let mut inner = self.lock();
+        if inner.model == model {
+            return;
+        }
+        inner.model = model.to_owned();
+        if !inner.enabled {
+            return;
+        }
+        let dropped = inner.classifier.take();
+        if inner.job_running {
+            // The running job sees the new name at its next progress report
+            // (or when it finishes), stops, and the restart is announced
+            // then.
+            drop(inner);
+        } else {
+            self.start_job(inner, Some(ClassifierState::Loading));
+        }
+        // Freeing the model can be slow; do it off the lock.
+        drop(dropped);
+    }
+
     /// Retry after a `Failed` (or `NotInstalled`) state.
     pub fn download(&self) {
         let inner = self.lock();
         let retryable = matches!(
             inner.state,
-            ClassifierState::Failed(_) | ClassifierState::NotInstalled
+            ClassifierState::Failed(_) | ClassifierState::NotInstalled { .. }
         );
         if inner.enabled && !inner.job_running && retryable {
-            self.start_job(inner);
+            self.start_job(inner, None);
         }
     }
 
@@ -176,41 +243,57 @@ impl Loader {
         self.lock().classifier.clone()
     }
 
-    /// Starts a job thread unless one is running. Takes the guard so the
-    /// check and the flag are one critical section.
-    fn start_job(&self, mut inner: MutexGuard<'_, Inner>) {
+    /// Starts a job thread for the current model unless one is running. Takes
+    /// the guard so the check and the flag are one critical section.
+    /// `announce` is reported before the thread starts, so the job's own
+    /// first report cannot be overtaken by it.
+    fn start_job(&self, mut inner: MutexGuard<'_, Inner>, announce: Option<ClassifierState>) {
         if inner.job_running {
             return;
         }
         inner.job_running = true;
         inner.generation += 1;
         inner.phase = ClassifierState::Loading;
+        let model = inner.model.clone();
+        if let Some(state) = &announce {
+            inner.state = state.clone();
+        }
         drop(inner);
+        if let Some(state) = announce {
+            (self.0.on_state)(state);
+        }
         let this = self.clone();
         let spawned = std::thread::Builder::new()
             .name("classifier-loader".into())
-            .spawn(move || this.run_job());
+            .spawn(move || this.run_job(model));
         if let Err(e) = spawned {
-            self.finish(Some(Outcome::State(ClassifierState::Failed(format!(
-                "could not start the loader thread: {e}"
-            )))));
+            self.finish(
+                Some(Outcome::State(ClassifierState::Failed(format!(
+                    "could not start the loader thread: {e}"
+                )))),
+                None,
+            );
         }
     }
 
-    fn run_job(&self) {
-        let outcome = match catch_unwind(AssertUnwindSafe(|| self.job())) {
+    fn run_job(&self, model: String) {
+        let outcome = match catch_unwind(AssertUnwindSafe(|| self.job(&model))) {
             Ok(outcome) => outcome,
             Err(_) => Some(Outcome::State(ClassifierState::Failed(
                 "the classifier loader panicked".into(),
             ))),
         };
-        self.finish(outcome);
+        self.finish(outcome, Some(&model));
     }
 
-    /// Reports an intermediate state; `false` means the setting was switched
-    /// off meanwhile and the job should stop.
-    fn progress(&self, state: ClassifierState) -> bool {
+    /// Reports an intermediate state of the job for `model`; `false` means
+    /// the setting was switched off or the model changed meanwhile and the
+    /// job should stop.
+    fn progress(&self, model: &str, state: ClassifierState) -> bool {
         let mut inner = self.lock();
+        if inner.model != model {
+            return false;
+        }
         inner.phase = state.clone();
         if !inner.enabled {
             return false;
@@ -221,25 +304,27 @@ impl Loader {
         true
     }
 
-    /// `None` means the job was cancelled by disabling.
-    fn job(&self) -> Option<Outcome> {
+    /// `None` means the job was cancelled by disabling or a model change.
+    fn job(&self, model: &str) -> Option<Outcome> {
         let shared = &self.0;
         if !shared.engine.gpu_available() {
             return Some(Outcome::State(ClassifierState::Unavailable(
                 "no usable GPU".into(),
             )));
         }
-        let dir = match shared.source.installed_dir() {
+        let dir = match shared.source.installed_dir(model) {
             Some(dir) => dir,
             None => {
-                if !self.progress(ClassifierState::NotInstalled)
-                    || !self.progress(ClassifierState::Downloading { done: 0, total: 0 })
+                // Shown for an install too (shiso has no offline probe): the
+                // call below then returns at once and `Loading` follows.
+                if !self.progress(model, ClassifierState::NotInstalled { total_bytes: None })
+                    || !self.progress(model, ClassifierState::Downloading { done: 0, total: 0 })
                 {
                     return None;
                 }
                 let mut cancelled = false;
-                let fetched = shared.source.ensure(&mut |done, total| {
-                    let go = self.progress(ClassifierState::Downloading { done, total });
+                let fetched = shared.source.ensure(model, &mut |done, total| {
+                    let go = self.progress(model, ClassifierState::Downloading { done, total });
                     cancelled |= !go;
                     go
                 });
@@ -248,11 +333,11 @@ impl Loader {
                 }
                 match fetched {
                     Ok(dir) => dir,
-                    Err(e) => return Some(Outcome::State(ClassifierState::Failed(e))),
+                    Err(e) => return Some(Outcome::State(e.into())),
                 }
             }
         };
-        if !self.progress(ClassifierState::Loading) {
+        if !self.progress(model, ClassifierState::Loading) {
             return None;
         }
         let generation = self.lock().generation;
@@ -263,9 +348,8 @@ impl Loader {
             }
         });
         Some(match shared.engine.load(&dir, on_trip) {
-            Ok(c) => Outcome::Ready(c),
-            Err(LoadError::Unavailable(m)) => Outcome::State(ClassifierState::Unavailable(m)),
-            Err(LoadError::Failed(m)) => Outcome::State(ClassifierState::Failed(m)),
+            Ok((c, source)) => Outcome::Ready(c, source),
+            Err(e) => Outcome::State(e.into()),
         })
     }
 
@@ -284,11 +368,12 @@ impl Loader {
         drop(dropped);
     }
 
-    /// Ends the job and records the outcome. A cancelled job (`None`) or a
-    /// result that arrives after a disable is discarded; if the setting was
-    /// switched back on meanwhile, a fresh job starts so that enable is not
-    /// lost.
-    fn finish(&self, outcome: Option<Outcome>) {
+    /// Ends the job and records the outcome. A cancelled job (`None`), a
+    /// result that arrives after a disable, or one for a model that is no
+    /// longer wanted is discarded; if the setting is on, a fresh job starts
+    /// (for the current model) so that enable or switch is not lost.
+    /// `model` is the job's model (`None` when the thread never started).
+    fn finish(&self, outcome: Option<Outcome>, model: Option<&str>) {
         let mut inner = self.lock();
         inner.job_running = false;
         if !inner.enabled {
@@ -297,12 +382,19 @@ impl Loader {
             drop(outcome);
             return;
         }
+        if model.is_some_and(|m| m != inner.model) {
+            // The model was switched while this job ran: whatever it made is
+            // for the wrong model.
+            self.start_job(inner, Some(ClassifierState::Loading));
+            drop(outcome);
+            return;
+        }
         let state = match outcome {
-            None => return self.start_job(inner),
+            None => return self.start_job(inner, None),
             Some(Outcome::State(state)) => state,
-            Some(Outcome::Ready(c)) => {
+            Some(Outcome::Ready(c, source)) => {
                 inner.classifier = Some(c);
-                ClassifierState::Ready
+                ClassifierState::Ready(source)
             }
         };
         inner.state = state.clone();
@@ -311,9 +403,18 @@ impl Loader {
     }
 }
 
+impl From<LoadError> for ClassifierState {
+    fn from(error: LoadError) -> ClassifierState {
+        match error {
+            LoadError::Unavailable(m) => ClassifierState::Unavailable(m),
+            LoadError::Failed(m) => ClassifierState::Failed(m),
+        }
+    }
+}
+
 enum Outcome {
     State(ClassifierState),
-    Ready(Arc<dyn CommandClassifier>),
+    Ready(Arc<dyn CommandClassifier>, SchemaSource),
 }
 
 #[cfg(test)]
@@ -327,11 +428,26 @@ mod tests {
 
     use super::*;
 
-    struct Fake;
+    /// A classifier that says which model it came from: `Dangerous` for the
+    /// model named `old`, `Safe` for any other.
+    struct Fake {
+        old: bool,
+    }
     impl CommandClassifier for Fake {
         fn classify(&self, _: &ClassifyInput<'_>) -> ModelOutcome {
-            ModelOutcome::Safe
+            if self.old {
+                ModelOutcome::Dangerous
+            } else {
+                ModelOutcome::Safe
+            }
         }
+    }
+
+    fn classify_with(c: &Arc<dyn CommandClassifier>) -> ModelOutcome {
+        c.classify(&ClassifyInput {
+            segment: "ls",
+            cwd: None,
+        })
     }
 
     #[derive(Default)]
@@ -340,6 +456,8 @@ mod tests {
         /// Errors handed out by successive `ensure` calls; empty means success.
         ensure_errors: Mutex<Vec<String>>,
         ensure_calls: AtomicUsize,
+        /// The model of each `ensure` call.
+        ensure_models: Mutex<Vec<String>>,
         /// `ensure` blocks until this receiver yields (when set).
         gate: Mutex<Option<mpsc::Receiver<()>>>,
         /// Set when `progress` told `ensure` to stop.
@@ -351,16 +469,21 @@ mod tests {
     }
 
     impl WeightsSource for FakeSource {
-        fn installed_dir(&self) -> Option<PathBuf> {
+        fn installed_dir(&self, _: &str) -> Option<PathBuf> {
             self.installed.lock().unwrap().clone()
         }
-        fn ensure(&self, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<PathBuf, String> {
+        fn ensure(
+            &self,
+            model: &str,
+            progress: &mut dyn FnMut(u64, u64) -> bool,
+        ) -> Result<PathBuf, LoadError> {
             self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+            self.ensure_models.lock().unwrap().push(model.to_owned());
             if let Some(rx) = self.gate.lock().unwrap().take() {
                 rx.recv().unwrap();
             }
             if let Some(e) = self.ensure_errors.lock().unwrap().pop() {
-                return Err(e);
+                return Err(LoadError::Failed(e));
             }
             for (done, total) in [(1, 4), (4, 4)] {
                 if !progress(done, total) {
@@ -371,12 +494,10 @@ mod tests {
                     if let Some(rx) = self.hold.lock().unwrap().take() {
                         rx.recv().unwrap();
                     }
-                    return Err("cancelled".into());
+                    return Err(LoadError::Failed("cancelled".into()));
                 }
             }
-            let dir = PathBuf::from("/fake/model");
-            *self.installed.lock().unwrap() = Some(dir.clone());
-            Ok(dir)
+            Ok(PathBuf::from(format!("/fake/{model}")))
         }
     }
 
@@ -384,6 +505,9 @@ mod tests {
         gpu: bool,
         load_error: Mutex<Option<LoadError>>,
         loads: AtomicUsize,
+        /// The directory of each load.
+        loaded: Mutex<Vec<PathBuf>>,
+        schema: SchemaSource,
         delay: Duration,
         /// The trip callback of the latest load.
         trip: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -395,6 +519,8 @@ mod tests {
                 gpu: true,
                 load_error: Mutex::new(None),
                 loads: AtomicUsize::new(0),
+                loaded: Mutex::new(Vec::new()),
+                schema: SchemaSource::BuiltIn,
                 delay: Duration::ZERO,
                 trip: Mutex::new(None),
             }
@@ -407,15 +533,21 @@ mod tests {
         }
         fn load(
             &self,
-            _: &Path,
+            dir: &Path,
             on_trip: Box<dyn Fn() + Send + Sync>,
-        ) -> Result<Arc<dyn CommandClassifier>, LoadError> {
+        ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError> {
             *self.trip.lock().unwrap() = Some(on_trip);
+            self.loaded.lock().unwrap().push(dir.to_owned());
             self.loads.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
             match self.load_error.lock().unwrap().take() {
                 Some(e) => Err(e),
-                None => Ok(Arc::new(Fake)),
+                None => Ok((
+                    Arc::new(Fake {
+                        old: dir.ends_with("old"),
+                    }),
+                    self.schema,
+                )),
             }
         }
     }
@@ -428,6 +560,10 @@ mod tests {
     }
 
     fn rig(source: FakeSource, engine: FakeEngine) -> Rig {
+        rig_for("d1-3b", source, engine)
+    }
+
+    fn rig_for(model: &str, source: FakeSource, engine: FakeEngine) -> Rig {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let source = Arc::new(source);
@@ -435,6 +571,7 @@ mod tests {
         let loader = Loader::with_parts(
             source.clone(),
             engine.clone(),
+            model,
             Arc::new(move |s| {
                 let _ = tx.lock().unwrap().send(s);
             }),
@@ -466,7 +603,7 @@ mod tests {
     }
 
     fn is_ready(s: &ClassifierState) -> bool {
-        *s == ClassifierState::Ready
+        matches!(s, ClassifierState::Ready(_))
     }
 
     fn is_failed(s: &ClassifierState) -> bool {
@@ -475,6 +612,8 @@ mod tests {
 
     use ClassifierState::*;
 
+    const NOT_INSTALLED: ClassifierState = NotInstalled { total_bytes: None };
+
     #[test]
     fn enable_without_weights_downloads_then_loads() {
         let r = rig(FakeSource::default(), FakeEngine::ok());
@@ -482,12 +621,12 @@ mod tests {
         assert_eq!(
             r.until(is_ready),
             [
-                NotInstalled,
+                NOT_INSTALLED,
                 Downloading { done: 0, total: 0 },
                 Downloading { done: 1, total: 4 },
                 Downloading { done: 4, total: 4 },
                 Loading,
-                Ready
+                Ready(SchemaSource::BuiltIn)
             ]
         );
         assert!(r.loader.classifier().is_some());
@@ -499,7 +638,7 @@ mod tests {
         *source.installed.lock().unwrap() = Some("/fake/model".into());
         let r = rig(source, FakeEngine::ok());
         r.loader.set_enabled(true);
-        assert_eq!(r.until(is_ready), [Loading, Ready]);
+        assert_eq!(r.until(is_ready), [Loading, Ready(SchemaSource::BuiltIn)]);
         assert_eq!(r.source.ensure_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -525,7 +664,7 @@ mod tests {
         *source.installed.lock().unwrap() = Some(PathBuf::from("/fake/model"));
         let r = rig(source, FakeEngine::ok());
         r.loader.set_enabled(true);
-        r.until(|s| *s == Ready);
+        r.until(|s| *s == Ready(SchemaSource::BuiltIn));
         assert!(r.loader.classifier().is_some());
         let trip = r.engine.trip.lock().unwrap().take().unwrap();
         trip();
@@ -548,12 +687,12 @@ mod tests {
         *source.installed.lock().unwrap() = Some(PathBuf::from("/fake/model"));
         let r = rig(source, FakeEngine::ok());
         r.loader.set_enabled(true);
-        r.until(|s| *s == Ready);
+        r.until(|s| *s == Ready(SchemaSource::BuiltIn));
         let stale = r.engine.trip.lock().unwrap().take().unwrap();
         r.loader.set_enabled(false);
         r.until(|s| *s == Off);
         r.loader.set_enabled(true);
-        r.until(|s| *s == Ready);
+        r.until(|s| *s == Ready(SchemaSource::BuiltIn));
         stale();
         assert!(r.loader.classifier().is_some());
         assert!(r.states.try_recv().is_err());
@@ -651,12 +790,13 @@ mod tests {
         let loader = Loader::with_parts(
             source,
             Arc::new(FakeEngine::ok()),
+            "d1-3b",
             Arc::new(move |s| {
                 // Re-entering would deadlock if the lock were held.
                 let l = in_cb.get().expect("set before enabling");
                 let _ = l.classifier();
                 l.set_enabled(true);
-                if s == Ready {
+                if s == Ready(SchemaSource::BuiltIn) {
                     let _ = done_tx.lock().unwrap().send(());
                 }
             }),
@@ -693,5 +833,240 @@ mod tests {
         assert_eq!(r.source.ensure_calls.load(Ordering::SeqCst), 2);
         assert_eq!(r.engine.loads.load(Ordering::SeqCst), 1);
         assert!(r.loader.classifier().is_some());
+    }
+
+    #[test]
+    fn ready_reports_schema_source() {
+        for source in [SchemaSource::Model, SchemaSource::BuiltIn] {
+            let mut engine = FakeEngine::ok();
+            engine.schema = source;
+            let r = rig(FakeSource::default(), engine);
+            r.loader.set_enabled(true);
+            assert_eq!(r.until(is_ready).last(), Some(&Ready(source)));
+        }
+    }
+
+    /// The setting changed while the old model's download was running: that
+    /// download stops, the new model is fetched and loaded, and nothing of
+    /// the old model is ever used.
+    #[test]
+    fn model_change_cancels_and_reloads() {
+        let source = FakeSource::default();
+        let (release, gate) = mpsc::channel();
+        *source.gate.lock().unwrap() = Some(gate);
+        let r = rig_for("old", source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(|s| matches!(s, Downloading { .. }));
+        r.loader.set_model("new");
+        release.send(()).unwrap();
+        // The old download is told to stop at its next report; nothing from
+        // it reaches the UI, and the new job is announced first.
+        let seen = r.until(is_ready);
+        assert_eq!(
+            seen,
+            [
+                Loading,
+                NOT_INSTALLED,
+                Downloading { done: 0, total: 0 },
+                Downloading { done: 1, total: 4 },
+                Downloading { done: 4, total: 4 },
+                Loading,
+                Ready(SchemaSource::BuiltIn)
+            ]
+        );
+        assert!(r.source.told_to_stop.load(Ordering::SeqCst));
+        assert_eq!(*r.source.ensure_models.lock().unwrap(), ["old", "new"]);
+        assert_eq!(
+            *r.engine.loaded.lock().unwrap(),
+            [PathBuf::from("/fake/new")]
+        );
+        let c = r.loader.classifier().unwrap();
+        assert_eq!(classify_with(&c), ModelOutcome::Safe, "the new model");
+    }
+
+    /// A model that is already loaded is dropped the moment the name changes.
+    #[test]
+    fn switching_models_drops_the_loaded_classifier() {
+        let mut engine = FakeEngine::ok();
+        engine.delay = Duration::from_millis(150);
+        let r = rig_for("old", FakeSource::default(), engine);
+        r.loader.set_enabled(true);
+        r.until(is_ready);
+        assert_eq!(
+            classify_with(&r.loader.classifier().unwrap()),
+            ModelOutcome::Dangerous
+        );
+        r.loader.set_model("new");
+        assert!(r.loader.classifier().is_none(), "old one is gone at once");
+        assert_eq!(r.until(|_| true), [Loading]);
+        assert_eq!(
+            r.until(is_ready).last(),
+            Some(&Ready(SchemaSource::BuiltIn))
+        );
+        assert_eq!(
+            classify_with(&r.loader.classifier().unwrap()),
+            ModelOutcome::Safe
+        );
+    }
+
+    /// The old model's load finishes after the switch: its result is thrown
+    /// away, not published.
+    #[test]
+    fn a_load_that_finishes_after_the_switch_is_discarded() {
+        let mut engine = FakeEngine::ok();
+        engine.delay = Duration::from_millis(300);
+        let r = rig_for("old", FakeSource::default(), engine);
+        r.loader.set_enabled(true);
+        // Wait until the old load is in flight.
+        while r.engine.loads.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        r.loader.set_model("new");
+        let mut states = Vec::new();
+        loop {
+            // Never the old model, at any moment.
+            if let Some(c) = r.loader.classifier() {
+                assert_eq!(classify_with(&c), ModelOutcome::Safe);
+            }
+            match r.states.recv_timeout(Duration::from_millis(20)) {
+                Ok(s) => {
+                    let done = is_ready(&s);
+                    states.push(s);
+                    if done {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(
+            states.iter().filter(|s| is_ready(s)).count(),
+            1,
+            "{states:?}"
+        );
+        assert_eq!(r.engine.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            classify_with(&r.loader.classifier().unwrap()),
+            ModelOutcome::Safe
+        );
+    }
+
+    #[test]
+    fn model_change_while_disabled_waits_for_the_next_enable() {
+        let r = rig_for("old", FakeSource::default(), FakeEngine::ok());
+        r.loader.set_model("new");
+        r.loader.set_model("new");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(r.states.try_recv().is_err());
+        assert_eq!(r.source.ensure_calls.load(Ordering::SeqCst), 0);
+        r.loader.set_enabled(true);
+        r.until(is_ready);
+        assert_eq!(*r.source.ensure_models.lock().unwrap(), ["new"]);
+    }
+
+    #[test]
+    fn the_same_model_name_changes_nothing() {
+        let source = FakeSource::default();
+        *source.installed.lock().unwrap() = Some("/fake/model".into());
+        let r = rig_for("d1-3b", source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(is_ready);
+        r.loader.set_model("d1-3b");
+        assert!(r.loader.classifier().is_some());
+        assert!(r.states.try_recv().is_err());
+        assert_eq!(r.engine.loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shiso_errors_map_to_states() {
+        use DecideError::*;
+        assert!(matches!(
+            load_error(NoDevice("no Metal".into())),
+            LoadError::Unavailable(m) if m == "no usable GPU: no Metal"
+        ));
+        assert!(matches!(
+            load_error(Download("offline".into())),
+            LoadError::Failed(m) if m.contains("offline")
+        ));
+        assert!(matches!(
+            load_error(UnknownModel("nope".into())),
+            LoadError::Failed(m) if m.contains("nope")
+        ));
+        assert!(matches!(load_error(Cancelled), LoadError::Failed(_)));
+    }
+
+    /// An invalid schema next to the weights is `Unavailable`, never the
+    /// built-in question, and nothing is opened.
+    #[test]
+    fn invalid_schema_is_unavailable_not_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("decision_schema.json"), "{ not json").unwrap();
+        let got = ShisoEngine.load(dir.path(), Box::new(|| {}));
+        match got {
+            Err(LoadError::Unavailable(m)) => {
+                assert!(m.starts_with("invalid decision schema"), "{m}")
+            }
+            Err(LoadError::Failed(m)) => panic!("failed, not unavailable: {m}"),
+            Ok(_) => panic!("loaded despite an invalid schema"),
+        }
+    }
+
+    #[test]
+    fn the_real_engine_needs_a_compiled_backend() {
+        assert_eq!(
+            ShisoEngine.gpu_available(),
+            cfg!(any(
+                feature = "local-classifier",
+                feature = "local-classifier-cuda"
+            ))
+        );
+    }
+
+    /// The whole path on the real engine: `ensure` (offline when the model is
+    /// installed in `SHISO_TEST_HOME`), schema, device, an answer.
+    #[test]
+    #[ignore = "requires a GPU build and SHISO_TEST_HOME with d1-3b installed"]
+    fn real_loader_answers_ls_la() {
+        let home = std::env::var("SHISO_TEST_HOME")
+            .expect("set SHISO_TEST_HOME to a model home that has d1-3b");
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let loader = Loader::with_parts(
+            Arc::new(WeightsManager::with_home(PathBuf::from(home))),
+            Arc::new(ShisoEngine),
+            "d1-3b",
+            Arc::new(move |s| {
+                eprintln!("state: {s:?}");
+                let _ = tx.lock().unwrap().send(s);
+            }),
+        );
+        loader.set_enabled(true);
+        loop {
+            let s = rx
+                .recv_timeout(Duration::from_secs(300))
+                .expect("timed out");
+            match s {
+                Ready(source) => {
+                    eprintln!("ready, schema {source:?}");
+                    break;
+                }
+                Failed(_) | Unavailable(_) => panic!("{s:?}"),
+                _ => {}
+            }
+        }
+        let c = loader.classifier().expect("ready");
+        let ls = c.classify(&ClassifyInput {
+            segment: "ls -la",
+            cwd: Some(Path::new("/repo")),
+        });
+        let rm = c.classify(&ClassifyInput {
+            segment: "rm -rf /",
+            cwd: Some(Path::new("/repo")),
+        });
+        eprintln!("ls -la -> {ls:?}; rm -rf / -> {rm:?}");
+        assert_eq!(ls, ModelOutcome::Safe);
+        assert_ne!(rm, ModelOutcome::Safe);
+        loader.set_enabled(false);
     }
 }

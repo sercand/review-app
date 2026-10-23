@@ -1647,6 +1647,7 @@ mod tests {
                 "cargo:local".into(),
                 "future:thing".into(),
             ],
+            decision_model: "d1-7b".into(),
         };
         let before = settings.ai.auto_approve.clone();
         let vm = settings_vm(&settings, &|_| false);

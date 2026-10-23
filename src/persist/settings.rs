@@ -245,6 +245,21 @@ pub struct AutoApproveSettings {
     /// Opt-in rule policies: `git:add`, `git:commit`, `git:restore-staged`,
     /// `git:tag`, `cargo:local`, `help-bypass`.
     pub capabilities: Vec<String>,
+    /// The registry name of the decision model behind the local classifier
+    /// (`[a-z0-9._-]+`, see [`valid_decision_model`]); downloaded when the
+    /// classifier is switched on.
+    pub decision_model: String,
+}
+
+/// The decision model used when none is configured.
+pub const DEFAULT_DECISION_MODEL: &str = "d1-3b";
+
+/// Whether `name` is a usable registry name: non-empty, only `[a-z0-9._-]`.
+pub fn valid_decision_model(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 impl Default for AutoApproveSettings {
@@ -255,6 +270,7 @@ impl Default for AutoApproveSettings {
             classifier_timeout_ms: 500,
             deny_paths: Vec::new(),
             capabilities: Vec::new(),
+            decision_model: DEFAULT_DECISION_MODEL.to_owned(),
         }
     }
 }
@@ -381,6 +397,14 @@ impl Settings {
                 if ![12.0, 13.0, 14.0].contains(&settings.code_font_size) {
                     settings.code_font_size = 13.0;
                 }
+                // A hand-edited model name that cannot be a registry name
+                // falls back to the default rather than failing later.
+                if !valid_decision_model(&settings.ai.auto_approve.decision_model) {
+                    tracing::warn!(
+                        "invalid ai.auto_approve.decision_model; using {DEFAULT_DECISION_MODEL}"
+                    );
+                    settings.ai.auto_approve.decision_model = DEFAULT_DECISION_MODEL.to_owned();
+                }
                 settings
             }
             Err(error) => {
@@ -437,10 +461,46 @@ mod tests {
             classifier_timeout_ms: 1234,
             deny_paths: vec!["secrets".into()],
             capabilities: vec!["git:add".into(), "cargo:local".into()],
+            decision_model: "d1-7b".into(),
         };
         s.save(dir.path()).unwrap();
         let back = Settings::load_or_default(dir.path());
         assert_eq!(back.ai.auto_approve, s.ai.auto_approve);
+    }
+
+    #[test]
+    fn old_settings_default_to_d1_3b() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[ai.auto_approve]\nlocal_classifier = true\n",
+        )
+        .unwrap();
+        let s = Settings::load_or_default(dir.path());
+        assert!(s.ai.auto_approve.local_classifier);
+        assert_eq!(s.ai.auto_approve.decision_model, "d1-3b");
+    }
+
+    #[test]
+    fn invalid_model_name_rejected() {
+        for ok in ["d1-3b", "a.b_c-9", "x"] {
+            assert!(valid_decision_model(ok), "{ok}");
+        }
+        for bad in ["", "D1", "a b", "../x", "a/b", "d1:3b", "é", "a\n"] {
+            assert!(!valid_decision_model(bad), "{bad:?}");
+        }
+        let dir = tempdir();
+        for bad in ["", "../etc", "Has Space"] {
+            std::fs::write(
+                dir.path().join("settings.toml"),
+                format!("[ai.auto_approve]\nlocal_classifier = true\ndecision_model = {bad:?}\n"),
+            )
+            .unwrap();
+            let s = Settings::load_or_default(dir.path());
+            assert_eq!(s.ai.auto_approve.decision_model, "d1-3b", "{bad:?}");
+            // The rest of the file still loads.
+            assert!(s.ai.auto_approve.local_classifier, "{bad:?}");
+        }
     }
 
     #[test]

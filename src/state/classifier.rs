@@ -9,19 +9,43 @@ pub enum ClassifierState {
     /// The setting is off.
     #[default]
     Off,
-    /// On, but the weights are not on disk.
-    NotInstalled,
+    /// On, but the weights are not on disk. `total_bytes` is the download
+    /// size when it is known.
+    NotInstalled {
+        total_bytes: Option<u64>,
+    },
     Downloading {
         done: u64,
         total: u64,
     },
     /// Creating the backend and uploading the weights.
     Loading,
-    Ready,
+    /// Loaded; the schema says which question the model is asked.
+    Ready(SchemaSource),
     /// No GPU, a backend error, or disabled after repeated failures.
     Unavailable(String),
     /// A download or load error; retryable.
     Failed(String),
+}
+
+/// Where the question put to the model came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaSource {
+    /// The model's own `decision_schema.json`.
+    Model,
+    /// The built-in default; the model has no schema file.
+    BuiltIn,
+}
+
+/// A byte count for people: `3.5 GB`, `135 MB`.
+fn human_bytes(bytes: u64) -> String {
+    const MB: f64 = 1_000_000.0;
+    let mb = bytes as f64 / MB;
+    if mb >= 1000.0 {
+        format!("{:.1} GB", mb / 1000.0)
+    } else {
+        format!("{} MB", mb.round().max(1.0))
+    }
 }
 
 /// Whether this build contains the classifier at all.
@@ -35,7 +59,10 @@ impl ClassifierState {
         }
         match self {
             ClassifierState::Off => "Off".to_owned(),
-            ClassifierState::NotInstalled => "Model not downloaded (≈135 MB)".to_owned(),
+            ClassifierState::NotInstalled {
+                total_bytes: Some(bytes),
+            } if *bytes > 0 => format!("Model not downloaded ({})", human_bytes(*bytes)),
+            ClassifierState::NotInstalled { .. } => "Model not downloaded".to_owned(),
             ClassifierState::Downloading { done, total } if *total > 0 => {
                 format!(
                     "Downloading… {} %",
@@ -46,7 +73,8 @@ impl ClassifierState {
             ClassifierState::Loading => {
                 "Loading on GPU… (first start can take a minute)".to_owned()
             }
-            ClassifierState::Ready => "Ready".to_owned(),
+            ClassifierState::Ready(SchemaSource::Model) => "Ready".to_owned(),
+            ClassifierState::Ready(SchemaSource::BuiltIn) => "Ready (built-in question)".to_owned(),
             ClassifierState::Unavailable(why) | ClassifierState::Failed(why) => why.clone(),
         }
     }
@@ -62,7 +90,7 @@ impl ClassifierState {
         compiled
             && matches!(
                 self,
-                ClassifierState::NotInstalled | ClassifierState::Failed(_)
+                ClassifierState::NotInstalled { .. } | ClassifierState::Failed(_)
             )
     }
 }
@@ -70,12 +98,33 @@ impl ClassifierState {
 #[cfg(test)]
 mod tests {
     use super::ClassifierState::*;
+    use super::SchemaSource;
+
+    const NOT_INSTALLED: super::ClassifierState = NotInstalled { total_bytes: None };
 
     #[test]
     fn state_text_table() {
         let rows = [
             (Off, "Off"),
-            (NotInstalled, "Model not downloaded (≈135 MB)"),
+            (NOT_INSTALLED, "Model not downloaded"),
+            (
+                NotInstalled {
+                    total_bytes: Some(3_500_000_000),
+                },
+                "Model not downloaded (3.5 GB)",
+            ),
+            (
+                NotInstalled {
+                    total_bytes: Some(135_000_000),
+                },
+                "Model not downloaded (135 MB)",
+            ),
+            (
+                NotInstalled {
+                    total_bytes: Some(0),
+                },
+                "Model not downloaded",
+            ),
             (Downloading { done: 0, total: 0 }, "Downloading…"),
             (
                 Downloading {
@@ -85,7 +134,8 @@ mod tests {
                 "Downloading… 42 %",
             ),
             (Loading, "Loading on GPU… (first start can take a minute)"),
-            (Ready, "Ready"),
+            (Ready(SchemaSource::Model), "Ready"),
+            (Ready(SchemaSource::BuiltIn), "Ready (built-in question)"),
             (Unavailable("no usable GPU".into()), "no usable GPU"),
             (Failed("offline".into()), "offline"),
         ];
@@ -99,15 +149,15 @@ mod tests {
     fn download_button_only_when_not_installed_or_failed() {
         let states = [
             Off,
-            NotInstalled,
+            NOT_INSTALLED,
             Downloading { done: 1, total: 2 },
             Loading,
-            Ready,
+            Ready(SchemaSource::Model),
             Unavailable("x".into()),
             Failed("x".into()),
         ];
         for state in states {
-            let expected = matches!(state, NotInstalled | Failed(_));
+            let expected = matches!(state, NotInstalled { .. } | Failed(_));
             assert_eq!(state.can_download(true), expected, "{state:?}");
             assert!(!state.can_download(false), "{state:?}");
         }
@@ -119,6 +169,6 @@ mod tests {
         assert!(Downloading { done: 0, total: 0 }.available(true));
         assert!(Loading.available(true));
         assert!(!Unavailable("x".into()).available(true));
-        assert!(!Ready.available(false));
+        assert!(!Ready(SchemaSource::Model).available(false));
     }
 }
