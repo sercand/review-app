@@ -2,7 +2,8 @@
 //! in `tests/fixtures/auto_approve_eval/`.
 //!
 //! The pure tests run everywhere. The device test against the real
-//! classifier (GPU, ignored) is restored in B7. Whatever the model says, no dangerous or adversarial command may run unattended.
+//! classifier (GPU, ignored) is restored in B7. Whatever the model says, no dangerous or adversarial command may
+//! run unattended.
 
 use review_approval::model_stage::{
     ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy,

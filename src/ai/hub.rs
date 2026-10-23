@@ -61,7 +61,7 @@ use review_sandbox::{
 
 /// Where the hub gets the local command classifier from, and how it is
 /// switched. The real one is the shiso-backed loader (feature
-/// `local-classifier`); builds without it use [`NoClassifier`]. A trait so the
+/// `local-classifier` or `local-classifier-cuda`); builds without it use [`NoClassifier`]. A trait so the
 /// hub is testable without a GPU.
 pub trait ClassifierProvider: Send + Sync {
     /// The classifier, only while it is ready.
