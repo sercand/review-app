@@ -57,6 +57,9 @@ pub struct SessionId(pub u64);
 /// Keys live only in the OS keychain under `llm:<name>`; a [`KeyOp`] carries a
 /// key only when the user typed a new one, and the reply never echoes it.
 #[cfg(unix)]
+// Beware the derived `Debug`: it prints [`KeyOp::Store`]'s key verbatim, so
+// never log a `KeyOp` (or a [`Command`] carrying one) whole — the key would
+// land in the log.
 #[derive(Debug)]
 pub enum KeyOp {
     /// Store (or replace) the key for `name`.

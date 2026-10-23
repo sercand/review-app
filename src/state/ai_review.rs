@@ -942,7 +942,7 @@ pub fn change_blocked(
         .chain(unrestored)
         .any(|record| unrestored_holds_repo(record, repo_key))
         .then(|| {
-            "This repository has an unrestored AI checkout — restore it before changing the folder."
+            "This repository has an unrestored AI checkout — restore it before changing the folder or starting a review."
                 .to_string()
         })
 }

@@ -163,6 +163,19 @@ pub fn start_blockers(
     blockers
 }
 
+/// The provider whose stored key gates Start: the one serving the default
+/// model, when both a default model and that provider are configured.
+///
+/// [`start_blockers`] reports a *missing* key; the app uses this to tell a
+/// missing key from one whose presence the probe has not answered yet — the
+/// keychain read blocks, so presence arrives from a cached probe, and a name
+/// the probe has not answered is unknown, not missing.
+pub fn key_gated_provider(ai: &AiSettings) -> Option<String> {
+    let model = ai.models.default.as_ref()?;
+    ai.provider(&model.provider)
+        .map(|provider| provider.name.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +430,27 @@ mod tests {
             vec!["work".to_string()],
             "the key is asked for the configured provider's name"
         );
+    }
+
+    /// The key gate names the provider serving the default model, and nothing
+    /// when either is missing: the app uses it to tell "no key" from "the
+    /// probe has not answered yet".
+    #[test]
+    fn key_gated_provider_names_the_default_models_provider() {
+        let mut ai = AiSettings::default();
+        assert_eq!(key_gated_provider(&ai), None, "no default model");
+
+        ai.models = AiModels {
+            default: Some(default_model("work")),
+            ..Default::default()
+        };
+        assert_eq!(
+            key_gated_provider(&ai),
+            None,
+            "the default model's provider is not configured"
+        );
+
+        ai.providers.push(provider("work"));
+        assert_eq!(key_gated_provider(&ai).as_deref(), Some("work"));
     }
 }

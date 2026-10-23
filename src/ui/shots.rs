@@ -802,7 +802,7 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
 
     let mut s = session(DiffMode::Split);
     let dialog = AiDialog::ConfirmCheckout(CheckoutPlan {
-        repo_path: std::path::PathBuf::from("/Users/sercand/Developer/otsimo/web"),
+        repo_path: std::path::PathBuf::from("/Users/dev/Developer/otsimo/web"),
         remote: "origin".to_string(),
         original: OriginalRef::Branch("main".to_string()),
         dirty: true,
@@ -874,7 +874,7 @@ fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
     let path = if linked {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     } else if missing {
-        std::path::PathBuf::from("/Users/sercand/Developer/src/widgets")
+        std::path::PathBuf::from("/Users/dev/Developer/src/widgets")
     } else {
         std::path::PathBuf::new()
     };
@@ -1381,7 +1381,7 @@ fn local_repos_shot(dark: bool, name: &str, expanded: bool, empty: bool, missing
     use crate::ui::widgets::local_repos;
 
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let gone = std::path::PathBuf::from("/Users/sercand/Developer/acme/infra");
+    let gone = std::path::PathBuf::from("/Users/dev/Developer/acme/infra");
     let ai = if empty {
         AiSettings::default()
     } else {

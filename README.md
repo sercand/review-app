@@ -105,9 +105,9 @@ submit it yourself.
 ### Setup
 
 1. In **Settings → AI**, add a provider (name, API type, base URL, API key)
-   and pick the models to use. Click a row, or "Add …", to edit it in a
-   dialog; the API key goes to the OS keychain, like the GitHub token, and
-   "Test connection" works from the dialog before you save.
+   and pick the models to use. Click a row, or "Add provider", to edit it in
+   a dialog; the API key goes to the OS keychain, like the GitHub token, and
+   "Test" works from the dialog before you save.
 2. Link a local folder to the repository, either from a PR's **AI tab** (the
    Local checkout row) or from the **Local repos** tab on the PR list, where
    linked repos are listed and their open PRs expand per row. The app reads

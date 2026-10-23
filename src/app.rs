@@ -223,6 +223,22 @@ fn local_change_blocked(
     }
 }
 
+/// The blocker line for a default-model provider whose key presence the
+/// probe has not answered yet: unknown is not "missing", so the row keeps
+/// Start disabled and says the keychain is being checked rather than
+/// claiming the key is gone (AI settings final review). `None` when the
+/// answer is known either way, or when no configured provider gates Start
+/// (`start_blockers` names those reasons itself).
+#[cfg(unix)]
+fn key_check_blocker(
+    ai: &crate::persist::settings::AiSettings,
+    keys: &BTreeMap<String, bool>,
+) -> Option<String> {
+    let name = crate::ai::repo_link::key_gated_provider(ai)?;
+    (!keys.contains_key(&name))
+        .then(|| format!("Checking the keychain for provider \"{name}\"'s API key…"))
+}
+
 /// The error an event carries, if it carries one. Every such event toasts
 /// it, so this is where the app notices a write-blocking failure.
 fn event_error(event: &Event) -> Option<&GhError> {
@@ -1535,7 +1551,9 @@ impl ReviewApp {
                 match result {
                     Ok(remote) if remote.key().eq_ignore_ascii_case(&repo_key) => {
                         link_repo(&mut self.settings.ai, &remote, path);
-                        self.ai_row_error = None;
+                        // Only this repo's complaint goes away; another
+                        // repo's row keeps its own (final review).
+                        self.ai_row_error.take_if(|(key, _)| *key == repo_key);
                         self.save_settings(now);
                     }
                     Ok(remote) => {
@@ -1899,12 +1917,21 @@ impl ReviewApp {
 
         #[cfg(unix)]
         let refresh_requested = msgs.iter().any(|msg| matches!(msg, PrListMsg::Refresh));
+        #[cfg(unix)]
+        let local_tab = self.pr_list_tab == ListTab::Local;
         for msg in msgs {
+            // The title bar's refresh reloads whichever tab is open (Task 9):
+            // on the Local tab the tab's own reload below is the whole
+            // refresh, and the All search must not re-run behind it.
+            #[cfg(unix)]
+            if local_tab && matches!(msg, PrListMsg::Refresh) {
+                continue;
+            }
             self.apply_pr_list(msg, now);
         }
         // The title bar's refresh reloads whichever tab is open (Task 9).
         #[cfg(unix)]
-        if refresh_requested && self.pr_list_tab == ListTab::Local {
+        if refresh_requested && local_tab {
             self.refresh_local_repos();
         }
         for action in actions {
@@ -2051,15 +2078,22 @@ impl ReviewApp {
                 .as_ref()
                 .filter(|(key, _)| *key == repo_key)
                 .map(|(_, message)| message.clone());
-            let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(false);
-            Some(crate::ui::widgets::ai_panel::local_checkout_vm(
+            // Unknown (the probe has not answered) must not read as
+            // "missing": `start_blockers` stays silent for it and
+            // `key_check_blocker` adds the checking line instead.
+            let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(true);
+            let mut vm = crate::ui::widgets::ai_panel::local_checkout_vm(
                 &self.settings.ai,
                 &repo_key,
                 &session.ai,
                 &self.ai_unrestored,
                 &has_key,
                 error,
-            ))
+            );
+            if let Some(reason) = key_check_blocker(&self.settings.ai, &self.llm_keys) {
+                vm.blockers.push(reason);
+            }
+            Some(vm)
         };
         // The repo's settings entry for the commands summary; taken before
         // the call moves `session` into the screen.
@@ -2419,7 +2453,10 @@ impl ReviewApp {
         };
         // The Local checkout row's and Start's shared view of this repo.
         let repo_key = format!("{}/{}/{}", key.host, key.owner, key.repo);
-        let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(false);
+        // Unknown key presence must not read as "missing" (final review):
+        // `start_blockers` stays silent for it and `key_check_blocker`
+        // carries the checking line instead.
+        let has_key = |name: &str| self.llm_keys.get(name).copied().unwrap_or(true);
         match action {
             AiPanelAction::Start => {
                 // A fresh Full review: any Continue mode left over from an
@@ -2431,6 +2468,7 @@ impl ReviewApp {
                 let blocked = start_blockers(&self.settings.ai, &repo_key, &has_key)
                     .into_iter()
                     .next()
+                    .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
                     .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
@@ -2458,6 +2496,7 @@ impl ReviewApp {
                 let blocked = start_blockers(&self.settings.ai, &repo_key, &has_key)
                     .into_iter()
                     .next()
+                    .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
                     .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
@@ -2711,7 +2750,9 @@ impl ReviewApp {
                     return;
                 }
                 unlink_repo(&mut self.settings.ai, &repo_key);
-                self.ai_row_error = None;
+                // Only this repo's complaint goes away; another repo's row
+                // keeps its own (final review).
+                self.ai_row_error.take_if(|(key, _)| *key == repo_key);
                 self.save_settings(now);
             }
             AiPanelAction::EditRepoCommands => {
@@ -3383,8 +3424,9 @@ impl ReviewApp {
             self.settings_window.close();
             return;
         }
-        // The repo-commands dialog floats topmost and owns `Esc` before
-        // anything else: closing it must not also dismiss a flow dialog or
+        // The repo-commands dialog floats over the screen and owns `Esc`
+        // after the palette, help and settings surfaces and before the AI
+        // flow dialogs: closing it must not also dismiss a flow dialog or
         // leave the PR behind it (AI settings Task 7).
         #[cfg(unix)]
         if self.ai_repo_dialog.is_some() {
@@ -3898,6 +3940,56 @@ mod tests {
             None
         );
         assert_eq!(picker_answer(&stored, Some(&stored), None), None);
+    }
+
+    /// A provider whose key presence the probe has not answered gets the
+    /// checking line, never a "missing" claim; a known answer either way —
+    /// or no configured model/provider to gate — gets none, because
+    /// `start_blockers` names those reasons itself (AI settings final review).
+    #[cfg(unix)]
+    #[test]
+    fn an_unprobed_key_checks_the_keychain_instead_of_claiming_missing() {
+        use crate::persist::settings::{AiModels, AiSettings};
+
+        let ai = AiSettings {
+            providers: vec![ProviderSettings {
+                name: "work".to_string(),
+                ..Default::default()
+            }],
+            models: AiModels {
+                default: Some(ModelSettings {
+                    provider: "work".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // The probe has not answered: unknown, not missing.
+        let mut keys = BTreeMap::new();
+        let reason = key_check_blocker(&ai, &keys).expect("an unprobed name is unknown");
+        assert!(reason.contains("keychain"), "{reason}");
+        assert!(reason.contains("\"work\""), "{reason}");
+
+        // Either known answer clears the line.
+        keys.insert("work".to_string(), true);
+        assert_eq!(key_check_blocker(&ai, &keys), None, "a stored key");
+        keys.insert("work".to_string(), false);
+        assert_eq!(
+            key_check_blocker(&ai, &keys),
+            None,
+            "a known-missing key is start_blockers' missing line, not this one"
+        );
+
+        // No default model, or a model whose provider is not configured:
+        // the gate is not about a key at all.
+        assert_eq!(key_check_blocker(&AiSettings::default(), &keys), None);
+        let no_provider = AiSettings {
+            models: ai.models.clone(),
+            ..Default::default()
+        };
+        assert_eq!(key_check_blocker(&no_provider, &keys), None);
     }
 
     #[test]

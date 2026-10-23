@@ -509,13 +509,17 @@ pub struct AiTabState {
 }
 
 impl AiTabState {
-    /// Open the dialog for the provider at `index` in `ai.providers`.
+    /// Open the dialog for the provider at `index` in `ai.providers`. Only
+    /// one dialog shows at a time: the model dialog closes.
     pub fn edit_provider(&mut self, ai: &AiSettings, index: usize) {
+        self.model_dialog = None;
         self.dialog = ai.providers.get(index).map(ProviderDialog::for_provider);
     }
 
-    /// Open the dialog for one model role (an unset role opens blank).
+    /// Open the dialog for one model role (an unset role opens blank). Only
+    /// one dialog shows at a time: the provider dialog closes.
     pub fn edit_model(&mut self, ai: &AiSettings, role: ModelRole) {
+        self.dialog = None;
         self.model_dialog = Some(ModelDialog::new(role, ai));
     }
 }
@@ -611,6 +615,8 @@ fn heading(ui: &mut egui::Ui, ai: &AiSettings, state: &mut AiTabState) {
                 .show(ui)
                 .clicked()
             {
+                // Only one dialog shows at a time (final review).
+                state.model_dialog = None;
                 state.dialog = Some(ProviderDialog::blank(unique_name(&ai.providers)));
             }
         });
@@ -1223,7 +1229,14 @@ fn provider_combo(ui: &mut egui::Ui, provider: &mut String, ai: &AiSettings) {
 /// which keeps the typed id and sizes.
 fn preset_combo(ui: &mut egui::Ui, dialog: &mut ModelDialog, ai: &AiSettings) {
     let list = dialog.presets(ai);
-    let selected = list.iter().find(|preset| preset.id == dialog.model);
+    // A preset is only the current choice when the fields still match it in
+    // full: a typed-over id or edited sizes read as "Custom", not as the
+    // preset they partly resemble.
+    let selected = list.iter().find(|preset| {
+        preset.id == dialog.model
+            && preset.context_window == dialog.context_window
+            && preset.max_tokens == dialog.max_tokens
+    });
     let label = selected.map(|preset| preset.label).unwrap_or("Custom");
     let mut choice: Option<Option<&'static ModelPreset>> = None;
     egui::ComboBox::from_id_salt("model-preset")
@@ -1625,5 +1638,28 @@ mod tests {
             "only models routed through the renamed provider are repointed"
         );
         assert_eq!(ai.models.default.as_ref().unwrap().provider, "work");
+    }
+
+    /// Only one dialog shows at a time: opening either closes the other
+    /// (final review — the two dialogs used to stack).
+    #[test]
+    fn opening_one_dialog_closes_the_other() {
+        let ai = ai_with_provider();
+        let mut state = AiTabState::default();
+
+        state.edit_provider(&ai, 0);
+        state.edit_model(&ai, ModelRole::Default);
+        assert!(
+            state.dialog.is_none(),
+            "the model dialog closes the provider dialog"
+        );
+        assert!(state.model_dialog.is_some());
+
+        state.edit_provider(&ai, 0);
+        assert!(
+            state.model_dialog.is_none(),
+            "the provider dialog closes the model dialog"
+        );
+        assert!(state.dialog.is_some());
     }
 }

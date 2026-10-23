@@ -259,7 +259,7 @@ pub fn render(
             ui.add_space(40.0);
             ui.label(
                 RichText::new(
-                    "No local repos linked yet. Use “+ Add local repo…” to link a folder that is a clone of a repository on this host.",
+                    "No local repos linked yet. Use “+ Add local repo…” to link a folder that is a clone of a repository on this host, or open a PR and use its AI tab.",
                 )
                 .color(pal.muted),
             );
@@ -525,12 +525,16 @@ mod tests {
 
     #[test]
     fn rows_list_only_linked_repos_on_this_host_sorted() {
+        // A path that cannot exist: a child of a fresh temp dir that was
+        // never created, so no machine can have it (final review).
+        let dir = crate::test_support::tempdir();
+        let gone = dir.path().join("no-such-folder");
         let ai = AiSettings {
             repos: vec![
                 entry("github.com/acme/zeta", "/z"),
                 entry("gitlab.com/acme/alpha", "/g"),
                 entry("github.com/acme/beta", PathBuf::new()),
-                entry("github.com/acme/alpha", "/a"),
+                entry("github.com/acme/alpha", gone.clone()),
             ],
             ..Default::default()
         };
@@ -550,7 +554,7 @@ mod tests {
         let rows = rows(&ai, "GitHub.com", &state);
         let keys: Vec<&str> = rows.iter().map(|row| row.repo.as_str()).collect();
         assert_eq!(keys, ["github.com/acme/alpha", "github.com/acme/zeta"]);
-        assert_eq!(rows[0].path, PathBuf::from("/a"));
+        assert_eq!(rows[0].path, gone);
         assert_eq!(rows[0].open_prs, Some(3));
         assert!(rows[0].expanded);
         assert_eq!(rows[1].open_prs, None, "a loading search has no count yet");
@@ -558,7 +562,7 @@ mod tests {
         assert_eq!(
             rows[0].status,
             FolderStatus::Missing,
-            "/a names no folder on the test machine"
+            "a child of a fresh temp dir names no folder anywhere"
         );
     }
 

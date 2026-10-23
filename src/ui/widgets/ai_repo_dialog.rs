@@ -102,7 +102,12 @@ pub fn put_repo_commands(ai: &mut AiSettings, repo: &str, lists: &RepoCommands) 
         .iter_mut()
         .find(|entry| entry.repo.to_lowercase() == key)
     {
-        Some(entry) => apply(entry, lists),
+        Some(entry) => {
+            // A relink-style patch stores the key lowercase like
+            // `link_repo`, so a hand-edited mixed-case row converges.
+            entry.repo = key;
+            apply(entry, lists);
+        }
         None => {
             let mut entry = RepoAiSettings {
                 repo: key,
@@ -283,11 +288,16 @@ mod tests {
     }
 
     /// Saving patches the lists onto the existing entry and keeps its
-    /// folder — the dialog edits commands, not the link.
+    /// folder — the dialog edits commands, not the link — and stores the
+    /// key lowercase like `link_repo`, converging a hand-edited mixed-case
+    /// row.
     #[test]
     fn save_patches_the_entry_and_keeps_the_path() {
         let mut ai = AiSettings {
-            repos: vec![entry()],
+            repos: vec![RepoAiSettings {
+                repo: "GitHub.com/Acme/Widgets".to_string(),
+                ..entry()
+            }],
             ..Default::default()
         };
         let lists = RepoCommands {
@@ -298,6 +308,10 @@ mod tests {
         };
         put_repo_commands(&mut ai, "GitHub.com/Acme/Widgets", &lists);
         assert_eq!(ai.repos.len(), 1, "the row is updated in place");
+        assert_eq!(
+            ai.repos[0].repo, "github.com/acme/widgets",
+            "the key is stored lowercase like link_repo"
+        );
         assert_eq!(ai.repos[0].path, PathBuf::from("/src/widgets"));
         assert_eq!(ai.repos[0].commands, vec!["npm test".to_string()]);
         assert!(ai.repos[0].prepare.is_empty());
