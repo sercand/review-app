@@ -28,6 +28,7 @@ for in-process generation, images and decisions — with decision/image IR in `s
 - Branch: shiso-llm `feat/shiso-runtime` from `feat/shiso-decision` (e9417ee), keeping PR #50's shiso-hub
   and literal-encoder fixes; the final diff vs master contains no `crates/shiso-decision`.
 - review-app: CI with the feature off; `--ignore-rust-version` (before `--`).
+- Decision model from now on: registry `smollm2-135m-decision` (Clef head on a Llama backbone, Q8_0, 0.2 GiB, Metal). Its Llama-backbone Clef support comes from the user's branch (to be pushed); `feat/shiso-runtime` merges that branch in when it lands. Until then device tests use `d1-3b` (readout path) and the Clef-head tests are skipped with a stderr reason. The built-in default schema (threshold 0.60) is used for it.
 
 ## Review Focus
 
@@ -129,4 +130,4 @@ for in-process generation, images and decisions — with decision/image IR in `s
 
 ### Task S2: Eval + docs
 
-- [ ] `model_stage_real` (release, d1-3b) reproduces benign 195→196, 0 Runs on the unsafe sets, Unavailable < 5 %. README / AGENTS.md / spec mentions of `shiso-decision` → `shiso-runtime`. Commit `docs: shiso-runtime`.
+- [ ] `model_stage_real` (release) runs on `smollm2-135m-decision` once its family is merged (and on d1-3b as a cross-check); on d1-3b it must reproduce benign 195→196, 0 Runs on the unsafe sets, Unavailable < 5 %. README / AGENTS.md / spec mentions of `shiso-decision` → `shiso-runtime`. Commit `docs: shiso-runtime`.
