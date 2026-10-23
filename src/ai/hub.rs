@@ -111,6 +111,8 @@ struct LiveClassifier {
     /// starts (it is created by the first enable command).
     provider: Arc<OnceLock<Arc<dyn ClassifierProvider>>>,
     enabled: Arc<AtomicBool>,
+    /// Bumped when the requested model changes ([`AiHub::classifier_generation`]).
+    generation: Arc<AtomicU64>,
 }
 
 impl review_approval::model_stage::CommandClassifier for LiveClassifier {
@@ -130,6 +132,10 @@ impl review_approval::model_stage::CommandClassifier for LiveClassifier {
 
     fn active(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 }
 
@@ -438,6 +444,9 @@ pub struct AiHub {
     /// The live `local_classifier` value: updated by settings changes and by
     /// [`Self::classifier_request`], read by every [`LiveClassifier`] call.
     classifier_enabled: Arc<AtomicBool>,
+    /// Counts model switches: a run's cached verdicts are dropped when it
+    /// changes, so an old model's "safe" never applies to the new one.
+    classifier_generation: Arc<AtomicU64>,
     /// The last enabled/disabled and model the user asked for (`None`: never
     /// asked), with the sequence number of the request that set it.
     classifier_desired: Mutex<(u64, Option<(bool, String)>)>,
@@ -511,6 +520,7 @@ impl AiHub {
             data_dir: config_root(),
             classifier: Arc::new(OnceLock::new()),
             classifier_enabled: Arc::new(AtomicBool::new(false)),
+            classifier_generation: Arc::new(AtomicU64::new(0)),
             classifier_desired: Mutex::new((0, None)),
             classifier_apply: Mutex::new(()),
             #[cfg(test)]
@@ -557,6 +567,9 @@ impl AiHub {
             .unwrap_or_else(|e| e.into_inner());
         if seq < desired.0 {
             return;
+        }
+        if desired.1.as_ref().is_some_and(|(_, was)| was != model) {
+            self.classifier_generation.fetch_add(1, Ordering::SeqCst);
         }
         *desired = (seq, Some((enabled, model.to_owned())));
         self.classifier_enabled.store(enabled, Ordering::SeqCst);
@@ -630,6 +643,7 @@ impl AiHub {
         Some(Arc::new(LiveClassifier {
             provider: self.classifier.clone(),
             enabled: self.classifier_enabled.clone(),
+            generation: self.classifier_generation.clone(),
         }))
     }
 
@@ -2048,6 +2062,47 @@ mod tests {
         hub.classifier_request(false, "d1-3b", 2);
         assert!(matches!(verdict(cmd), Verdict::Ask { .. }));
         assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_cached_safe_from_the_old_model_does_not_outlive_a_model_switch() {
+        use review_approval::model_stage::{DecisionCache, ModelPolicy};
+        use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+        let provider = Arc::new(FakeProvider::default());
+        provider.ready.store(true, Ordering::SeqCst);
+        let hub = hub_with(&provider);
+        hub.classifier_request(true, "d1-3b", 1);
+        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let cache = DecisionCache::new();
+        let verdict = |cmd: &str| {
+            let policy = ModelPolicy {
+                classifier: live.as_ref(),
+                cache: &cache,
+                deadline: None,
+            };
+            let extra: [&dyn SegmentPolicy; 1] = [&policy];
+            classify(
+                cmd,
+                &ApprovalConfig {
+                    allowed: &[],
+                    deny_paths: &[],
+                    cwd: None,
+                    extra: &extra,
+                },
+            )
+        };
+        let cmd = "/usr/bin/pr -t file.txt";
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1, "cached");
+        // Same model again: the cache stays.
+        hub.classifier_request(true, "d1-3b", 2);
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 1);
+        // Another model: the old verdict is gone and the new model is asked.
+        hub.classifier_request(true, "other", 3);
+        assert!(matches!(verdict(cmd), Verdict::Run { .. }));
+        assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

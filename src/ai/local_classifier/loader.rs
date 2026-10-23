@@ -103,6 +103,7 @@ impl Engine for ShisoEngine {
         let (schema, source) = load_schema(dir).map_err(LoadError::Unavailable)?;
         let decider = Decider::open(&OpenDesc::new(dir)).map_err(load_error)?;
         let classifier = DecisionClassifier::new(Arc::new(decider), schema, on_trip);
+        classifier.check_schema().map_err(LoadError::Unavailable)?;
         Ok((Arc::new(classifier), source))
     }
 }

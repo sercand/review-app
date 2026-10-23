@@ -181,6 +181,26 @@ impl DecisionClassifier {
         }
     }
 
+    /// Asks the real question once on a fixed input, so a schema the model
+    /// cannot lay out (too long, ambiguous options, ...) fails the load
+    /// instead of showing Ready and then refusing every command. Only a
+    /// refused request or layout counts; any other error is left to the
+    /// failure breaker. Does not touch the busy flag or the failure count.
+    pub fn check_schema(&self) -> Result<(), String> {
+        let request = DecisionRequest {
+            input: "cwd: unknown\ntask: unknown\ncmd: ls".to_owned(),
+            questions: vec![self.schema.to_question()],
+            temperature: None,
+        };
+        match catch_unwind(AssertUnwindSafe(|| self.source.decide(&request))) {
+            Ok(Err(e)) if matches!(e.kind, "layout" | "request") => Err(format!(
+                "the decision schema does not fit this model: {}",
+                e.detail
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn record_failure(&self) -> ModelOutcome {
         if self.failures.fetch_add(1, Ordering::AcqRel) + 1 == MAX_FAILURES {
             (self.on_trip)();
@@ -454,6 +474,33 @@ mod tests {
                 input_caused: true,
             })
         }
+    }
+
+    #[test]
+    fn a_schema_the_model_cannot_lay_out_fails_the_check() {
+        for kind in ["layout", "request"] {
+            let c = DecisionClassifier::with_source(
+                Box::new(Refusing(kind)),
+                builtin_schema(),
+                Box::new(|| {}),
+            );
+            let err = c.check_schema().unwrap_err();
+            assert!(
+                err.starts_with("the decision schema does not fit this model: "),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schema_check_passes_on_an_answer_and_ignores_other_errors() {
+        let (c, inputs) = Script::recording(vec![Some(Err("device".into())), Some(Ok(vec![]))]);
+        assert!(c.check_schema().is_ok());
+        assert!(c.check_schema().is_ok());
+        assert_eq!(
+            inputs.lock().unwrap()[0],
+            "cwd: unknown\ntask: unknown\ncmd: ls"
+        );
     }
 
     /// An over-long command is refused by the request or layout; that says

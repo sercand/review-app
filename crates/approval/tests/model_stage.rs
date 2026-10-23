@@ -464,3 +464,14 @@ fn cache_key_includes_cwd() {
     run_in("mytool --check", Some(b), &fake, &cache);
     assert_eq!(fake.calls(), 2);
 }
+
+#[test]
+fn a_new_classifier_generation_empties_the_cache() {
+    let cache = DecisionCache::new();
+    cache.sync_generation(0);
+    cache.put(None, "ls".into(), ModelOutcome::Safe);
+    cache.sync_generation(0);
+    assert_eq!(cache.get(None, "ls"), Some(ModelOutcome::Safe));
+    cache.sync_generation(1);
+    assert_eq!(cache.get(None, "ls"), None);
+}

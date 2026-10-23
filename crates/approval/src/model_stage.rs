@@ -48,6 +48,13 @@ pub trait CommandClassifier: Send + Sync {
     fn active(&self) -> bool {
         true
     }
+
+    /// Identifies the model behind this classifier. When it changes, outcomes
+    /// cached under the earlier value are dropped before the cache is read,
+    /// so a verdict never outlives the model that gave it.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// Most entries held; the cache is emptied when a new key arrives at the cap.
@@ -58,7 +65,14 @@ type CacheKey = (Option<PathBuf>, String);
 
 #[derive(Default)]
 pub struct DecisionCache {
-    map: Mutex<HashMap<CacheKey, ModelOutcome>>,
+    map: Mutex<CacheState>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    /// The classifier generation the entries were produced under.
+    generation: u64,
+    entries: HashMap<CacheKey, ModelOutcome>,
 }
 
 impl DecisionCache {
@@ -66,24 +80,34 @@ impl DecisionCache {
         DecisionCache::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, ModelOutcome>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
         // A poisoned map is still a valid map of earlier outcomes.
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Empties the cache when `generation` is not the one it was filled under.
+    pub fn sync_generation(&self, generation: u64) {
+        let mut state = self.lock();
+        if state.generation != generation {
+            state.entries.clear();
+            state.generation = generation;
+        }
+    }
+
     pub fn get(&self, cwd: Option<&Path>, segment: &str) -> Option<ModelOutcome> {
         self.lock()
+            .entries
             .get(&(cwd.map(Path::to_path_buf), segment.to_string()))
             .copied()
     }
 
     pub fn put(&self, cwd: Option<&Path>, segment: String, v: ModelOutcome) {
         let k = (cwd.map(Path::to_path_buf), segment);
-        let mut map = self.lock();
-        if map.len() >= CACHE_CAP && !map.contains_key(&k) {
-            map.clear();
+        let mut state = self.lock();
+        if state.entries.len() >= CACHE_CAP && !state.entries.contains_key(&k) {
+            state.entries.clear();
         }
-        map.insert(k, v);
+        state.entries.insert(k, v);
     }
 }
 
@@ -105,6 +129,7 @@ impl SegmentPolicy for ModelPolicy<'_> {
         if seg.argv.is_empty() || !self.classifier.active() {
             return None;
         }
+        self.cache.sync_generation(self.classifier.generation());
         let key = seg.argv.join(" ");
         let outcome = match self.cache.get(cwd, &key) {
             Some(o) => o,
