@@ -323,13 +323,13 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::time::Duration;
 
-    use review_approval::model_stage::{CommandClassifier, ModelOutcome};
+    use review_approval::model_stage::{ClassifyInput, CommandClassifier, ModelOutcome};
 
     use super::*;
 
     struct Fake;
     impl CommandClassifier for Fake {
-        fn classify(&self, _: &str) -> ModelOutcome {
+        fn classify(&self, _: &ClassifyInput<'_>) -> ModelOutcome {
             ModelOutcome::Safe
         }
     }

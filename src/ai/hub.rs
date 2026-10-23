@@ -108,13 +108,16 @@ struct LiveClassifier {
 }
 
 impl review_approval::model_stage::CommandClassifier for LiveClassifier {
-    fn classify(&self, segment: &str) -> review_approval::model_stage::ModelOutcome {
+    fn classify(
+        &self,
+        input: &review_approval::model_stage::ClassifyInput<'_>,
+    ) -> review_approval::model_stage::ModelOutcome {
         use review_approval::model_stage::ModelOutcome;
         if !self.enabled.load(Ordering::SeqCst) {
             return ModelOutcome::Unavailable;
         }
         match self.provider.get().and_then(|p| p.classifier()) {
-            Some(classifier) => classifier.classify(segment),
+            Some(classifier) => classifier.classify(input),
             None => ModelOutcome::Unavailable,
         }
     }
@@ -1858,7 +1861,10 @@ mod tests {
 
     struct SafeClassifier(Arc<FakeProvider>);
     impl review_approval::model_stage::CommandClassifier for SafeClassifier {
-        fn classify(&self, _: &str) -> review_approval::model_stage::ModelOutcome {
+        fn classify(
+            &self,
+            _: &review_approval::model_stage::ClassifyInput<'_>,
+        ) -> review_approval::model_stage::ModelOutcome {
             self.0.classify_calls.fetch_add(1, Ordering::SeqCst);
             review_approval::model_stage::ModelOutcome::Safe
         }
@@ -1898,7 +1904,10 @@ mod tests {
     }
 
     fn classify(c: &Arc<dyn review_approval::model_stage::CommandClassifier>) -> ModelOutcome {
-        c.classify("pr -t x")
+        c.classify(&review_approval::model_stage::ClassifyInput {
+            segment: "pr -t x",
+            cwd: None,
+        })
     }
 
     use review_approval::model_stage::ModelOutcome;

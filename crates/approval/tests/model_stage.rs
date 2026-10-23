@@ -1,8 +1,12 @@
 //! The model stage as the app plugs it in: `ApprovalConfig.extra`.
 
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use review_approval::model_stage::{CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy};
+use review_approval::model_stage::{
+    ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy,
+};
 use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
 
 struct FakeClassifier {
@@ -23,7 +27,7 @@ impl FakeClassifier {
 }
 
 impl CommandClassifier for FakeClassifier {
-    fn classify(&self, _segment: &str) -> ModelOutcome {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.outcome
     }
@@ -169,7 +173,7 @@ struct PanicsOnce {
 }
 
 impl CommandClassifier for PanicsOnce {
-    fn classify(&self, _segment: &str) -> ModelOutcome {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
         if self.panicked.fetch_add(1, Ordering::SeqCst) == 0 {
             panic!("classifier exploded");
         }
@@ -194,12 +198,12 @@ fn panic_is_unavailable_and_not_cached() {
 fn cache_clears_when_full() {
     let cache = DecisionCache::new();
     for i in 0..4096 {
-        cache.put(format!("k{i}"), ModelOutcome::Safe);
+        cache.put(None, format!("k{i}"), ModelOutcome::Safe);
     }
-    assert_eq!(cache.get("k0"), Some(ModelOutcome::Safe));
-    cache.put("new".into(), ModelOutcome::Dangerous);
-    assert_eq!(cache.get("new"), Some(ModelOutcome::Dangerous));
-    assert_eq!(cache.get("k0"), None);
+    assert_eq!(cache.get(None, "k0"), Some(ModelOutcome::Safe));
+    cache.put(None, "new".into(), ModelOutcome::Dangerous);
+    assert_eq!(cache.get(None, "new"), Some(ModelOutcome::Dangerous));
+    assert_eq!(cache.get(None, "k0"), None);
 }
 
 fn run_deny_paths(cmd: &str, outcome: ModelOutcome) -> Verdict {
@@ -349,7 +353,7 @@ fn past_deadline_skips_the_classifier() {
 fn overrun_stops_consulting_the_model_for_later_segments() {
     struct Slow(AtomicUsize);
     impl CommandClassifier for Slow {
-        fn classify(&self, _segment: &str) -> ModelOutcome {
+        fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
             self.0.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(60));
             ModelOutcome::Safe
@@ -369,8 +373,8 @@ struct Switchable {
 }
 
 impl CommandClassifier for Switchable {
-    fn classify(&self, segment: &str) -> ModelOutcome {
-        self.inner.classify(segment)
+    fn classify(&self, input: &ClassifyInput<'_>) -> ModelOutcome {
+        self.inner.classify(input)
     }
     fn active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
@@ -396,4 +400,67 @@ fn inactive_classifier_ignores_cached_outcomes_and_is_not_called() {
     model.active.store(true, Ordering::SeqCst);
     assert!(matches!(run_with(cmd, &model, &cache), Verdict::Run { .. }));
     assert_eq!(model.inner.calls(), 1);
+}
+
+/// Records every input it is asked about.
+struct Recorder {
+    seen: Mutex<Vec<(Option<PathBuf>, String)>>,
+}
+
+impl CommandClassifier for Recorder {
+    fn classify(&self, input: &ClassifyInput<'_>) -> ModelOutcome {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((input.cwd.map(Path::to_path_buf), input.segment.to_string()));
+        ModelOutcome::Safe
+    }
+}
+
+fn run_in(cmd: &str, cwd: Option<&Path>, fake: &dyn CommandClassifier, cache: &DecisionCache) {
+    let policy = ModelPolicy {
+        classifier: fake,
+        cache,
+        deadline: None,
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    classify(
+        cmd,
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &[],
+            cwd,
+            extra: &extra,
+        },
+    );
+}
+
+#[test]
+fn cwd_reaches_the_classifier() {
+    let fake = Recorder {
+        seen: Mutex::new(Vec::new()),
+    };
+    let repo = Path::new("/repo");
+    run_in("mytool --check", Some(repo), &fake, &DecisionCache::new());
+    run_in("mytool --check", None, &fake, &DecisionCache::new());
+    assert_eq!(
+        *fake.seen.lock().unwrap(),
+        [
+            (Some(repo.to_path_buf()), "mytool --check".to_string()),
+            (None, "mytool --check".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn cache_key_includes_cwd() {
+    let fake = FakeClassifier::new(ModelOutcome::Safe);
+    let cache = DecisionCache::new();
+    let (a, b) = (Path::new("/a"), Path::new("/b"));
+    run_in("mytool --check", Some(a), &fake, &cache);
+    run_in("mytool --check", Some(b), &fake, &cache);
+    assert_eq!(fake.calls(), 2);
+    run_in("mytool --check", Some(a), &fake, &cache);
+    run_in("mytool --check", Some(b), &fake, &cache);
+    assert_eq!(fake.calls(), 2);
 }

@@ -1391,7 +1391,7 @@ async fn bash_still_asks_for_unknown_commands() {
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use review_approval::model_stage::{CommandClassifier, ModelOutcome};
+use review_approval::model_stage::{ClassifyInput, CommandClassifier, ModelOutcome};
 
 use crate::ai::approval_setup::ApprovalSetup;
 use crate::persist::settings::AutoApproveSettings;
@@ -1412,7 +1412,7 @@ impl FixedClassifier {
 }
 
 impl CommandClassifier for FixedClassifier {
-    fn classify(&self, _segment: &str) -> ModelOutcome {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.outcome
     }
@@ -1426,7 +1426,7 @@ struct SlowClassifier {
 }
 
 impl CommandClassifier for SlowClassifier {
-    fn classify(&self, _segment: &str) -> ModelOutcome {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
         for _ in 0..300 {
             if self.release.load(Ordering::SeqCst) {
@@ -1441,7 +1441,7 @@ impl CommandClassifier for SlowClassifier {
 struct PanicClassifier;
 
 impl CommandClassifier for PanicClassifier {
-    fn classify(&self, _segment: &str) -> ModelOutcome {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
         panic!("classifier blew up");
     }
 }

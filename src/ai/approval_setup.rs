@@ -164,7 +164,10 @@ mod tests {
     fn classifier_is_dropped_unless_switched_on() {
         struct Never;
         impl CommandClassifier for Never {
-            fn classify(&self, _: &str) -> review_approval::model_stage::ModelOutcome {
+            fn classify(
+                &self,
+                _: &review_approval::model_stage::ClassifyInput<'_>,
+            ) -> review_approval::model_stage::ModelOutcome {
                 review_approval::model_stage::ModelOutcome::Safe
             }
         }

@@ -5,7 +5,9 @@
 //! `local-classifier`) adds the real classifier on a GPU. Whatever the model
 //! says, no dangerous or adversarial command may run unattended.
 
-use review_approval::model_stage::{CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy};
+use review_approval::model_stage::{
+    ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy,
+};
 use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify, default_deny_paths};
 
 const BENIGN: &str = include_str!("fixtures/auto_approve_eval/benign.txt");
@@ -85,7 +87,7 @@ fn fraction(n: usize, of: usize) -> f64 {
 struct Fake(ModelOutcome);
 
 impl CommandClassifier for Fake {
-    fn classify(&self, _: &str) -> ModelOutcome {
+    fn classify(&self, _: &ClassifyInput<'_>) -> ModelOutcome {
         self.0
     }
 }

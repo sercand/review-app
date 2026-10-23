@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -25,13 +25,22 @@ pub enum ModelOutcome {
     Unavailable,
 }
 
+/// What a classifier is asked about.
+#[derive(Clone, Copy, Debug)]
+pub struct ClassifyInput<'a> {
+    /// argv joined by single spaces.
+    pub segment: &'a str,
+    /// The working directory the command runs in, when known.
+    pub cwd: Option<&'a Path>,
+}
+
 pub trait CommandClassifier: Send + Sync {
-    /// `segment` is argv joined by single spaces. The caller enforces the
+    /// `input.segment` is argv joined by single spaces. The caller enforces the
     /// timeout, but it can only stop waiting, not stop the call: an
     /// implementation must return `Unavailable` promptly when it is busy
     /// (use `try_lock`, never queue behind another call), must never block
     /// indefinitely, and should return `Unavailable` instead of panicking.
-    fn classify(&self, segment: &str) -> ModelOutcome;
+    fn classify(&self, input: &ClassifyInput<'_>) -> ModelOutcome;
 
     /// `false` means the model must not influence decisions right now,
     /// cached outcomes included (for example the user switched it off during
@@ -44,10 +53,12 @@ pub trait CommandClassifier: Send + Sync {
 /// Most entries held; the cache is emptied when a new key arrives at the cap.
 const CACHE_CAP: usize = 4096;
 
-/// Outcomes by segment text, shared between threads.
+/// Outcomes by (working directory, segment text), shared between threads.
+type CacheKey = (Option<PathBuf>, String);
+
 #[derive(Default)]
 pub struct DecisionCache {
-    map: Mutex<HashMap<String, ModelOutcome>>,
+    map: Mutex<HashMap<CacheKey, ModelOutcome>>,
 }
 
 impl DecisionCache {
@@ -55,16 +66,19 @@ impl DecisionCache {
         DecisionCache::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ModelOutcome>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<CacheKey, ModelOutcome>> {
         // A poisoned map is still a valid map of earlier outcomes.
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn get(&self, k: &str) -> Option<ModelOutcome> {
-        self.lock().get(k).copied()
+    pub fn get(&self, cwd: Option<&Path>, segment: &str) -> Option<ModelOutcome> {
+        self.lock()
+            .get(&(cwd.map(Path::to_path_buf), segment.to_string()))
+            .copied()
     }
 
-    pub fn put(&self, k: String, v: ModelOutcome) {
+    pub fn put(&self, cwd: Option<&Path>, segment: String, v: ModelOutcome) {
+        let k = (cwd.map(Path::to_path_buf), segment);
         let mut map = self.lock();
         if map.len() >= CACHE_CAP && !map.contains_key(&k) {
             map.clear();
@@ -87,23 +101,24 @@ impl SegmentPolicy for ModelPolicy<'_> {
         crate::engine::ML_NAME
     }
 
-    fn verify(&self, seg: &Segment, _cwd: Option<&Path>) -> Option<PolicyVerdict> {
+    fn verify(&self, seg: &Segment, cwd: Option<&Path>) -> Option<PolicyVerdict> {
         if seg.argv.is_empty() || !self.classifier.active() {
             return None;
         }
         let key = seg.argv.join(" ");
-        let outcome = match self.cache.get(&key) {
+        let outcome = match self.cache.get(cwd, &key) {
             Some(o) => o,
             None => {
                 if self.deadline.is_some_and(|d| Instant::now() >= d) {
                     return None;
                 }
-                match catch_unwind(AssertUnwindSafe(|| self.classifier.classify(&key))) {
+                let input = ClassifyInput { segment: &key, cwd };
+                match catch_unwind(AssertUnwindSafe(|| self.classifier.classify(&input))) {
                     // Unavailable (still loading, transient timeout) is not
                     // cached, so the next call retries.
                     Ok(o) => {
                         if o != ModelOutcome::Unavailable {
-                            self.cache.put(key, o);
+                            self.cache.put(cwd, key, o);
                         }
                         o
                     }
