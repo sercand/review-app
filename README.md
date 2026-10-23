@@ -170,8 +170,7 @@ the decision model on d1-3b gives the same result (see
 
 - The model is a **decision model**, chosen by its shiso registry name in
   **Settings → AI → Auto-approve** (click a row to open the dialog; the
-  Decision model field, `ai.auto_approve.decision_model`, default `d1-3b`,
-  which is the model used for testing). It is asked one question
+  Decision model field, `ai.auto_approve.decision_model`, default `smollm2-135m-decision`). It is asked one question
   about each command (approve / ask / deny) and answers with probabilities.
   The question comes from `decision_schema.json` in the model's folder, or a
   built-in default when the model has none; either way a command is approved
@@ -183,7 +182,7 @@ the decision model on d1-3b gives the same result (see
   from source, build with `--features local-classifier`. A Linux CUDA build
   (`--features local-classifier-cuda`) exists but is untested.
 - Turning it on in Settings downloads the weights from the shiso model
-  registry (the size is the registry's; about 3.5 GB for `d1-3b`), verifies
+  registry (the size is the registry's; about 0.2 GiB for `smollm2-135m-decision`), verifies
   them and stores them under the app config folder in `models/`. Nothing is
   downloaded until you turn it on, and no weights are bundled. Changing the
   model name while it is on downloads and loads the new one.

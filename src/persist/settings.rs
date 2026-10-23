@@ -275,7 +275,7 @@ pub struct AutoApproveSettings {
 }
 
 /// The decision model used when none is configured.
-pub const DEFAULT_DECISION_MODEL: &str = "d1-3b";
+pub const DEFAULT_DECISION_MODEL: &str = "smollm2-135m-decision";
 
 /// Whether `name` is a usable registry name: non-empty, only `[a-z0-9._-]`.
 pub fn valid_decision_model(name: &str) -> bool {
@@ -502,7 +502,7 @@ mod tests {
         .unwrap();
         let s = Settings::load_or_default(dir.path());
         assert!(s.ai.auto_approve.local_classifier);
-        assert_eq!(s.ai.auto_approve.decision_model, "d1-3b");
+        assert_eq!(s.ai.auto_approve.decision_model, "smollm2-135m-decision");
     }
 
     #[test]
@@ -521,7 +521,10 @@ mod tests {
             )
             .unwrap();
             let s = Settings::load_or_default(dir.path());
-            assert_eq!(s.ai.auto_approve.decision_model, "d1-3b", "{bad:?}");
+            assert_eq!(
+                s.ai.auto_approve.decision_model, "smollm2-135m-decision",
+                "{bad:?}"
+            );
             // The rest of the file still loads.
             assert!(s.ai.auto_approve.local_classifier, "{bad:?}");
         }
