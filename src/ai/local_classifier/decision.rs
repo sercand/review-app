@@ -30,29 +30,44 @@ trait DecideSource: Send + Sync {
 struct SourceError {
     kind: &'static str,
     detail: String,
+    /// The request itself was refused (an over-long command, say): the model
+    /// is fine, so this does not count toward the failure breaker.
+    input_caused: bool,
 }
 
 impl DecideSource for Decider {
     fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
-        self.decide_blocking(request).map_err(|e| SourceError {
-            kind: match &e {
-                DecideError::NoDevice(_) => "no device",
-                DecideError::Load(_) => "load",
-                DecideError::Request(_) => "request",
-                DecideError::Layout(_) => "layout",
-                DecideError::Engine(_) => "engine",
-                DecideError::Io(_) => "io",
-                _ => "other",
-            },
-            detail: e.to_string(),
-        })
+        self.decide_blocking(request).map_err(source_error)
+    }
+}
+
+fn source_error(e: DecideError) -> SourceError {
+    SourceError {
+        kind: match &e {
+            DecideError::NoDevice(_) => "no device",
+            DecideError::Load(_) => "load",
+            DecideError::Request(_) => "request",
+            DecideError::Layout(_) => "layout",
+            DecideError::Engine(_) => "engine",
+            DecideError::Io(_) => "io",
+            _ => "other",
+        },
+        detail: e.to_string(),
+        input_caused: matches!(e, DecideError::Request(_) | DecideError::Layout(_)),
+    }
+}
+
+impl DecideSource for Arc<Decider> {
+    fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
+        DecideSource::decide(self.as_ref(), request)
     }
 }
 
 /// The model input for one command, exactly
 /// `"cwd: {cwd}\ntask: unknown\ncmd: {segment}"` with `{cwd}` the working
-/// directory or `unknown`. Line breaks inside the values are escaped, so the
-/// command cannot add lines of its own.
+/// directory or `unknown`. Backslashes, control characters and line
+/// separators inside the values are escaped, so the command cannot add lines
+/// of its own.
 pub fn build_input(input: &ClassifyInput<'_>) -> String {
     let cwd = input
         .cwd
@@ -67,18 +82,36 @@ pub fn build_input(input: &ClassifyInput<'_>) -> String {
     out
 }
 
+/// Backslash, `\n` and `\r` as `\\`, `\n` and `\r`; every other control
+/// character and the Unicode line and paragraph separators as `\u{..}`. The
+/// result has no character that could end the line or look like one.
 fn escape(text: &str) -> String {
-    text.replace('\r', "\\r").replace('\n', "\\n")
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
+                // Writing to a String cannot fail.
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// What the model's answer means: `approve` at or above the schema's
 /// threshold is `Safe`, `deny` is `Dangerous`, anything else needs approval.
-/// Probabilities are matched to the schema's values by name; a missing or
-/// non-finite one is `Unavailable`.
+/// Probabilities are matched to the schema's values by name; a missing,
+/// duplicated or non-finite one is `Unavailable`.
 pub fn verdict(answer: &Answer, schema: &DecisionSchema) -> ModelOutcome {
     let mut approve = None;
     for (value, _) in &schema.choices {
-        let Some((_, p)) = answer.probabilities.iter().find(|(v, _)| v == value) else {
+        let mut matching = answer.probabilities.iter().filter(|(v, _)| v == value);
+        // Missing, or listed twice (which one is meant?): a broken answer.
+        let (Some((_, p)), None) = (matching.next(), matching.next()) else {
             return ModelOutcome::Unavailable;
         };
         if !p.is_finite() {
@@ -163,14 +196,9 @@ impl DecisionClassifier {
             .ok_or(SourceError {
                 kind: "no answer",
                 detail: format!("no answer named {}", self.schema.question),
+                input_caused: false,
             })?;
         Ok(verdict(answer, &self.schema))
-    }
-}
-
-impl DecideSource for Arc<Decider> {
-    fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
-        DecideSource::decide(self.as_ref(), request)
     }
 }
 
@@ -203,7 +231,11 @@ impl CommandClassifier for DecisionClassifier {
             Ok(Err(e)) => {
                 tracing::warn!("local classifier call failed: {}", e.kind);
                 tracing::debug!("local classifier error detail: {}", e.detail);
-                self.record_failure()
+                if e.input_caused {
+                    ModelOutcome::Unavailable
+                } else {
+                    self.record_failure()
+                }
             }
             Err(_) => {
                 tracing::warn!("local classifier call panicked");
@@ -281,6 +313,29 @@ mod tests {
     }
 
     #[test]
+    fn input_escapes_every_control_character_and_backslash() {
+        let text = build_input(&input(
+            "a\tb\u{0}c\u{1b}[2Jd\u{85}e\u{2028}f\u{2029}g\\h\\ni",
+        ));
+        assert_eq!(
+            text,
+            "cwd: /r\ntask: unknown\ncmd: a\\u{9}b\\u{0}c\\u{1b}[2Jd\\u{85}e\\u{2028}f\\u{2029}g\\\\h\\\\ni"
+        );
+        // Nothing that could end a line, or any control character, is left.
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert_eq!(text.lines().count(), 3);
+        // A real newline and the two-character text `\n` stay distinguishable.
+        assert_ne!(escape("\n"), escape("\\n"));
+        // The same holds for the working directory.
+        let odd = ClassifyInput {
+            segment: "ls",
+            cwd: Some(Path::new("/r\u{2028}cmd: x\u{7}")),
+        };
+        let text = build_input(&odd);
+        assert_eq!(text, "cwd: /r\\u{2028}cmd: x\\u{7}\ntask: unknown\ncmd: ls");
+    }
+
+    #[test]
     fn verdict_table() {
         let s = builtin_schema();
         assert_eq!(verdict(&top("approve", 0.61), &s), ModelOutcome::Safe);
@@ -308,6 +363,31 @@ mod tests {
         assert_eq!(verdict(&inf, &s), ModelOutcome::Unavailable);
         let odd = answer("maybe", &[("approve", 0.1), ("ask", 0.1), ("deny", 0.1)]);
         assert_eq!(verdict(&odd, &s), ModelOutcome::Unavailable);
+    }
+
+    /// Which of two entries for one value is meant is unknowable.
+    #[test]
+    fn duplicate_probability_values_are_unavailable() {
+        let s = builtin_schema();
+        let twice = answer(
+            "approve",
+            &[
+                ("approve", 0.9),
+                ("ask", 0.05),
+                ("deny", 0.05),
+                ("approve", 0.1),
+            ],
+        );
+        assert_eq!(verdict(&twice, &s), ModelOutcome::Unavailable);
+        let deny_twice = answer(
+            "deny",
+            &[("approve", 0.1), ("ask", 0.1), ("deny", 0.7), ("deny", 0.7)],
+        );
+        assert_eq!(verdict(&deny_twice, &s), ModelOutcome::Unavailable);
+        // And it counts as a broken answer.
+        let c = Script::classifier(vec![Some(Ok(vec![twice]))]);
+        assert_eq!(c.classify(&input("ls")), ModelOutcome::Unavailable);
+        assert_eq!(c.failures.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -358,8 +438,60 @@ mod tests {
                 .map_err(|detail| SourceError {
                     kind: "engine",
                     detail,
+                    input_caused: false,
                 })
         }
+    }
+
+    /// A source error caused by the request, not the model.
+    struct Refusing(&'static str);
+
+    impl DecideSource for Refusing {
+        fn decide(&self, _: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
+            Err(SourceError {
+                kind: self.0,
+                detail: "too long".into(),
+                input_caused: true,
+            })
+        }
+    }
+
+    /// An over-long command is refused by the request or layout; that says
+    /// nothing about the model, so it never trips the breaker.
+    #[test]
+    fn input_caused_errors_are_unavailable_without_counting() {
+        for kind in ["request", "layout"] {
+            let (c, trips) = with_trips(DecisionClassifier::with_source(
+                Box::new(Refusing(kind)),
+                builtin_schema(),
+                Box::new(|| {}),
+            ));
+            for _ in 0..10 {
+                assert_eq!(
+                    c.classify(&input("ls")),
+                    ModelOutcome::Unavailable,
+                    "{kind}"
+                );
+            }
+            assert_eq!(c.failures.load(Ordering::Acquire), 0, "{kind}");
+            assert_eq!(trips.load(Ordering::SeqCst), 0, "{kind}");
+        }
+    }
+
+    /// The mapping from shiso's errors: only a refused request or layout is
+    /// the input's fault.
+    #[test]
+    fn only_request_and_layout_errors_are_input_caused() {
+        let flag = |e: DecideError| {
+            // `decide_blocking` is not callable without a model: apply the
+            // same conversion the `Decider` source uses.
+            source_error(e).input_caused
+        };
+        assert!(flag(DecideError::Request("x".into())));
+        assert!(flag(DecideError::Layout("x".into())));
+        assert!(!flag(DecideError::Engine("x".into())));
+        assert!(!flag(DecideError::Load("x".into())));
+        assert!(!flag(DecideError::NoDevice("x".into())));
     }
 
     fn safe() -> Step {
