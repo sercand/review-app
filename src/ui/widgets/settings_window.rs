@@ -129,7 +129,8 @@ pub struct AutoApproveVm {
     pub classifier_state: ClassifierState,
     /// The classifier timeout in milliseconds, as typed.
     pub timeout_ms: String,
-    /// The registry name of the decision model, as typed.
+    /// The registry name of the decision model, as typed. Blank saves as the
+    /// default model.
     pub decision_model: String,
     /// The extra deny patterns, one per line.
     pub deny_paths_text: String,
@@ -197,7 +198,8 @@ impl AutoApproveVm {
             Ok(ms) if (50..=5000).contains(&ms) => {}
             _ => return Err("classifier timeout must be 50 to 5000 ms".to_owned()),
         }
-        if !valid_decision_model(self.decision_model.trim()) {
+        let model = self.decision_model.trim();
+        if !model.is_empty() && !valid_decision_model(model) {
             return Err(
                 "decision model must be a registry name: lowercase letters, digits, . _ -"
                     .to_owned(),
@@ -227,7 +229,10 @@ impl AutoApproveVm {
             .trim()
             .parse()
             .unwrap_or(s.classifier_timeout_ms);
-        s.decision_model = self.decision_model.trim().to_owned();
+        s.decision_model = match self.decision_model.trim() {
+            "" => crate::persist::settings::DEFAULT_DECISION_MODEL.to_owned(),
+            model => model.to_owned(),
+        };
         s.deny_paths = self.deny_paths();
         s.capabilities = self
             .capabilities
@@ -1069,24 +1074,17 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<
                 .size(12.0)
                 .color(p.faint),
         );
+        // Only a failed download or load can be retried.
         if vm.classifier_state.can_download(classifier::COMPILED)
-            && Btn::new(
-                BtnKind::Default,
-                if matches!(vm.classifier_state, ClassifierState::Failed(_)) {
-                    "Retry"
-                } else {
-                    "Download"
-                },
-            )
-            .show(ui)
-            .clicked()
+            && Btn::new(BtnKind::Default, "Retry").show(ui).clicked()
         {
             actions.push(SettingsAction::ClassifierDownload);
         }
     });
     // The model is a registry name; its weights download when the classifier is on.
     setting_row(ui, "Decision model", |ui| {
-        ui.add(
+        ui.add_enabled(
+            vm.classifier_available,
             egui::TextEdit::singleline(&mut vm.decision_model)
                 .hint_text(crate::persist::settings::DEFAULT_DECISION_MODEL)
                 .desired_width(160.0),
@@ -1688,8 +1686,25 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_decision_model_saves_as_the_default() {
+        use crate::persist::settings::DEFAULT_DECISION_MODEL;
+        for blank in ["", "   "] {
+            let mut settings = Settings::default();
+            settings.ai.auto_approve.decision_model = "d1-7b".into();
+            let mut vm = settings_vm(&settings, &|_| false);
+            vm.ai.auto_approve.decision_model = blank.into();
+            assert!(vm.ai.auto_approve.validate().is_ok(), "{blank:?}");
+            vm.apply(&mut settings).unwrap();
+            assert_eq!(
+                settings.ai.auto_approve.decision_model,
+                DEFAULT_DECISION_MODEL
+            );
+        }
+    }
+
+    #[test]
     fn validate_rejects_bad_model_name() {
-        for bad in ["", "  ", "D1", "a b", "a/b", "../x", "d1:3b"] {
+        for bad in ["D1", "a b", "a/b", "../x", "d1:3b"] {
             let vm = AutoApproveVm {
                 decision_model: bad.into(),
                 ..AutoApproveVm::default()
