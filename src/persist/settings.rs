@@ -267,7 +267,7 @@ impl Default for AutoApproveSettings {
         AutoApproveSettings {
             enabled: true,
             local_classifier: false,
-            classifier_timeout_ms: 500,
+            classifier_timeout_ms: 2000,
             deny_paths: Vec::new(),
             capabilities: Vec::new(),
             decision_model: DEFAULT_DECISION_MODEL.to_owned(),
@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(s.ai.max_parallel_reviewers, 3);
         assert!(s.ai.auto_approve.enabled);
         assert!(!s.ai.auto_approve.local_classifier);
-        assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 500);
+        assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 2000);
         assert!(s.ai.auto_approve.deny_paths.is_empty());
         assert!(s.ai.auto_approve.capabilities.is_empty());
     }
@@ -501,6 +501,17 @@ mod tests {
             // The rest of the file still loads.
             assert!(s.ai.auto_approve.local_classifier, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn timeout_default_is_2000() {
+        assert_eq!(AutoApproveSettings::default().classifier_timeout_ms, 2000);
+        let s: Settings = toml::from_str("[ai.auto_approve]\nlocal_classifier = true\n").unwrap();
+        assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 2000);
+        assert_eq!(
+            AutoApproveSettings::default().timeout(),
+            std::time::Duration::from_millis(2000)
+        );
     }
 
     #[test]

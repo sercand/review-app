@@ -881,6 +881,26 @@ mod tests {
         assert_eq!(classify_with(&c), ModelOutcome::Safe, "the new model");
     }
 
+    /// `Loading` is announced on a model switch while the old job is still
+    /// blocked, not after it is released.
+    #[test]
+    fn a_model_switch_announces_loading_before_the_old_job_is_released() {
+        let source = FakeSource::default();
+        let (release, gate) = mpsc::channel();
+        *source.gate.lock().unwrap() = Some(gate);
+        let r = rig_for("old", source, FakeEngine::ok());
+        r.loader.set_enabled(true);
+        r.until(|s| matches!(s, Downloading { .. }));
+        r.loader.set_model("new");
+        let first = r
+            .states
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Loading is announced while the old job is still gated");
+        assert_eq!(first, Loading);
+        release.send(()).unwrap();
+        r.until(is_ready);
+    }
+
     /// A model that is already loaded is dropped the moment the name changes.
     #[test]
     fn switching_models_drops_the_loaded_classifier() {

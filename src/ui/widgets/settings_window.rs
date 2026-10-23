@@ -18,7 +18,8 @@ use eframe::egui::{Popup, PopupCloseBehavior};
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
 use crate::persist::settings::{
-    AutoApproveSettings, ModelSettings, ProviderSettings, RepoAiSettings, Settings,
+    AutoApproveSettings, DEFAULT_DECISION_MODEL, ModelSettings, ProviderSettings, RepoAiSettings,
+    Settings, valid_decision_model,
 };
 use crate::state::classifier::{self, ClassifierState};
 use crate::ui::theme::Theme;
@@ -128,6 +129,8 @@ pub struct AutoApproveVm {
     pub classifier_state: ClassifierState,
     /// The classifier timeout in milliseconds, as typed.
     pub timeout_ms: String,
+    /// The registry name of the decision model, as typed.
+    pub decision_model: String,
     /// The extra deny patterns, one per line.
     pub deny_paths_text: String,
     /// Every capability with its on/off state. Names the window does not
@@ -159,6 +162,7 @@ impl AutoApproveVm {
             classifier_available: false,
             classifier_state: ClassifierState::Off,
             timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
+            decision_model: s.decision_model.clone(),
             deny_paths_text: s.deny_paths.join("\n"),
             capabilities,
         }
@@ -193,6 +197,12 @@ impl AutoApproveVm {
             Ok(ms) if (50..=5000).contains(&ms) => {}
             _ => return Err("classifier timeout must be 50 to 5000 ms".to_owned()),
         }
+        if !valid_decision_model(self.decision_model.trim()) {
+            return Err(
+                "decision model must be a registry name: lowercase letters, digits, . _ -"
+                    .to_owned(),
+            );
+        }
         for pattern in self.deny_paths() {
             if pattern.chars().any(char::is_whitespace) {
                 return Err(format!("deny pattern \"{pattern}\" contains whitespace"));
@@ -217,6 +227,7 @@ impl AutoApproveVm {
             .trim()
             .parse()
             .unwrap_or(s.classifier_timeout_ms);
+        s.decision_model = self.decision_model.trim().to_owned();
         s.deny_paths = self.deny_paths();
         s.capabilities = self
             .capabilities
@@ -426,7 +437,7 @@ fn save_actions(vm: &mut SettingsVm) -> Vec<SettingsAction> {
     for provider in &mut vm.ai.providers {
         provider.key_input.clear();
     }
-    let mut actions = vec![SettingsAction::Apply(vm.clone())];
+    let mut actions = vec![SettingsAction::Apply(Box::new(vm.clone()))];
     actions.extend(
         keys.into_iter()
             .map(|(provider, key)| SettingsAction::SetLlmKey { provider, key }),
@@ -476,7 +487,7 @@ impl SettingsWindowState {
 pub enum SettingsAction {
     /// Persist these edited settings (the app saves; a host change ends the
     /// session). Errors when the AI section is invalid.
-    Apply(SettingsVm),
+    Apply(Box<SettingsVm>),
     /// Store `key` for `provider` in the keychain, never in the settings file.
     SetLlmKey {
         /// The provider name the key belongs to.
@@ -1073,6 +1084,14 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<
             actions.push(SettingsAction::ClassifierDownload);
         }
     });
+    // The model is a registry name; its weights download when the classifier is on.
+    setting_row(ui, "Decision model", |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut vm.decision_model)
+                .hint_text(DEFAULT_DECISION_MODEL)
+                .desired_width(160.0),
+        );
+    });
     ui.label(
         RichText::new(
             "Advisory only. A \"safe\" answer never approves a listed network, interpreter, install, delete or wrapper program, a program outside the system bin directories (PR code), a pager or viewer, a shell builtin that changes later commands (`alias`, `trap`, `hash`, ...), a tool that loads and runs the repo's config or plugins (`eslint`, `tsc`, `terraform`, ...), a command naming one or passing it a working-tree path or a program-running option; those still ask. Unlisted programs can be approved. The sandbox remains the security boundary.",
@@ -1655,6 +1674,29 @@ mod tests {
         assert_eq!(vm.ai.auto_approve.deny_paths_text, "secrets\n.env*");
         vm.apply(&mut settings).unwrap();
         assert_eq!(settings.ai.auto_approve, before);
+    }
+
+    #[test]
+    fn vm_round_trips_decision_model() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.decision_model = "d1-7b".into();
+        let mut vm = settings_vm(&settings, &|_| false);
+        assert_eq!(vm.ai.auto_approve.decision_model, "d1-7b");
+        vm.ai.auto_approve.decision_model = " smol.v2_x ".into();
+        vm.apply(&mut settings).unwrap();
+        assert_eq!(settings.ai.auto_approve.decision_model, "smol.v2_x");
+    }
+
+    #[test]
+    fn validate_rejects_bad_model_name() {
+        for bad in ["", "  ", "D1", "a b", "a/b", "../x", "d1:3b"] {
+            let vm = AutoApproveVm {
+                decision_model: bad.into(),
+                ..AutoApproveVm::default()
+            };
+            assert!(vm.validate().is_err(), "{bad:?}");
+        }
+        assert!(AutoApproveVm::default().validate().is_ok());
     }
 
     #[test]

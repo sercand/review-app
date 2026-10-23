@@ -53,8 +53,12 @@ impl ClassifierState {
             ClassifierState::Loading => {
                 "Loading on GPU… (first start can take a minute)".to_owned()
             }
-            ClassifierState::Ready(SchemaSource::Model) => "Ready".to_owned(),
-            ClassifierState::Ready(SchemaSource::BuiltIn) => "Ready (built-in question)".to_owned(),
+            ClassifierState::Ready(SchemaSource::Model) => {
+                "Ready — model's own decision schema".to_owned()
+            }
+            ClassifierState::Ready(SchemaSource::BuiltIn) => {
+                "Ready — built-in decision schema".to_owned()
+            }
             ClassifierState::Unavailable(why) | ClassifierState::Failed(why) => why.clone(),
         }
     }
@@ -77,6 +81,18 @@ mod tests {
     use super::SchemaSource;
 
     #[test]
+    fn state_text_names_schema_source() {
+        assert_eq!(
+            Ready(SchemaSource::Model).text(true),
+            "Ready — model's own decision schema"
+        );
+        assert_eq!(
+            Ready(SchemaSource::BuiltIn).text(true),
+            "Ready — built-in decision schema"
+        );
+    }
+
+    #[test]
     fn state_text_table() {
         let rows = [
             (Off, "Off"),
@@ -89,8 +105,14 @@ mod tests {
                 "Downloading… 42 %",
             ),
             (Loading, "Loading on GPU… (first start can take a minute)"),
-            (Ready(SchemaSource::Model), "Ready"),
-            (Ready(SchemaSource::BuiltIn), "Ready (built-in question)"),
+            (
+                Ready(SchemaSource::Model),
+                "Ready — model's own decision schema",
+            ),
+            (
+                Ready(SchemaSource::BuiltIn),
+                "Ready — built-in decision schema",
+            ),
             (Unavailable("no usable GPU".into()), "no usable GPU"),
             (Failed("offline".into()), "offline"),
         ];
