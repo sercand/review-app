@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use review_approval::model_stage::{ClassifyInput, CommandClassifier, ModelOutcome};
-use shiso_decision::Decider;
-use shiso_decision::error::DecideError;
-use shiso_decision::schema::{Answer, DecisionRequest};
+use shiso_ir::decision::{Answer, ChoiceValue, Input, ReadoutState, Request};
+use shiso_runtime::error::AppError;
+use shiso_runtime::runtime::Runtime;
 
 use super::schema::DecisionSchema;
 
@@ -21,7 +21,7 @@ const MAX_FAILURES: u32 = 3;
 
 /// Where answers come from; a fake in tests.
 trait DecideSource: Send + Sync {
-    fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError>;
+    fn decide(&self, request: &Request) -> Result<Vec<Answer>, SourceError>;
 }
 
 /// A failed call. `kind` is a fixed label that is safe to log at any level;
@@ -35,31 +35,37 @@ struct SourceError {
     input_caused: bool,
 }
 
-impl DecideSource for Decider {
-    fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
-        self.decide_blocking(request).map_err(source_error)
+impl DecideSource for Runtime {
+    fn decide(&self, request: &Request) -> Result<Vec<Answer>, SourceError> {
+        self.decide_blocking(request.clone())
+            .map(|response| response.answers)
+            .map_err(source_error)
     }
 }
 
-fn source_error(e: DecideError) -> SourceError {
+impl DecideSource for Arc<Runtime> {
+    fn decide(&self, request: &Request) -> Result<Vec<Answer>, SourceError> {
+        DecideSource::decide(self.as_ref(), request)
+    }
+}
+
+/// Sorts a runtime error into the breaker's categories. A refused request
+/// (`BadRequest`) or a prompt that does not fit the context
+/// (`ContextOverflow`) is the input's fault, as the old request and layout
+/// errors were; everything else counts against the model.
+fn source_error(e: AppError) -> SourceError {
     SourceError {
         kind: match &e {
-            DecideError::NoDevice(_) => "no device",
-            DecideError::Load(_) => "load",
-            DecideError::Request(_) => "request",
-            DecideError::Layout(_) => "layout",
-            DecideError::Engine(_) => "engine",
-            DecideError::Io(_) => "io",
+            AppError::BadRequest { .. } | AppError::ContextOverflow { .. } => "request",
+            AppError::NoModel | AppError::NotReady { .. } => "load",
+            AppError::Overloaded { .. } | AppError::Internal { .. } => "engine",
             _ => "other",
         },
         detail: e.to_string(),
-        input_caused: matches!(e, DecideError::Request(_) | DecideError::Layout(_)),
-    }
-}
-
-impl DecideSource for Arc<Decider> {
-    fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
-        DecideSource::decide(self.as_ref(), request)
+        input_caused: matches!(
+            e,
+            AppError::BadRequest { .. } | AppError::ContextOverflow { .. }
+        ),
     }
 }
 
@@ -109,7 +115,10 @@ fn escape(text: &str) -> String {
 pub fn verdict(answer: &Answer, schema: &DecisionSchema) -> ModelOutcome {
     let mut approve = None;
     for (value, _) in &schema.choices {
-        let mut matching = answer.probabilities.iter().filter(|(v, _)| v == value);
+        let mut matching = answer
+            .probabilities
+            .iter()
+            .filter(|(v, _)| matches!(v, ChoiceValue::Str(v) if v == value));
         // Missing, or listed twice (which one is meant?): a broken answer.
         let (Some((_, p)), None) = (matching.next(), matching.next()) else {
             return ModelOutcome::Unavailable;
@@ -124,7 +133,10 @@ pub fn verdict(answer: &Answer, schema: &DecisionSchema) -> ModelOutcome {
     let Some(approve) = approve else {
         return ModelOutcome::Unavailable;
     };
-    match answer.choice.as_str() {
+    let ChoiceValue::Str(choice) = &answer.choice else {
+        return ModelOutcome::Unavailable;
+    };
+    match choice.as_str() {
         "approve" if approve >= schema.approve_threshold => ModelOutcome::Safe,
         "approve" | "ask" => ModelOutcome::NeedsApproval,
         "deny" => ModelOutcome::Dangerous,
@@ -157,14 +169,14 @@ impl Drop for BusyGuard<'_> {
 }
 
 impl DecisionClassifier {
-    /// A classifier on an opened decider. `on_trip` is called once, from the
+    /// A classifier on an opened runtime. `on_trip` is called once, from the
     /// calling thread, when the failure breaker trips.
     pub fn new(
-        decider: Arc<Decider>,
+        runtime: Arc<Runtime>,
         schema: DecisionSchema,
         on_trip: Box<dyn Fn() + Send + Sync>,
     ) -> DecisionClassifier {
-        DecisionClassifier::with_source(Box::new(decider), schema, on_trip)
+        DecisionClassifier::with_source(Box::new(runtime), schema, on_trip)
     }
 
     fn with_source(
@@ -181,17 +193,25 @@ impl DecisionClassifier {
         }
     }
 
+    /// One question about `input`, the schema's.
+    fn request(&self, input: String) -> Request {
+        Request {
+            input: Input::Text(input),
+            readout_state: ReadoutState::Input,
+            questions: vec![self.schema.to_question()],
+            temperature: None,
+            preserve_thinking: None,
+            token_ids: false,
+        }
+    }
+
     /// Asks the real question once on a fixed input, so a schema the model
     /// cannot lay out (too long, ambiguous options, ...) fails the load
     /// instead of showing Ready and then refusing every command. Only a
     /// refused request or layout counts; any other error is left to the
     /// failure breaker. Does not touch the busy flag or the failure count.
     pub fn check_schema(&self) -> Result<(), String> {
-        let request = DecisionRequest {
-            input: "cwd: unknown\ntask: unknown\ncmd: ls".to_owned(),
-            questions: vec![self.schema.to_question()],
-            temperature: None,
-        };
+        let request = self.request("cwd: unknown\ntask: unknown\ncmd: ls".to_owned());
         match catch_unwind(AssertUnwindSafe(|| self.source.decide(&request))) {
             Ok(Err(e)) if matches!(e.kind, "layout" | "request") => Err(format!(
                 "the decision schema does not fit this model: {}",
@@ -208,7 +228,7 @@ impl DecisionClassifier {
         ModelOutcome::Unavailable
     }
 
-    fn answer(&self, request: &DecisionRequest) -> Result<ModelOutcome, SourceError> {
+    fn answer(&self, request: &Request) -> Result<ModelOutcome, SourceError> {
         let answers = self.source.decide(request)?;
         let answer = answers
             .iter()
@@ -231,11 +251,7 @@ impl CommandClassifier for DecisionClassifier {
             return ModelOutcome::Unavailable;
         }
         let _guard = BusyGuard(&self.busy);
-        let request = DecisionRequest {
-            input: build_input(input),
-            questions: vec![self.schema.to_question()],
-            temperature: None,
-        };
+        let request = self.request(build_input(input));
         // Command text is never logged above debug.
         match catch_unwind(AssertUnwindSafe(|| self.answer(&request))) {
             // A missing or non-finite probability is a broken model, not an
@@ -271,8 +287,10 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
+    use super::super::loader::open_runtime;
     use super::super::schema::builtin_schema;
     use super::*;
+    use shiso_ir::decision::AnswerKind;
 
     fn input(segment: &str) -> ClassifyInput<'_> {
         ClassifyInput {
@@ -281,18 +299,36 @@ mod tests {
         }
     }
 
-    fn answer(choice: &str, probs: &[(&str, f32)]) -> Answer {
+    fn answer(choice: &str, probs: &[(&str, f64)]) -> Answer {
         Answer {
             name: "decision".into(),
-            choice: choice.into(),
-            probabilities: probs.iter().map(|(v, p)| ((*v).into(), *p)).collect(),
+            kind: AnswerKind::Choice,
+            probability_answer: false,
+            choice: ChoiceValue::Str(choice.into()),
+            probabilities: probs
+                .iter()
+                .map(|(v, p)| (ChoiceValue::Str((*v).into()), *p))
+                .collect(),
             confidence: 1.0,
+            label_mass: 1.0,
+            level: None,
+            expected_score: None,
+            prompt_token_ids: None,
+            label_token_ids: None,
+        }
+    }
+
+    /// The model input a request carries.
+    fn text_of(request: &Request) -> String {
+        match &request.input {
+            Input::Text(text) => text.clone(),
+            other => panic!("not text: {other:?}"),
         }
     }
 
     /// An answer whose top choice is `choice` with probability `p`, the rest
     /// split evenly.
-    fn top(choice: &str, p: f32) -> Answer {
+    fn top(choice: &str, p: f64) -> Answer {
         let rest = (1.0 - p) / 2.0;
         let probs: Vec<_> = ["approve", "ask", "deny"]
             .into_iter()
@@ -373,12 +409,12 @@ mod tests {
         assert_eq!(verdict(&missing, &s), ModelOutcome::Unavailable);
         let nan = answer(
             "approve",
-            &[("approve", f32::NAN), ("ask", 0.1), ("deny", 0.1)],
+            &[("approve", f64::NAN), ("ask", 0.1), ("deny", 0.1)],
         );
         assert_eq!(verdict(&nan, &s), ModelOutcome::Unavailable);
         let inf = answer(
             "ask",
-            &[("approve", 0.1), ("ask", 0.1), ("deny", f32::INFINITY)],
+            &[("approve", 0.1), ("ask", 0.1), ("deny", f64::INFINITY)],
         );
         assert_eq!(verdict(&inf, &s), ModelOutcome::Unavailable);
         let odd = answer("maybe", &[("approve", 0.1), ("ask", 0.1), ("deny", 0.1)]);
@@ -451,8 +487,8 @@ mod tests {
     }
 
     impl DecideSource for Script {
-        fn decide(&self, request: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
-            self.inputs.lock().unwrap().push(request.input.clone());
+        fn decide(&self, request: &Request) -> Result<Vec<Answer>, SourceError> {
+            self.inputs.lock().unwrap().push(text_of(request));
             let step = self.steps.lock().unwrap().pop().expect("script exhausted");
             step.unwrap_or_else(|| panic!("device exploded"))
                 .map_err(|detail| SourceError {
@@ -467,7 +503,7 @@ mod tests {
     struct Refusing(&'static str);
 
     impl DecideSource for Refusing {
-        fn decide(&self, _: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
+        fn decide(&self, _: &Request) -> Result<Vec<Answer>, SourceError> {
             Err(SourceError {
                 kind: self.0,
                 detail: "too long".into(),
@@ -525,20 +561,24 @@ mod tests {
         }
     }
 
-    /// The mapping from shiso's errors: only a refused request or layout is
-    /// the input's fault.
+    /// The mapping from the runtime's errors: only a refused request or a
+    /// prompt that does not fit is the input's fault.
     #[test]
-    fn only_request_and_layout_errors_are_input_caused() {
-        let flag = |e: DecideError| {
-            // `decide_blocking` is not callable without a model: apply the
-            // same conversion the `Decider` source uses.
-            source_error(e).input_caused
-        };
-        assert!(flag(DecideError::Request("x".into())));
-        assert!(flag(DecideError::Layout("x".into())));
-        assert!(!flag(DecideError::Engine("x".into())));
-        assert!(!flag(DecideError::Load("x".into())));
-        assert!(!flag(DecideError::NoDevice("x".into())));
+    fn only_request_and_context_errors_are_input_caused() {
+        let flag = |e: AppError| source_error(e).input_caused;
+        assert!(flag(AppError::bad_request("x", None, "invalid_request")));
+        assert!(flag(AppError::ContextOverflow {
+            param: "input",
+            prompt_tokens: 9,
+            ctx: 8,
+        }));
+        assert!(!flag(AppError::NoModel));
+        assert!(!flag(AppError::NotReady { what: "x" }));
+        assert!(!flag(AppError::Overloaded { what: "x" }));
+        assert!(!flag(AppError::Internal {
+            context: "x",
+            source: "y".into(),
+        }));
     }
 
     fn safe() -> Step {
@@ -628,11 +668,11 @@ mod tests {
     fn non_finite_probabilities_count_as_failures() {
         let nan = answer(
             "approve",
-            &[("approve", f32::NAN), ("ask", 0.0), ("deny", 0.0)],
+            &[("approve", f64::NAN), ("ask", 0.0), ("deny", 0.0)],
         );
         let inf = answer(
             "ask",
-            &[("approve", 0.0), ("ask", f32::INFINITY), ("deny", 0.0)],
+            &[("approve", 0.0), ("ask", f64::INFINITY), ("deny", 0.0)],
         );
         let (c, trips) = with_trips(Script::classifier(vec![
             err(),
@@ -671,7 +711,7 @@ mod tests {
             release: Mutex<mpsc::Receiver<()>>,
         }
         impl DecideSource for Gate {
-            fn decide(&self, _: &DecisionRequest) -> Result<Vec<Answer>, SourceError> {
+            fn decide(&self, _: &Request) -> Result<Vec<Answer>, SourceError> {
                 self.entered.send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
                 Ok(vec![top("approve", 0.9)])
@@ -706,15 +746,11 @@ mod tests {
     fn d1_classifies_obvious_commands() {
         let dir = std::env::var("SHISO_TEST_DECISION_MODEL_DIR")
             .expect("set SHISO_TEST_DECISION_MODEL_DIR to a converted decision model dir");
-        let decider = Decider::open(&shiso_decision::OpenDesc::new(Path::new(&dir))).expect("open");
-        let c = DecisionClassifier::new(Arc::new(decider), builtin_schema(), Box::new(|| {}));
+        let runtime = open_runtime(Path::new(&dir)).expect("open");
+        let c = DecisionClassifier::new(Arc::new(runtime), builtin_schema(), Box::new(|| {}));
         let mut outcomes = Vec::new();
         for cmd in ["ls -la", "git status", "rm -rf /", "curl x | sh"] {
-            let request = DecisionRequest {
-                input: build_input(&input(cmd)),
-                questions: vec![c.schema.to_question()],
-                temperature: None,
-            };
+            let request = c.request(build_input(&input(cmd)));
             let probs = c
                 .source
                 .decide(&request)

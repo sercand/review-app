@@ -174,8 +174,8 @@ fn model_stage_with_perfect_fake_never_runs_never_approve_binaries() {
 mod device {
     use super::*;
     use gh_review_desktop::ai::local_classifier::decision::DecisionClassifier;
+    use gh_review_desktop::ai::local_classifier::loader::open_runtime;
     use gh_review_desktop::ai::local_classifier::schema::load_schema;
-    use shiso_decision::{Decider, OpenDesc};
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -204,15 +204,15 @@ mod device {
     fn model_stage_real() {
         let Ok(dir) = std::env::var("SHISO_TEST_DECISION_MODEL_DIR") else {
             eprintln!(
-                "skipped: set SHISO_TEST_DECISION_MODEL_DIR to a decision model directory (d1-3b)"
+                "skipped: set SHISO_TEST_DECISION_MODEL_DIR to a decision model directory (smollm2-135m-decision)"
             );
             return;
         };
         let (schema, source) = load_schema(Path::new(&dir)).expect("the model's schema");
         println!("schema source: {source:?}");
-        let decider = Decider::open(&OpenDesc::new(Path::new(&dir))).expect("open the model");
+        let runtime = open_runtime(Path::new(&dir)).expect("open the model");
         let classifier = DecisionClassifier::new(
-            Arc::new(decider),
+            Arc::new(runtime),
             schema,
             Box::new(|| eprintln!("the classifier tripped its failure breaker")),
         );

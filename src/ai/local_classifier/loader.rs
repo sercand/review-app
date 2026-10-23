@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use review_approval::model_stage::CommandClassifier;
-use shiso_decision::error::DecideError;
-use shiso_decision::{Decider, OpenDesc};
+use shiso_runtime::boot_error::BootError;
+use shiso_runtime::hub::PullError;
+use shiso_runtime::options::ExplicitlySet;
+use shiso_runtime::runtime::{OpenError, Runtime, RuntimeOptions, Source};
 
 use super::decision::DecisionClassifier;
 use super::schema::{SchemaSource, load_schema};
@@ -54,13 +56,35 @@ pub enum LoadError {
     Failed(String),
 }
 
-/// Maps a shiso error to the state it should show. A missing device is
+/// Maps a runtime error to the state it should show. A missing device is
 /// `Unavailable`; everything else is retryable.
-pub(super) fn load_error(error: DecideError) -> LoadError {
-    match error {
-        DecideError::NoDevice(why) => LoadError::Unavailable(format!("no usable GPU: {why}")),
-        other => LoadError::Failed(other.to_string()),
+pub(super) fn load_error(error: OpenError) -> LoadError {
+    let no_device = match &error {
+        OpenError::Pull(PullError::NoDevice(why)) => Some(why.as_str()),
+        OpenError::Boot(BootError::Refused(why)) if why.contains("no compute backend") => {
+            Some(why.as_str())
+        }
+        // Boot's device step: "opening the Metal device" (or CUDA).
+        OpenError::Boot(BootError::Step { context, .. }) if context.starts_with("opening the ") => {
+            Some(context.as_str())
+        }
+        _ => None,
+    };
+    match no_device {
+        Some(why) => LoadError::Unavailable(format!("no usable GPU: {why}")),
+        None => LoadError::Failed(error.to_string()),
     }
+}
+
+/// Opens the model in `dir` for decisions. One sequence at a time: the
+/// classifier never makes concurrent calls, so the server's default of
+/// several resident sequences would only hold memory. Warms the device.
+pub fn open_runtime(dir: &Path) -> Result<Runtime, OpenError> {
+    let mut options = RuntimeOptions::default();
+    options.serve.max_num_seqs = 1;
+    options.explicit = ExplicitlySet::default();
+    options.explicit.insert("max_num_seqs");
+    Runtime::open(Source::Dir(dir), options, &mut |_, _| true)
 }
 
 /// The compute side; a fake in tests.
@@ -77,12 +101,12 @@ pub trait Engine: Send + Sync {
     ) -> Result<(Arc<dyn CommandClassifier>, SchemaSource), LoadError>;
 }
 
-/// The real engine: the model's schema, then a `shiso_decision::Decider`.
+/// The real engine: the model's schema, then a `shiso_runtime::Runtime`.
 ///
-/// There is no cheap device probe in shiso, so the check before the download
-/// is only whether this build has a backend at all. On a machine whose
-/// device is unusable the download therefore still happens and the failure
-/// shows at open time (`NoDevice` becomes `Unavailable`).
+/// There is no cheap device probe, so the check before the download is only
+/// whether this build has a backend at all. On a machine whose device is
+/// unusable the download therefore still happens and the failure shows at open
+/// time (a missing device becomes `Unavailable`).
 struct ShisoEngine;
 
 impl Engine for ShisoEngine {
@@ -101,8 +125,8 @@ impl Engine for ShisoEngine {
         // An unreadable schema is never replaced by the default: the model
         // was shipped with a question this build cannot ask.
         let (schema, source) = load_schema(dir).map_err(LoadError::Unavailable)?;
-        let decider = Decider::open(&OpenDesc::new(dir)).map_err(load_error)?;
-        let classifier = DecisionClassifier::new(Arc::new(decider), schema, on_trip);
+        let runtime = open_runtime(dir).map_err(load_error)?;
+        let classifier = DecisionClassifier::new(Arc::new(runtime), schema, on_trip);
         classifier.check_schema().map_err(LoadError::Unavailable)?;
         Ok((Arc::new(classifier), source))
     }
@@ -316,8 +340,7 @@ impl Loader {
         let dir = match shared.source.installed_dir(model) {
             Some(dir) => dir,
             None => {
-                // Shown for an install too (shiso has no offline probe): the
-                // call below then returns at once and `Loading` follows.
+                // Not installed (or not readable): fetch it.
                 if !self.progress(model, ClassifierState::Downloading { done: 0, total: 0 }) {
                     return None;
                 }
@@ -1015,20 +1038,31 @@ mod tests {
 
     #[test]
     fn shiso_errors_map_to_states() {
-        use DecideError::*;
+        let pull = |e: PullError| load_error(OpenError::Pull(e));
         assert!(matches!(
-            load_error(NoDevice("no Metal".into())),
+            pull(PullError::NoDevice("no Metal".into())),
             LoadError::Unavailable(m) if m == "no usable GPU: no Metal"
         ));
         assert!(matches!(
-            load_error(Download("offline".into())),
+            pull(PullError::Install("offline".into())),
             LoadError::Failed(m) if m.contains("offline")
         ));
         assert!(matches!(
-            load_error(UnknownModel("nope".into())),
+            pull(PullError::UnknownModel("nope".into())),
             LoadError::Failed(m) if m.contains("nope")
         ));
-        assert!(matches!(load_error(Cancelled), LoadError::Failed(_)));
+        assert!(matches!(pull(PullError::Cancelled), LoadError::Failed(_)));
+        // A device that will not open at boot is as unusable as no backend.
+        assert!(matches!(
+            load_error(OpenError::Boot(BootError::Refused(
+                "this build has no compute backend; rebuild".into()
+            ))),
+            LoadError::Unavailable(_)
+        ));
+        assert!(matches!(
+            load_error(OpenError::NothingLoaded),
+            LoadError::Failed(_)
+        ));
     }
 
     /// An invalid schema next to the weights is `Unavailable`, never the
@@ -1061,16 +1095,16 @@ mod tests {
     /// The whole path on the real engine: `ensure` (offline when the model is
     /// installed in `SHISO_TEST_HOME`), schema, device, an answer.
     #[test]
-    #[ignore = "requires a GPU build and SHISO_TEST_HOME with d1-3b installed"]
+    #[ignore = "requires a GPU build and SHISO_TEST_HOME with smollm2-135m-decision installed"]
     fn real_loader_answers_ls_la() {
         let home = std::env::var("SHISO_TEST_HOME")
-            .expect("set SHISO_TEST_HOME to a model home that has d1-3b");
+            .expect("set SHISO_TEST_HOME to a model home that has smollm2-135m-decision");
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let loader = Loader::with_parts(
             Arc::new(WeightsManager::with_home(PathBuf::from(home))),
             Arc::new(ShisoEngine),
-            "d1-3b",
+            "smollm2-135m-decision",
             Arc::new(move |s| {
                 eprintln!("state: {s:?}");
                 let _ = tx.lock().unwrap().send(s);

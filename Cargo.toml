@@ -13,7 +13,7 @@ license = "MIT"
 # Test doubles for the AI pipeline (`ai::testing`), for integration tests that
 # drive the worker. Unit tests compile them unconditionally.
 ai-testing = []
-# Local command classifier: a shiso decision model (`shiso-decision`). Off by
+# Local command classifier: a shiso decision model (`shiso-runtime`). Off by
 # default: pulls a large git dependency. Cargo features are target-independent
 # and shiso refuses both backends at once, so pick exactly one:
 #   macOS (Metal):  --features local-classifier
@@ -24,9 +24,9 @@ ai-testing = []
 # `_classifier` is internal: it gates the code and pulls the dependency, and
 # both public features enable it. Never enable it alone, and never let one
 # public feature enable the other.
-_classifier = ["dep:shiso-decision"]
-local-classifier = ["_classifier", "shiso-decision/metal"]
-local-classifier-cuda = ["_classifier", "shiso-decision/cuda"]
+_classifier = ["dep:shiso-runtime", "dep:shiso-ir"]
+local-classifier = ["_classifier", "shiso-runtime/metal"]
+local-classifier-cuda = ["_classifier", "shiso-runtime/cuda"]
 
 [[test]]
 name = "ai_pipeline"
@@ -72,7 +72,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
 tokio-util = "0.7"
 url = "2.5"
-shiso-decision = { git = "https://github.com/sercand/shiso-llm", rev = "e9417ee44ffdc98d91aa29f5572051ff37cfcb0a", optional = true }
+shiso-runtime = { git = "https://github.com/sercand/shiso-llm", rev = "e3f5a4bbbf82cd6940da2d0a05b102f1cf8b156b", optional = true }
+shiso-ir = { git = "https://github.com/sercand/shiso-llm", rev = "e3f5a4bbbf82cd6940da2d0a05b102f1cf8b156b", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.21"

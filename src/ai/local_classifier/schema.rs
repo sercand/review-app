@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use shiso_ir::decision::{Choice, ChoiceValue, Question, QuestionKind};
 
 /// Name of the schema file in a model directory.
 pub const SCHEMA_FILE: &str = "decision_schema.json";
@@ -11,7 +12,7 @@ pub const SCHEMA_FILE: &str = "decision_schema.json";
 /// The answer values, as a set; the order in a file does not matter.
 const VALUES: [&str; 3] = ["approve", "ask", "deny"];
 
-const DEFAULT_THRESHOLD: f32 = 0.60;
+const DEFAULT_THRESHOLD: f64 = 0.60;
 
 /// One multiple-choice question about a command.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +24,7 @@ pub struct DecisionSchema {
     /// `(value, description)` pairs, in the schema's order.
     pub choices: Vec<(String, String)>,
     /// Least probability of `approve` that still counts as safe.
-    pub approve_threshold: f32,
+    pub approve_threshold: f64,
 }
 
 pub use crate::state::classifier::SchemaSource;
@@ -41,23 +42,25 @@ struct FileSchema {
     question: String,
     instructions: String,
     choices: Vec<FileChoice>,
-    approve_threshold: Option<f32>,
+    approve_threshold: Option<f64>,
 }
 
 impl DecisionSchema {
     /// The question as shiso takes it.
-    pub fn to_question(&self) -> shiso_decision::schema::Question {
-        shiso_decision::schema::Question::Choice {
+    pub fn to_question(&self) -> Question {
+        Question {
             name: self.question.clone(),
             instructions: self.instructions.clone(),
-            choices: self
-                .choices
-                .iter()
-                .map(|(value, description)| shiso_decision::schema::Choice {
-                    value: value.clone(),
-                    description: Some(description.clone()),
-                })
-                .collect(),
+            kind: QuestionKind::Choice(
+                self.choices
+                    .iter()
+                    .map(|(value, description)| Choice {
+                        value: ChoiceValue::Str(value.clone()),
+                        description: Some(description.clone()),
+                    })
+                    .collect(),
+            ),
+            probability_answer: false,
         }
     }
 }
@@ -193,11 +196,11 @@ mod tests {
 
     #[test]
     fn to_question_carries_choices_and_descriptions() {
-        use shiso_decision::schema::Question;
-        let Question::Choice {
+        let Question {
             name,
             instructions,
-            choices,
+            kind: QuestionKind::Choice(choices),
+            ..
         } = builtin_schema().to_question()
         else {
             panic!("not a choice question");

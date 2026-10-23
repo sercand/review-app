@@ -1,21 +1,23 @@
-//! The on-disk model store under `<data dir>/models`, filled by
-//! `shiso_decision::ensure_model` from the registry.
+//! The on-disk model store under `<data dir>/models`, filled from the shiso
+//! registry by `shiso_runtime::hub`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use shiso_decision::ensure_model;
+use shiso_runtime::hub::{self, InstalledModel};
+use shiso_runtime::runtime::OpenError;
 
 use super::loader::{LoadError, load_error};
 
 /// Owns the on-disk model store under `<data dir>/models`.
 pub struct WeightsManager {
     home: PathBuf,
-    /// Models this process has already ensured, by name: shiso has no
-    /// offline "is it installed" probe, so this is what lets a re-enable skip
-    /// the download states.
-    ensured: Mutex<HashMap<String, PathBuf>>,
+    /// The installs this process has found or pulled, by name. Each entry
+    /// holds the install's lock, which is what keeps `shiso rm` and a
+    /// reinstall from removing files a loaded model is reading: the model is
+    /// opened from the bare directory, so the lock must outlive it.
+    installed: Mutex<HashMap<String, InstalledModel>>,
 }
 
 impl WeightsManager {
@@ -28,18 +30,21 @@ impl WeightsManager {
     pub fn with_home(home: PathBuf) -> WeightsManager {
         WeightsManager {
             home,
-            ensured: Mutex::new(HashMap::new()),
+            installed: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The install of `model` this process has ensured before, without
-    /// touching the network or the disk.
+    /// The complete install of `model`, found offline (no network). `None`
+    /// when it is not installed or the store cannot be read.
     pub fn installed_dir(&self, model: &str) -> Option<PathBuf> {
-        self.ensured
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(model)
-            .cloned()
+        let mut installed = self.installed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = installed.get(model) {
+            return Some(found.dir.clone());
+        }
+        let found = hub::resolve(model, &hub::config_for_home(&self.home)).ok()??;
+        let dir = found.dir.clone();
+        installed.insert(model.to_owned(), found);
+        Some(dir)
     }
 
     /// Blocking: finds `model` in the store or downloads it, verifying and
@@ -51,12 +56,19 @@ impl WeightsManager {
         model: &str,
         progress: &mut dyn FnMut(u64, u64) -> bool,
     ) -> Result<PathBuf, LoadError> {
-        let installed = ensure_model(model, &self.home, progress).map_err(load_error)?;
-        self.ensured
+        // Not `pull` for an install already held: reinstalling a variant
+        // needs its lock exclusively.
+        if let Some(dir) = self.installed_dir(model) {
+            return Ok(dir);
+        }
+        let pulled = hub::pull(model, &hub::config_for_home(&self.home), progress)
+            .map_err(|e| load_error(OpenError::Pull(e)))?;
+        let dir = pulled.dir.clone();
+        self.installed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(model.to_owned(), installed.dir.clone());
-        Ok(installed.dir)
+            .insert(model.to_owned(), pulled);
+        Ok(dir)
     }
 }
 
@@ -68,18 +80,18 @@ mod tests {
     fn the_store_is_the_models_directory() {
         let m = WeightsManager::new(Path::new("/cfg"));
         assert_eq!(m.home, Path::new("/cfg/models"));
-        assert!(m.installed_dir("d1-3b").is_none());
+        assert!(m.installed_dir("smollm2-135m-decision").is_none());
     }
 
-    /// Downloads the real model (about 3.5 GB) into a temporary home.
+    /// Downloads the real model (about 0.2 GiB) into a temporary home.
     #[test]
-    #[ignore = "downloads about 3.5 GB from the model registry"]
-    fn real_pull_d1_3b() {
+    #[ignore = "downloads about 0.2 GiB from the model registry"]
+    fn real_pull_smollm2() {
         let home = tempfile::tempdir().unwrap();
         let m = WeightsManager::with_home(home.path().to_owned());
         let mut last = (0, 0);
         let dir = m
-            .ensure_blocking("d1-3b", &mut |done, total| {
+            .ensure_blocking("smollm2-135m-decision", &mut |done, total| {
                 last = (done, total);
                 true
             })
@@ -87,9 +99,11 @@ mod tests {
         eprintln!("installed at {} after {last:?}", dir.display());
         assert!(dir.is_dir());
         assert!(last.1 > 0 && last.0 == last.1, "{last:?}");
-        assert_eq!(m.installed_dir("d1-3b"), Some(dir.clone()));
+        assert_eq!(m.installed_dir("smollm2-135m-decision"), Some(dir.clone()));
         // A second call is answered from the store, without progress.
-        let again = m.ensure_blocking("d1-3b", &mut |_, _| true).unwrap();
+        let again = m
+            .ensure_blocking("smollm2-135m-decision", &mut |_, _| true)
+            .unwrap();
         assert_eq!(again, dir);
     }
 }
