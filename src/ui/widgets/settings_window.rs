@@ -18,8 +18,8 @@ use eframe::egui::{Popup, PopupCloseBehavior};
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
 use crate::persist::settings::{
-    AutoApproveSettings, DEFAULT_DECISION_MODEL, ModelSettings, ProviderSettings, RepoAiSettings,
-    Settings, valid_decision_model,
+    AutoApproveSettings, ModelSettings, ProviderSettings, RepoAiSettings, Settings,
+    valid_decision_model,
 };
 use crate::state::classifier::{self, ClassifierState};
 use crate::ui::theme::Theme;
@@ -1088,7 +1088,7 @@ fn ai_auto_approve(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<
     setting_row(ui, "Decision model", |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut vm.decision_model)
-                .hint_text(DEFAULT_DECISION_MODEL)
+                .hint_text(crate::persist::settings::DEFAULT_DECISION_MODEL)
                 .desired_width(160.0),
         );
     });
