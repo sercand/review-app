@@ -197,6 +197,26 @@ pub struct AiTimelineEntry {
     pub content_json: String,
 }
 
+/// Whether the snapshot's run row still has anything executing behind it.
+///
+/// The row alone cannot say: a run whose forwarder is gone (the app was
+/// closed mid-run, the pipeline task died, a finish parked the run awaiting a
+/// restore decision) keeps `status = "running"` in the store, and a tab that
+/// rebuilt from that row showed a spinner and a Cancel button that could only
+/// answer "no AI review is running". This travels with every snapshot so the
+/// tab can tell "running" from "was running".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunLiveness {
+    /// A handle exists but the start is still working through checkout,
+    /// prepare and the sandbox.
+    Starting,
+    /// The pipeline is executing (paused runs count: they resume).
+    Live,
+    /// No handle at all, or a handle with nothing executing: the row is
+    /// history, whatever it says.
+    Stopped,
+}
+
 /// Everything the AI tab needs to rebuild itself on attach (spec §10.3).
 #[derive(Clone, Debug)]
 pub struct AiSnapshotData {
@@ -210,6 +230,8 @@ pub struct AiSnapshotData {
     pub brief: Option<String>,
     /// The latest run row, when the session has one.
     pub run: Option<RunRecord>,
+    /// Whether that row still has a live run behind it.
+    pub run_liveness: RunLiveness,
     /// The checkout this PR holds, when any does.
     pub checkout: Option<CheckoutRecord>,
     /// Why the agent shell is unsandboxed (spec §8.2), for the live run.
@@ -344,6 +366,16 @@ impl Drop for StartSlot<'_> {
     }
 }
 
+/// The snapshot's view of a handle: see [`RunLiveness`].
+fn liveness(live: Option<&RunHandle>) -> RunLiveness {
+    match live {
+        None => RunLiveness::Stopped,
+        Some(run) if run.starting => RunLiveness::Starting,
+        Some(run) if run.control.is_some() && run.live.load(Ordering::SeqCst) => RunLiveness::Live,
+        Some(_) => RunLiveness::Stopped,
+    }
+}
+
 /// How long a finish waits for the pipeline to wind down after cancelling.
 const PIPELINE_GRACE: Duration = Duration::from_secs(30);
 
@@ -351,8 +383,7 @@ const PIPELINE_GRACE: Duration = Duration::from_secs(30);
 /// is gone.
 const SANDBOX_RELEASE: Duration = Duration::from_secs(10);
 
-/// Stop the pipeline task: wait up to `grace` for it to end by itself, then
-/// abort it and wait for the abort to land, so no agent is still running
+/// Stop the pipeline task: wait up to `grace` for it to end by itself, then/// abort it and wait for the abort to land, so no agent is still running
 /// when the caller moves the working tree. Returns whether it had to abort.
 async fn halt_pipeline<T>(mut pipeline: JoinHandle<T>, grace: Duration) -> bool {
     if tokio::time::timeout(grace, &mut pipeline).await.is_ok() {
@@ -706,16 +737,13 @@ impl AiHub {
     /// (spec §10.2). Works with no live run too: the stored findings and
     /// checkout still describe the PR.
     pub fn attach(&self, session: SessionId, key: PrKey, events: &EventSender) {
-        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(run) = runs.get(&key) {
-            *run.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+        {
+            let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(run) = runs.get(&key) {
+                *run.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
+            }
         }
-        match self.snapshot_data(&key, runs.get(&key)) {
-            Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
-            Err(error) => events.send(Event::Toast(format!(
-                "could not load the AI review state: {error}"
-            ))),
-        }
+        self.push_snapshot(session, &key, events);
     }
 
     /// The stored state for `key`, overlaid with the live run's checkout and
@@ -783,12 +811,28 @@ impl AiHub {
             timeline,
             brief,
             run,
+            run_liveness: liveness(live),
             checkout,
             bash_disabled,
             last_reviewed_sha,
             draft,
             usage,
         })
+    }
+
+    /// Push a fresh snapshot for `key` answering `session`, rebinding nothing.
+    /// Every command that finds no live run calls this with the session that
+    /// asked: it is how a tab whose run events were lost (a stale session, a
+    /// run that died with the app) learns the truth instead of keeping a
+    /// spinner and a Cancel button that can only fail.
+    fn push_snapshot(&self, session: SessionId, key: &PrKey, events: &EventSender) {
+        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+        match self.snapshot_data(key, runs.get(key)) {
+            Ok(snapshot) => events.send(Event::AiSnapshot { session, snapshot }),
+            Err(error) => events.send(Event::Toast(format!(
+                "could not load the AI review state: {error}"
+            ))),
+        }
     }
 
     /// Validate and plan the checkout for `pr`, answering with
@@ -1077,6 +1121,7 @@ impl AiHub {
         let extra_write = repo_settings.extra_write_paths.clone();
         let extra_deny = repo_settings.extra_deny_read.clone();
         let app_config = config_root();
+        let trust_all = settings.auto_approve.dangerously_approve_all;
         let tmp_for_sandbox = tmp_dir.clone();
         let sandbox_build = tokio::task::spawn_blocking(move || {
             let home = home.ok_or_else(|| "HOME is not set".to_string())?;
@@ -1089,13 +1134,22 @@ impl AiHub {
             .map_err(|e| e.to_string())?;
             let mut write_paths = default_write_paths(&home);
             write_paths.extend(extra_write);
-            let mut deny_read = default_deny_read(&home, &app_config);
-            deny_read.extend(extra_deny);
+            // Full trust reads the credentials too: the text-level denies
+            // are bypassed in `bash`, so the OS-level ones go as well. The
+            // `.git/` write deny, the tmp dir and the env allowlist stay.
+            let deny_read = if trust_all {
+                Vec::new()
+            } else {
+                let mut deny_read = default_deny_read(&home, &app_config);
+                deny_read.extend(extra_deny);
+                deny_read
+            };
             let policy = SandboxPolicy {
                 repo: repo_root.clone(),
                 tmp: tmp_for_sandbox,
                 write_paths,
                 deny_read,
+                deny_env_reads: !trust_all,
             };
             match launcher(&policy, env) {
                 Ok(launch) => LocalHost::with_launch(&repo_root, launch)
@@ -1389,48 +1443,69 @@ impl AiHub {
 
     /// Pause every running agent before its next model call. A start still
     /// in progress gets the "still starting" refusal, mirroring
-    /// [`Self::finish`] (Task 8).
-    pub fn pause(&self, key: &PrKey, events: &EventSender) {
-        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key) {
-            Some(run) if run.starting => {
-                events.send(Event::Toast(STILL_STARTING.to_owned()));
+    /// [`Self::finish`] (Task 8). With nothing executing, the tab is sent a
+    /// fresh snapshot instead of a toast: the button it showed was stale.
+    pub fn pause(&self, session: SessionId, key: &PrKey, events: &EventSender) {
+        let mut stale = false;
+        {
+            let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            match runs.get(key) {
+                Some(run) if run.starting => {
+                    events.send(Event::Toast(STILL_STARTING.to_owned()));
+                }
+                Some(run) => match run.control.as_ref() {
+                    Some(control) => control.pause(),
+                    None => stale = true,
+                },
+                None => stale = true,
             }
-            Some(run) => match run.control.as_ref() {
-                Some(control) => control.pause(),
-                None => events.send(Event::Toast(NO_RUN.to_owned())),
-            },
-            None => events.send(Event::Toast(NO_RUN.to_owned())),
+        }
+        if stale {
+            self.push_snapshot(session, key, events);
         }
     }
 
     /// Release a [`Self::pause`].
-    pub fn resume(&self, key: &PrKey, events: &EventSender) {
-        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key) {
-            Some(run) if run.starting => {
-                events.send(Event::Toast(STILL_STARTING.to_owned()));
+    pub fn resume(&self, session: SessionId, key: &PrKey, events: &EventSender) {
+        let mut stale = false;
+        {
+            let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            match runs.get(key) {
+                Some(run) if run.starting => {
+                    events.send(Event::Toast(STILL_STARTING.to_owned()));
+                }
+                Some(run) => match run.control.as_ref() {
+                    Some(control) => control.resume(),
+                    None => stale = true,
+                },
+                None => stale = true,
             }
-            Some(run) => match run.control.as_ref() {
-                Some(control) => control.resume(),
-                None => events.send(Event::Toast(NO_RUN.to_owned())),
-            },
-            None => events.send(Event::Toast(NO_RUN.to_owned())),
+        }
+        if stale {
+            self.push_snapshot(session, key, events);
         }
     }
 
     /// Stop the run; the checkout stays held so a re-run is cheap (spec §10.3).
-    pub fn cancel(&self, key: &PrKey, events: &EventSender) {
-        let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
-        match runs.get(key) {
-            Some(run) if run.starting => {
-                events.send(Event::Toast(STILL_STARTING.to_owned()));
+    /// With nothing executing, the tab is sent a fresh snapshot instead of a
+    /// toast, so a run whose events were lost cannot leave it stuck.
+    pub fn cancel(&self, session: SessionId, key: &PrKey, events: &EventSender) {
+        let mut stale = false;
+        {
+            let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            match runs.get(key) {
+                Some(run) if run.starting => {
+                    events.send(Event::Toast(STILL_STARTING.to_owned()));
+                }
+                Some(run) => match run.control.as_ref() {
+                    Some(control) => control.cancel(),
+                    None => stale = true,
+                },
+                None => stale = true,
             }
-            Some(run) => match run.control.as_ref() {
-                Some(control) => control.cancel(),
-                None => events.send(Event::Toast(NO_RUN.to_owned())),
-            },
-            None => events.send(Event::Toast(NO_RUN.to_owned())),
+        }
+        if stale {
+            self.push_snapshot(session, key, events);
         }
     }
 
@@ -1483,11 +1558,17 @@ impl AiHub {
                 None => None,
             }
         };
-        let Some(Some(mut run)) = taken else {
-            if taken.is_none() {
-                events.send(Event::Toast(NO_RUN.to_owned()));
+        let mut run = match taken {
+            Some(Some(run)) => run,
+            // A finish is already restoring this run: its events are on the
+            // way, and a second one would move the tree twice.
+            Some(None) => return,
+            // Nothing to finish. The tab that asked is showing a run the hub
+            // does not have, so send it the truth rather than a toast.
+            None => {
+                self.push_snapshot(session, key, events);
+                return;
             }
-            return;
         };
         if run.starting {
             events.send(Event::Toast(STILL_STARTING.to_owned()));
@@ -1727,17 +1808,20 @@ impl AiHub {
                  yourself, then restore again",
                 changes.len()
             ))),
-            Ok(Ok((rec, RestoreOutcome::Restored))) => events.send(Event::Toast(format!(
-                "restored {} to {}",
-                rec.repo_path.display(),
-                original_ref_text(&rec.original)
-            ))),
-            Ok(Ok((rec, RestoreOutcome::StashConflict { stash_sha }))) => {
-                events.send(Event::Toast(format!(
-                    "{} went back to its original ref, but the stash did not apply cleanly; \
-                 your changes are still in stash {stash_sha}",
-                    rec.repo_path.display()
-                )))
+            Ok(Ok((rec, outcome))) => {
+                let text = match outcome {
+                    RestoreOutcome::Restored => format!(
+                        "restored {} to {}",
+                        rec.repo_path.display(),
+                        original_ref_text(&rec.original)
+                    ),
+                    RestoreOutcome::StashConflict { stash_sha } => format!(
+                        "{} went back to its original ref, but the stash did not apply cleanly; \
+                         your changes are still in stash {stash_sha}",
+                        rec.repo_path.display()
+                    ),
+                };
+                events.send(Event::Toast(text));
             }
             Ok(Err(error)) => events.send(Event::Toast(format!(
                 "could not restore the checkout: {error}"
@@ -2045,6 +2129,7 @@ mod tests {
                 classifier: live.as_ref(),
                 cache: &cache,
                 deadline: None,
+                trace: None,
             };
             let extra: [&dyn SegmentPolicy; 1] = [&policy];
             classify(
@@ -2079,6 +2164,7 @@ mod tests {
                 classifier: live.as_ref(),
                 cache: &cache,
                 deadline: None,
+                trace: None,
             };
             let extra: [&dyn SegmentPolicy; 1] = [&policy];
             classify(
@@ -2928,7 +3014,7 @@ mod tests {
             _ => unreachable!(),
         };
 
-        fx.hub.cancel(&fx.key, &fx.tx);
+        fx.hub.cancel(SessionId(1), &fx.key, &fx.tx);
         let ended = wait_for(&fx.events, is_run_end);
         assert_eq!(run_status(&ended), Some(RunStatus::Cancelled));
 
@@ -2950,6 +3036,40 @@ mod tests {
             &fx.events,
             |e| matches!(e, Event::AiSnapshot { session, .. } if *session == SessionId(3)),
         );
+    }
+
+    /// A Cancel with nothing executing answers with a snapshot, not a toast:
+    /// the tab that showed a Cancel button learns what is really there instead
+    /// of keeping a spinner. The store's row still says `running`, which is
+    /// exactly the shape left behind by a run that died with the app.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_with_nothing_running_pushes_a_snapshot() {
+        use crate::ai::store::RunKind;
+
+        let fx = harness(clean_scripts(), host_launcher()).await;
+        let session = fx.store.session_id(&fx.key).expect("session");
+        fx.store
+            .run_begin(session, RunKind::Full, None, &fx.pr.head_sha)
+            .expect("a run row with no handle");
+
+        fx.hub.cancel(SessionId(1), &fx.key, &fx.tx);
+        let snapshot = match wait_for(&fx.events, |e| matches!(e, Event::AiSnapshot { .. })) {
+            Event::AiSnapshot { snapshot, .. } => snapshot,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            snapshot.run_liveness,
+            RunLiveness::Stopped,
+            "no handle means nothing is running, whatever the row says"
+        );
+        assert_eq!(
+            snapshot.run.as_ref().map(|run| run.status.as_str()),
+            Some("running")
+        );
+
+        // Finish finds the same nothing and answers the same way.
+        fx.hub.finish(SessionId(1), &fx.key, None, &fx.tx).await;
+        wait_for(&fx.events, |e| matches!(e, Event::AiSnapshot { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3788,7 +3908,7 @@ mod tests {
 
         // Resume: the reviewer continues, and its next request carries the
         // note the chat delivered.
-        fx.hub.resume(&fx.key, &fx.tx);
+        fx.hub.resume(SessionId(1), &fx.key, &fx.tx);
         wait_for(&fx.events, |e| {
             is_run_end(e) && run_status(e) == Some(RunStatus::Completed)
         });

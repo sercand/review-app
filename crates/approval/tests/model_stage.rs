@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use review_approval::model_stage::{
-    ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome, ModelPolicy,
+    ClassifierNote, ClassifierTrace, ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome,
+    ModelPolicy,
 };
 use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
 
@@ -38,6 +39,7 @@ fn run_with(cmd: &str, fake: &dyn CommandClassifier, cache: &DecisionCache) -> V
         classifier: fake,
         cache,
         deadline: None,
+        trace: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     let cfg = ApprovalConfig {
@@ -213,6 +215,7 @@ fn run_deny_paths(cmd: &str, outcome: ModelOutcome) -> Verdict {
         classifier: &fake,
         cache: &cache,
         deadline: None,
+        trace: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     let deny = review_approval::default_deny_paths();
@@ -325,6 +328,7 @@ fn run_with_deadline(
         classifier: fake,
         cache: &cache,
         deadline: Some(deadline),
+        trace: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     classify(
@@ -422,6 +426,7 @@ fn run_in(cmd: &str, cwd: Option<&Path>, fake: &dyn CommandClassifier, cache: &D
         classifier: fake,
         cache,
         deadline: None,
+        trace: None,
     };
     let extra: [&dyn SegmentPolicy; 1] = [&policy];
     classify(
@@ -474,4 +479,114 @@ fn a_new_classifier_generation_empties_the_cache() {
     assert_eq!(cache.get(None, "ls"), Some(ModelOutcome::Safe));
     cache.sync_generation(1);
     assert_eq!(cache.get(None, "ls"), None);
+}
+
+/// The trace the UI reads: one note per segment the model was consulted on,
+/// and a single aggregated verdict per command.
+fn run_traced(cmd: &str, outcome: ModelOutcome) -> (Verdict, Option<ClassifierNote>) {
+    let trace = ClassifierTrace::new();
+    let fake = FakeClassifier::new(outcome);
+    let cache = DecisionCache::new();
+    let policy = ModelPolicy {
+        classifier: &fake,
+        cache: &cache,
+        deadline: None,
+        trace: Some(&trace),
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    let verdict = classify(
+        cmd,
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &[],
+            cwd: None,
+            extra: &extra,
+        },
+    );
+    let ran = matches!(verdict, Verdict::Run { .. });
+    let note = trace.note(ran);
+    (verdict, note)
+}
+
+#[test]
+fn traces_record_the_model_verdict() {
+    // A command the rules cannot vouch for, approved by the model: it ran
+    // on the model's word.
+    let (verdict, note) = run_traced("mytool --check", ModelOutcome::Safe);
+    assert!(matches!(verdict, Verdict::Run { .. }), "{verdict:?}");
+    assert_eq!(note, Some(ClassifierNote::Approved));
+
+    // A safe verdict on a never-auto-run binary asks anyway: the model's
+    // word is shown but never runs the command.
+    let (verdict, note) = run_traced("curl example.com", ModelOutcome::Safe);
+    assert!(matches!(verdict, Verdict::Ask { .. }), "{verdict:?}");
+    assert_eq!(note, Some(ClassifierNote::Blocked));
+
+    // Abstain and danger show as what they are.
+    assert_eq!(
+        run_traced("mytool --check", ModelOutcome::NeedsApproval).1,
+        Some(ClassifierNote::NeedsApproval)
+    );
+    assert_eq!(
+        run_traced("mytool --check", ModelOutcome::Dangerous).1,
+        Some(ClassifierNote::Dangerous)
+    );
+    assert_eq!(
+        run_traced("mytool --check", ModelOutcome::Unavailable).1,
+        Some(ClassifierNote::Unavailable)
+    );
+}
+
+#[test]
+fn an_unconsulted_command_leaves_no_trace() {
+    // A read-only command is vouched by the rules before the model is ever
+    // consulted: no note, nothing to show.
+    let trace = ClassifierTrace::new();
+    let fake = FakeClassifier::new(ModelOutcome::Safe);
+    let cache = DecisionCache::new();
+    let policy = ModelPolicy {
+        classifier: &fake,
+        cache: &cache,
+        deadline: None,
+        trace: Some(&trace),
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    classify(
+        "ls -la",
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &[],
+            cwd: None,
+            extra: &extra,
+        },
+    );
+    assert_eq!(fake.calls(), 0);
+    assert_eq!(trace.note(true), None);
+}
+
+#[test]
+fn a_dangerous_segment_wins_the_aggregate() {
+    // `ls && mytool`: the model is consulted only for the segment the rules
+    // cannot vouch for; its danger carries the whole command.
+    let trace = ClassifierTrace::new();
+    let fake = FakeClassifier::new(ModelOutcome::Dangerous);
+    let cache = DecisionCache::new();
+    let policy = ModelPolicy {
+        classifier: &fake,
+        cache: &cache,
+        deadline: None,
+        trace: Some(&trace),
+    };
+    let extra: [&dyn SegmentPolicy; 1] = [&policy];
+    classify(
+        "ls && mytool --check",
+        &ApprovalConfig {
+            allowed: &[],
+            deny_paths: &[],
+            cwd: None,
+            extra: &extra,
+        },
+    );
+    assert_eq!(trace.notes(), [ClassifierNote::Dangerous]);
+    assert_eq!(trace.note(false), Some(ClassifierNote::Dangerous));
 }

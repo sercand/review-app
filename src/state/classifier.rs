@@ -17,7 +17,8 @@ pub enum ClassifierState {
     Loading,
     /// Loaded; the schema says which question the model is asked.
     Ready(SchemaSource),
-    /// No GPU, a backend error, or disabled after repeated failures.
+    /// No usable compute device, a backend error, or disabled after repeated
+    /// failures.
     Unavailable(String),
     /// A download or load error; retryable.
     Failed(String),
@@ -51,7 +52,7 @@ impl ClassifierState {
             }
             ClassifierState::Downloading { .. } => "Downloading…".to_owned(),
             ClassifierState::Loading => {
-                "Loading on GPU… (first start can take a minute)".to_owned()
+                "Loading the model… (first start can take a minute)".to_owned()
             }
             ClassifierState::Ready(SchemaSource::Model) => {
                 "Ready — model's own decision schema".to_owned()
@@ -104,7 +105,10 @@ mod tests {
                 },
                 "Downloading… 42 %",
             ),
-            (Loading, "Loading on GPU… (first start can take a minute)"),
+            (
+                Loading,
+                "Loading the model… (first start can take a minute)",
+            ),
             (
                 Ready(SchemaSource::Model),
                 "Ready — model's own decision schema",
@@ -113,7 +117,10 @@ mod tests {
                 Ready(SchemaSource::BuiltIn),
                 "Ready — built-in decision schema",
             ),
-            (Unavailable("no usable GPU".into()), "no usable GPU"),
+            (
+                Unavailable("no usable compute device".into()),
+                "no usable compute device",
+            ),
             (Failed("offline".into()), "offline"),
         ];
         for (state, text) in rows {

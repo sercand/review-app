@@ -32,6 +32,10 @@ pub struct ApprovalSetup {
     pub cache: Arc<DecisionCache>,
     /// How long the classifier may take before the command asks instead.
     pub timeout: Duration,
+    /// Full trust (settings `[ai.auto_approve].dangerously_approve_all`):
+    /// every command runs, denies and the classifier included. Checked
+    /// before anything else; see [`crate::ai::tools::bash`].
+    pub dangerously_approve_all: bool,
     /// Set while a model classification is running on a blocking thread. A
     /// timed-out call cannot be cancelled, so while it lingers later commands
     /// are decided without the model rather than stacking more threads.
@@ -94,6 +98,7 @@ impl ApprovalSetup {
             classifier: classifier.filter(|_| settings.local_classifier),
             cache: Arc::new(DecisionCache::new()),
             timeout: settings.timeout(),
+            dangerously_approve_all: settings.dangerously_approve_all,
             in_flight: Arc::new(AtomicBool::new(false)),
         }
     }

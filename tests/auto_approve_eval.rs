@@ -159,6 +159,7 @@ fn model_stage_with_perfect_fake_never_runs_never_approve_binaries() {
         classifier: &fake,
         cache: &cache,
         deadline: None,
+        trace: None,
     };
     let mut all = lines(DANGEROUS);
     all.extend(adversarial());
@@ -227,6 +228,7 @@ mod device {
             classifier: &counting,
             cache: &cache,
             deadline: None,
+            trace: None,
         };
         let extra: [&dyn SegmentPolicy; 1] = [&policy];
 

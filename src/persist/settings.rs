@@ -272,6 +272,13 @@ pub struct AutoApproveSettings {
     /// (`[a-z0-9._-]+`, see [`valid_decision_model`]); downloaded when the
     /// classifier is switched on.
     pub decision_model: String,
+    /// Full trust: every bash command runs without asking **and** the
+    /// secret-path denies are bypassed — the agent may read `.env*`,
+    /// `~/.ssh`, `~/.aws`, `.git/config` and this app's config folder, and
+    /// anything it reads can reach the model provider. Off by default; the
+    /// sandbox still confines writes and the agent still has no GitHub
+    /// credentials. Prepare commands (outside the sandbox) still ask.
+    pub dangerously_approve_all: bool,
 }
 
 /// The decision model used when none is configured.
@@ -294,6 +301,7 @@ impl Default for AutoApproveSettings {
             deny_paths: Vec::new(),
             capabilities: Vec::new(),
             decision_model: DEFAULT_DECISION_MODEL.to_owned(),
+            dangerously_approve_all: false,
         }
     }
 }
@@ -473,6 +481,10 @@ mod tests {
         assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 2000);
         assert!(s.ai.auto_approve.deny_paths.is_empty());
         assert!(s.ai.auto_approve.capabilities.is_empty());
+        assert!(
+            !s.ai.auto_approve.dangerously_approve_all,
+            "full trust is opt-in"
+        );
     }
 
     #[test]
@@ -486,6 +498,7 @@ mod tests {
             deny_paths: vec!["secrets".into()],
             capabilities: vec!["git:add".into(), "cargo:local".into()],
             decision_model: "d1-7b".into(),
+            dangerously_approve_all: true,
         };
         s.save(dir.path()).unwrap();
         let back = Settings::load_or_default(dir.path());

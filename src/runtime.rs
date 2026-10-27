@@ -1940,11 +1940,11 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             ctx.ai.user_message(session, &key, text, &events);
         }
         #[cfg(unix)]
-        Command::AiPause { session: _, key } => ctx.ai.pause(&key, &events),
+        Command::AiPause { session, key } => ctx.ai.pause(session, &key, &events),
         #[cfg(unix)]
-        Command::AiResume { session: _, key } => ctx.ai.resume(&key, &events),
+        Command::AiResume { session, key } => ctx.ai.resume(session, &key, &events),
         #[cfg(unix)]
-        Command::AiCancel { session: _, key } => ctx.ai.cancel(&key, &events),
+        Command::AiCancel { session, key } => ctx.ai.cancel(session, &key, &events),
         #[cfg(unix)]
         Command::AiFinish {
             session,

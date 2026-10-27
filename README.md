@@ -118,6 +118,14 @@ submit it yourself.
    confirm them.
 
 Other commands ask for approval in the AI tab, once or for the whole review.
+Under **Settings → AI → Auto-approve** there is a **Dangerous: approve every
+command (full trust)** option: every command runs without asking and the
+sandbox stops hiding secret files (`.env*`, `~/.ssh`, `~/.aws`, `.git/config`
+and this app's config folder become readable, and what the agent reads can
+reach the model provider). Writes stay confined to the checkout and a temp
+dir, the agent still has no GitHub credentials, and prepare commands — which
+run outside the sandbox — still ask. While it is on, the AI tab shows a red
+warning. Off by default; turning it on asks for an explicit confirmation.
 
 ### The sandbox
 
@@ -183,8 +191,10 @@ rank models, and no model can meet the +10-point promotion rule on it (see
   (`approve_threshold`), and a model that picks `deny` makes the command ask
   with a warning. A schema file that is present but invalid disables the
   classifier rather than falling back to the default.
-- macOS only for now (Apple GPU through Metal). The release builds include it;
-  from source, build with `--features local-classifier`. A Linux CUDA build
+- Runs on any machine: shiso always compiles its CPU backend, so a build with
+  no usable GPU loads the model on the CPU (slower per command). On macOS the
+  release builds include Metal; from source, build with
+  `--features local-classifier`. A Linux CUDA build
   (`--features local-classifier-cuda`) exists but is untested.
 - Turning it on in Settings downloads the weights from the shiso model
   registry (the size is the registry's; about 0.2 GiB for

@@ -19,7 +19,10 @@ use crate::ai::store::CheckoutRecord;
 use crate::ai::tools::AgentRole;
 use crate::ai::ui_interaction::ApprovalKind;
 use crate::persist::settings::{AiSettings, RepoAiSettings};
-use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry, change_blocked};
+use crate::state::ai_review::{
+    AiPhase, AiReviewState, ClassifierNote, TimelineEntry, change_blocked, classifier_note_text,
+    unrestored_for_repo,
+};
 use crate::ui::widgets::markdown;
 use crate::ui::{fonts, icons, theme};
 
@@ -81,6 +84,9 @@ pub enum AiPanelAction {
     /// Unlink the repo's local folder; the commands, prepare commands and
     /// extra paths stay for a relink (AI settings Task 7).
     UnlinkFolder,
+    /// Reopen the recovery dialog for this repo's unrestored checkouts
+    /// (dismissed earlier with "Later"); the records ride along.
+    RestoreCheckout(Vec<CheckoutRecord>),
     /// Open the repo-commands dialog from the row's edit affordance
     /// (AI settings Task 7).
     EditRepoCommands,
@@ -107,6 +113,13 @@ pub struct LocalCheckoutVm {
     pub blockers: Vec<String>,
     /// Why Change… / Unlink are disabled, or `None` when the link can move.
     pub change_blocked: Option<String>,
+    /// The repo's unrestored checkouts a Restore… action can offer (empty
+    /// when nothing waits or a run is live); the records [`change_blocked`]
+    /// names, for the recovery dialog.
+    pub restore: Vec<CheckoutRecord>,
+    /// Full trust (`[ai.auto_approve].dangerously_approve_all`) is on: the
+    /// tab warns that every command will run without asking.
+    pub trust_all: bool,
 }
 
 /// Window-level data the tab displays but does not own.
@@ -151,6 +164,8 @@ pub fn local_checkout_vm(
         error,
         blockers: start_blockers(ai, repo_key, has_key),
         change_blocked: change_blocked(ai_state, unrestored, repo_key),
+        restore: unrestored_for_repo(ai_state, unrestored, repo_key),
+        trust_all: ai.auto_approve.dangerously_approve_all,
     }
 }
 
@@ -301,6 +316,15 @@ pub fn render(
     let mut actions = Vec::new();
     if let Some(vm) = inputs.checkout {
         render_local_checkout(ui, vm, inputs.repo, &mut actions);
+        // A standing reminder while full trust is on: the agent asks nothing
+        // and can read secret paths (Settings → AI → Auto-approve).
+        if vm.trust_all {
+            let p = theme::palette_of(ui);
+            ui.colored_label(
+                p.bad,
+                RichText::new("Full trust is on: every command runs without asking.").strong(),
+            );
+        }
         ui.separator();
     }
     render_stage_strip(ui, st);
@@ -383,7 +407,19 @@ fn render_local_checkout(
             }
         }
         if let Some(reason) = &vm.change_blocked {
-            ui.colored_label(p.pending, reason);
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(p.pending, reason);
+                // The blocker the user can act on: the recovery dialog
+                // they dismissed with "Later", reopened from here.
+                if !vm.restore.is_empty()
+                    && ui
+                        .button("Restore…")
+                        .on_hover_text("Restore the checkout this AI review left behind")
+                        .clicked()
+                {
+                    actions.push(AiPanelAction::RestoreCheckout(vm.restore.clone()));
+                }
+            });
         }
         if let Some(error) = &vm.error {
             ui.colored_label(p.bad, error);
@@ -616,13 +652,16 @@ fn render_entry(
                 .id_salt(("ai-entry", index))
                 .default_open(stop.is_none())
                 .show(ui, |ui| {
-                    for (name, summary) in tools {
+                    for line in tools {
                         // Tool summaries are JSON one-liners with long
                         // unbreakable tokens; truncate to the pane width and
                         // show the full line on hover, or the tab's min width
                         // would widen the right pane past the splitter
                         // (the ScrollArea expands to fit its content).
-                        tool_line(ui, &format!("{name} {summary}"), p.muted);
+                        tool_line(ui, &format!("{} {}", line.name, line.summary), p.muted);
+                        if let Some(note) = line.note {
+                            classifier_note_label(ui, note, p);
+                        }
                     }
                     if !text.is_empty() {
                         markdown::render(ui, &markdown::to_doc(text));
@@ -753,8 +792,15 @@ fn render_entry(
             ui.label(RichText::new("Chat").font(fonts::semibold(12.5)));
             markdown::render(ui, &markdown::to_doc(text));
         }
-        TimelineEntry::ChatTool { name, summary } => {
+        TimelineEntry::ChatTool {
+            name,
+            summary,
+            note,
+        } => {
             tool_line(ui, &format!("{name} {summary}"), p.muted);
+            if let Some(note) = note {
+                classifier_note_label(ui, *note, p);
+            }
         }
         TimelineEntry::Notice { text } => {
             ui.colored_label(p.pending, text);
@@ -983,6 +1029,23 @@ fn tool_line(ui: &mut egui::Ui, text: &str, color: Color32) {
         .on_hover_text(text);
 }
 
+/// The classifier's verdict under a `bash` tool line, in the badge colour
+/// its meaning deserves: quiet approval in green, an ask it could not
+/// settle in amber, danger in red, the rest muted.
+fn classifier_note_label(ui: &mut egui::Ui, note: ClassifierNote, p: &theme::Palette) {
+    let color = match note {
+        ClassifierNote::Approved => p.ok,
+        ClassifierNote::Blocked | ClassifierNote::NeedsApproval => p.pending,
+        ClassifierNote::Dangerous => p.bad,
+        ClassifierNote::Unavailable => p.faint,
+    };
+    ui.label(
+        RichText::new(classifier_note_text(note))
+            .color(color)
+            .size(11.0),
+    );
+}
+
 /// The accent for a finding's severity, matching the diff's draft styling.
 pub(crate) fn severity_color(p: &theme::Palette, severity: crate::ai::review::Severity) -> Color32 {
     use crate::ai::review::Severity;
@@ -998,7 +1061,7 @@ pub(crate) fn severity_color(p: &theme::Palette, severity: crate::ai::review::Se
 mod tests {
     use super::*;
     use crate::ai::tools::AgentRef;
-    use crate::state::ai_review::BriefSuggestions;
+    use crate::state::ai_review::{BriefSuggestions, ToolLine};
 
     fn reviewer(group: Option<&str>) -> TimelineEntry {
         TimelineEntry::Agent {
@@ -1161,7 +1224,11 @@ mod tests {
                 TimelineEntry::Agent {
                     agent: agent.clone(),
                     group: Some("notifications".to_string()),
-                    tools: vec![("read_file".to_string(), "src/a.rs".to_string())],
+                    tools: vec![ToolLine {
+                        name: "read_file".to_string(),
+                        summary: "src/a.rs".to_string(),
+                        note: None,
+                    }],
                     text: "Checking the retry path.".to_string(),
                     stop: None,
                 },
@@ -1342,6 +1409,8 @@ mod tests {
             error: None,
             blockers: vec!["Link a local folder for github.com/acme/widgets.".to_string()],
             change_blocked: None,
+            restore: Vec::new(),
+            trust_all: false,
         };
         let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
         harness.get_by_label("Start AI review").click();
@@ -1376,6 +1445,8 @@ mod tests {
             error: None,
             blockers: Vec::new(),
             change_blocked: None,
+            restore: Vec::new(),
+            trust_all: false,
         };
         let repo = RepoAiSettings {
             repo: "github.com/acme/widgets".to_string(),
@@ -1420,6 +1491,8 @@ mod tests {
                 "An AI review is running for this repository — finish it before changing the folder."
                     .to_string(),
             ),
+            restore: Vec::new(),
+            trust_all: false,
         };
         let mut harness = panel_harness_row(
             AiReviewState {
@@ -1444,6 +1517,48 @@ mod tests {
         );
     }
 
+    /// A dismissed recovery dialog is reopenable: with unrestored records
+    /// the row shows Restore… next to the blocker and hands the records to
+    /// the app, which reopens the dialog.
+    #[test]
+    fn the_row_offers_to_reopen_recovery() {
+        use crate::ai::store::{CheckoutState, OriginalRef};
+        use egui_kittest::kittest::Queryable;
+        use std::path::PathBuf;
+
+        let record = CheckoutRecord {
+            id: 4,
+            repo_path: PathBuf::from("/src/widgets"),
+            repo: "acme/widgets".to_string(),
+            pr_number: 7,
+            original: OriginalRef::Branch("main".to_string()),
+            stash_sha: None,
+            head_sha: "sha_head".to_string(),
+            state: CheckoutState::Failed,
+        };
+        let vm = LocalCheckoutVm {
+            repo: "acme/widgets".to_string(),
+            path: Some(PathBuf::from("/src/widgets")),
+            status: FolderStatus::Ok,
+            error: None,
+            blockers: Vec::new(),
+            change_blocked: Some(
+                "This repository has an unrestored AI checkout — restore it before changing the folder or starting a review."
+                    .to_string(),
+            ),
+            restore: vec![record.clone()],
+            trust_all: false,
+        };
+        let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
+        harness.run();
+        harness.get_by_label("Restore…").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![AiPanelAction::RestoreCheckout(vec![record])]
+        );
+    }
+
     /// The row's error — the probe's complaint about the last folder
     /// choice — is shown in the row, not a toast.
     #[test]
@@ -1461,6 +1576,8 @@ mod tests {
             ),
             blockers: Vec::new(),
             change_blocked: None,
+            restore: Vec::new(),
+            trust_all: false,
         };
         let mut harness = panel_harness_row(AiReviewState::default(), vm, None);
         harness.run();
@@ -1536,11 +1653,16 @@ mod tests {
                     agent: agent.clone(),
                     group: Some("notifications".into()),
                     tools: vec![
-                        ("bash".into(), long_json),
-                        (
-                            "read_file".into(),
-                            "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
-                        ),
+                        ToolLine {
+                            name: "bash".into(),
+                            summary: long_json,
+                            note: None,
+                        },
+                        ToolLine {
+                            name: "read_file".into(),
+                            summary: "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
+                            note: None,
+                        },
                     ],
                     text: String::new(),
                     stop: None,

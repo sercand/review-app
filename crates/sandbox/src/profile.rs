@@ -34,6 +34,11 @@ pub struct SandboxPolicy {
     pub write_paths: Vec<PathBuf>,
     /// Paths the agent must not read (spec §8.2 credentials).
     pub deny_read: Vec<PathBuf>,
+    /// Hide repo-local `.env*` files (Seatbelt by name at any depth,
+    /// bubblewrap by covering the ones that exist at launch). True unless
+    /// the user switched on full trust (`dangerously_approve_all`), which
+    /// also empties `deny_read`.
+    pub deny_env_reads: bool,
 }
 
 /// The toolchain caches the agent may write (spec §8.2), joined onto `home`.
@@ -205,10 +210,12 @@ pub fn seatbelt_profile(policy: &SandboxPolicy) -> std::io::Result<String> {
     // later. In an SBPL `#"..."` regex literal a backslash is not an escape
     // and a quote cannot be written, so the repo root is only regex-escaped,
     // with `"` matched by `.` (over-matching a path no real repo has).
-    let root = regex_escape(&repo.display().to_string()).replace('"', ".");
-    p.push_str(&format!(
-        "(deny file-read* (regex #\"^{root}/(.*/)?\\.env[^/]*$\"))\n"
-    ));
+    if policy.deny_env_reads {
+        let root = regex_escape(&repo.display().to_string()).replace('"', ".");
+        p.push_str(&format!(
+            "(deny file-read* (regex #\"^{root}/(.*/)?\\.env[^/]*$\"))\n"
+        ));
+    }
     Ok(p)
 }
 
@@ -257,9 +264,11 @@ pub fn bwrap_args(policy: &SandboxPolicy) -> std::io::Result<Vec<OsString>> {
     }
     // Repo-local secrets: hide each `.env*` file that exists now (see
     // `repo_env_files`; files created later are not covered here).
-    for f in repo_env_files(&repo) {
-        push(&mut args, "--ro-bind", Path::new("/dev/null"));
-        args.push(f.as_os_str().to_os_string());
+    if policy.deny_env_reads {
+        for f in repo_env_files(&repo) {
+            push(&mut args, "--ro-bind", Path::new("/dev/null"));
+            args.push(f.as_os_str().to_os_string());
+        }
     }
     args.push("--die-with-parent".into());
     push(&mut args, "--chdir", &repo);
@@ -368,6 +377,7 @@ mod tests {
             tmp,
             write_paths: vec![],
             deny_read: vec![],
+            deny_env_reads: true,
         })
         .unwrap();
         let canon = canon(&repo).replace('"', "\\\"");
@@ -400,6 +410,7 @@ mod tests {
             tmp: tmp.clone(),
             write_paths: vec![],
             deny_read: vec![secret.clone(), netrc.clone()],
+            deny_env_reads: true,
         })
         .unwrap()
         .iter()
@@ -442,6 +453,7 @@ mod tests {
             tmp,
             write_paths: vec![t.path().join("gone-write")],
             deny_read: vec![t.path().join("gone-deny")],
+            deny_env_reads: true,
         };
         let p = seatbelt_profile(&policy).unwrap();
         assert!(!p.contains("gone-write"));
@@ -469,6 +481,7 @@ mod tests {
             tmp,
             write_paths: vec![],
             deny_read: vec![secret.clone(), netrc.clone()],
+            deny_env_reads: true,
         })
         .unwrap();
         assert!(p.contains(&format!(
@@ -493,6 +506,7 @@ mod tests {
             tmp,
             write_paths: vec![],
             deny_read: vec![],
+            deny_env_reads: true,
         })
         .unwrap();
         // Regex metacharacters backslash-escaped once (an SBPL regex literal
@@ -538,6 +552,7 @@ mod tests {
             tmp,
             write_paths: vec![],
             deny_read: vec![],
+            deny_env_reads: true,
         })
         .unwrap()
         .iter()
@@ -584,6 +599,7 @@ mod tests {
             tmp,
             write_paths: vec![],
             deny_read: vec![],
+            deny_env_reads: true,
         })
         .unwrap();
         assert!(!args.iter().any(|a| a.to_string_lossy().ends_with("/.env")));

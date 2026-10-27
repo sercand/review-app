@@ -381,7 +381,9 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
     use crate::ai::ui_interaction::ApprovalKind;
     use crate::model::comment::Anchor;
     use crate::model::diff::Side;
-    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+    use crate::state::ai_review::{
+        AiPhase, AiReviewState, ClassifierNote, TimelineEntry, ToolLine,
+    };
 
     let reviewer = AgentRef {
         id: 1,
@@ -403,7 +405,11 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
         TimelineEntry::Agent {
             agent: scout,
             group: None,
-            tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
+            tools: vec![ToolLine {
+                name: "read_file".into(),
+                summary: "src/lib/data-tools/push.ts".into(),
+                note: None,
+            }],
             text: "Grouped the 6 changed files into 2 review groups.".into(),
             stop: Some("finished".into()),
         },
@@ -415,16 +421,18 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
             agent: reviewer.clone(),
             group: Some("notifications".into()),
             tools: vec![
-                (
-                    "bash".into(),
+                ToolLine {
+                    name: "bash".into(),
                     // A real scout/reviewer tool call: 400+ chars of JSON with
                     // long unbreakable path tokens (the live smoke-test bug).
-                    "{\"command\":\"for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md docs/superpowers/plans/2026-10-20-ai-review-3-ui-chat.md docs/superpowers/specs/2026-10-19-ai-review-design.md ; do echo \\\"=== $f ===\\\"; head -40 \\\"$f\\\"; done\"}".into(),
-                ),
-                (
-                    "read_file".into(),
-                    "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
-                ),
+                    summary: "{\"command\":\"for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md docs/superpowers/plans/2026-10-20-ai-review-3-ui-chat.md docs/superpowers/specs/2026-10-19-ai-review-design.md ; do echo \\\"=== $f ===\\\"; head -40 \\\"$f\\\"; done\"}".into(),
+                    note: Some(ClassifierNote::Blocked),
+                },
+                ToolLine {
+                    name: "read_file".into(),
+                    summary: "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
+                    note: None,
+                },
             ],
             text: "The create path looks up links even when the author set them. Checking whether the lookup can fail the create.".into(),
             stop: None,
@@ -497,7 +505,7 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
     use crate::ai::ui_interaction::ApprovalKind;
     use crate::model::comment::Anchor;
     use crate::model::diff::Side;
-    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry, ToolLine};
 
     let reviewer = AgentRef {
         id: 1,
@@ -547,7 +555,11 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
             TimelineEntry::Agent {
                 agent: reviewer.clone(),
                 group: Some("notifications".into()),
-                tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
+                tools: vec![ToolLine {
+                    name: "read_file".into(),
+                    summary: "src/lib/data-tools/push.ts".into(),
+                    note: None,
+                }],
                 text:
                     "The create path fails when the link lookup rejects; the warning path is fine."
                         .into(),
@@ -577,6 +589,7 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
             TimelineEntry::ChatTool {
                 name: "note_agent".into(),
                 summary: "{\"agent_id\":4,\"text\":\"focus on the create path\"}".into(),
+                note: None,
             },
             TimelineEntry::ChatReply {
                 text: "Both reviewers now cover the create path; one bug found.".into(),
@@ -895,6 +908,8 @@ fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
             vec!["Link a local folder for github.com/acme/widgets.".to_string()]
         },
         change_blocked: None,
+        restore: Vec::new(),
+        trust_all: false,
     };
     let repo = RepoAiSettings {
         repo: "github.com/acme/widgets".to_string(),

@@ -398,6 +398,12 @@ pub struct AutoApproveVm {
     /// The registry name of the decision model, as typed. Blank saves as the
     /// default model.
     pub decision_model: String,
+    /// Full trust: run every command, bypass the denies. Turning it on
+    /// needs a confirmation checkbox first.
+    pub dangerously_approve_all: bool,
+    /// The confirmation ticked in this dialog session; required before
+    /// Save while it turns full trust on.
+    pub approve_all_confirmed: bool,
     /// The extra deny patterns, one per line.
     pub deny_paths_text: String,
     /// Every capability with its on/off state. Names the dialog does not
@@ -430,6 +436,8 @@ impl AutoApproveVm {
             classifier_state: ClassifierState::Off,
             timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
             decision_model: s.decision_model.clone(),
+            dangerously_approve_all: s.dangerously_approve_all,
+            approve_all_confirmed: s.dangerously_approve_all,
             deny_paths_text: s.deny_paths.join("\n"),
             capabilities,
         }
@@ -501,6 +509,7 @@ impl AutoApproveVm {
             model => model.to_owned(),
         };
         s.deny_paths = self.deny_paths();
+        s.dangerously_approve_all = self.dangerously_approve_all;
         s.capabilities = self
             .capabilities
             .iter()
@@ -511,8 +520,18 @@ impl AutoApproveVm {
 
     /// The table the dialog's Save commits: `stored` with the edits written
     /// over it, or why it cannot be saved (nothing is written then).
+    /// Turning full trust on is refused until the confirmation is ticked.
     pub fn saved(&self, stored: &AutoApproveSettings) -> Result<AutoApproveSettings, String> {
         self.validate()?;
+        if self.dangerously_approve_all
+            && !stored.dangerously_approve_all
+            && !self.approve_all_confirmed
+        {
+            return Err(
+                "confirm the full-trust warning before saving: every command runs, and the agent can read secret paths"
+                    .to_owned(),
+            );
+        }
         let mut next = stored.clone();
         self.write_to(&mut next);
         Ok(next)
@@ -561,6 +580,11 @@ pub fn auto_approve_rows(
                 aa.decision_model,
                 classifier_state.text(classifier::COMPILED)
             ),
+        },
+        AutoApproveRowVm {
+            stage: "Full trust (dangerous)",
+            state: on_off(aa.dangerously_approve_all),
+            detail: "every command runs, secret paths readable".to_owned(),
         },
     ]
 }
@@ -1578,6 +1602,36 @@ fn auto_approve_fields(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut 
             .map_or("", |(_, description)| *description);
         ui.checkbox(on, format!("{name}  {description}"));
     }
+    // Full trust: the whole engine aside. Red, and needs a confirmation
+    // tick when turned on; turning it off needs none.
+    ui.add_space(6.0);
+    rule(ui);
+    let turning_on = vm.dangerously_approve_all && !vm.approve_all_confirmed;
+    ui.colored_label(
+        p.bad,
+        RichText::new("Dangerous: approve every command (full trust)").strong(),
+    );
+    ui.checkbox(
+        &mut vm.dangerously_approve_all,
+        "Run every command without asking",
+    );
+    ui.label(
+        RichText::new(
+            "Skips the rules, the classifier and the deny list, and the sandbox stops hiding secret \
+             files: the agent may read .env files, ~/.ssh, ~/.aws, .git/config and this app's \
+             config folder, and what it reads can reach the model provider. Writes stay confined \
+             to the checkout and a temp dir, the agent still has no GitHub credentials, and \
+             prepare commands (which run outside the sandbox) still ask.",
+        )
+        .size(12.0)
+        .color(p.muted),
+    );
+    if turning_on {
+        ui.checkbox(
+            &mut vm.approve_all_confirmed,
+            RichText::new("I understand every command will run unreviewed").color(p.bad),
+        );
+    }
 }
 
 /// The auto-approve dialog, shown only while [`AiTabState::auto_approve`] is
@@ -2152,6 +2206,7 @@ mod tests {
                 "future:thing".into(),
             ],
             decision_model: "d1-7b".into(),
+            dangerously_approve_all: false,
         };
         let before = settings.clone();
         let vm = AutoApproveVm::from_settings(&settings);
@@ -2159,6 +2214,30 @@ mod tests {
         assert_eq!(vm.deny_paths_text, "secrets\n.env*");
         apply(&vm, &mut settings).unwrap();
         assert_eq!(settings, before);
+    }
+
+    /// Full trust saves only with the confirmation ticked, and a vm opened
+    /// on already-on settings needs none (so turning it off always works).
+    #[test]
+    fn approve_all_requires_confirmation_to_turn_on() {
+        let off = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&off);
+        vm.dangerously_approve_all = true;
+        assert!(
+            vm.saved(&off).is_err(),
+            "a fresh full-trust choice needs the tick"
+        );
+        vm.approve_all_confirmed = true;
+        let next = vm.saved(&off).unwrap();
+        assert!(next.dangerously_approve_all);
+
+        // Already on: reopening the dialog can save (and switch off) with
+        // no tick.
+        let vm = AutoApproveVm::from_settings(&next);
+        assert!(vm.saved(&next).unwrap().dangerously_approve_all);
+        let mut vm = AutoApproveVm::from_settings(&next);
+        vm.dangerously_approve_all = false;
+        assert!(!vm.saved(&next).unwrap().dangerously_approve_all);
     }
 
     #[test]
@@ -2295,7 +2374,10 @@ mod tests {
             ..AutoApproveSettings::default()
         };
         let mut vm = AutoApproveVm::from_settings(&settings);
-        vm.set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        vm.set_classifier_state_for(
+            ClassifierState::Unavailable("no usable compute device".into()),
+            true,
+        );
         // Untouched: the stored true stays.
         apply(&vm, &mut settings).unwrap();
         assert!(settings.local_classifier);
@@ -2314,7 +2396,10 @@ mod tests {
         let mut aa = AutoApproveVm::default();
         aa.set_classifier_state_for(ClassifierState::Failed("offline".into()), true);
         assert!(aa.classifier_available, "editable while Failed");
-        aa.set_classifier_state_for(ClassifierState::Unavailable("no usable GPU".into()), true);
+        aa.set_classifier_state_for(
+            ClassifierState::Unavailable("no usable compute device".into()),
+            true,
+        );
         assert!(!aa.classifier_available);
         aa.set_classifier_state_for(ClassifierState::Off, false);
         assert!(!aa.classifier_available);
@@ -2370,7 +2455,7 @@ mod tests {
             ..AutoApproveSettings::default()
         };
         let rows = auto_approve_rows(&aa, &ClassifierState::Failed("offline".into()));
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].stage, "Rules");
         assert_eq!(rows[0].state, "on");
         assert_eq!(rows[0].detail, "1 capability, 2 extra deny patterns");
@@ -2382,5 +2467,13 @@ mod tests {
                 .detail
                 .ends_with(&ClassifierState::Failed("offline".into()).text(classifier::COMPILED))
         );
+        // Full trust rides along, off by default and named as dangerous.
+        assert_eq!(rows[2].stage, "Full trust (dangerous)");
+        assert_eq!(rows[2].state, "off");
+        let on = AutoApproveSettings {
+            dangerously_approve_all: true,
+            ..aa.clone()
+        };
+        assert_eq!(auto_approve_rows(&on, &ClassifierState::Off)[2].state, "on");
     }
 }

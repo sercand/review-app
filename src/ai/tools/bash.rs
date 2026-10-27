@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use review_approval::model_stage::ModelPolicy;
+use review_approval::model_stage::{ClassifierNote, ClassifierTrace, ModelPolicy};
 use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -113,7 +113,13 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     if cx.for_review_contains(&line) {
         return None;
     }
-    let verdict = decide(command, cx).await;
+    let (verdict, note) = decide(command, cx).await;
+    if let Some(note) = note {
+        // The tool line gets the classifier's verdict; a command approved
+        // earlier in this review never reaches this function, so it shows
+        // no badge.
+        cx.run.classifier_note(&cx.agent, note);
+    }
     let reason = match verdict {
         Verdict::Run { source } => {
             tracing::debug!(source, command, "bash command auto-approved");
@@ -147,7 +153,8 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
     }
 }
 
-/// The engine's verdict for `command` under the run's [`ApprovalSetup`].
+/// The engine's verdict for `command` under the run's [`ApprovalSetup`], and
+/// what the local classifier thought of it, if it was consulted.
 ///
 /// Without a classifier the engine is pure and fast, so it runs inline. With
 /// one, the model may block (a GPU call, a lock), so the whole classification
@@ -161,7 +168,17 @@ async fn approve(command: &str, cx: &ToolCx) -> Option<ToolOutput> {
 ///
 /// [`ApprovalSetup`]: crate::ai::approval_setup::ApprovalSetup
 /// [`ApprovalSetup::timeout`]: crate::ai::approval_setup::ApprovalSetup::timeout
-async fn decide(command: &str, cx: &ToolCx) -> Verdict {
+async fn decide(command: &str, cx: &ToolCx) -> (Verdict, Option<ClassifierNote>) {
+    // Full trust short-circuits everything below: no rules, no model, no
+    // timeout machinery.
+    if cx.approval.dangerously_approve_all {
+        return (
+            Verdict::Run {
+                source: "dangerous",
+            },
+            None,
+        );
+    }
     let setup = cx.approval.clone();
     let allowed = cx.allowed_snapshot();
     let deny_paths = setup.effective_deny_paths();
@@ -176,7 +193,7 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
     } else {
         None
     };
-    let verdict = if let Some(guard) = guard {
+    let (verdict, note) = if let Some(guard) = guard {
         let owned = command.to_string();
         let timeout = cx.approval.timeout;
         let deadline = Instant::now() + timeout;
@@ -189,7 +206,7 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
             })
         };
         match tokio::time::timeout(timeout, blocking).await {
-            Ok(Ok(verdict)) => verdict,
+            Ok(Ok(pair)) => pair,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "command classifier thread failed; asking");
                 run(command, Some(Instant::now()))
@@ -206,10 +223,13 @@ async fn decide(command: &str, cx: &ToolCx) -> Verdict {
         run(command, Some(Instant::now()))
     };
     match verdict {
-        Verdict::Run { .. } if !cx.approval.enabled => Verdict::Ask {
-            reason: "auto-approve is off".to_string(),
-        },
-        other => other,
+        Verdict::Run { .. } if !cx.approval.enabled => (
+            Verdict::Ask {
+                reason: "auto-approve is off".to_string(),
+            },
+            note,
+        ),
+        other => (other, note),
     }
 }
 
@@ -223,7 +243,7 @@ fn classify_with(
     deny_paths: &[String],
     repo_root: &std::path::Path,
     model_deadline: Option<Instant>,
-) -> Verdict {
+) -> (Verdict, Option<ClassifierNote>) {
     // With auto-approve off nothing may vouch for the command; only the deny
     // list and the repo's own allowed lines (which `Run` is mapped away from
     // by the caller) are left.
@@ -233,18 +253,20 @@ fn classify_with(
             extra.push(*policy);
         }
     }
+    let trace = ClassifierTrace::new();
     let model = match (&setup.classifier, model_deadline.is_some() && setup.enabled) {
         (Some(classifier), true) => Some(ModelPolicy {
             classifier: classifier.as_ref(),
             cache: &setup.cache,
             deadline: model_deadline,
+            trace: Some(&trace),
         }),
         _ => None,
     };
     if let Some(model) = &model {
         extra.push(model);
     }
-    classify(
+    let verdict = classify(
         command,
         &ApprovalConfig {
             allowed,
@@ -252,7 +274,9 @@ fn classify_with(
             cwd: Some(repo_root),
             extra: &extra,
         },
-    )
+    );
+    let ran = matches!(verdict, Verdict::Run { .. });
+    (verdict, trace.note(ran))
 }
 
 /// The line "for this review" remembers.

@@ -16,6 +16,7 @@ frame (`src/runtime.rs`).
 - GitHub reads may be retried; writes never are.
 - No change may make `review_approval::classify` return `Run` for a command containing an unhandled construct; every new policy needs a table test and a deny/defer counter-example.
 - A new `CommandClassifier` implementation must keep returning `Unavailable` on any failure; the never-approve table may only grow without a design review.
+- `[ai.auto_approve].dangerously_approve_all` (full trust) bypasses the approval engine and the sandbox's secret-read denies only at the `bash` tool and hub boundaries; no other tool may consult it, and it never skips prepare-command approval.
 - `local_classifier` (decision-model) code must return `Unavailable` rather than propagate errors, keep a present-but-invalid `decision_schema.json` from falling back to the built-in schema, and never log command text above debug; the decision input must stay one `cmd:` line (command text escaped).
 - [src/ai/**] No tool may write to GitHub, merge, approve, or edit files.
 - [src/diff/**] Changes keep the diff virtualized; check `tests/perf_large_pr.rs`.

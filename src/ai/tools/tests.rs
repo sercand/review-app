@@ -1387,6 +1387,43 @@ async fn bash_still_asks_for_unknown_commands() {
     assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
 }
 
+/// Full trust (`dangerously_approve_all`) runs what the rules deny and what
+/// they would ask, with no prompt and no classifier call.
+#[tokio::test]
+async fn full_trust_runs_denied_and_unvouched_commands_silently() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let settings = AutoApproveSettings {
+        dangerously_approve_all: true,
+        ..AutoApproveSettings::default()
+    };
+    let classifier = FixedClassifier::new(ModelOutcome::Dangerous);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(classifier.clone()),
+    );
+
+    // A denied secret path: normally blocked without asking.
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(text(&out).contains("TOKEN=1"));
+
+    // An unvouched command: normally an ask.
+    let out = bash(&cx, json!({"command": "touch trusted"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("trusted").exists());
+
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    assert_eq!(
+        classifier.calls.load(Ordering::SeqCst),
+        0,
+        "full trust never asks the model"
+    );
+}
+
 // ---- the optional classifier stage ----
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

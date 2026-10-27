@@ -34,6 +34,74 @@ pub struct ClassifyInput<'a> {
     pub cwd: Option<&'a Path>,
 }
 
+/// What the model stage concluded about one command, as shown to the user.
+///
+/// Recorded per consulted segment, then aggregated by the caller into one
+/// note per command. A note exists only when the model was actually asked:
+/// commands the rules vouched for on their own show nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassifierNote {
+    /// Every segment the model saw it approved, and the command ran.
+    Approved,
+    /// The model approved a segment, but a never-auto-run rule (a listed
+    /// binary, a repo path) still had the last word; the command asked.
+    Blocked,
+    /// The model abstained; the command asked.
+    NeedsApproval,
+    /// The model flagged the command; the command asked with a warning.
+    Dangerous,
+    /// The model was asked but could not answer (busy, timed out, failed).
+    Unavailable,
+}
+
+/// Per-segment [`ClassifierNote`]s of one command, filled by [`ModelPolicy`]
+/// while the engine consults it, read by the caller afterwards.
+#[derive(Default)]
+pub struct ClassifierTrace {
+    notes: Mutex<Vec<ClassifierNote>>,
+}
+
+impl ClassifierTrace {
+    pub fn new() -> ClassifierTrace {
+        ClassifierTrace::default()
+    }
+
+    fn push(&self, note: ClassifierNote) {
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(note);
+    }
+
+    /// What was recorded, in order.
+    pub fn notes(&self) -> Vec<ClassifierNote> {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The single note for the command: the most informative segment wins,
+    /// and a command that ran is approved whatever the segments said along
+    /// the way (they cannot disagree with a `Run`: the model is the last
+    /// policy, and anything it withheld asks).
+    pub fn note(&self, ran: bool) -> Option<ClassifierNote> {
+        let notes = self.notes();
+        if notes.is_empty() {
+            return None;
+        }
+        let has = |note| notes.contains(&note);
+        if ran {
+            Some(ClassifierNote::Approved)
+        } else if has(ClassifierNote::Dangerous) {
+            Some(ClassifierNote::Dangerous)
+        } else if has(ClassifierNote::Blocked) {
+            Some(ClassifierNote::Blocked)
+        } else if has(ClassifierNote::NeedsApproval) {
+            Some(ClassifierNote::NeedsApproval)
+        } else {
+            Some(ClassifierNote::Unavailable)
+        }
+    }
+}
+
 pub trait CommandClassifier: Send + Sync {
     /// `input.segment` is argv joined by single spaces. The caller enforces the
     /// timeout, but it can only stop waiting, not stop the call: an
@@ -118,6 +186,10 @@ pub struct ModelPolicy<'a> {
     /// once this instant has passed (the caller's timeout for the whole
     /// command), so one slow call is the last for that command.
     pub deadline: Option<Instant>,
+    /// Where to record what the model said about each segment, so the
+    /// caller can show the user the classifier's verdict for the command.
+    /// `None` records nothing.
+    pub trace: Option<&'a ClassifierTrace>,
 }
 
 impl SegmentPolicy for ModelPolicy<'_> {
@@ -135,6 +207,9 @@ impl SegmentPolicy for ModelPolicy<'_> {
             Some(o) => o,
             None => {
                 if self.deadline.is_some_and(|d| Instant::now() >= d) {
+                    // Past the caller's deadline nothing more is asked of
+                    // the model; that is a skip, not an answer, so it is
+                    // not recorded.
                     return None;
                 }
                 let input = ClassifyInput { segment: &key, cwd };
@@ -153,9 +228,38 @@ impl SegmentPolicy for ModelPolicy<'_> {
             }
         };
         match outcome {
-            ModelOutcome::Safe => model_may_approve(seg).then_some(PolicyVerdict::Approve),
-            ModelOutcome::Dangerous => Some(PolicyVerdict::Deny),
-            ModelOutcome::NeedsApproval | ModelOutcome::Unavailable => None,
+            ModelOutcome::Safe => {
+                if model_may_approve(seg) {
+                    self.record(ClassifierNote::Approved);
+                    Some(PolicyVerdict::Approve)
+                } else {
+                    // The model vouched, but a never-auto-run rule may not
+                    // hand it out silently; the user still sees the model's
+                    // opinion next to the ask.
+                    self.record(ClassifierNote::Blocked);
+                    None
+                }
+            }
+            ModelOutcome::Dangerous => {
+                self.record(ClassifierNote::Dangerous);
+                Some(PolicyVerdict::Deny)
+            }
+            ModelOutcome::NeedsApproval => {
+                self.record(ClassifierNote::NeedsApproval);
+                None
+            }
+            ModelOutcome::Unavailable => {
+                self.record(ClassifierNote::Unavailable);
+                None
+            }
+        }
+    }
+}
+
+impl ModelPolicy<'_> {
+    fn record(&self, note: ClassifierNote) {
+        if let Some(trace) = self.trace {
+            trace.push(note);
         }
     }
 }

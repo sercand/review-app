@@ -87,6 +87,7 @@ fn sandboxed_in(repo_name: &str, files: &[(&str, &str)]) -> anyhow::Result<Optio
         tmp: tmp.clone(),
         write_paths: vec![],
         deny_read: vec![secret.clone()],
+        deny_env_reads: true,
     };
     // A realistic agent environment: allowlisted host vars only, and a token
     // that must never reach the shell.

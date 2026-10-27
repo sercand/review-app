@@ -441,6 +441,20 @@ impl RunState {
         self.cache().findings.clone()
     }
 
+    /// Announce what the local command classifier said about the agent's
+    /// last tool call (`bash` is the only tool that asks). Emitted only when
+    /// the classifier was consulted; the UI badges the tool line.
+    pub fn classifier_note(
+        &self,
+        agent: &AgentRef,
+        note: review_approval::model_stage::ClassifierNote,
+    ) {
+        let _ = self.events.send(PipelineEvent::ClassifierNote {
+            agent: agent.clone(),
+            note,
+        });
+    }
+
     /// Append one line to the coverage log.
     pub fn record_check(&self, e: CoverageEntry) -> anyhow::Result<()> {
         self.store.coverage_insert(self.run_id, &e)?;

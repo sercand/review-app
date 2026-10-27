@@ -2832,6 +2832,15 @@ impl ReviewApp {
                 self.ai_row_error.take_if(|(key, _)| *key == repo_key);
                 self.save_settings(now);
             }
+            AiPanelAction::RestoreCheckout(records) => {
+                // Reopen the recovery dialog for records the user dismissed
+                // with "Later". A dialog already open keeps precedence: the
+                // row is a second path to the same list, not a replacement.
+                if self.ai_dialog.is_none() && !records.is_empty() {
+                    self.ai_dialog =
+                        Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(records));
+                }
+            }
             AiPanelAction::EditRepoCommands => {
                 // The dialog edits the repo's entry even when no folder is
                 // linked yet, so it opens for any repo the tab can name.
@@ -3055,6 +3064,15 @@ impl ReviewApp {
                 // the app keeps its own copy for the Local checkout row in
                 // step with the dialog (AI settings Task 7).
                 self.ai_unrestored.retain(|record| record.id != id);
+                // Re-read the open PR's state once the restore lands (the
+                // worker runs commands in order): the Local checkout row's
+                // blocker and Restore… button clear when this was its
+                // checkout, and stay when it was not.
+                #[cfg(unix)]
+                if let Some(session) = &self.session {
+                    self.worker
+                        .send(crate::state::pr_detail::ai_attach_command(session));
+                }
                 // Drop the restored row from the recovery list (closing it
                 // when the last one goes), and close a Held dialog — the
                 // restore it offered is on its way and the toast reports

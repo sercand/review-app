@@ -70,6 +70,13 @@ pub enum PipelineEvent {
         name: String,
         summary: String,
     },
+    /// What the local command classifier thought of the agent's last tool
+    /// call, announced after the call was decided. Arrives only when the
+    /// classifier was consulted for it; the UI shows it on the tool line.
+    ClassifierNote {
+        agent: AgentRef,
+        note: review_approval::model_stage::ClassifierNote,
+    },
     /// An agent asked the user a question; the UI answers through
     /// [`crate::ai::interaction::Interaction`].
     Question {

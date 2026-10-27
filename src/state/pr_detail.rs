@@ -4201,7 +4201,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn snapshot_replay_prefills_the_review_once() {
-        use crate::ai::hub::AiSnapshotData;
+        use crate::ai::hub::{AiSnapshotData, RunLiveness};
         use crate::ai::stages::assemble::{ReviewDraft, Verdict};
         use crate::ai::store::RunRecord;
 
@@ -4225,6 +4225,7 @@ mod tests {
                 status: "completed".into(),
                 stop_reason: None,
             }),
+            run_liveness: RunLiveness::Stopped,
             checkout: None,
             bash_disabled: None,
             last_reviewed_sha: Some("sha1".into()),

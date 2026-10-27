@@ -56,7 +56,8 @@ pub enum LoadError {
 }
 
 /// What boot says when the compute device itself will not open (Metal, CUDA).
-/// Other "opening the ..." steps are model files and stay retryable.
+/// Other "opening the ..." steps are model files and stay retryable. The CPU
+/// backend is always built, so there is no corresponding CPU step.
 const DEVICE_STEPS: [&str; 2] = ["opening the Metal device", "opening the CUDA device"];
 
 /// Maps a runtime error to the state it should show. A missing device is
@@ -76,7 +77,7 @@ pub(super) fn load_error(error: OpenError) -> LoadError {
         _ => None,
     };
     match no_device {
-        Some(why) => LoadError::Unavailable(format!("no usable GPU: {why}")),
+        Some(why) => LoadError::Unavailable(format!("no usable compute device: {why}")),
         None => LoadError::Failed(error.to_string()),
     }
 }
@@ -96,8 +97,10 @@ pub fn open_runtime(source: Source<'_>, home: Option<&Path>) -> Result<Runtime, 
 
 /// The compute side; a fake in tests.
 pub trait Engine: Send + Sync {
-    /// Cheap check that a GPU backend exists, run before any download.
-    fn gpu_available(&self) -> bool;
+    /// Cheap check that this build has any compute backend, run before any
+    /// download. shiso always compiles its CPU backend, so this is about the
+    /// build, not the machine.
+    fn compute_available(&self) -> bool;
     /// Opens the backend and the installed `model` (at `dir`). The classifier
     /// owns whatever keeps the install in place. Blocking; call from a job
     /// thread.
@@ -114,20 +117,17 @@ pub trait Engine: Send + Sync {
 /// The real engine: the model's schema, then a `shiso_runtime::Runtime`.
 ///
 /// There is no cheap device probe, so the check before the download is only
-/// whether this build has a backend at all. On a machine whose device is
-/// unusable the download therefore still happens and the failure shows at open
-/// time (a missing device becomes `Unavailable`).
+/// whether this build has a backend at all — always true, since shiso's CPU
+/// backend is not optional. A GPU is used when `auto` finds one; otherwise the
+/// model loads on the CPU.
 struct ShisoEngine {
     /// The model store the runtime opens `model` from.
     home: PathBuf,
 }
 
 impl Engine for ShisoEngine {
-    fn gpu_available(&self) -> bool {
-        cfg!(any(
-            feature = "local-classifier",
-            feature = "local-classifier-cuda"
-        ))
+    fn compute_available(&self) -> bool {
+        true
     }
 
     fn load(
@@ -217,7 +217,7 @@ impl Loader {
     }
 
     /// Switches the classifier on or off. On, with no classifier yet, starts
-    /// the job: GPU check, download if the weights are absent, then load.
+    /// the job: backend check, download if the weights are absent, then load.
     pub fn set_enabled(&self, enabled: bool) {
         let mut inner = self.lock();
         if inner.enabled == enabled {
@@ -353,9 +353,9 @@ impl Loader {
     /// `None` means the job was cancelled by disabling or a model change.
     fn job(&self, model: &str) -> Option<Outcome> {
         let shared = &self.0;
-        if !shared.engine.gpu_available() {
+        if !shared.engine.compute_available() {
             return Some(Outcome::State(ClassifierState::Unavailable(
-                "no usable GPU".into(),
+                "no usable compute device".into(),
             )));
         }
         let dir = match shared.source.installed_dir(model) {
@@ -579,7 +579,7 @@ mod tests {
     }
 
     impl Engine for FakeEngine {
-        fn gpu_available(&self) -> bool {
+        fn compute_available(&self) -> bool {
             self.gpu
         }
         fn load(
@@ -770,14 +770,14 @@ mod tests {
     }
 
     #[test]
-    fn no_gpu_is_unavailable_without_downloading() {
+    fn no_backend_is_unavailable_without_downloading() {
         let mut engine = FakeEngine::ok();
         engine.gpu = false;
         let r = rig(FakeSource::default(), engine);
         r.loader.set_enabled(true);
         assert_eq!(
             r.until(|s| matches!(s, Unavailable(_))),
-            [Unavailable("no usable GPU".into())]
+            [Unavailable("no usable compute device".into())]
         );
         assert_eq!(r.source.ensure_calls.load(Ordering::SeqCst), 0);
         assert!(r.loader.classifier().is_none());
@@ -1088,7 +1088,7 @@ mod tests {
         let pull = |e: PullError| load_error(OpenError::Pull(e));
         assert!(matches!(
             pull(PullError::NoDevice("no Metal".into())),
-            LoadError::Unavailable(m) if m == "no usable GPU: no Metal"
+            LoadError::Unavailable(m) if m == "no usable compute device: no Metal"
         ));
         assert!(matches!(
             pull(PullError::Install("offline".into())),
@@ -1114,7 +1114,7 @@ mod tests {
         };
         for device in DEVICE_STEPS {
             assert!(
-                matches!(step(device), LoadError::Unavailable(m) if m == format!("no usable GPU: {device}")),
+                matches!(step(device), LoadError::Unavailable(m) if m == format!("no usable compute device: {device}")),
                 "{device}"
             );
         }
@@ -1151,15 +1151,11 @@ mod tests {
         }
     }
 
+    /// shiso's CPU backend is built unconditionally, so the real engine always
+    /// reports a backend, with or without a GPU feature.
     #[test]
-    fn the_real_engine_needs_a_compiled_backend() {
-        assert_eq!(
-            real_engine().gpu_available(),
-            cfg!(any(
-                feature = "local-classifier",
-                feature = "local-classifier-cuda"
-            ))
-        );
+    fn the_real_engine_always_has_the_cpu_backend() {
+        assert!(real_engine().compute_available());
     }
 
     /// The whole path on the real engine: `ensure` (offline when the model is
