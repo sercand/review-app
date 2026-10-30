@@ -4272,6 +4272,68 @@ mod tests {
         );
     }
 
+    /// A bulk triage keeps and drops drafts like their buttons, leaves
+    /// other states alone, and a chat request lands the same way with a
+    /// notice in the AI tab.
+    #[test]
+    #[cfg(unix)]
+    fn triage_keeps_and_drops_drafts_only() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::state::ai_review::TimelineEntry;
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        for (id, severity, state) in [
+            (1, Severity::Bug, FindingState::Draft),
+            (2, Severity::Nit, FindingState::Draft),
+            (3, Severity::Nit, FindingState::Posted),
+            (4, Severity::Risk, FindingState::Draft),
+        ] {
+            s.ai.findings.insert(
+                id,
+                ai_finding(
+                    id,
+                    FindingAnchor::Line(line_anchor("a.rs", 1)),
+                    severity,
+                    state,
+                    "t",
+                    "b",
+                ),
+            );
+        }
+        assert_eq!(draft_ids(&s, Severity::Nit), [2]);
+        let done = triage(&mut s, &[1], &[2, 3], Instant::now());
+        assert_eq!((done.kept, done.dropped), (1, 1));
+        assert_eq!(done.commands.len(), 2);
+        assert_eq!(s.ai.findings[&1].state, FindingState::Kept);
+        assert_eq!(
+            s.pending.comments.len(),
+            1,
+            "the kept bug is a pending comment"
+        );
+        assert_eq!(s.ai.findings[&2].state, FindingState::DroppedByUser);
+        assert_eq!(
+            s.ai.findings[&3].state,
+            FindingState::Posted,
+            "only drafts change"
+        );
+
+        let commands = s.on_event(&Event::AiPipeline {
+            session: s.id,
+            event: PipelineEvent::TriageRequested {
+                keep: vec![],
+                drop: vec![4],
+            },
+        });
+        assert_eq!(commands.len(), 1);
+        assert_eq!(s.ai.findings[&4].state, FindingState::DroppedByUser);
+        assert!(matches!(
+            s.ai.timeline.last(),
+            Some(TimelineEntry::Notice { text }) if text.contains("dropped 1")
+        ));
+    }
+
     /// A kept draft's evidence goes into the comment as permalinks to the
     /// commit the draft is pinned to.
     #[test]

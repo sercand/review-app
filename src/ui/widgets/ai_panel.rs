@@ -1191,18 +1191,23 @@ fn counts_bar(ui: &mut egui::Ui, counts: &DecisionCounts) {
 pub fn draft_counts(st: &AiReviewState) -> Vec<(crate::ai::review::Severity, usize)> {
     use crate::ai::review::{FindingState, Severity};
 
-    [Severity::Bug, Severity::Risk, Severity::Nit, Severity::Question]
-        .into_iter()
-        .map(|severity| {
-            let n = st
-                .findings
-                .values()
-                .filter(|f| f.state == FindingState::Draft && f.severity == severity)
-                .count();
-            (severity, n)
-        })
-        .filter(|(_, n)| *n > 0)
-        .collect()
+    [
+        Severity::Bug,
+        Severity::Risk,
+        Severity::Nit,
+        Severity::Question,
+    ]
+    .into_iter()
+    .map(|severity| {
+        let n = st
+            .findings
+            .values()
+            .filter(|f| f.state == FindingState::Draft && f.severity == severity)
+            .count();
+        (severity, n)
+    })
+    .filter(|(_, n)| *n > 0)
+    .collect()
 }
 
 /// Quick triage: one row per severity with drafts, Keep all / Drop all, so
@@ -1216,6 +1221,8 @@ fn render_quick_triage(
 ) {
     let counts = draft_counts(st);
     let total: usize = counts.iter().map(|(_, n)| n).sum();
+    // The shortcut through a long list: open unless the user folded it.
+    view.sections.entry("triage").or_insert(true);
     if total == 0 || !section(ui, view, "triage", "DRAFTS TO TRIAGE", total) {
         return;
     }
@@ -1255,9 +1262,11 @@ fn render_quick_triage(
             }
         });
     ui.label(
-        RichText::new("For finer picks, ask the chat (\"keep the bugs in stream.rs, drop the rest\").")
-            .size(11.0)
-            .color(p.faint),
+        RichText::new(
+            "For finer picks, ask the chat (\"keep the bugs in stream.rs, drop the rest\").",
+        )
+        .size(11.0)
+        .color(p.faint),
     );
 }
 
@@ -3366,6 +3375,55 @@ mod tests {
         harness.get_by_label("Adds the Nemotron transcribe model");
         harness.get_by_label("g1 · Decoder");
         harness.get_by_label("The PR description does not match the change.");
+    }
+
+    /// The triage rows count drafts per severity and report Keep all /
+    /// Drop all for one severity.
+    #[test]
+    fn quick_triage_reports_keep_and_drop_per_severity() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::{ai_finding, line_anchor};
+        use egui_kittest::kittest::Queryable;
+
+        let mut st = AiReviewState::default();
+        for (id, severity, state) in [
+            (1, Severity::Bug, FindingState::Draft),
+            (2, Severity::Bug, FindingState::Draft),
+            (3, Severity::Nit, FindingState::Draft),
+            (4, Severity::Nit, FindingState::Kept),
+        ] {
+            st.findings.insert(
+                id,
+                ai_finding(
+                    id,
+                    FindingAnchor::Line(line_anchor("a.rs", 1)),
+                    severity,
+                    state,
+                    "t",
+                    "b",
+                ),
+            );
+        }
+        assert_eq!(draft_counts(&st), [(Severity::Bug, 2), (Severity::Nit, 1)]);
+        let mut harness = panel_harness(st);
+        harness.run();
+        harness.get_by_label("Keep all 2").click();
+        harness.run();
+        harness.get_by_label("Drop all 1").click();
+        harness.run();
+        assert_eq!(
+            *harness.state(),
+            vec![
+                AiPanelAction::Triage {
+                    severity: Severity::Bug,
+                    keep: true
+                },
+                AiPanelAction::Triage {
+                    severity: Severity::Nit,
+                    keep: false
+                },
+            ]
+        );
     }
 
     /// The composer stays pinned at the bottom of a tall pane and leaves the

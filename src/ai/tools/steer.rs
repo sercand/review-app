@@ -1386,6 +1386,25 @@ mod tests {
             .await;
         assert!(out.is_error, "a kept finding is in the draft already");
         assert_eq!(state(kept), FindingState::Kept);
+
+        // Bulk triage selects drafts by severity and asks the app to apply
+        // it; only the restored draft matches, the kept one does not.
+        while events.try_recv().is_ok() {}
+        let out = tool("triage_findings")
+            .call(serde_json::json!({"keep": {"severities": ["bug"]}}), &cx)
+            .await;
+        assert!(!out.is_error, "{:?}", out.parts);
+        assert_eq!(
+            events.try_recv(),
+            Ok(crate::ai::events::PipelineEvent::TriageRequested {
+                keep: vec![dropped],
+                drop: vec![],
+            })
+        );
+        let out = tool("triage_findings")
+            .call(serde_json::json!({"drop": {"severities": ["blocker"]}}), &cx)
+            .await;
+        assert!(out.is_error, "an unknown severity is refused");
     }
 
     /// A minimal [`ToolCx`] for the tools above: they answer before they
