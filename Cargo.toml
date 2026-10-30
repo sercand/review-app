@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "gh-review-desktop"
-version = "0.1.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
@@ -13,6 +13,22 @@ license = "MIT"
 # Test doubles for the AI pipeline (`ai::testing`), for integration tests that
 # drive the worker. Unit tests compile them unconditionally.
 ai-testing = []
+# Local command classifier: a shiso decision model (`shiso-runtime`). Off by
+# default: pulls a large git dependency. shiso always compiles its CPU backend,
+# so the classifier runs on any machine; a GPU build only makes it faster.
+# Cargo features are target-independent and shiso refuses both GPU backends at
+# once, so pick at most one:
+#   macOS (Metal):  --features local-classifier
+#   Linux (CUDA):   --features local-classifier-cuda  (CUDA toolkit and
+#                   SHISO_CUDA_COMPILE=1; the binary links cuBLAS)
+# `local-classifier` adds Metal; off macOS shiso-metal is a stub, so it still
+# compiles on Linux and simply runs on the CPU there.
+# `_classifier` is internal: it gates the code and pulls the dependency, and
+# both public features enable it. Never enable it alone, and never let one
+# public feature enable the other.
+_classifier = ["dep:shiso-runtime", "dep:shiso-ir"]
+local-classifier = ["_classifier", "shiso-runtime/metal"]
+local-classifier-cuda = ["_classifier", "shiso-runtime/cuda"]
 
 [[test]]
 name = "ai_pipeline"
@@ -50,6 +66,7 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 globset = "0.4"
 ignore = "0.4"
+review-approval = { path = "crates/approval" }
 review-llm = { path = "crates/llm" }
 review-sandbox = { path = "crates/sandbox" }
 rfd = "0.17.2"
@@ -57,6 +74,8 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = "0.10.3"
 tokio-util = "0.7"
 url = "2.5"
+shiso-runtime = { git = "https://github.com/sercand/shiso-llm", rev = "3fa8fbdd2d906b74dbabb058ae560fb2082d769c", optional = true }
+shiso-ir = { git = "https://github.com/sercand/shiso-llm", rev = "3fa8fbdd2d906b74dbabb058ae560fb2082d769c", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.21"

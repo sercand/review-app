@@ -147,6 +147,10 @@ pub struct ScreenInputs<'a> {
     /// when the repo has no entry yet.
     #[cfg(unix)]
     pub repo_ai: Option<&'a crate::persist::settings::RepoAiSettings>,
+    /// The current auto-approve settings for the AI tab's chips; `None`
+    /// hides them.
+    #[cfg(unix)]
+    pub auto_approve: Option<&'a crate::ui::widgets::ai_panel::AutoApproveView>,
 }
 
 /// Paint the whole screen, returning what the user asked of it.
@@ -315,28 +319,38 @@ pub fn render(
             };
             metadata_panel::render_tab_strip(ui, &mut state.details_tab, counts);
             ui.separator();
+            // The AI tab lays itself out: its composer is pinned under its
+            // own scroll area, so it is not wrapped in the details one.
+            #[cfg(unix)]
+            if state.details_tab == metadata_panel::DetailsTab::Ai {
+                // The AI tab reads the session's reducer state and reports
+                // its own actions (spec §12); the Local checkout row and the
+                // auto-approve chips ride in through the screen inputs (AI
+                // settings Task 7).
+                let title = crate::ui::widgets::ai_panel::run_title(
+                    &session.repo.owner,
+                    &session.repo.name,
+                    session.number,
+                    session.files.len(),
+                );
+                let ai_inputs = crate::ui::widgets::ai_panel::PanelInputs {
+                    checkout: inputs.local_checkout,
+                    repo: inputs.repo_ai,
+                    title: Some(&title),
+                    auto_approve: inputs.auto_approve,
+                };
+                ai_actions = crate::ui::widgets::ai_panel::render(
+                    ui,
+                    &session.ai,
+                    &ai_inputs,
+                    session.ai.show_dropped,
+                );
+                return;
+            }
             egui::ScrollArea::vertical()
                 .id_salt("metadata-panel")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    #[cfg(unix)]
-                    if state.details_tab == metadata_panel::DetailsTab::Ai {
-                        // The AI tab reads the session's reducer state and
-                        // reports its own actions (spec §12); the Local
-                        // checkout row rides in through the screen inputs
-                        // (AI settings Task 7).
-                        let ai_inputs = crate::ui::widgets::ai_panel::PanelInputs {
-                            checkout: inputs.local_checkout,
-                            repo: inputs.repo_ai,
-                        };
-                        ai_actions = crate::ui::widgets::ai_panel::render(
-                            ui,
-                            &session.ai,
-                            &ai_inputs,
-                            session.ai.show_dropped,
-                        );
-                        return;
-                    }
                     metadata_panel::render_body(ui, &meta_inputs, state.details_tab);
                 });
         });
@@ -718,6 +732,8 @@ mod tests {
                     local_checkout: None,
                     #[cfg(unix)]
                     repo_ai: None,
+                    #[cfg(unix)]
+                    auto_approve: None,
                 },
             );
         });
@@ -777,6 +793,8 @@ mod tests {
                     local_checkout: None,
                     #[cfg(unix)]
                     repo_ai: None,
+                    #[cfg(unix)]
+                    auto_approve: None,
                 },
             );
         });

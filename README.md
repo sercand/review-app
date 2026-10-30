@@ -117,7 +117,31 @@ submit it yourself.
    On your first review of a repo, the scout agent proposes these and you
    confirm them.
 
-Other commands ask for approval in the AI tab, once or for the whole review.
+**Settings → AI → Auto-approve bash commands** is one slider with five
+levels; the dialog lists what runs, what asks you and what is refused at
+the level you pick:
+
+1. **Ask me**: read-only commands run, you are asked about the rest.
+2. **Ask when unsure**: the local classifier approves what it can, you are
+   asked about the rest.
+3. **Never ask** (default): the classifier approves what it can, the rest is
+   refused and the agent is told why.
+4. **Ask only on danger**: everything the classifier does not call dangerous
+   runs; you are asked about what it flags.
+5. **Full trust**: every command runs without asking and the
+sandbox stops hiding secret files (`.env*`, `~/.ssh`, `~/.aws`, `.git/config`
+and this app's config folder become readable, and what the agent reads can
+reach the model provider). Writes stay confined to the checkout and a temp
+dir, the agent still has no GitHub credentials, and prepare commands — which
+run outside the sandbox — still ask. While it is on, the AI tab shows a red
+warning. Picking it asks for an explicit confirmation.
+
+Levels 2 to 4 download the classifier when you save. Secret paths stay
+blocked at every level but full trust. The Advanced section holds extra
+commands to allow without asking, extra paths to block, and the classifier's
+model and time limit. When a command runs, the AI tab marks it with an icon
+(built-in check, classifier, you, refused, blocked); hover it for the
+reason.
 
 ### The sandbox
 
@@ -143,6 +167,71 @@ If a build still needs a fetch, the agent can ask to re-run the configured
 prepare commands; you approve, and the app runs the same fixed list.
 
 AI review is Unix-only for now: the sandbox has no Windows backend.
+
+### Local command classifier
+
+An optional on-device model that decides the shell commands the built-in
+rules could not. It sees the whole command as the agent wrote it, including
+forms the rules do not parse (loops, heredocs, `[ … ]`), and its "safe" runs
+the command, except for a short floor of shapes where a small model's mistake
+costs the most: code handed to a shell or interpreter inline, environment or
+config overrides, deleting, moving or overwriting files, git commands that
+change the repository, network, clipboard and privilege commands, installers,
+searches that reach `.git` or hidden files, and `$(...)` or anything else the
+parser cannot see into. Those keep the rules' verdict, and the panel shows
+"classifier: safe, overruled". Commands that touch secret paths are blocked
+before the model is asked. If the model is missing, loading or failing, the
+command is handled exactly as without it. Command text never leaves your
+machine.
+
+Running a program from the checkout (`cargo test`, `make`, `./scripts/x`,
+`eslint .`) is not on the floor, so the model's "safe" runs PR code. The
+agent's sandbox confines writes and hides secret files, but it does not block
+network access.
+
+Rules, not the model, keep repo secrets out of reach: searches that recurse
+or look at hidden, ignored or untracked files ask, and the sandbox cannot read
+repo-local `.env*` files (on Linux only those that exist when the review
+starts). `.git/config` is only protected by a text match, because git has to
+read it, so treat a remote URL that embeds a token as visible to the agent.
+
+It is **off by default**. On the fixture sets in
+`tests/fixtures/auto_approve_eval/`, the rules alone auto-run 89 % of benign
+commands; with `smollm2-135m-decision` deciding the rest under the floor,
+99.1 % of benign commands run, along with 20 % of the "needs approval" set
+(builds, tests, scripts), none of the 151 dangerous commands, and 42 of 472
+adversarial ones, all of them programs from the checkout listed in
+`left_to_model.txt`. A model that approves everything gets past the floor
+only with those listed commands (`floor_holds_everything_else`).
+
+- The model is a **decision model**, chosen by its shiso registry name in
+  **Settings → AI → Auto-approve** (open the dialog, then Advanced; the
+  Classifier model field, `ai.auto_approve.decision_model`, default
+  `smollm2-135m-decision`). It is asked one question
+  about each command (approve / ask / deny) and answers with probabilities.
+  The question comes from `decision_schema.json` in the model's folder, or a
+  built-in default when the model has none; either way a command is approved
+  only when the model picks `approve` with probability of at least 0.60
+  (`approve_threshold`), and a model that picks `deny` makes the command ask
+  with a warning. A schema file that is present but invalid disables the
+  classifier rather than falling back to the default.
+- Runs on any machine: shiso always compiles its CPU backend, so a build with
+  no usable GPU loads the model on the CPU (slower per command). On macOS the
+  release builds include Metal; from source, build with
+  `--features local-classifier`. A Linux CUDA build
+  (`--features local-classifier-cuda`) exists but is untested.
+- Turning it on in Settings downloads the weights from the shiso model
+  registry (the size is the registry's; about 0.2 GiB for
+  `smollm2-135m-decision`), verifies
+  them and stores them under the app config folder in `models/`. Nothing is
+  downloaded until you turn it on, and no weights are bundled. Changing the
+  model name while it is on downloads and loads the new one.
+- The classifier has 2 seconds per command by default
+  (`classifier_timeout_ms`, 50 to 5000); a command that takes longer asks as
+  it would without the model. The default used to be 500 ms; a settings file
+  that already stores a value keeps it.
+- To turn it off, untick the setting. You can delete `models/` to reclaim the
+  space.
 
 ## Where data is stored
 

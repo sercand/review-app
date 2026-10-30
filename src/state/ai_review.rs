@@ -20,8 +20,9 @@
 use std::collections::BTreeMap;
 
 use crate::ai::checkout::{CheckoutPlan, RestoreOutcome};
+pub use crate::ai::events::CommandDecision;
 use crate::ai::events::{PipelineEvent, RunStatus, StageKind, StageStatus};
-use crate::ai::hub::{AiSnapshotData, AiTimelineEntry, ChatEvent};
+use crate::ai::hub::{AiSnapshotData, AiTimelineEntry, ChatEvent, RunLiveness};
 use crate::ai::review::{
     CheckResult, CoverageEntry, Finding, FindingAnchor, FindingState, Severity,
 };
@@ -30,6 +31,33 @@ use crate::ai::store::{CheckoutRecord, CheckoutState};
 use crate::ai::tools::{AgentRef, AgentRole};
 use crate::ai::ui_interaction::ApprovalKind;
 use crate::runtime::Event;
+pub use review_approval::model_stage::ClassifierNote;
+
+/// One tool line inside an agent's timeline entry. `decision` says who let a
+/// `bash` call run or why it did not; `note` is the local classifier's
+/// verdict, set when it was consulted for the call.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolLine {
+    /// The tool name.
+    pub name: String,
+    /// A one-line summary of its input.
+    pub summary: String,
+    /// The classifier's verdict, when it was asked.
+    pub note: Option<ClassifierNote>,
+    /// How a `bash` call was decided, once it was.
+    pub decision: Option<CommandDecision>,
+}
+
+/// The tab's badge text for a classifier verdict.
+pub fn classifier_note_text(note: ClassifierNote) -> &'static str {
+    match note {
+        ClassifierNote::Approved => "classifier: safe",
+        ClassifierNote::Overruled => "classifier: safe, overruled",
+        ClassifierNote::NeedsApproval => "classifier: needs approval",
+        ClassifierNote::Dangerous => "classifier: flagged dangerous",
+        ClassifierNote::Unavailable => "classifier: unavailable",
+    }
+}
 
 /// Where the checkout/run lifecycle of this PR's AI review stands (spec §4).
 /// `Paused` is UI-driven: the hub has no pause event, so Task 3's Pause
@@ -74,8 +102,9 @@ pub enum TimelineEntry {
         agent: AgentRef,
         /// The scout-assigned group, for reviewers and challengers.
         group: Option<String>,
-        /// `(tool name, input summary)` in call order.
-        tools: Vec<(String, String)>,
+        /// The tool calls, in call order; `note` is set on the `bash` lines
+        /// the local classifier was consulted for.
+        tools: Vec<ToolLine>,
         /// The streamed assistant text so far.
         text: String,
         /// Why the loop ended, once it did.
@@ -130,6 +159,11 @@ pub enum TimelineEntry {
         name: String,
         /// A one-line summary of its input.
         summary: String,
+        /// What the local classifier said about a `bash` call; `None` when
+        /// it was not consulted (every non-bash tool, and bash without one).
+        note: Option<ClassifierNote>,
+        /// How a `bash` call was decided, once it was.
+        decision: Option<CommandDecision>,
     },
     /// A notice the app produced: a cancelled or budget-stopped run, the
     /// unsandboxed shell, a stash conflict.
@@ -185,6 +219,12 @@ pub struct AiReviewState {
     pub show_dropped: bool,
     /// The head the last completed review ran against (spec §5.8).
     pub last_reviewed_sha: Option<String>,
+    /// How many agents each stage announced it would run
+    /// ([`PipelineEvent::StagePlanned`]); live runs only.
+    pub planned: Vec<(crate::ai::events::StageKind, u32)>,
+    /// The scout's brief, shown in place of its `submit_brief` call: from
+    /// the run's `BriefReady`, or the stored one when the tab loads.
+    pub brief: Option<crate::ai::stages::scout::Brief>,
     /// The scout's suggested commands awaiting the tab's "Add to settings"
     /// action (spec §4 step 1), read from the snapshot's stored brief. The
     /// scout only fills them when the repo has no configured commands.
@@ -192,6 +232,21 @@ pub struct AiReviewState {
     /// The inline editor of one AI draft: the finding id and its buffer.
     /// UI-local; cleared when a snapshot replaces the findings.
     pub edit: Option<(i64, String)>,
+    /// The `bash` lines in the order their decisions landed, oldest first:
+    /// the tab's command log lists them newest first. Rebuilt timelines
+    /// (snapshots) carry no decisions, so a snapshot clears it.
+    pub decided: Vec<CommandRef>,
+}
+
+/// Where one decided `bash` call sits in [`AiReviewState::timeline`]: the
+/// entry index, and the tool index inside an [`TimelineEntry::Agent`]
+/// entry (`None` for a [`TimelineEntry::ChatTool`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandRef {
+    /// The timeline index.
+    pub entry: usize,
+    /// The tool index inside an agent entry; `None` for a chat tool.
+    pub tool: Option<usize>,
 }
 
 /// The scout's build/test/lint suggestions for a repo with no configured
@@ -385,6 +440,8 @@ impl AiReviewState {
                 self.timeline.push(TimelineEntry::ChatTool {
                     name: name.clone(),
                     summary: summary.clone(),
+                    note: None,
+                    decision: None,
                 });
                 // Later text is a new bubble, not a continuation.
                 self.chat_reply_open = false;
@@ -534,6 +591,18 @@ impl AiReviewState {
     fn apply_snapshot(&mut self, snap: &AiSnapshotData) {
         self.phase = snapshot_phase(snap);
         self.timeline = timeline_from_transcript(&snap.timeline);
+        // The transcript has no stop rows: with nothing running behind the
+        // snapshot, every agent in it has ended.
+        if !matches!(self.phase, AiPhase::Running | AiPhase::Paused) {
+            for entry in &mut self.timeline {
+                if let TimelineEntry::Agent {
+                    stop: stop @ None, ..
+                } = entry
+                {
+                    *stop = Some("finished".to_string());
+                }
+            }
+        }
         if let Some(reason) = &snap.bash_disabled {
             self.timeline.push(TimelineEntry::Notice {
                 text: format!("the agent shell is unsandboxed: {reason}"),
@@ -544,6 +613,10 @@ impl AiReviewState {
         self.checkout = snap.checkout.clone();
         self.last_reviewed_sha = snap.last_reviewed_sha.clone();
         self.suggestions = brief_suggestions(snap.brief.as_deref());
+        self.brief = snap
+            .brief
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok());
         // The snapshot replays the latest run's draft and usage (spec §10.3):
         // a run that finished while the user was on another PR loses its
         // `DraftReady` to the stale-event rule, and this is the second path
@@ -555,11 +628,18 @@ impl AiReviewState {
         self.restore_decision = None;
         self.edit = None;
         self.chat_reply_open = false;
+        self.decided.clear();
     }
 
     /// Fold one forwarded pipeline event in.
     fn apply_pipeline(&mut self, ev: &PipelineEvent) {
         match ev {
+            PipelineEvent::StagePlanned { stage, agents } => {
+                match self.planned.iter_mut().find(|(seen, _)| seen == stage) {
+                    Some((_, n)) => *n = *agents,
+                    None => self.planned.push((*stage, *agents)),
+                }
+            }
             PipelineEvent::Stage { stage, status } => {
                 self.timeline.push(TimelineEntry::Stage {
                     stage: *stage,
@@ -597,7 +677,54 @@ impl AiReviewState {
             } => {
                 let index = self.ensure_agent_entry(agent);
                 if let TimelineEntry::Agent { tools, .. } = &mut self.timeline[index] {
-                    tools.push((name.clone(), summary.clone()));
+                    tools.push(ToolLine {
+                        name: name.clone(),
+                        summary: summary.clone(),
+                        ..ToolLine::default()
+                    });
+                }
+            }
+            PipelineEvent::CommandDecided {
+                agent,
+                decision,
+                note,
+            } => {
+                // The decision is announced while the tool call is being
+                // settled, so it lands on the tool line that was added last.
+                // The chat agent's bash calls arrive here too (the tool
+                // context is the run's); they mark the chat's tool line.
+                if agent.role == AgentRole::Chat {
+                    let found = self.timeline.iter().rposition(|entry| {
+                        matches!(entry, TimelineEntry::ChatTool { name, .. } if name == "bash")
+                    });
+                    if let Some(index) = found
+                        && let TimelineEntry::ChatTool {
+                            note: note_slot,
+                            decision: decision_slot,
+                            ..
+                        } = &mut self.timeline[index]
+                    {
+                        *note_slot = *note;
+                        *decision_slot = Some(decision.clone());
+                        self.note_decided(CommandRef {
+                            entry: index,
+                            tool: None,
+                        });
+                    }
+                } else {
+                    let index = self.ensure_agent_entry(agent);
+                    if let TimelineEntry::Agent { tools, .. } = &mut self.timeline[index]
+                        && let Some(last) = tools.last_mut()
+                        && last.name == "bash"
+                    {
+                        last.note = *note;
+                        last.decision = Some(decision.clone());
+                        let tool = tools.len() - 1;
+                        self.note_decided(CommandRef {
+                            entry: index,
+                            tool: Some(tool),
+                        });
+                    }
                 }
             }
             PipelineEvent::Question { agent, question } => {
@@ -623,9 +750,10 @@ impl AiReviewState {
             // The full finding and coverage rows arrive with the
             // [`Event::AiFindings`] that follows; the card already exists
             // from `FindingAdded`.
-            PipelineEvent::FindingChanged { .. }
-            | PipelineEvent::Coverage { .. }
-            | PipelineEvent::BriefReady => {}
+            PipelineEvent::FindingChanged { .. } | PipelineEvent::Coverage { .. } => {}
+            // Applied by the PR session, which owns the pending review.
+            PipelineEvent::TriageRequested { .. } => {}
+            PipelineEvent::BriefReady { brief } => self.brief = Some((**brief).clone()),
             PipelineEvent::RunEnded {
                 status,
                 stop_reason,
@@ -653,6 +781,13 @@ impl AiReviewState {
                 };
             }
         }
+    }
+
+    /// Record that the line at `at` was decided (once: a re-announced
+    /// decision moves it to the newest place).
+    fn note_decided(&mut self, at: CommandRef) {
+        self.decided.retain(|seen| *seen != at);
+        self.decided.push(at);
     }
 
     /// The index of `agent`'s timeline entry, creating an empty one at the
@@ -732,18 +867,26 @@ fn brief_suggestions(raw: Option<&str>) -> Option<BriefSuggestions> {
     })
 }
 
-/// The phase a snapshot's run row and checkout describe (spec §10.3).
+/// What the tab says when a run row claims to be running and nothing is.
+const INTERRUPTED: &str = "the run was interrupted";
+
+/// The phase a snapshot describes (spec §10.3).
+///
+/// The run row says what happened; the hub's liveness says whether anything is
+/// still running behind it. A `running` row with nothing live is a run that
+/// died (the app quit mid-run, the pipeline task was lost, a finish parked the
+/// run awaiting a restore decision), never a spinner with a Cancel button that
+/// can only answer "no AI review is running".
 fn snapshot_phase(snap: &AiSnapshotData) -> AiPhase {
+    if snap.run_liveness == RunLiveness::Starting {
+        return AiPhase::CheckingOut;
+    }
     let Some(run) = snap.run.as_ref() else {
-        // A checkout with no run row: the start is still in flight.
-        return if snap.checkout.is_some() {
-            AiPhase::CheckingOut
-        } else {
-            AiPhase::Idle
-        };
+        return AiPhase::Idle;
     };
     match run.status.as_str() {
-        "running" => AiPhase::Running,
+        "running" if snap.run_liveness == RunLiveness::Live => AiPhase::Running,
+        "running" => AiPhase::Failed(INTERRUPTED.to_string()),
         "completed" | "cancelled" | "budget_exhausted" => AiPhase::Done,
         "failed" => AiPhase::Failed(
             run.stop_reason
@@ -757,41 +900,92 @@ fn snapshot_phase(snap: &AiSnapshotData) -> AiPhase {
     }
 }
 
-/// Rebuild the timeline from the stored transcript (spec §10.3): assistant
-/// turns contribute their text and tool calls to a per-agent entry. User
-/// rows are task prompts and tool results, nothing the tab shows.
+/// Rebuild the timeline from the stored transcript (spec §10.3), so a
+/// reopened tab reads like the live one: assistant turns contribute their
+/// text and tool calls to a per-agent entry (reviewers and challengers
+/// under their group, as `AgentStarted` names them), and the chat's rows
+/// become chat bubbles and tool lines, never an agent row. Tool inputs are
+/// cut like [`PipelineEvent::ToolCall`]'s, so result tools stay whole for
+/// their cards. Other user rows are task prompts and tool results.
 fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
     let mut out: Vec<TimelineEntry> = Vec::new();
     for row in rows {
-        if row.role != "assistant" {
-            continue;
-        }
         let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&row.content_json) else {
             continue;
         };
-        let mut text = String::new();
-        let mut tools: Vec<(String, String)> = Vec::new();
-        for block in &blocks {
-            match block.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => {
-                    text.push_str(
-                        block
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(""),
-                    );
+        let kind = |block: &serde_json::Value| {
+            block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let block_text = |block: &serde_json::Value| {
+            block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let tool_line = |block: &serde_json::Value| {
+            let name = block
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let summary = block
+                .get("input")
+                .map(|input| crate::ai::agent::tool_call_summary(&name, input))
+                .unwrap_or_default();
+            (name, summary)
+        };
+        if row.agent_id == crate::ai::chat::CHAT_LABEL {
+            for block in &blocks {
+                match (row.role.as_str(), kind(block).as_deref()) {
+                    ("user", Some("text")) => {
+                        let text = strip_chat_digest(&block_text(block));
+                        if !text.is_empty() {
+                            out.push(TimelineEntry::ChatUser { text });
+                        }
+                    }
+                    ("assistant", Some("text")) => {
+                        let text = block_text(block);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        match out.last_mut() {
+                            Some(TimelineEntry::ChatReply { text: last }) => last.push_str(&text),
+                            _ => out.push(TimelineEntry::ChatReply { text }),
+                        }
+                    }
+                    ("assistant", Some("tool_use")) => {
+                        let (name, summary) = tool_line(block);
+                        out.push(TimelineEntry::ChatTool {
+                            name,
+                            summary,
+                            note: None,
+                            decision: None,
+                        });
+                    }
+                    _ => {}
                 }
+            }
+            continue;
+        }
+        if row.role != "assistant" {
+            continue;
+        }
+        let mut text = String::new();
+        let mut tools: Vec<ToolLine> = Vec::new();
+        for block in &blocks {
+            match kind(block).as_deref() {
+                Some("text") => text.push_str(&block_text(block)),
                 Some("tool_use") => {
-                    let name = block
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let summary = block
-                        .get("input")
-                        .map(|input| summarize_input(&input.to_string()))
-                        .unwrap_or_default();
-                    tools.push((name, summary));
+                    let (name, summary) = tool_line(block);
+                    tools.push(ToolLine {
+                        name,
+                        summary,
+                        ..ToolLine::default()
+                    });
                 }
                 _ => {}
             }
@@ -805,9 +999,17 @@ fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
         {
             Some(index) => index,
             None => {
+                let agent = agent_ref_from_label(&row.agent_id);
+                let group = match agent.role {
+                    AgentRole::Reviewer | AgentRole::Challenger => row
+                        .agent_id
+                        .split_once(':')
+                        .map(|(_, group)| group.to_string()),
+                    _ => None,
+                };
                 out.push(TimelineEntry::Agent {
-                    agent: agent_ref_from_label(&row.agent_id),
-                    group: None,
+                    agent,
+                    group,
                     tools: Vec::new(),
                     text: String::new(),
                     stop: None,
@@ -826,6 +1028,25 @@ fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
         }
     }
     out
+}
+
+/// A stored chat user turn without the status digest the app put before it
+/// ([`crate::ai::tools::steer::SteerCtx::digest`], "## Run status" up to its
+/// "open questions" line).
+fn strip_chat_digest(stored: &str) -> String {
+    if !stored.starts_with("## Run status") {
+        return stored.trim().to_string();
+    }
+    match stored.find("\nopen questions:") {
+        Some(at) => {
+            let rest = &stored[at + 1..];
+            rest.split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim()
+                .to_string()
+        }
+        None => String::new(),
+    }
 }
 
 /// The transcript stores agents by their pipeline label (spec §9.2):
@@ -851,19 +1072,8 @@ fn agent_ref_from_label(label: &str) -> AgentRef {
     }
 }
 
-/// A tool input summary, cut like [`PipelineEvent::ToolCall`]'s.
-fn summarize_input(input: &str) -> String {
-    const MAX: usize = 120;
-    let count = input.chars().count();
-    if count <= MAX {
-        return input.to_string();
-    }
-    let cut: String = input.chars().take(MAX).collect();
-    format!("{cut}…")
-}
-
 /// Which stage's progress an agent role counts toward.
-fn agent_stage(role: AgentRole) -> Option<StageKind> {
+pub(crate) fn agent_stage(role: AgentRole) -> Option<StageKind> {
     match role {
         AgentRole::Scout => Some(StageKind::Scout),
         AgentRole::Reviewer => Some(StageKind::Review),
@@ -876,7 +1086,7 @@ fn agent_stage(role: AgentRole) -> Option<StageKind> {
 }
 
 /// Pipeline execution order, the order the strip shows (spec §6).
-fn stage_order(stage: StageKind) -> u8 {
+pub(crate) fn stage_order(stage: StageKind) -> u8 {
     match stage {
         StageKind::PriorCheck => 0,
         StageKind::Scout => 1,
@@ -923,6 +1133,43 @@ pub fn change_blocked(
     unrestored: &[CheckoutRecord],
     repo_key: &str,
 ) -> Option<String> {
+    change_blocked_for(ai_state, unrestored, repo_key, None)
+}
+
+/// The note shown while the open PR's own checkout holds the folder.
+pub const HELD_BY_THIS_PR: &str =
+    "The folder is on this pull request's checkout; Finish puts your branch back.";
+
+/// [`change_blocked`] seen from PR `pr_number`: a checkout that PR itself
+/// holds still blocks a folder change (its restore needs the folder), but
+/// is named as this PR's own, not as a stray to restore.
+pub fn change_blocked_for(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+    pr_number: Option<u64>,
+) -> Option<String> {
+    if let Some(reason) = start_blocked(ai_state, unrestored, repo_key, pr_number) {
+        return Some(reason);
+    }
+    ai_state
+        .checkout
+        .iter()
+        .chain(unrestored)
+        .any(|record| unrestored_holds_repo(record, repo_key))
+        .then(|| HELD_BY_THIS_PR.to_string())
+}
+
+/// What stops a review of PR `pr_number` from starting: a live run, or an
+/// unrestored checkout of a *different* PR in the repo. The PR's own held
+/// checkout does not: `plan_checkout` reuses it (a re-review after Keep or
+/// a restart). With `pr_number: None` every record counts.
+pub fn start_blocked(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+    pr_number: Option<u64>,
+) -> Option<String> {
     if matches!(
         ai_state.phase,
         AiPhase::Planning
@@ -940,11 +1187,51 @@ pub fn change_blocked(
         .checkout
         .iter()
         .chain(unrestored)
+        .filter(|record| pr_number != Some(record.pr_number))
         .any(|record| unrestored_holds_repo(record, repo_key))
         .then(|| {
             "This repository has an unrestored AI checkout — restore it before changing the folder or starting a review."
                 .to_string()
         })
+}
+
+/// The checkout records for `repo_key` that await a restore and can be
+/// restored right now: the rows behind [`change_blocked`]'s unrestored
+/// message, minus nothing — with no live run they are all restorable, and a
+/// live run reports no records (the dialog would fight the run).
+pub fn unrestored_for_repo(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+) -> Vec<CheckoutRecord> {
+    if matches!(
+        ai_state.phase,
+        AiPhase::Planning
+            | AiPhase::CheckingOut
+            | AiPhase::Running
+            | AiPhase::Paused
+            | AiPhase::Restoring
+    ) {
+        return Vec::new();
+    }
+    let records: Vec<CheckoutRecord> = ai_state
+        .checkout
+        .iter()
+        .chain(unrestored)
+        .filter(|record| unrestored_holds_repo(record, repo_key))
+        .cloned()
+        .collect();
+    // The session's own row is also in the app-wide list once the hub
+    // reports it; keep the ids distinct.
+    let mut seen: Vec<i64> = Vec::with_capacity(records.len());
+    records
+        .into_iter()
+        .filter(|record| {
+            let fresh = !seen.contains(&record.id);
+            seen.push(record.id);
+            fresh
+        })
+        .collect()
 }
 
 /// Whether `record` is a checkout of `repo_key` that still awaits its
@@ -1102,7 +1389,12 @@ mod tests {
             &TimelineEntry::Agent {
                 agent: reviewer(),
                 group: Some("g1".to_string()),
-                tools: vec![("read_file".to_string(), "src/a.rs".to_string())],
+                tools: vec![ToolLine {
+                    name: "read_file".to_string(),
+                    summary: "src/a.rs".to_string(),
+                    note: None,
+                    decision: None,
+                }],
                 text: "Hello".to_string(),
                 stop: Some("finished".to_string()),
             },
@@ -1185,6 +1477,140 @@ mod tests {
         );
     }
 
+    /// The classifier's verdict badges the bash tool line it was consulted
+    /// for — the agent's own line, or the chat's — and nothing else: lines
+    /// the rules settled alone, and non-bash tools, stay bare.
+    /// Decisions are remembered in the order they landed, for the command
+    /// log; a snapshot (whose timeline carries no decisions) clears them.
+    #[test]
+    fn decided_lines_are_recorded_in_order() {
+        let mut st = AiReviewState::default();
+        let bash = |agent: AgentRef, command: &str| {
+            pipeline(PipelineEvent::ToolCall {
+                agent,
+                name: "bash".to_string(),
+                summary: format!("{{\"command\":\"{command}\"}}"),
+            })
+        };
+        let decided = |agent: AgentRef| {
+            pipeline(PipelineEvent::CommandDecided {
+                agent,
+                decision: CommandDecision::Classifier,
+                note: None,
+            })
+        };
+        st.apply(&bash(reviewer(), "ls"));
+        st.apply(&decided(reviewer()));
+        st.apply(&Event::AiChat {
+            session: SESSION,
+            event: ChatEvent::ToolCall {
+                name: "bash".to_string(),
+                summary: "{\"command\":\"pwd\"}".to_string(),
+            },
+        });
+        st.apply(&decided(crate::ai::chat::chat_agent()));
+        st.apply(&bash(reviewer(), "wc -l a"));
+        st.apply(&decided(reviewer()));
+        assert_eq!(
+            st.decided,
+            vec![
+                CommandRef {
+                    entry: 0,
+                    tool: Some(0)
+                },
+                CommandRef {
+                    entry: 1,
+                    tool: None
+                },
+                CommandRef {
+                    entry: 0,
+                    tool: Some(1)
+                },
+            ]
+        );
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot: AiSnapshotData {
+                findings: Vec::new(),
+                coverage: Vec::new(),
+                timeline: Vec::new(),
+                brief: None,
+                run: None,
+                run_liveness: RunLiveness::Stopped,
+                checkout: None,
+                bash_disabled: None,
+                last_reviewed_sha: None,
+                draft: None,
+                usage: (0, 0),
+            },
+        });
+        assert!(st.decided.is_empty());
+    }
+
+    #[test]
+    fn command_decisions_mark_the_last_bash_line() {
+        use review_approval::model_stage::ClassifierNote;
+
+        let mut st = AiReviewState::default();
+        st.apply(&pipeline(PipelineEvent::ToolCall {
+            agent: reviewer(),
+            name: "bash".to_string(),
+            summary: "{\"command\":\"rm x\"}".to_string(),
+        }));
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
+            agent: reviewer(),
+            decision: CommandDecision::AutoDenied {
+                reason: "rm x: not in the allowed commands".to_string(),
+            },
+            note: Some(ClassifierNote::NeedsApproval),
+        }));
+        st.apply(&pipeline(PipelineEvent::ToolCall {
+            agent: reviewer(),
+            name: "read_file".to_string(),
+            summary: "src/a.rs".to_string(),
+        }));
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
+            agent: reviewer(),
+            decision: CommandDecision::Classifier,
+            note: Some(ClassifierNote::Dangerous),
+        }));
+        let TimelineEntry::Agent { tools, .. } = &st.timeline[0] else {
+            panic!("agent entry");
+        };
+        assert_eq!(tools[0].note, Some(ClassifierNote::NeedsApproval));
+        assert!(matches!(
+            tools[0].decision,
+            Some(CommandDecision::AutoDenied { .. })
+        ));
+        assert_eq!(
+            (&tools[1].note, &tools[1].decision),
+            (&None, &None),
+            "the read_file line gets no badge: bash is the only tool that is decided"
+        );
+
+        // The chat agent's bash call badges the chat's tool line, not a
+        // phantom agent entry.
+        let mut st = AiReviewState::default();
+        st.apply(&Event::AiChat {
+            session: SESSION,
+            event: crate::ai::hub::ChatEvent::ToolCall {
+                name: "bash".to_string(),
+                summary: "{\"command\":\"ls\"}".to_string(),
+            },
+        });
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
+            agent: crate::ai::chat::chat_agent(),
+            decision: CommandDecision::Classifier,
+            note: Some(ClassifierNote::Approved),
+        }));
+        let TimelineEntry::ChatTool { note, decision, .. } = &st.timeline[0] else {
+            panic!("chat tool entry, got {:?}", st.timeline);
+        };
+        assert_eq!(*note, Some(ClassifierNote::Approved));
+        assert_eq!(*decision, Some(CommandDecision::Classifier));
+        assert_eq!(st.timeline.len(), 1, "no phantom agent entry");
+    }
+
     /// The chat-stream fold (Task 7): the optimistic user entry absorbs its
     /// echo, text deltas coalesce into one reply bubble, a tool call closes
     /// the bubble so later text starts a new one, and `TurnDone` closes it
@@ -1248,6 +1674,8 @@ mod tests {
                 TimelineEntry::ChatTool {
                     name: "get_finding".to_string(),
                     summary: "{\"id\":3}".to_string(),
+                    note: None,
+                    decision: None,
                 },
                 TimelineEntry::ChatReply {
                     text: "See finding #3.".to_string()
@@ -1363,6 +1791,69 @@ mod tests {
         );
     }
 
+    /// A reopened tab reads like the live one: the chat's rows become
+    /// bubbles and tool lines without the status digest, reviewers carry
+    /// their group, and result tools keep their whole input for the cards.
+    #[test]
+    fn the_transcript_rebuilds_chat_groups_and_results() {
+        let row = |agent: &str, role: &str, content: serde_json::Value| AiTimelineEntry {
+            agent_id: agent.into(),
+            role: role.into(),
+            content_json: content.to_string(),
+        };
+        let long = "x".repeat(400);
+        let rows = vec![
+            row(
+                "reviewer:g2",
+                "assistant",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "1", "name": "done", "input": {"summary": long}}
+                ]),
+            ),
+            row(
+                "chat",
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": "## Run status\n\nstate: finished\nopen questions: none\n\n\nbring #97 back"}
+                ]),
+            ),
+            row(
+                "chat",
+                "assistant",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "2", "name": "list_findings", "input": {}},
+                    {"type": "text", "text": "Done."}
+                ]),
+            ),
+        ];
+        let timeline = timeline_from_transcript(&rows);
+        assert!(
+            matches!(
+                &timeline[0],
+                TimelineEntry::Agent { group: Some(g), tools, .. }
+                    if g == "g2" && tools[0].summary.contains(&long)
+            ),
+            "{timeline:?}"
+        );
+        assert_eq!(
+            timeline[1..],
+            [
+                TimelineEntry::ChatUser {
+                    text: "bring #97 back".into()
+                },
+                TimelineEntry::ChatTool {
+                    name: "list_findings".into(),
+                    summary: "{}".into(),
+                    note: None,
+                    decision: None,
+                },
+                TimelineEntry::ChatReply {
+                    text: "Done.".into()
+                },
+            ]
+        );
+    }
+
     #[test]
     fn can_continue_only_when_head_moved_and_not_running() {
         let mut st = AiReviewState::default();
@@ -1428,6 +1919,7 @@ mod tests {
             timeline: vec![assistant("scout", r#""scouting done""#)],
             brief: None,
             run: Some(run("completed", None)),
+            run_liveness: RunLiveness::Stopped,
             checkout: Some(checkout_record()),
             bash_disabled: Some("no bwrap".to_string()),
             last_reviewed_sha: Some("sha_old".to_string()),
@@ -1472,7 +1964,7 @@ mod tests {
                     group: None,
                     tools: Vec::new(),
                     text: "scouting done".to_string(),
-                    stop: None,
+                    stop: Some("finished".to_string()),
                 },
                 TimelineEntry::Notice {
                     text: "the agent shell is unsandboxed: no bwrap".to_string(),
@@ -1506,6 +1998,7 @@ mod tests {
             timeline: Vec::new(),
             brief: None,
             run: Some(run("running", None)),
+            run_liveness: RunLiveness::Live,
             checkout: Some(checkout_record()),
             bash_disabled: None,
             last_reviewed_sha: None,
@@ -1518,6 +2011,91 @@ mod tests {
         });
         assert_eq!(st.draft, None);
         assert_eq!(st.usage, (0, 0));
+    }
+
+    /// The phase comes from the row *and* the hub's liveness. A `running` row
+    /// with nothing behind it (the app quit mid-run, the pipeline task was
+    /// lost, a finish parked the run awaiting a decision) must not show a
+    /// spinner with a Cancel button that can only answer "nothing is running".
+    #[test]
+    fn snapshot_phase_needs_a_live_run_for_a_running_row() {
+        fn snapshot(
+            run: Option<RunRecord>,
+            run_liveness: RunLiveness,
+            checkout: Option<CheckoutRecord>,
+        ) -> AiSnapshotData {
+            AiSnapshotData {
+                findings: Vec::new(),
+                coverage: Vec::new(),
+                timeline: Vec::new(),
+                brief: None,
+                run,
+                run_liveness,
+                checkout,
+                bash_disabled: None,
+                last_reviewed_sha: None,
+                draft: None,
+                usage: (0, 0),
+            }
+        }
+        let phase = |snap: &AiSnapshotData| {
+            let mut st = AiReviewState::default();
+            st.apply(&Event::AiSnapshot {
+                session: SESSION,
+                snapshot: snap.clone(),
+            });
+            st.phase
+        };
+
+        assert_eq!(
+            phase(&snapshot(
+                Some(run("running", None)),
+                RunLiveness::Live,
+                Some(checkout_record())
+            )),
+            AiPhase::Running
+        );
+        assert_eq!(
+            phase(&snapshot(
+                Some(run("running", None)),
+                RunLiveness::Stopped,
+                Some(checkout_record())
+            )),
+            AiPhase::Failed(INTERRUPTED.to_string()),
+            "a dead run must offer Start again"
+        );
+        assert_eq!(
+            phase(&snapshot(
+                Some(run("running", None)),
+                RunLiveness::Stopped,
+                None
+            )),
+            AiPhase::Failed(INTERRUPTED.to_string())
+        );
+        // A held checkout with no run row is a blocker, not an endless
+        // spinner: `start` installs its handle before it touches the tree.
+        assert_eq!(
+            phase(&snapshot(
+                None,
+                RunLiveness::Stopped,
+                Some(checkout_record())
+            )),
+            AiPhase::Idle
+        );
+        // A start in flight reads as checkout even while the previous run's
+        // row still says completed.
+        assert_eq!(
+            phase(&snapshot(
+                Some(run("completed", None)),
+                RunLiveness::Starting,
+                Some(checkout_record())
+            )),
+            AiPhase::CheckingOut
+        );
+        assert_eq!(
+            phase(&snapshot(None, RunLiveness::Starting, None)),
+            AiPhase::CheckingOut
+        );
     }
 
     /// A tab awaiting a checkout confirmation.
@@ -1599,6 +2177,7 @@ mod tests {
                 timeline: Vec::new(),
                 brief: brief.map(str::to_string),
                 run: Some(run("completed", None)),
+                run_liveness: RunLiveness::Stopped,
                 checkout: Some(checkout_record()),
                 bash_disabled: None,
                 last_reviewed_sha: None,
@@ -1845,6 +2424,26 @@ mod tests {
     /// Changing or unlinking the repo's folder is blocked while a run for
     /// it is live or a checkout of it awaits its restore — the restore
     /// logic depends on the path (spec: AI settings, Unlink / Change).
+    /// The PR's own held checkout never blocks its review from starting
+    /// and reads as a quiet note; another PR's still blocks both.
+    #[test]
+    fn the_prs_own_checkout_does_not_block_its_review() {
+        let st = AiReviewState::default();
+        let held = [checkout_record()];
+        let key = "github.com/o/r";
+        assert_eq!(start_blocked(&st, &held, key, Some(7)), None);
+        assert_eq!(
+            change_blocked_for(&st, &held, key, Some(7)).as_deref(),
+            Some(HELD_BY_THIS_PR),
+            "a folder change still waits for the restore"
+        );
+        assert!(start_blocked(&st, &held, key, Some(8)).is_some());
+        assert_ne!(
+            change_blocked_for(&st, &held, key, Some(8)).as_deref(),
+            Some(HELD_BY_THIS_PR)
+        );
+    }
+
     #[test]
     fn change_blocked_while_a_run_is_live_or_unrestored() {
         let key = "github.com/acme/widgets";
@@ -1902,5 +2501,63 @@ mod tests {
             let done = CheckoutRecord { state, ..record() };
             assert_eq!(change_blocked(&st, &[done], key), None, "{state:?}");
         }
+    }
+
+    /// The Restore… affordance lists exactly the records behind the
+    /// unrestored blocker — none while a run is live, the session's held
+    /// row, the app-wide rows, without duplicates — so the dialog it opens
+    /// matches the message the row shows.
+    #[test]
+    fn unrestored_for_repo_lists_the_blocking_records() {
+        let key = "github.com/acme/widgets";
+        let record = |id: i64, repo: &str| CheckoutRecord {
+            id,
+            repo: repo.to_string(),
+            ..checkout_record()
+        };
+
+        // Idle, nothing held.
+        let idle = AiReviewState::default();
+        assert!(unrestored_for_repo(&idle, &[], key).is_empty());
+
+        // A live run: the dialog would fight it, so nothing is offered.
+        for phase in [
+            AiPhase::Running,
+            AiPhase::Paused,
+            AiPhase::Restoring,
+            AiPhase::CheckingOut,
+            AiPhase::Planning,
+        ] {
+            let st = AiReviewState {
+                phase: phase.clone(),
+                checkout: Some(record(1, "acme/widgets")),
+                ..AiReviewState::default()
+            };
+            assert!(
+                unrestored_for_repo(&st, &[record(2, "acme/widgets")], key).is_empty(),
+                "{phase:?}"
+            );
+        }
+
+        // The session's own held checkout after the run ended.
+        let st = AiReviewState {
+            phase: AiPhase::Done,
+            checkout: Some(record(1, "acme/widgets")),
+            ..AiReviewState::default()
+        };
+        let listed = unrestored_for_repo(&st, &[], key);
+        assert_eq!(listed.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1]);
+
+        // App-wide rows, deduplicated by id, other repos left out.
+        let listed = unrestored_for_repo(
+            &st,
+            &[
+                record(1, "acme/widgets"),
+                record(3, "Acme/Widgets"),
+                record(4, "acme/api"),
+            ],
+            key,
+        );
+        assert_eq!(listed.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 }

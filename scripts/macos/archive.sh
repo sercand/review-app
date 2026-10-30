@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a signed, universal "GH Review.app" and wrap it in an .xcarchive.
+# Build a signed, arm64-only "GH Review.app" and wrap it in an .xcarchive.
 #
 #   scripts/macos/archive.sh
 #
@@ -8,14 +8,14 @@
 #   dSYMs/gh-review-desktop.dSYM           for symbolicating crash reports
 #
 # Environment (see common.sh): SIGN_IDENTITY, BUNDLE_ID, APP_NAME, MIN_MACOS,
-# BUILD_NUMBER, and TARGETS (default "aarch64-apple-darwin x86_64-apple-darwin";
-# set one triple for a single-arch build).
+# BUILD_NUMBER, and TARGETS (default "aarch64-apple-darwin"; add more triples
+# for a universal build).
 #
 # Next step: scripts/macos/notarize.sh
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
-TARGETS="${TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
+TARGETS="${TARGETS:-aarch64-apple-darwin}"
 
 [ -n "$SIGN_IDENTITY" ] || die "no \"Developer ID Application\" identity for team $TEAM_ID in the keychain; set TEAM_ID or SIGN_IDENTITY"
 for target in $TARGETS; do
@@ -37,7 +37,7 @@ bins=()
 dsyms=()
 for target in $TARGETS; do
     log "building $BIN_NAME $VERSION ($BUILD_NUMBER) for $target"
-    cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --target "$target" --bin "$BIN_NAME"
+    cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked --target "$target" --bin "$BIN_NAME" --features local-classifier
     bins+=("$ROOT/target/$target/release/$BIN_NAME")
     dsyms+=("$ROOT/target/$target/release/$BIN_NAME.dSYM")
 done

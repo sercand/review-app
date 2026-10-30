@@ -1,5 +1,7 @@
-//! The Settings window's AI tab: the providers table and its edit dialog, and
-//! the Models table with its model dialog (spec §10, Tasks 5–6).
+//! The Settings window's AI tab: the providers table and its edit dialog,
+//! the Models table with its model dialog (spec §10, Tasks 5–6), and the
+//! Auto-approve table with its dialog (bash auto-approve and the local
+//! classifier).
 //!
 //! Like the other widgets this never mutates the app's settings: a dialog
 //! reports a [`AiTabAction`] and `app.rs` applies it (patching the settings,
@@ -16,8 +18,10 @@ use eframe::egui::{self, Frame, Margin, RichText};
 
 use crate::ai::presets::{ModelPreset, presets as model_presets};
 use crate::persist::settings::{
-    AiSettings, LlmApi, ModelSettings, ProviderSettings, ReasoningLevel,
+    AiSettings, ApprovalLevel, AutoApproveSettings, DEFAULT_DECISION_MODEL, LlmApi, ModelSettings,
+    ProviderSettings, ReasoningLevel, valid_decision_model,
 };
+use crate::state::classifier::{self, ClassifierState};
 use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_galley, segmented};
 use crate::ui::widgets::settings_window::ModelRole;
 use crate::ui::{fonts, icons, theme};
@@ -354,6 +358,292 @@ pub fn reasoning_label(level: Option<ReasoningLevel>) -> &'static str {
     }
 }
 
+/// The extra commands the dialog's Advanced section can allow without
+/// asking, with their one-line descriptions. The names are the `[ai.auto_approve].capabilities` values
+/// (mapped to rule policies in `ai::approval_setup`).
+pub const AUTO_APPROVE_CAPABILITIES: [(&str, &str); 6] = [
+    ("git:add", "stage files with git add (any path)"),
+    (
+        "git:commit",
+        "git commit (not --amend, --no-verify or --no-gpg-sign)",
+    ),
+    ("git:restore-staged", "unstage with git restore --staged"),
+    ("git:tag", "create, list and delete local tags"),
+    (
+        "cargo:local",
+        "cargo build/test/run/fmt/update and other local subcommands (runs project code)",
+    ),
+    (
+        "help-bypass",
+        "run any binary with only --help, -h, --version, -V, help or version",
+    ),
+];
+
+/// The auto-approve dialog's working copy of `[ai.auto_approve]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoApproveVm {
+    /// The slider position. Picking full trust needs the confirmation tick
+    /// first.
+    pub level: ApprovalLevel,
+    /// Whether this build has a classifier at all. Filled by the caller;
+    /// while `false` a classifier level cannot switch the stored
+    /// `local_classifier` on.
+    pub classifier_available: bool,
+    /// Where the classifier is on its way to ready; drives the status line and
+    /// the Retry button. Filled by the caller.
+    pub classifier_state: ClassifierState,
+    /// The classifier timeout in milliseconds, as typed.
+    pub timeout_ms: String,
+    /// The registry name of the decision model, as typed. Blank saves as the
+    /// default model.
+    pub decision_model: String,
+    /// The confirmation ticked in this dialog session; required before
+    /// Save while it turns full trust on.
+    pub approve_all_confirmed: bool,
+    /// The extra deny patterns, one per line.
+    pub deny_paths_text: String,
+    /// Every capability with its on/off state. Names the dialog does not
+    /// know (from a newer settings file) are kept, so saving never drops them.
+    pub capabilities: Vec<(String, bool)>,
+}
+
+impl Default for AutoApproveVm {
+    fn default() -> Self {
+        AutoApproveVm::from_settings(&AutoApproveSettings::default())
+    }
+}
+
+impl AutoApproveVm {
+    /// The working copy of `s`; `classifier_available` starts `false`.
+    pub fn from_settings(s: &AutoApproveSettings) -> AutoApproveVm {
+        let mut capabilities: Vec<(String, bool)> = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .map(|(name, _)| ((*name).to_owned(), s.capabilities.iter().any(|c| c == name)))
+            .collect();
+        for unknown in &s.capabilities {
+            if !capabilities.iter().any(|(name, _)| name == unknown) {
+                capabilities.push((unknown.clone(), true));
+            }
+        }
+        AutoApproveVm {
+            level: ApprovalLevel::of_settings(s),
+            classifier_available: false,
+            classifier_state: ClassifierState::Off,
+            timeout_ms: s.classifier_timeout_ms.clamp(50, 5000).to_string(),
+            decision_model: s.decision_model.clone(),
+            approve_all_confirmed: s.trust_all(),
+            deny_paths_text: s.deny_paths.join("\n"),
+            capabilities,
+        }
+    }
+
+    /// Show `state`: the checkbox is editable unless this build has no
+    /// classifier or the device is unusable.
+    pub fn set_classifier_state(&mut self, state: ClassifierState) {
+        self.set_classifier_state_for(state, classifier::COMPILED);
+    }
+
+    fn set_classifier_state_for(&mut self, state: ClassifierState, compiled: bool) {
+        self.classifier_available = state.available(compiled);
+        self.classifier_state = state;
+    }
+
+    /// The deny patterns: trimmed, empty lines dropped.
+    fn deny_paths(&self) -> Vec<String> {
+        self.deny_paths_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Reject what [`Self::write_to`] cannot store: a timeout that is not
+    /// 50..=5000 ms, a decision model that is not a registry name, and deny
+    /// patterns containing whitespace (`/` is fine: `Library/Keychains` is a
+    /// built-in).
+    pub fn validate(&self) -> Result<(), String> {
+        match self.timeout_ms.trim().parse::<u64>() {
+            Ok(ms) if (50..=5000).contains(&ms) => {}
+            _ => return Err("classifier timeout must be 50 to 5000 ms".to_owned()),
+        }
+        let model = self.decision_model.trim();
+        if !model.is_empty() && !valid_decision_model(model) {
+            return Err(
+                "decision model must be a registry name: lowercase letters, digits, . _ -"
+                    .to_owned(),
+            );
+        }
+        for pattern in self.deny_paths() {
+            if pattern.chars().any(char::is_whitespace) {
+                return Err(format!("deny pattern \"{pattern}\" contains whitespace"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the validated copy into `s`: the level's mode, and the
+    /// classifier on for the levels that use it. While no classifier is
+    /// available it can be switched off but never on (M4).
+    fn write_to(&self, s: &mut AutoApproveSettings) {
+        s.mode = self.level.mode();
+        let wanted = self.level.uses_classifier();
+        if self.classifier_available {
+            s.local_classifier = wanted;
+        } else {
+            s.local_classifier &= wanted;
+        }
+        s.classifier_timeout_ms = self
+            .timeout_ms
+            .trim()
+            .parse()
+            .unwrap_or(s.classifier_timeout_ms);
+        s.decision_model = match self.decision_model.trim() {
+            "" => DEFAULT_DECISION_MODEL.to_owned(),
+            model => model.to_owned(),
+        };
+        s.deny_paths = self.deny_paths();
+        s.capabilities = self
+            .capabilities
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name.clone())
+            .collect();
+    }
+
+    /// The table the dialog's Save commits: `stored` with the edits written
+    /// over it, or why it cannot be saved (nothing is written then).
+    /// Turning full trust on is refused until the confirmation is ticked.
+    pub fn saved(&self, stored: &AutoApproveSettings) -> Result<AutoApproveSettings, String> {
+        self.validate()?;
+        if self.level == ApprovalLevel::Trust && !stored.trust_all() && !self.approve_all_confirmed
+        {
+            return Err(
+                "confirm the full-trust warning before saving: every command runs, and the agent can read secret paths"
+                    .to_owned(),
+            );
+        }
+        let mut next = stored.clone();
+        self.write_to(&mut next);
+        Ok(next)
+    }
+}
+
+/// The level's short name, for the slider, the Settings row and the AI
+/// tab's chip.
+pub fn level_name(level: ApprovalLevel) -> &'static str {
+    match level {
+        ApprovalLevel::AskMe => "Ask me",
+        ApprovalLevel::AskWhenUnsure => "Ask when unsure",
+        ApprovalLevel::NeverAsk => "Never ask",
+        ApprovalLevel::AskOnDanger => "Ask only on danger",
+        ApprovalLevel::Trust => "Full trust",
+    }
+}
+
+/// One sentence on what the level does.
+pub fn level_summary(level: ApprovalLevel) -> &'static str {
+    match level {
+        ApprovalLevel::AskMe => "Read-only commands run. You are asked about everything else.",
+        ApprovalLevel::AskWhenUnsure => {
+            "The local classifier approves what it can. You are asked about the rest."
+        }
+        ApprovalLevel::NeverAsk => {
+            "The local classifier approves what it can. The rest is refused and the agent is told why, so it tries another way. Nothing asks you."
+        }
+        ApprovalLevel::AskOnDanger => {
+            "Everything runs except what the local classifier calls dangerous, which asks you."
+        }
+        ApprovalLevel::Trust => {
+            "Every command runs unchecked, and the agent can read your secret files."
+        }
+    }
+}
+
+/// What happens to a command at a level, as shown under the slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Runs,
+    AsksYou,
+    Refused,
+}
+
+/// The level's outcomes, each with what gets it, in display order.
+pub fn level_points(level: ApprovalLevel) -> Vec<(Outcome, &'static str)> {
+    const READ_ONLY: &str = "read-only commands (ls, cat, grep, git log, …)";
+    const FLOOR: &str =
+        "deletes, moves, network, installs and inline scripts, even when the classifier says safe";
+    match level {
+        ApprovalLevel::AskMe => vec![
+            (Outcome::Runs, READ_ONLY),
+            (Outcome::AsksYou, "everything else"),
+        ],
+        ApprovalLevel::AskWhenUnsure => vec![
+            (Outcome::Runs, READ_ONLY),
+            (
+                Outcome::Runs,
+                "what the classifier calls safe, tests and builds included",
+            ),
+            (
+                Outcome::AsksYou,
+                "what it is unsure about or calls dangerous",
+            ),
+            (Outcome::AsksYou, FLOOR),
+        ],
+        ApprovalLevel::NeverAsk => vec![
+            (Outcome::Runs, READ_ONLY),
+            (
+                Outcome::Runs,
+                "what the classifier calls safe, tests and builds included",
+            ),
+            (Outcome::Refused, "everything else"),
+        ],
+        ApprovalLevel::AskOnDanger => vec![
+            (Outcome::Runs, READ_ONLY),
+            (
+                Outcome::Runs,
+                "everything the classifier does not call dangerous",
+            ),
+            (Outcome::AsksYou, "what it calls dangerous"),
+            (Outcome::AsksYou, FLOOR),
+            (
+                Outcome::AsksYou,
+                "every other command while the classifier is not ready",
+            ),
+        ],
+        ApprovalLevel::Trust => vec![
+            (
+                Outcome::Runs,
+                "every command, including reads of .env files, ~/.ssh, ~/.aws and .git/config",
+            ),
+            (
+                Outcome::AsksYou,
+                "prepare commands, which run outside the sandbox",
+            ),
+        ],
+    }
+}
+
+/// The Settings tab's one-line summary of `aa`: the level and, for a
+/// classifier level, where the model stands.
+pub fn auto_approve_summary(
+    aa: &AutoApproveSettings,
+    classifier_state: &ClassifierState,
+) -> (String, String) {
+    let level = ApprovalLevel::of_settings(aa);
+    let title = format!("Level {} of 5 · {}", level.number(), level_name(level));
+    let detail = if level.uses_classifier() {
+        format!(
+            "{} Classifier: {}.",
+            level_summary(level),
+            classifier_state.text(classifier::COMPILED)
+        )
+    } else {
+        level_summary(level).to_owned()
+    };
+    (title, detail)
+}
+
 /// The model dialog's working copy: the fields are the dialog's own, so a
 /// preset fill or a typed id never touches the settings until Save.
 #[derive(Clone, Debug, PartialEq)]
@@ -506,6 +796,8 @@ pub struct AiTabState {
     pub model_dialog: Option<ModelDialog>,
     /// The latest connection-test outcome per provider name.
     pub test_results: BTreeMap<String, Result<String, String>>,
+    /// The auto-approve dialog, when one is open.
+    pub auto_approve: Option<AutoApproveVm>,
 }
 
 impl AiTabState {
@@ -513,6 +805,7 @@ impl AiTabState {
     /// one dialog shows at a time: the model dialog closes.
     pub fn edit_provider(&mut self, ai: &AiSettings, index: usize) {
         self.model_dialog = None;
+        self.auto_approve = None;
         self.dialog = ai.providers.get(index).map(ProviderDialog::for_provider);
     }
 
@@ -520,7 +813,18 @@ impl AiTabState {
     /// one dialog shows at a time: the provider dialog closes.
     pub fn edit_model(&mut self, ai: &AiSettings, role: ModelRole) {
         self.dialog = None;
+        self.auto_approve = None;
         self.model_dialog = Some(ModelDialog::new(role, ai));
+    }
+
+    /// Open the auto-approve dialog on the stored table, showing the
+    /// classifier's latest state. Only one dialog shows at a time.
+    pub fn edit_auto_approve(&mut self, ai: &AiSettings, classifier_state: &ClassifierState) {
+        self.dialog = None;
+        self.model_dialog = None;
+        let mut vm = AutoApproveVm::from_settings(&ai.auto_approve);
+        vm.set_classifier_state(classifier_state.clone());
+        self.auto_approve = Some(vm);
     }
 }
 
@@ -561,13 +865,18 @@ pub enum AiTabAction {
         /// A key typed in the dialog; wins over the stored one.
         key: Option<String>,
     },
+    /// Commit the `[ai.auto_approve]` table (validated by the dialog).
+    SaveAutoApprove(AutoApproveSettings),
+    /// Fetch the classifier weights again (the Retry button).
+    ClassifierDownload,
 }
 
-/// Draw the providers table, the Models table, and, when open, a dialog.
-/// Returns what the user asked for this frame.
+/// Draw the providers table, the Models table, the Auto-approve table, and,
+/// when open, a dialog. Returns what the user asked for this frame.
 pub fn render(
     ui: &mut egui::Ui,
     state: &mut AiTabState,
+    classifier_state: &ClassifierState,
     ai: &AiSettings,
     keys: &KeyPresence,
 ) -> Vec<AiTabAction> {
@@ -600,8 +909,13 @@ pub fn render(
         state.edit_model(ai, role);
     }
 
+    if auto_approve_section(ui, ai, classifier_state, &mut actions) {
+        state.edit_auto_approve(ai, classifier_state);
+    }
+
     render_dialog(ui.ctx(), state, ai, keys, &mut actions);
     render_model_dialog(ui.ctx(), state, ai, &mut actions);
+    render_auto_approve_dialog(ui.ctx(), state, ai, &mut actions);
     actions
 }
 
@@ -617,6 +931,7 @@ fn heading(ui: &mut egui::Ui, ai: &AiSettings, state: &mut AiTabState) {
             {
                 // Only one dialog shows at a time (final review).
                 state.model_dialog = None;
+                state.auto_approve = None;
                 state.dialog = Some(ProviderDialog::blank(unique_name(&ai.providers)));
             }
         });
@@ -1199,6 +1514,343 @@ fn render_model_dialog(
     }
 }
 
+/// The Auto-approve section: a heading and one clickable row naming the
+/// level, plus a Retry button while a download or load failed. Returns
+/// whether the user clicked the row (which opens the dialog).
+fn auto_approve_section(
+    ui: &mut egui::Ui,
+    ai: &AiSettings,
+    classifier_state: &ClassifierState,
+    actions: &mut Vec<AiTabAction>,
+) -> bool {
+    ui.add_space(12.0);
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new("Auto-approve bash commands").font(fonts::semibold(13.0)));
+    ui.add_space(2.0);
+    let (title, detail) = auto_approve_summary(&ai.auto_approve, classifier_state);
+    let level = ApprovalLevel::of_settings(&ai.auto_approve);
+    let response = Frame::new()
+        .stroke((1.0, p.line_soft))
+        .corner_radius(6.0)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&title)
+                        .font(fonts::semibold(12.5))
+                        .color(level_color(p, level)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Change…").size(12.0).color(p.accent));
+                });
+            });
+            ui.label(RichText::new(&detail).size(12.0).color(p.muted));
+        })
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &title));
+    let open = response.clicked();
+    // Only a failed download or load can be retried.
+    if level.uses_classifier() && classifier_state.can_download(classifier::COMPILED) {
+        ui.add_space(4.0);
+        if Btn::new(BtnKind::Default, "Retry classifier download")
+            .show(ui)
+            .clicked()
+        {
+            actions.push(AiTabAction::ClassifierDownload);
+        }
+    }
+    open
+}
+
+/// The colour a level is named in: the further from asking, the warmer.
+fn level_color(p: &theme::Palette, level: ApprovalLevel) -> egui::Color32 {
+    match level {
+        ApprovalLevel::AskMe | ApprovalLevel::AskWhenUnsure => p.text,
+        ApprovalLevel::NeverAsk => p.ok,
+        ApprovalLevel::AskOnDanger => p.warn,
+        ApprovalLevel::Trust => p.bad,
+    }
+}
+
+/// The auto-approve dialog's fields: the level slider, what the level does,
+/// the classifier's state, and an Advanced section for the rest.
+fn auto_approve_fields(ui: &mut egui::Ui, vm: &mut AutoApproveVm, actions: &mut Vec<AiTabAction>) {
+    let p = theme::palette_of(ui);
+    let heading = ui.label(
+        RichText::new(format!(
+            "Level {} of 5 · {}",
+            vm.level.number(),
+            level_name(vm.level)
+        ))
+        .font(fonts::semibold(14.0))
+        .color(level_color(p, vm.level)),
+    );
+    let mut number = vm.level.number();
+    // Inset by half a column on each side, so each stop sits over its
+    // label below.
+    let width = ui.available_width();
+    let inset = width / (2.0 * ApprovalLevel::ALL.len() as f32);
+    ui.horizontal(|ui| {
+        ui.add_space(inset - ui.spacing().item_spacing.x);
+        ui.spacing_mut().slider_width = width - 2.0 * inset;
+        ui.add(
+            egui::Slider::new(&mut number, 1..=5)
+                .step_by(1.0)
+                .show_value(false)
+                .trailing_fill(true),
+        )
+        .labelled_by(heading.id);
+    });
+    // The stops, clickable, under the slider.
+    ui.columns(ApprovalLevel::ALL.len(), |columns| {
+        for (column, level) in columns.iter_mut().zip(ApprovalLevel::ALL) {
+            column.vertical_centered(|ui| {
+                let selected = level == vm.level;
+                let text = RichText::new(level_name(level))
+                    .size(11.0)
+                    .color(if selected {
+                        level_color(p, level)
+                    } else {
+                        p.muted
+                    });
+                if ui.selectable_label(selected, text).clicked() {
+                    number = level.number();
+                }
+            });
+        }
+    });
+    vm.level = ApprovalLevel::ALL[number.clamp(1, 5) - 1];
+
+    ui.add_space(4.0);
+    ui.label(RichText::new(level_summary(vm.level)).size(12.5));
+    for outcome in [Outcome::Runs, Outcome::AsksYou, Outcome::Refused] {
+        let items: Vec<&str> = level_points(vm.level)
+            .into_iter()
+            .filter(|(o, _)| *o == outcome)
+            .map(|(_, text)| text)
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        let (icon, title, color) = match outcome {
+            Outcome::Runs => (icons::CIRCLE_CHECK, "Runs without asking", p.ok),
+            Outcome::AsksYou => (icons::USER_CHECK, "Asks you", p.warn),
+            Outcome::Refused => (icons::CIRCLE_X, "Refused, the agent is told why", p.bad),
+        };
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new(icons::icon_text(icon, title))
+                .font(fonts::semibold(12.0))
+                .color(color),
+        );
+        for item in items {
+            ui.label(
+                RichText::new(format!("    {item}"))
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        }
+    }
+    if vm.level != ApprovalLevel::Trust {
+        ui.label(
+            RichText::new("Secret files (.env, ~/.ssh, ~/.aws, keychains) are always blocked.")
+                .size(12.0)
+                .color(p.muted),
+        );
+    }
+
+    if vm.level.uses_classifier() {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Local classifier:").size(12.0).color(p.muted));
+            let text = if classifier::COMPILED
+                && !vm.classifier_available
+                && vm.classifier_state == ClassifierState::Off
+            {
+                "downloads when you save".to_owned()
+            } else {
+                vm.classifier_state.text(classifier::COMPILED)
+            };
+            ui.label(RichText::new(text).size(12.0));
+            if vm.classifier_state.can_download(classifier::COMPILED)
+                && Btn::new(BtnKind::Default, "Retry").show(ui).clicked()
+            {
+                actions.push(AiTabAction::ClassifierDownload);
+            }
+        });
+        if !classifier::COMPILED {
+            ui.label(
+                RichText::new(
+                    "This build has no classifier, so only read-only commands are approved automatically.",
+                )
+                .size(12.0)
+                .color(p.warn),
+            );
+        }
+    }
+
+    if vm.level == ApprovalLevel::Trust {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Writes stay confined to the checkout and a temp dir and the agent has no GitHub \
+                 credentials, but what it reads can reach the model provider. A review already \
+                 running keeps its sandbox: secret files stay hidden until the next review.",
+            )
+            .size(12.0)
+            .color(p.muted),
+        );
+        if !vm.approve_all_confirmed {
+            ui.checkbox(
+                &mut vm.approve_all_confirmed,
+                RichText::new("I understand every command will run unchecked").color(p.bad),
+            );
+        }
+    }
+
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new("Advanced")
+        .id_salt("auto-approve-advanced")
+        .default_open(false)
+        .show(ui, |ui| advanced_fields(ui, vm));
+    ui.label(
+        RichText::new("Saving applies to running reviews from their next command.")
+            .size(12.0)
+            .color(p.faint),
+    );
+}
+
+/// The dialog's Advanced section: extra commands to allow, extra paths to
+/// block, and the classifier's model and timeout.
+fn advanced_fields(ui: &mut egui::Ui, vm: &mut AutoApproveVm) {
+    let p = theme::palette_of(ui);
+    let hint = |ui: &mut egui::Ui, text: &str| {
+        ui.label(RichText::new(text).size(12.0).color(p.faint));
+    };
+    field_label(ui, "Also allow without asking");
+    hint(
+        ui,
+        "Commands that run at every level, on top of the read-only ones. Off unless you tick them.",
+    );
+    for (name, on) in &mut vm.capabilities {
+        let description = AUTO_APPROVE_CAPABILITIES
+            .iter()
+            .find(|(known, _)| known == name)
+            .map_or(name.as_str(), |(_, description)| *description);
+        ui.checkbox(on, description);
+    }
+    let label = field_label_response(ui, "Never let the agent read these paths");
+    hint(
+        ui,
+        "One pattern per line, on top of the built-in secret paths. * at the end matches a prefix, at the start a suffix; case-insensitive.",
+    );
+    ui.add(
+        egui::TextEdit::multiline(&mut vm.deny_paths_text)
+            .hint_text("for example: secrets, .env*, Library/Keychains")
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    )
+    .labelled_by(label.id);
+    let label = field_label_response(ui, "Classifier model");
+    ui.add_enabled(
+        vm.classifier_available,
+        egui::TextEdit::singleline(&mut vm.decision_model)
+            .hint_text(DEFAULT_DECISION_MODEL)
+            .desired_width(200.0),
+    )
+    .labelled_by(label.id);
+    let label = field_label_response(ui, "Classifier time limit per command (ms)");
+    ui.add(egui::TextEdit::singleline(&mut vm.timeout_ms).desired_width(80.0))
+        .labelled_by(label.id);
+    hint(
+        ui,
+        "A command the classifier has not answered in time is treated as unsure.",
+    );
+}
+
+/// [`field_label`], returning the label so a field can be named after it.
+fn field_label_response(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let p = theme::palette_of(ui);
+    ui.label(RichText::new(label).size(12.0).color(p.muted))
+}
+
+/// The auto-approve dialog, shown only while [`AiTabState::auto_approve`] is
+/// set. Save commits the whole `[ai.auto_approve]` table.
+fn render_auto_approve_dialog(
+    ctx: &egui::Context,
+    state: &mut AiTabState,
+    ai: &AiSettings,
+    actions: &mut Vec<AiTabAction>,
+) {
+    let Some(vm) = state.auto_approve.as_mut() else {
+        return;
+    };
+    let p = theme::palette(ctx.theme() == egui::Theme::Dark);
+    let mut close = false;
+    let title = "Auto-approve bash commands";
+    egui::Window::new(title)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .frame(
+            Frame::new()
+                .fill(p.surface)
+                .corner_radius(10.0)
+                .stroke((1.0, p.line))
+                .inner_margin(Margin::symmetric(16, 12)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).font(fonts::semibold(14.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icons::icon_button(ui, icons::X, "Close  Esc").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            rule(ui);
+
+            egui::ScrollArea::vertical()
+                .max_height((ctx.viewport_rect().height() - 220.0).clamp(160.0, 520.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| auto_approve_fields(ui, vm, actions));
+
+            let saved = vm.saved(&ai.auto_approve);
+            if let Err(error) = &saved {
+                ui.label(RichText::new(error).size(12.0).color(p.bad));
+            }
+            ui.add_space(4.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save = Btn::new(BtnKind::Primary, "Save")
+                    .enabled(saved.is_ok())
+                    .show(ui);
+                let save = if saved.is_ok() {
+                    save
+                } else {
+                    save.on_hover_text("fix the auto-approve settings before saving")
+                };
+                if save.clicked()
+                    && let Ok(next) = saved
+                {
+                    actions.push(AiTabAction::SaveAutoApprove(next));
+                    close = true;
+                }
+                if Btn::new(BtnKind::Default, "Cancel").show(ui).clicked() {
+                    close = true;
+                }
+            });
+        });
+    if close {
+        state.auto_approve = None;
+    }
+}
+
 /// The model dialog's provider dropdown: the providers the file names.
 fn provider_combo(ui: &mut egui::Ui, provider: &mut String, ai: &AiSettings) {
     let p = theme::palette_of(ui);
@@ -1294,7 +1946,9 @@ fn api_combo(ui: &mut egui::Ui, api: &mut LlmApi) {
 mod tests {
     use super::*;
     use crate::ai::presets::presets;
-    use crate::persist::settings::{LlmApi, ModelSettings, ProviderSettings, ReasoningLevel};
+    use crate::persist::settings::{
+        ApprovalMode, LlmApi, ModelSettings, ProviderSettings, ReasoningLevel,
+    };
     use crate::ui::widgets::settings_window::ModelRole;
 
     fn provider(name: &str) -> ProviderSettings {
@@ -1661,5 +2315,349 @@ mod tests {
             "the provider dialog closes the model dialog"
         );
         assert!(state.dialog.is_some());
+    }
+    /// The auto-approve dialog closes the other two, and they close it.
+    #[test]
+    fn the_auto_approve_dialog_is_exclusive_too() {
+        let ai = ai_with_provider();
+        let mut state = AiTabState::default();
+        state.edit_model(&ai, ModelRole::Default);
+        state.edit_auto_approve(&ai, &ClassifierState::Off);
+        assert!(state.model_dialog.is_none() && state.dialog.is_none());
+        assert!(state.auto_approve.is_some());
+        state.edit_provider(&ai, 0);
+        assert!(state.auto_approve.is_none());
+        state.edit_auto_approve(&ai, &ClassifierState::Off);
+        state.edit_model(&ai, ModelRole::Default);
+        assert!(state.auto_approve.is_none());
+    }
+
+    /// Save writes the dialog's copy over the stored table (the old Apply).
+    fn apply(vm: &AutoApproveVm, s: &mut AutoApproveSettings) -> Result<(), String> {
+        *s = vm.saved(s)?;
+        Ok(())
+    }
+
+    #[test]
+    fn vm_round_trips_settings() {
+        let mut settings = AutoApproveSettings {
+            mode: ApprovalMode::Ask,
+            local_classifier: false,
+            classifier_timeout_ms: 1234,
+            deny_paths: vec!["secrets".into(), ".env*".into()],
+            capabilities: vec![
+                "git:add".into(),
+                "cargo:local".into(),
+                "future:thing".into(),
+            ],
+            decision_model: "d1-7b".into(),
+            ..AutoApproveSettings::default()
+        };
+        let before = settings.clone();
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "1234");
+        assert_eq!(vm.deny_paths_text, "secrets\n.env*");
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings, before);
+    }
+
+    /// The slider's stops are buttons: from full trust one click moves to
+    /// "Never ask", and picking full trust again asks for the confirmation.
+    #[test]
+    fn the_level_stops_pick_the_level() {
+        use egui_kittest::kittest::Queryable;
+
+        let on = AutoApproveSettings {
+            mode: ApprovalMode::Trust,
+            ..AutoApproveSettings::default()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([520.0, 1400.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                |ui, vm: &mut AutoApproveVm| auto_approve_fields(ui, vm, &mut Vec::new()),
+                AutoApproveVm::from_settings(&on),
+            );
+        harness.run();
+        harness.get_by_label("Never ask").click();
+        harness.run();
+        assert_eq!(harness.state().level, ApprovalLevel::NeverAsk);
+        assert!(!harness.state().saved(&on).unwrap().trust_all());
+        harness.get_by_label_contains("Refused, the agent is told why");
+
+        let off = AutoApproveSettings::default();
+        *harness.state_mut() = AutoApproveVm::from_settings(&off);
+        harness.run();
+        harness.get_by_label("Full trust").click();
+        harness.run();
+        assert!(harness.state().saved(&off).is_err(), "needs the tick");
+        harness
+            .get_by_label("I understand every command will run unchecked")
+            .click();
+        harness.run();
+        assert!(harness.state().saved(&off).unwrap().trust_all());
+    }
+
+    /// Full trust saves only with the confirmation ticked, and a vm opened
+    /// on already-on settings needs none (so turning it off always works).
+    #[test]
+    fn approve_all_requires_confirmation_to_turn_on() {
+        let off = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&off);
+        vm.level = ApprovalLevel::Trust;
+        assert!(
+            vm.saved(&off).is_err(),
+            "a fresh full-trust choice needs the tick"
+        );
+        vm.approve_all_confirmed = true;
+        let next = vm.saved(&off).unwrap();
+        assert!(next.trust_all());
+
+        // Already on: reopening the dialog can save (and switch off) with
+        // no tick.
+        let vm = AutoApproveVm::from_settings(&next);
+        assert!(vm.saved(&next).unwrap().trust_all());
+        let mut vm = AutoApproveVm::from_settings(&next);
+        vm.level = ApprovalLevel::NeverAsk;
+        assert!(!vm.saved(&next).unwrap().trust_all());
+    }
+
+    #[test]
+    fn vm_round_trips_decision_model() {
+        let mut settings = AutoApproveSettings {
+            decision_model: "d1-7b".into(),
+            ..AutoApproveSettings::default()
+        };
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.decision_model, "d1-7b");
+        vm.decision_model = " smol.v2_x ".into();
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.decision_model, "smol.v2_x");
+    }
+
+    #[test]
+    fn a_blank_decision_model_saves_as_the_default() {
+        for blank in ["", "   "] {
+            let mut settings = AutoApproveSettings {
+                decision_model: "d1-7b".into(),
+                ..AutoApproveSettings::default()
+            };
+            let mut vm = AutoApproveVm::from_settings(&settings);
+            vm.decision_model = blank.into();
+            assert!(vm.validate().is_ok(), "{blank:?}");
+            apply(&vm, &mut settings).unwrap();
+            assert_eq!(settings.decision_model, DEFAULT_DECISION_MODEL);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_model_name() {
+        for bad in ["D1", "a b", "a/b", "../x", "d1:3b"] {
+            let vm = AutoApproveVm {
+                decision_model: bad.into(),
+                ..AutoApproveVm::default()
+            };
+            assert!(vm.validate().is_err(), "{bad:?}");
+        }
+        assert!(AutoApproveVm::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_timeout_and_patterns() {
+        let ok = AutoApproveVm::default();
+        assert!(ok.validate().is_ok());
+        for bad in ["", "abc", "49", "5001", "-1"] {
+            let vm = AutoApproveVm {
+                timeout_ms: bad.into(),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "timeout {bad:?}");
+        }
+        for bad in ["a b", "a\tb"] {
+            let vm = AutoApproveVm {
+                deny_paths_text: format!("fine\n{bad}"),
+                ..ok.clone()
+            };
+            assert!(vm.validate().is_err(), "pattern {bad:?}");
+        }
+        let vm = AutoApproveVm {
+            timeout_ms: "50".into(),
+            deny_paths_text: "\n  secrets* \n\n".into(),
+            ..ok
+        };
+        assert!(vm.validate().is_ok());
+    }
+
+    /// Every level says what runs; the levels short of full trust keep
+    /// the floor's list where the classifier decides.
+    #[test]
+    fn every_level_says_what_runs_and_what_does_not() {
+        for level in ApprovalLevel::ALL {
+            let points = level_points(level);
+            assert!(points.iter().any(|(o, _)| *o == Outcome::Runs), "{level:?}");
+            assert!(points.iter().any(|(o, _)| *o != Outcome::Runs), "{level:?}");
+        }
+        assert!(
+            level_points(ApprovalLevel::NeverAsk)
+                .iter()
+                .all(|(o, _)| *o != Outcome::AsksYou),
+            "never ask never asks"
+        );
+    }
+
+    #[test]
+    fn apply_writes_settings() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.level = ApprovalLevel::AskMe;
+        vm.timeout_ms = "800".into();
+        vm.deny_paths_text = " secrets \n\n.env*\n".into();
+        for (name, on) in &mut vm.capabilities {
+            *on = name == "git:commit" || name == "help-bypass";
+        }
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.mode, ApprovalMode::Ask);
+        assert_eq!(settings.classifier_timeout_ms, 800);
+        assert_eq!(settings.deny_paths, vec!["secrets", ".env*"]);
+        assert_eq!(settings.capabilities, vec!["git:commit", "help-bypass"]);
+    }
+
+    #[test]
+    fn invalid_auto_approve_blocks_apply_without_writing() {
+        let mut settings = AutoApproveSettings::default();
+        let before = settings.clone();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.timeout_ms = "0".into();
+        vm.level = ApprovalLevel::AskMe;
+        assert!(apply(&vm, &mut settings).is_err());
+        assert_eq!(settings, before);
+    }
+
+    #[test]
+    fn a_classifier_level_turns_it_on_only_when_available() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        assert!(!vm.classifier_available);
+        vm.level = ApprovalLevel::AskWhenUnsure;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+        vm.classifier_available = true;
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+    }
+
+    #[test]
+    fn opening_the_dialog_gates_the_checkbox_by_the_classifier_state() {
+        let ai = ai_with_provider();
+        let mut state = AiTabState::default();
+        state.edit_auto_approve(&ai, &ClassifierState::Downloading { done: 1, total: 2 });
+        let aa = state.auto_approve.as_ref().unwrap();
+        assert_eq!(
+            aa.classifier_state,
+            ClassifierState::Downloading { done: 1, total: 2 }
+        );
+        assert_eq!(aa.classifier_available, classifier::COMPILED);
+    }
+
+    #[test]
+    fn an_unavailable_classifier_can_be_switched_off_but_never_on() {
+        let mut settings = AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        };
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.set_classifier_state_for(
+            ClassifierState::Unavailable("no usable compute device".into()),
+            true,
+        );
+        // Untouched: the stored true stays.
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+        // A level without it: it goes off.
+        vm.level = ApprovalLevel::AskMe;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+        // Back to a classifier level while unavailable: does not stick.
+        vm.level = ApprovalLevel::NeverAsk;
+        apply(&vm, &mut settings).unwrap();
+        assert!(!settings.local_classifier);
+    }
+
+    #[test]
+    fn unavailable_or_uncompiled_classifier_is_not_editable() {
+        let mut aa = AutoApproveVm::default();
+        aa.set_classifier_state_for(ClassifierState::Failed("offline".into()), true);
+        assert!(aa.classifier_available, "editable while Failed");
+        aa.set_classifier_state_for(
+            ClassifierState::Unavailable("no usable compute device".into()),
+            true,
+        );
+        assert!(!aa.classifier_available);
+        aa.set_classifier_state_for(ClassifierState::Off, false);
+        assert!(!aa.classifier_available);
+    }
+
+    // M4: a hand-set `local_classifier = true` survives saving while the
+    // checkbox was not editable (no classifier available).
+    #[test]
+    fn save_keeps_hand_set_local_classifier_while_unavailable() {
+        let mut settings = AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        };
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert!(!vm.classifier_available);
+        apply(&vm, &mut settings).unwrap();
+        assert!(settings.local_classifier);
+    }
+
+    #[test]
+    fn stored_out_of_range_timeout_and_slash_pattern_do_not_block_save() {
+        let mut settings = AutoApproveSettings {
+            classifier_timeout_ms: 0,
+            deny_paths: vec!["Library/Keychains".into()],
+            ..AutoApproveSettings::default()
+        };
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "50");
+        assert!(vm.validate().is_ok());
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.classifier_timeout_ms, 50);
+        assert_eq!(settings.deny_paths, ["Library/Keychains"]);
+        settings.classifier_timeout_ms = 10_000;
+        let vm = AutoApproveVm::from_settings(&settings);
+        assert_eq!(vm.timeout_ms, "5000");
+    }
+
+    #[test]
+    fn crlf_deny_paths_are_split_cleanly() {
+        let mut settings = AutoApproveSettings::default();
+        let mut vm = AutoApproveVm::from_settings(&settings);
+        vm.deny_paths_text = "a\r\nb\r\n".into();
+        assert!(vm.validate().is_ok());
+        apply(&vm, &mut settings).unwrap();
+        assert_eq!(settings.deny_paths, ["a", "b"]);
+    }
+
+    #[test]
+    fn the_summary_names_the_level_and_the_classifier_state() {
+        let aa = AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        };
+        let failed = ClassifierState::Failed("offline".into());
+        let (title, detail) = auto_approve_summary(&aa, &failed);
+        assert_eq!(title, "Level 3 of 5 · Never ask");
+        assert!(
+            detail.contains(&failed.text(classifier::COMPILED)),
+            "{detail}"
+        );
+        let on = AutoApproveSettings {
+            mode: ApprovalMode::Trust,
+            ..aa
+        };
+        let (title, detail) = auto_approve_summary(&on, &failed);
+        assert_eq!(title, "Level 5 of 5 · Full trust");
+        assert!(!detail.contains("Classifier"), "{detail}");
     }
 }

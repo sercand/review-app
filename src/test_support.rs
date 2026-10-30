@@ -40,6 +40,16 @@ pub fn tempdir() -> tempfile::TempDir {
 /// is dropped at once, so the state's sends fail and are ignored.
 #[cfg(unix)]
 pub fn ai_run_state() -> std::sync::Arc<crate::ai::review::RunState> {
+    ai_run_state_with_events().0
+}
+
+/// [`ai_run_state`] with the receiving end of its event channel, for tests
+/// that check what the run announces.
+#[cfg(unix)]
+pub fn ai_run_state_with_events() -> (
+    std::sync::Arc<crate::ai::review::RunState>,
+    tokio::sync::mpsc::UnboundedReceiver<crate::ai::events::PipelineEvent>,
+) {
     use crate::ai::review::RunState;
     use crate::ai::store::{PrKey, RunKind, Store};
     use std::sync::Arc;
@@ -56,8 +66,8 @@ pub fn ai_run_state() -> std::sync::Arc<crate::ai::review::RunState> {
     let run = store
         .run_begin(session, RunKind::Full, None, "sha_head")
         .expect("run row");
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    Arc::new(RunState::new(store, session, run, tx))
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    (Arc::new(RunState::new(store, session, run, tx)), rx)
 }
 
 /// A repository reference in the `o/r` every unit test uses.

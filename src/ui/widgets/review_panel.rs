@@ -367,8 +367,23 @@ pub fn render(
     pending: &mut PendingReview,
     actions: &mut Vec<ReviewAction>,
 ) {
-    let p = theme::palette_of(ui);
     ui.set_width(380.0);
+    render_body(ui, vm, pending, actions);
+}
+
+/// The summary box's height: what the window leaves after the verdicts, the
+/// comment list and the footer, which always stay on screen.
+fn summary_max_height(ui: &egui::Ui) -> f32 {
+    (ui.ctx().viewport_rect().height() - 460.0).clamp(100.0, 400.0)
+}
+
+fn render_body(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    pending: &mut PendingReview,
+    actions: &mut Vec<ReviewAction>,
+) {
+    let p = theme::palette_of(ui);
     ui.strong("Finish your review");
     if vm.github {
         ui.colored_label(
@@ -385,12 +400,21 @@ pub fn render(
         ui.label(RichText::new(suggested.clone()).color(p.muted));
     }
 
-    let body_response = ui.add(
-        egui::TextEdit::multiline(&mut pending.body)
-            .hint_text("Leave a summary (optional for Approve)")
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
+    // Only the summary and the comment list scroll: a long summary (the
+    // assembler's pre-fill) never pushes the verdicts or Submit away.
+    let body_response = egui::ScrollArea::vertical()
+        .id_salt("review-summary-scroll")
+        .max_height(summary_max_height(ui))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut pending.body)
+                    .hint_text("Leave a summary (optional for Approve)")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            )
+        })
+        .inner;
     // The edit wrote straight into `pending.body`; report the change so the
     // app persists the draft.
     if body_response.changed() {
@@ -465,6 +489,26 @@ pub fn render(
         }
     }
 
+    egui::ScrollArea::vertical()
+        .id_salt("review-comments-scroll")
+        .max_height(180.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| comment_lists(ui, vm, pending, actions));
+    if let Some(reason) = vm.blocked_reason {
+        ui.colored_label(p.pending, reason);
+    }
+    footer(ui, vm, actions, &owned_ids);
+}
+
+/// The comments on GitHub and the pending ones, each row jumping to its
+/// place in the diff.
+fn comment_lists(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    pending: &PendingReview,
+    actions: &mut Vec<ReviewAction>,
+) {
+    let p = theme::palette_of(ui);
     if !vm.github_items.is_empty() {
         ui.label(format!("{} comments on GitHub", vm.github_items.len()));
         for item in &vm.github_items {
@@ -489,10 +533,6 @@ pub fn render(
             }
         }
     }
-    if let Some(reason) = vm.blocked_reason {
-        ui.colored_label(p.pending, reason);
-    }
-
     if vm.pending_count > 0 {
         ui.label(format!("{} pending comments", vm.pending_count));
         for item in pending_items(pending) {
@@ -517,7 +557,16 @@ pub fn render(
             }
         }
     }
+}
 
+/// Submit, Discard (with its confirmation) and the scoped ⌘↵ shortcut.
+fn footer(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    actions: &mut Vec<ReviewAction>,
+    owned_ids: &[egui::Id],
+) {
+    let p = theme::palette_of(ui);
     ui.separator();
     if confirm_discard(ui) {
         ui.horizontal(|ui| {
@@ -568,7 +617,7 @@ pub fn render(
     // any other field) can never submit the review by accident.
     let focused = ui.ctx().memory(|m| m.focused());
     let submit_shortcut = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
-        && submit_shortcut_allowed(focused, &owned_ids);
+        && submit_shortcut_allowed(focused, owned_ids);
     if submit_shortcut && vm.submit_enabled {
         actions.push(ReviewAction::Submit);
     }
@@ -803,6 +852,44 @@ mod tests {
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
         assert!(!opened, "an untouched banner opens nothing");
+    }
+
+    /// A very long summary scrolls inside its box: the verdict cards stay
+    /// on screen and clickable.
+    #[test]
+    fn a_long_summary_keeps_the_verdicts_reachable() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut pending = PendingReview::default();
+        pending.set_body((0..200).map(|i| format!("line {i}\n")).collect());
+        let vm = review_panel_vm(&inputs(&pending));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([420.0, 700.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, (pending, actions): &mut (PendingReview, Vec<ReviewAction>)| {
+                    render(ui, &vm, pending, actions)
+                },
+                (pending, Vec::new()),
+            );
+        harness.run();
+        let comment = harness.get_by_label("Comment").rect();
+        assert!(
+            comment.bottom() < 700.0,
+            "the verdicts are pushed off: {comment:?}"
+        );
+        let submit = harness.get_by_label_contains("Submit review").rect();
+        assert!(submit.bottom() < 700.0, "Submit is pushed off: {submit:?}");
+        harness.get_by_label("Approve").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .1
+                .contains(&ReviewAction::SetEvent(ReviewEvent::Approve)),
+            "{:?}",
+            harness.state().1
+        );
     }
 
     #[test]

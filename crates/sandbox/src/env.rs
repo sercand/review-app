@@ -115,6 +115,10 @@ pub fn agent_env(input: &EnvInput) -> std::io::Result<BTreeMap<OsString, OsStrin
     }
     // An empty `helper` unsets every inherited credential helper.
     cfg.push_str("[credential]\n\thelper =\n");
+    // C2b: the approval engine runs `git -C DIR log` / `cd DIR && git status`
+    // silently; refuse to discover bare-repo layouts committed as plain files
+    // in a PR checkout (their `config` would be loaded and could run code).
+    cfg.push_str("[safe]\n\tbareRepository = explicit\n");
     std::fs::write(&gitconfig, cfg)?;
 
     let mut env = BTreeMap::new();
@@ -195,6 +199,7 @@ mod tests {
         let cfg = std::fs::read_to_string(tmp.path().join("gitconfig")).unwrap();
         assert!(cfg.contains("name = Ada") && cfg.contains("email = ada@example.com"));
         assert!(cfg.contains("[credential]") && cfg.contains("helper ="));
+        assert!(cfg.contains("[safe]") && cfg.contains("bareRepository = explicit"));
     }
 
     #[test]

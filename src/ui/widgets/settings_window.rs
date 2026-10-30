@@ -15,7 +15,10 @@ use eframe::egui::{self, Frame, Margin, RichText};
 
 use crate::github::search::Scope;
 use crate::model::diff::DiffMode;
-use crate::persist::settings::{AiSettings, ModelSettings, ProviderSettings, Settings};
+use crate::persist::settings::{
+    AiSettings, AutoApproveSettings, ModelSettings, ProviderSettings, Settings,
+};
+use crate::state::classifier::ClassifierState;
 use crate::ui::components::{Btn, BtnKind, Field, Seg, elided_label, segmented, toggle_chip};
 use crate::ui::theme::Theme;
 #[cfg(unix)]
@@ -169,6 +172,9 @@ pub struct SettingsWindowState {
     /// The AI tab's dialog and latest test results (spec §10).
     #[cfg(unix)]
     pub ai_tab: settings_ai_tab::AiTabState,
+    /// The classifier's latest state. Kept here, not only in the AI tab,
+    /// because `open_with` resets the tab and the state outlives it.
+    pub classifier_state: ClassifierState,
 }
 
 impl SettingsWindowState {
@@ -181,6 +187,16 @@ impl SettingsWindowState {
             self.ai_tab = settings_ai_tab::AiTabState::default();
         }
         self.open = true;
+    }
+
+    /// The classifier moved to `state`: remember it and show it in an open
+    /// auto-approve dialog.
+    pub fn set_classifier_state(&mut self, state: ClassifierState) {
+        #[cfg(unix)]
+        if let Some(dialog) = self.ai_tab.auto_approve.as_mut() {
+            dialog.set_classifier_state(state.clone());
+        }
+        self.classifier_state = state;
     }
 
     /// Dismiss the window, discarding unapplied edits.
@@ -260,6 +276,12 @@ pub enum SettingsAction {
         /// The provider to remove.
         name: String,
     },
+    /// Commit the `[ai.auto_approve]` table from the AI tab's auto-approve
+    /// dialog (already validated; the app detects a classifier switch or
+    /// model change and tells the worker).
+    SaveAutoApprove(AutoApproveSettings),
+    /// Fetch the classifier weights again (the Retry button).
+    ClassifierDownload,
     /// Run the "Test connection" probe against `provider` with `model`.
     TestProvider {
         /// The endpoint to dial.
@@ -288,6 +310,10 @@ impl From<AiTabAction> for SettingsAction {
                 key,
             },
             AiTabAction::DeleteProvider { name } => SettingsAction::DeleteProvider { name },
+            AiTabAction::SaveAutoApprove(auto_approve) => {
+                SettingsAction::SaveAutoApprove(auto_approve)
+            }
+            AiTabAction::ClassifierDownload => SettingsAction::ClassifierDownload,
             AiTabAction::TestProvider {
                 provider,
                 model,
@@ -501,9 +527,13 @@ pub fn render(
                 }
                 #[cfg(unix)]
                 SettingsTab::Ai => {
-                    for action in
-                        settings_ai_tab::render(ui, &mut state.ai_tab, ai_settings, key_presence)
-                    {
+                    for action in settings_ai_tab::render(
+                        ui,
+                        &mut state.ai_tab,
+                        &state.classifier_state,
+                        ai_settings,
+                        key_presence,
+                    ) {
                         actions.push(SettingsAction::from(action));
                     }
                 }
@@ -729,6 +759,51 @@ mod tests {
             settings.ai, before,
             "the General save neither validates nor rewrites [ai]"
         );
+    }
+
+    #[test]
+    fn classifier_state_survives_reopening_and_gates_the_checkbox() {
+        let dir = tempdir();
+        let settings = Settings::load_or_default(dir.path());
+        let mut state = SettingsWindowState::default();
+        state.set_classifier_state(ClassifierState::Downloading { done: 1, total: 2 });
+        state.open_with(&settings);
+        assert_eq!(
+            state.classifier_state,
+            ClassifierState::Downloading { done: 1, total: 2 }
+        );
+        #[cfg(unix)]
+        {
+            use crate::state::classifier;
+            state
+                .ai_tab
+                .edit_auto_approve(&settings.ai, &state.classifier_state);
+            let aa = state.ai_tab.auto_approve.as_ref().unwrap();
+            assert_eq!(
+                aa.classifier_state,
+                ClassifierState::Downloading { done: 1, total: 2 }
+            );
+            assert_eq!(aa.classifier_available, classifier::COMPILED);
+            // A later event reaches the open dialog too.
+            state.set_classifier_state(ClassifierState::Failed("offline".into()));
+            assert_eq!(
+                state.ai_tab.auto_approve.as_ref().unwrap().classifier_state,
+                ClassifierState::Failed("offline".into())
+            );
+        }
+    }
+
+    /// Off Unix nothing edits `[ai.auto_approve]`: a General save passes it
+    /// through verbatim.
+    #[cfg(not(unix))]
+    #[test]
+    fn auto_approve_passes_through_verbatim_off_unix() {
+        let mut settings = Settings::default();
+        settings.ai.auto_approve.classifier_timeout_ms = 0;
+        let before = settings.ai.auto_approve.clone();
+        let vm = settings_vm(&settings);
+        vm.apply(&mut settings);
+        assert_eq!(settings.ai.auto_approve, before);
     }
 
     #[test]

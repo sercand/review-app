@@ -564,6 +564,8 @@ mod tests {
                             local_checkout: None,
                             #[cfg(unix)]
                             repo_ai: None,
+                            #[cfg(unix)]
+                            auto_approve: None,
                         },
                     );
                 },

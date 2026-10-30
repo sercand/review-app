@@ -437,6 +437,21 @@ pub enum Command {
         /// The folder to probe.
         path: PathBuf,
     },
+    /// Switch the local command classifier on or off. On starts the weights
+    /// download if they are absent, then the GPU load; progress arrives as
+    /// [`Event::ClassifierState`]. App-global, so no `SessionId`.
+    ClassifierSetEnabled {
+        enabled: bool,
+        /// The registry name of the decision model to use. A name that
+        /// differs from the loaded one restarts the load for the new model.
+        model: String,
+        /// Stamped by the UI in send order; the hub ignores a request older
+        /// than one it has seen, since the worker may run commands out of
+        /// order.
+        seq: u64,
+    },
+    /// Fetch the classifier weights again after a failure (the Retry button).
+    ClassifierDownload,
     /// Attach to a PR's AI review: rebinds any live run to `session` and
     /// answers with [`Event::AiSnapshot`] (spec §10.2). Unix-only with
     /// [`crate::ai`].
@@ -842,6 +857,13 @@ pub enum Event {
         /// The model that served the probe, or why the probe failed.
         result: Result<String, String>,
     },
+    /// The local classifier moved to a new state.
+    ///
+    /// App-global, like [`Event::AiProviderTested`]: the classifier belongs to
+    /// the process, not to an open PR, so this carries no [`SessionId`] and the
+    /// stale-event rule never drops it (leaving a PR must not hide the
+    /// download progress or a failure from Settings).
+    ClassifierState(crate::state::classifier::ClassifierState),
     /// The result of a [`Command::AiProbeFolder`]: the repository the folder is
     /// a clone of, or the reason it cannot be one (safe to show).
     #[cfg(unix)]
@@ -1787,6 +1809,30 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             }
         }
         #[cfg(unix)]
+        Command::ClassifierSetEnabled {
+            enabled,
+            model,
+            seq,
+        } => {
+            // Commands run as separate tasks and may overtake each other, so
+            // order comes from `seq` (stamped by the UI in send order): the
+            // hub drops a request older than one it has recorded, and the
+            // blocking task applies the newest recorded value.
+            ctx.ai.classifier_request(enabled, &model, seq);
+            // Switching off can free a GPU model, which is slow: keep it off
+            // the async worker.
+            let ctx = ctx.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                ctx.ai.classifier_apply_desired(&events);
+            })
+            .await;
+        }
+        #[cfg(unix)]
+        Command::ClassifierDownload => ctx.ai.classifier_download(&events),
+        // No AI (and no classifier) off Unix; the Settings window says so.
+        #[cfg(not(unix))]
+        Command::ClassifierSetEnabled { .. } | Command::ClassifierDownload => {}
+        #[cfg(unix)]
         Command::AiKeyOp { token, op } => {
             // Not PR-scoped: no SessionId, the token names the request. The
             // keychain blocks (it may prompt), so the op runs on the blocking
@@ -1894,11 +1940,11 @@ pub async fn execute(ctx: Arc<ExecCtx>, cmd: Command, events: EventSender) {
             ctx.ai.user_message(session, &key, text, &events);
         }
         #[cfg(unix)]
-        Command::AiPause { session: _, key } => ctx.ai.pause(&key, &events),
+        Command::AiPause { session, key } => ctx.ai.pause(session, &key, &events),
         #[cfg(unix)]
-        Command::AiResume { session: _, key } => ctx.ai.resume(&key, &events),
+        Command::AiResume { session, key } => ctx.ai.resume(session, &key, &events),
         #[cfg(unix)]
-        Command::AiCancel { session: _, key } => ctx.ai.cancel(&key, &events),
+        Command::AiCancel { session, key } => ctx.ai.cancel(session, &key, &events),
         #[cfg(unix)]
         Command::AiFinish {
             session,

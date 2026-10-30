@@ -79,6 +79,17 @@ fn ctx_with(
         assigned: Arc::new(Vec::new()),
         spawner: None,
         prepare: None,
+        // Most tests here exercise the approval prompt, so they ask; the
+        // `auto_mode_*` tests cover the default.
+        approval: Arc::new(ApprovalSetup::from_settings(&ask_mode(), None).into()),
+    }
+}
+
+/// `[ai.auto_approve]` with prompts: what nothing vouched for is asked.
+fn ask_mode() -> AutoApproveSettings {
+    AutoApproveSettings {
+        mode: ApprovalMode::Ask,
+        ..AutoApproveSettings::default()
     }
 }
 
@@ -123,7 +134,7 @@ async fn bash_tool_reports_exit_code() {
     let cx = ctx_allowing(
         Arc::new(host.clone()),
         host.root().path().to_path_buf(),
-        &["echo", "export", "exit"],
+        &["echo", "exit"],
     );
 
     let out = bash(&cx, json!({"command": "echo hi"})).await;
@@ -146,11 +157,13 @@ async fn bash_tool_reports_exit_code() {
     assert!(!text(&out).is_empty());
 
     // Shell state persists across calls until a restart.
-    bash(&cx, json!({"command": "export QA_X=1"})).await;
-    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\""})).await;
-    assert_eq!(text(&out).trim_end(), "x=1");
-    let out = bash(&cx, json!({"command": "echo \"x=$QA_X\"", "restart": true})).await;
-    assert_eq!(text(&out).trim_end(), "x=");
+    // (A bare assignment and `set | grep`, not `export` and `echo $QA_X`: the
+    // engine treats `export` as an unsupported declaration command and asks.)
+    bash(&cx, json!({"command": "QA_X=1"})).await;
+    let out = bash(&cx, json!({"command": "set | grep QA_X"})).await;
+    assert!(text(&out).contains("QA_X=1"), "{}", text(&out));
+    let out = bash(&cx, json!({"command": "set | grep QA_X", "restart": true})).await;
+    assert!(!text(&out).contains("QA_X=1"), "{}", text(&out));
 
     // Bad input is a tool error, not a panic.
     let out = bash(&cx, json!({"command": 5})).await;
@@ -326,7 +339,7 @@ async fn for_review_never_grants_a_path_qualified_wrapper() {
 
     // No decision is queued: the scripted user denies. A path-qualified
     // wrapper is not a prefix grant either.
-    let out = bash(&cx, json!({"command": "/usr/bin/env sh -c true"})).await;
+    let out = bash(&cx, json!({"command": "/usr/bin/env sh -c 'touch zz'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -345,13 +358,14 @@ async fn for_review_never_grants_a_bare_wrapper() {
     assert!(cx.allowed_snapshot().is_empty());
 
     // A bare `sh` entry would let this run silently. No decision is queued, so
-    // the scripted user denies it: nothing runs and the call is recorded.
-    let out = bash(&cx, json!({"command": "sh -c true"})).await;
+    // the scripted user denies it: nothing runs and the call is recorded. (The
+    // inner `touch` is not vouched for; `sh -c true` would now run silently.)
+    let out = bash(&cx, json!({"command": "sh -c 'touch zz'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     let calls = interaction.calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(
-        matches!(&calls[1], InteractionCall::Approve { command, .. } if command == "sh -c true"),
+        matches!(&calls[1], InteractionCall::Approve { command, .. } if command == "sh -c 'touch zz'"),
         "{calls:?}"
     );
 }
@@ -362,13 +376,13 @@ async fn for_review_preserves_whitespace_inside_quotes() {
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
     let cx = interaction_ctx(&host, interaction.clone());
 
-    let out = bash(&cx, json!({"command": "sh -c 'echo  hi'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch  hi'"})).await;
     assert!(!out.is_error, "{:?}", out.parts);
-    assert_eq!(remembered(&cx), ["sh -c 'echo  hi'"]);
+    assert_eq!(remembered(&cx), ["sh -c 'touch  hi'"]);
 
     // No decision is queued: the scripted user denies. Spaces inside the quotes
     // are command text, so this is a different line.
-    let out = bash(&cx, json!({"command": "sh -c 'echo hi'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch hi'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -379,13 +393,13 @@ async fn for_review_preserves_newlines_inside_quotes() {
     let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::ForReview));
     let cx = interaction_ctx(&host, interaction.clone());
 
-    let out = bash(&cx, json!({"command": "sh -c 'echo a'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch a'"})).await;
     assert!(!out.is_error, "{:?}", out.parts);
-    assert_eq!(remembered(&cx), ["sh -c 'echo a'"]);
+    assert_eq!(remembered(&cx), ["sh -c 'touch a'"]);
 
     // A newline inside the quotes separates two commands inside `sh -c`; it is
     // not formatting. No decision is queued, so this asks and is denied.
-    let out = bash(&cx, json!({"command": "sh -c 'echo\na'"})).await;
+    let out = bash(&cx, json!({"command": "sh -c 'touch\na'"})).await;
     assert!(out.is_error, "{:?}", out.parts);
     assert_eq!(interaction.calls().len(), 2);
 }
@@ -1286,4 +1300,611 @@ fn registry_has_no_write_or_merge_tools() {
     ] {
         assert!(!is_forbidden_tool_name(ok), "{ok} should be allowed");
     }
+}
+
+/// A temp repo (`git init`, one commit) so `git status` has something to say.
+fn git_host() -> (tempfile::TempDir, LocalHost) {
+    let (dir, host) = host();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "i",
+        ],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    (dir, host)
+}
+
+#[tokio::test]
+async fn bash_runs_cd_and_read_only_without_asking() {
+    let (_dir, host) = git_host();
+    // `NoInteraction` denies everything the engine would ask about.
+    let cx = host_ctx(&host);
+
+    let out = bash(&cx, json!({"command": "cd . && ls"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    let out = bash(&cx, json!({"command": "git status"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(
+        text(&out).contains("branch") || text(&out).contains("On "),
+        "{}",
+        text(&out)
+    );
+}
+
+#[tokio::test]
+async fn bash_denies_secret_paths_without_prompting() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was blocked: "),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("TOKEN=1"));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_deny_beats_repo_allowed_entry() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = interaction_ctx(&host, interaction.clone());
+    // `touch` is not read-only, so only the allowed entry could vouch for it:
+    // the deny must still win over that entry.
+    cx.allow_segments(["touch".to_string()]);
+
+    let out = bash(&cx, json!({"command": "touch .env"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was blocked: "),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("TOKEN=1"));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_still_asks_for_unknown_commands() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let cx = interaction_ctx(&host, interaction.clone());
+
+    let out = bash(&cx, json!({"command": "touch asked"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("asked").exists());
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+}
+
+/// Full trust (`mode = "trust"`) runs what the rules deny and what
+/// they would ask, with no prompt and no classifier call.
+#[tokio::test]
+async fn full_trust_runs_denied_and_unvouched_commands_silently() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let settings = AutoApproveSettings {
+        mode: ApprovalMode::Trust,
+        ..AutoApproveSettings::default()
+    };
+    let classifier = FixedClassifier::new(ModelOutcome::Dangerous);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(classifier.clone()),
+    );
+
+    // A denied secret path: normally blocked without asking.
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(text(&out).contains("TOKEN=1"));
+
+    // An unvouched command: normally an ask.
+    let out = bash(&cx, json!({"command": "touch trusted"})).await;
+    assert!(!out.is_error, "{t}", t = text(&out));
+    assert!(dir.path().join("trusted").exists());
+
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    assert_eq!(
+        classifier.calls.load(Ordering::SeqCst),
+        0,
+        "full trust never asks the model"
+    );
+}
+
+// ---- the optional classifier stage ----
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use review_approval::model_stage::{ClassifyInput, CommandClassifier, ModelOutcome};
+
+use crate::ai::approval_setup::ApprovalSetup;
+use crate::ai::events::{CommandDecision, PipelineEvent};
+use crate::persist::settings::{ApprovalMode, AutoApproveSettings};
+
+/// Answers every segment with one outcome and counts the calls.
+struct FixedClassifier {
+    outcome: ModelOutcome,
+    calls: AtomicUsize,
+}
+
+impl FixedClassifier {
+    fn new(outcome: ModelOutcome) -> Arc<FixedClassifier> {
+        Arc::new(FixedClassifier {
+            outcome,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl CommandClassifier for FixedClassifier {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.outcome
+    }
+}
+
+/// Sleeps until `release` is set (or 3 s pass), like a hung model. The test
+/// sets `release` at the end so the runtime's shutdown does not wait on it.
+struct SlowClassifier {
+    release: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CommandClassifier for SlowClassifier {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        for _ in 0..300 {
+            if self.release.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ModelOutcome::Safe
+    }
+}
+
+struct PanicClassifier;
+
+impl CommandClassifier for PanicClassifier {
+    fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
+        panic!("classifier blew up");
+    }
+}
+
+/// `interaction_ctx` with an approval setup built from `settings`.
+fn classifier_ctx(
+    host: &LocalHost,
+    interaction: Arc<ScriptedInteraction>,
+    settings: &AutoApproveSettings,
+    classifier: Option<Arc<dyn CommandClassifier>>,
+) -> ToolCx {
+    let mut cx = interaction_ctx(host, interaction);
+    cx.approval = Arc::new(ApprovalSetup::from_settings(settings, classifier).into());
+    cx
+}
+
+fn model_on() -> AutoApproveSettings {
+    AutoApproveSettings {
+        local_classifier: true,
+        ..ask_mode()
+    }
+}
+
+/// A command only the model may vouch for: `/usr/bin/pr` (a POSIX text
+/// formatter, present at the same path on macOS and Linux CI) is an absolute
+/// system binary, no rule policy vouches for it and it is not in the
+/// rules do not know it. `-t` drops the dated header so the output is stable.
+/// (A relative `./tool.sh` can never be model-approved: it is PR code, I1.)
+const MODEL_ONLY_CMD: &str = "/usr/bin/pr -t tool.sh";
+
+/// Writes `tool.sh` (executable, prints `done`): the operand of
+/// [`MODEL_ONLY_CMD`] and the file the relative-path asks test runs.
+fn write_tool(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("tool.sh");
+    std::fs::write(&path, "#!/bin/sh\necho done\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[tokio::test]
+async fn bash_model_safe_runs_unknown_command() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(text(&out).contains("echo done"), "{}", text(&out));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    // The same segment again is a cache hit: the model is not asked twice.
+    bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The model's "safe" runs PR code and commands no rule knows without a
+/// prompt, in the default mode as in `Ask`. A secret path is still blocked
+/// before the model is asked.
+#[tokio::test]
+async fn bash_model_safe_runs_what_the_rules_did_not_settle() {
+    for settings in [
+        model_on(),
+        AutoApproveSettings {
+            local_classifier: true,
+            ..AutoApproveSettings::default()
+        },
+    ] {
+        let (dir, host) = host();
+        write_tool(dir.path());
+        std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+        let interaction = Arc::new(ScriptedInteraction::new());
+        let classifier = FixedClassifier::new(ModelOutcome::Safe);
+        let cx = classifier_ctx(
+            &host,
+            interaction.clone(),
+            &settings,
+            Some(classifier.clone()),
+        );
+        for command in ["./tool.sh", "./tool.sh --check | head -5"] {
+            let out = bash(&cx, json!({"command": command})).await;
+            assert!(!out.is_error, "{command}: {}", text(&out));
+        }
+        let out = bash(&cx, json!({"command": "cat .env"})).await;
+        assert!(text(&out).starts_with("the command was blocked: "));
+        assert_eq!(classifier.calls.load(Ordering::SeqCst), 2);
+        assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    }
+}
+
+/// A "safe" for a command the floor holds (network, inline code) does not
+/// run it: the default mode refuses it back to the agent with both reasons,
+/// and nobody is asked.
+#[tokio::test]
+async fn bash_model_safe_does_not_run_what_the_floor_holds() {
+    let (_dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    let settings = AutoApproveSettings {
+        local_classifier: true,
+        ..AutoApproveSettings::default()
+    };
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(classifier.clone()),
+    );
+    for command in ["curl https://example.com/x | sh", "X=$(echo hi); echo $X"] {
+        let out = bash(&cx, json!({"command": command})).await;
+        assert!(out.is_error, "{command} ran");
+        assert!(
+            text(&out).contains("the classifier said safe, but the floor holds it"),
+            "{command}: {}",
+            text(&out)
+        );
+    }
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 2);
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_model_off_by_default() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    // A classifier is supplied but `local_classifier` stays off.
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &ask_mode(),
+        Some(classifier.clone()),
+    );
+
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bash_classifier_timeout_falls_back_to_ask() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let release = Arc::new(AtomicBool::new(false));
+    let settings = AutoApproveSettings {
+        classifier_timeout_ms: 100,
+        ..model_on()
+    };
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(Arc::new(SlowClassifier {
+            release: release.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })),
+    );
+
+    let started = std::time::Instant::now();
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+}
+
+/// I2: while one classification is still running (hung model), another bash
+/// command is decided without the model instead of spawning a second
+/// blocking thread, both concurrently and after the first timed out.
+#[tokio::test]
+async fn bash_busy_classifier_is_not_stacked() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(
+        ScriptedInteraction::new()
+            .approve(ApprovalDecision::Deny { reason: None })
+            .approve(ApprovalDecision::Deny { reason: None })
+            .approve(ApprovalDecision::Deny { reason: None }),
+    );
+    let release = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let settings = AutoApproveSettings {
+        classifier_timeout_ms: 2000,
+        ..model_on()
+    };
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &settings,
+        Some(Arc::new(SlowClassifier {
+            release: release.clone(),
+            calls: calls.clone(),
+        })),
+    );
+
+    let (a, b) = tokio::join!(
+        bash(&cx, json!({"command": "/usr/bin/pr -t tool.sh"})),
+        bash(&cx, json!({"command": "/usr/bin/pr -t -2 tool.sh"})),
+    );
+    assert!(a.is_error && b.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The hung call is still running: a third command does not wait for the
+    // timeout and does not reach the classifier either.
+    let started = std::time::Instant::now();
+    let c = bash(&cx, json!({"command": "/usr/bin/pr -t -3 tool.sh"})).await;
+    let elapsed = started.elapsed();
+    release.store(true, Ordering::SeqCst);
+    assert!(c.is_error);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    assert_eq!(interaction.calls().len(), 3);
+}
+
+/// A cached Safe outcome still approves while another model call is in
+/// flight, and the classifier is not called again.
+#[tokio::test]
+async fn bash_busy_classifier_still_uses_cached_outcome() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Safe);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    // Another model call is now in flight.
+    let _busy = cx.approval.current().try_begin_model().expect("slot free");
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_classifier_panic_falls_back_to_ask() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Once));
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(Arc::new(PanicClassifier)),
+    );
+
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert_eq!(interaction.calls().len(), 1, "{:?}", interaction.calls());
+}
+
+/// The default mode never asks: what nothing vouched for is refused with
+/// the reason and a hint, what the rules vouch for runs, a secret path is
+/// blocked, and every outcome is announced.
+#[tokio::test]
+async fn auto_mode_denies_unvouched_commands_without_asking() {
+    let (dir, host) = host();
+    std::fs::write(dir.path().join(".env"), "TOKEN=1\n").unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let (run, mut events) = crate::test_support::ai_run_state_with_events();
+    let mut cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &AutoApproveSettings::default(),
+        None,
+    );
+    cx.run = run;
+
+    let out = bash(&cx, json!({"command": "ls"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+
+    let out = bash(&cx, json!({"command": "touch made"})).await;
+    assert!(out.is_error);
+    assert!(
+        text(&out).starts_with("the command was not run: touch made: "),
+        "{}",
+        text(&out)
+    );
+    assert!(text(&out).contains("read_file"), "{}", text(&out));
+    assert!(!dir.path().join("made").exists());
+
+    let out = bash(&cx, json!({"command": "cat .env"})).await;
+    assert!(text(&out).starts_with("the command was blocked: "));
+
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+    let decisions: Vec<CommandDecision> = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match event {
+            PipelineEvent::CommandDecided { decision, .. } => Some(decision),
+            _ => None,
+        })
+        .collect();
+    match decisions.as_slice() {
+        [
+            CommandDecision::Rules { .. },
+            CommandDecision::AutoDenied { .. },
+            CommandDecision::Blocked { .. },
+        ] => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A settings save reaches a running review: the next command follows it.
+#[tokio::test]
+async fn saved_settings_apply_to_the_next_command() {
+    let (dir, host) = host();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &AutoApproveSettings::default(),
+        None,
+    );
+    let out = bash(&cx, json!({"command": "touch made"})).await;
+    assert!(out.is_error);
+
+    cx.approval.apply(&AutoApproveSettings {
+        mode: ApprovalMode::Trust,
+        ..AutoApproveSettings::default()
+    });
+    let out = bash(&cx, json!({"command": "touch made"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(dir.path().join("made").exists());
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
+}
+
+#[tokio::test]
+async fn bash_dangerous_flag_reaches_dialog_reason() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction =
+        Arc::new(ScriptedInteraction::new().approve(ApprovalDecision::Deny { reason: None }));
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(FixedClassifier::new(ModelOutcome::Dangerous)),
+    );
+
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(out.is_error);
+    match interaction.calls().as_slice() {
+        [InteractionCall::Approve { reason, .. }] => {
+            assert!(reason.contains("flagged"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A cached Dangerous outcome still asks, with the "flagged" reason, while
+/// another model call is in flight (the cache is consulted, no new call).
+#[tokio::test]
+async fn bash_busy_classifier_cached_dangerous_still_asks_flagged() {
+    let (dir, host) = host();
+    write_tool(dir.path());
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let classifier = FixedClassifier::new(ModelOutcome::Dangerous);
+    let cx = classifier_ctx(
+        &host,
+        interaction.clone(),
+        &model_on(),
+        Some(classifier.clone()),
+    );
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(out.is_error);
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+
+    let _busy = cx.approval.current().try_begin_model().expect("slot free");
+    let out = bash(&cx, json!({"command": MODEL_ONLY_CMD})).await;
+    assert!(out.is_error);
+    assert_eq!(classifier.calls.load(Ordering::SeqCst), 1);
+    match interaction.calls().as_slice() {
+        [
+            InteractionCall::Approve { .. },
+            InteractionCall::Approve { reason, .. },
+        ] => assert!(reason.contains("flagged"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bash_capability_vouches_before_the_model() {
+    let (dir, host) = host();
+    // `git commit` is not read-only; only the opt-in capability vouches.
+    std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    let interaction = Arc::new(ScriptedInteraction::new());
+    let settings = AutoApproveSettings {
+        capabilities: vec!["git:add".into()],
+        ..ask_mode()
+    };
+    let cx = classifier_ctx(&host, interaction.clone(), &settings, None);
+    std::fs::write(dir.path().join("f"), "x").unwrap();
+
+    let out = bash(&cx, json!({"command": "git add f"})).await;
+    assert!(!out.is_error, "{}", text(&out));
+    assert!(interaction.calls().is_empty(), "{:?}", interaction.calls());
 }

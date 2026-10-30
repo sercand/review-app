@@ -363,14 +363,17 @@ fn detail(mode: DiffMode, dark: bool, name: &str) {
                 local_checkout: None,
                 #[cfg(unix)]
                 repo_ai: None,
+                #[cfg(unix)]
+                auto_approve: None,
             },
         );
     });
     save(h, name);
 }
 
-/// A live AI review: stage strip, a running reviewer, an unanswered question
-/// and a pending command approval (spec §12).
+/// A live AI review (spec §12): scout done, three reviewers (one running,
+/// one waiting on the single pending approval, one just started), a mix of
+/// decided commands in the log, a finding, a chat exchange and a notice.
 #[cfg(unix)]
 fn ai_state_running() -> crate::state::ai_review::AiReviewState {
     use crate::ai::events::{StageKind, StageStatus};
@@ -381,17 +384,31 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
     use crate::ai::ui_interaction::ApprovalKind;
     use crate::model::comment::Anchor;
     use crate::model::diff::Side;
-    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+    use crate::state::ai_review::{
+        AiPhase, AiReviewState, ClassifierNote, CommandDecision, CommandRef, TimelineEntry,
+        ToolLine,
+    };
 
-    let reviewer = AgentRef {
-        id: 1,
+    let reviewer = |id: u32, group: &str| AgentRef {
+        id,
         role: AgentRole::Reviewer,
-        label: "reviewer:g1".to_string(),
+        label: format!("reviewer:{group}"),
     };
     let scout = AgentRef {
         id: 2,
         role: AgentRole::Scout,
         label: "scout".to_string(),
+    };
+    let bash = |command: &str, decision: CommandDecision, note: Option<ClassifierNote>| ToolLine {
+        name: "bash".into(),
+        summary: serde_json::json!({ "command": command }).to_string(),
+        note,
+        decision: Some(decision),
+    };
+    let read = |path: &str| ToolLine {
+        name: "read_file".into(),
+        summary: serde_json::json!({ "path": path }).to_string(),
+        ..ToolLine::default()
     };
     let mut st = AiReviewState {
         phase: AiPhase::Running,
@@ -400,52 +417,109 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
                 stage: StageKind::Scout,
                 status: StageStatus::Done,
             },
-        TimelineEntry::Agent {
-            agent: scout,
-            group: None,
-            tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
-            text: "Grouped the 6 changed files into 2 review groups.".into(),
-            stop: Some("finished".into()),
-        },
-        TimelineEntry::Stage {
-            stage: StageKind::Review,
-            status: StageStatus::Started,
-        },
-        TimelineEntry::Agent {
-            agent: reviewer.clone(),
-            group: Some("notifications".into()),
-            tools: vec![
-                (
-                    "bash".into(),
-                    // A real scout/reviewer tool call: 400+ chars of JSON with
-                    // long unbreakable path tokens (the live smoke-test bug).
-                    "{\"command\":\"for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md docs/superpowers/plans/2026-10-20-ai-review-3-ui-chat.md docs/superpowers/specs/2026-10-19-ai-review-design.md ; do echo \\\"=== $f ===\\\"; head -40 \\\"$f\\\"; done\"}".into(),
-                ),
-                (
-                    "read_file".into(),
-                    "{\"path\":\"src/ui/widgets/merge_panel.rs\"}".into(),
-                ),
-            ],
-            text: "The create path looks up links even when the author set them. Checking whether the lookup can fail the create.".into(),
-            stop: None,
-        },
-        TimelineEntry::Question {
-            id: 7,
-            agent: reviewer.clone(),
-            text: "Is an empty notification list allowed here?".into(),
-            options: vec!["yes".into(), "no".into()],
-            answer: None,
-        },
-        TimelineEntry::Approval {
-            id: 3,
-            agent: reviewer.clone(),
-            kind: ApprovalKind::Command {
-                command: "git -C /Users/sercand/Developer/otsimo/web log --format=%H%n%an%n%s --since=2026-10-01 -- src/lib/data-tools/push-notification-default-links.ts".into(),
-                reason: "the agent wants the recent history of the default-links module to see whether the lookup was changed on purpose".into(),
+            TimelineEntry::Agent {
+                agent: scout,
+                group: None,
+                tools: vec![
+                    bash(
+                        "git diff master...HEAD --stat | tail -40",
+                        CommandDecision::Rules { source: "git read" },
+                        None,
+                    ),
+                    read("src/lib/data-tools/push.ts"),
+                ],
+                text: "Read the diff.\n\nGrouped the 6 changed files into 3 review areas.".into(),
+                stop: Some("finished".into()),
             },
-            decided: None,
-        },
+            TimelineEntry::Stage {
+                stage: StageKind::Review,
+                status: StageStatus::Started,
+            },
+            TimelineEntry::Agent {
+                agent: reviewer(3, "notifications"),
+                group: Some("notifications".into()),
+                tools: vec![
+                    read("src/lib/data-tools/push.ts"),
+                    bash(
+                        "grep -n \"defaultLinks\" src/lib/data-tools/push.ts src/lib/data-tools/revision.ts",
+                        CommandDecision::Rules { source: "read-only" },
+                        None,
+                    ),
+                    bash(
+                        "cat .env.local",
+                        CommandDecision::Blocked {
+                            reason: ".env.local is a secret path".into(),
+                        },
+                        None,
+                    ),
+                    bash(
+                        "wc -l src/lib/data-tools/push.ts src/lib/data-tools/revision.ts",
+                        CommandDecision::Classifier,
+                        Some(ClassifierNote::Approved),
+                    ),
+                    bash(
+                        "for f in docs/superpowers/plans/2026-10-20-ai-review-1-foundation.md docs/superpowers/plans/2026-10-20-ai-review-2-state-machine.md ; do echo \"=== $f ===\"; head -40 \"$f\"; done",
+                        CommandDecision::User { for_review: false },
+                        Some(ClassifierNote::NeedsApproval),
+                    ),
+                    bash(
+                        "node -e 'console.log(1)'",
+                        CommandDecision::AutoDenied {
+                            reason: "node -e: interpreters are never auto-approved".into(),
+                        },
+                        None,
+                    ),
+                    read("src/ui/widgets/merge_panel.rs"),
+                ],
+                text: "The create path looks up links even when the author set them.\n\nChecking whether the lookup can fail the create.".into(),
+                stop: None,
+            },
+            TimelineEntry::Agent {
+                agent: reviewer(4, "revision"),
+                group: Some("revision".into()),
+                tools: vec![bash(
+                    "sed -n 80,140p src/lib/revision.ts",
+                    CommandDecision::User { for_review: true },
+                    None,
+                )],
+                text: String::new(),
+                stop: None,
+            },
+            TimelineEntry::Agent {
+                agent: reviewer(5, "assets"),
+                group: Some("assets".into()),
+                tools: Vec::new(),
+                text: String::new(),
+                stop: None,
+            },
+            TimelineEntry::Approval {
+                id: 3,
+                agent: reviewer(4, "revision"),
+                kind: ApprovalKind::Command {
+                    command: "git -C /Users/sercand/Developer/otsimo/web log --format=%H%n%an%n%s --since=2026-10-01 -- src/lib/data-tools/push.ts src/lib/data-tools/push-notification-default-links.ts".into(),
+                    reason: "git log with a path outside the checkout is not on the read-only list".into(),
+                },
+                decided: None,
+            },
             TimelineEntry::Finding { id: 1 },
+            TimelineEntry::ChatUser {
+                text: "Is the lookup failure on the create path real?".into(),
+            },
+            TimelineEntry::ChatTool {
+                name: "get_agent_log".into(),
+                summary: "{\"agent\":\"notifications\"}".into(),
+                note: None,
+                decision: None,
+            },
+            TimelineEntry::ChatTool {
+                name: "bash".into(),
+                summary: "{\"command\":\"grep -n \\\"lookupLinks\\\" -A12 src/lib/data-tools/push.ts\"}".into(),
+                note: None,
+                decision: Some(CommandDecision::Rules { source: "read-only" }),
+            },
+            TimelineEntry::ChatReply {
+                text: "Yes: `lookupLinks` rejects on a 404 and the create awaits it, so finding #1 stands.".into(),
+            },
             TimelineEntry::Notice {
                 text: "the agent shell is unsandboxed: no bwrap".into(),
             },
@@ -459,12 +533,30 @@ fn ai_state_running() -> crate::state::ai_review::AiReviewState {
         usage: (48_213, 3_904),
         ..AiReviewState::default()
     };
+    // The order the decisions landed in, oldest first.
+    let tool = |entry, tool| CommandRef {
+        entry,
+        tool: Some(tool),
+    };
+    st.decided = vec![
+        tool(1, 0),
+        tool(3, 1),
+        tool(3, 2),
+        tool(4, 0),
+        tool(3, 3),
+        tool(3, 4),
+        CommandRef {
+            entry: 10,
+            tool: None,
+        },
+        tool(3, 5),
+    ];
     st.findings.insert(
         1,
         Finding {
             id: 1,
             run_id: 9,
-            agent: reviewer,
+            agent: reviewer(3, "notifications"),
             anchor: FindingAnchor::Line(Anchor {
                 path: "src/lib/data-tools/push.ts".into(),
                 side: Side::Right,
@@ -497,7 +589,7 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
     use crate::ai::ui_interaction::ApprovalKind;
     use crate::model::comment::Anchor;
     use crate::model::diff::Side;
-    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry};
+    use crate::state::ai_review::{AiPhase, AiReviewState, TimelineEntry, ToolLine};
 
     let reviewer = AgentRef {
         id: 1,
@@ -547,7 +639,12 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
             TimelineEntry::Agent {
                 agent: reviewer.clone(),
                 group: Some("notifications".into()),
-                tools: vec![("read_file".into(), "src/lib/data-tools/push.ts".into())],
+                tools: vec![ToolLine {
+                    name: "read_file".into(),
+                    summary: "src/lib/data-tools/push.ts".into(),
+                    note: None,
+                    decision: None,
+                }],
                 text:
                     "The create path fails when the link lookup rejects; the warning path is fine."
                         .into(),
@@ -577,6 +674,8 @@ fn ai_state_done() -> crate::state::ai_review::AiReviewState {
             TimelineEntry::ChatTool {
                 name: "note_agent".into(),
                 summary: "{\"agent_id\":4,\"text\":\"focus on the create path\"}".into(),
+                note: None,
+                decision: None,
             },
             TimelineEntry::ChatReply {
                 text: "Both reviewers now cover the create path; one bug found.".into(),
@@ -689,6 +788,25 @@ fn ai_detail_pane(
         state.right_pane = right_pane;
     }
     state.details_tab = crate::ui::widgets::metadata_panel::DetailsTab::Ai;
+    // A linked checkout (this repo, so the clone check is real) and the
+    // auto-approve chips over "ask me" with the classifier ready.
+    let checkout = crate::ui::widgets::ai_panel::LocalCheckoutVm {
+        repo: "acme/widgets".to_string(),
+        path: Some(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+        status: crate::ai::repo_link::FolderStatus::Ok,
+        error: None,
+        blockers: Vec::new(),
+        change_blocked: None,
+        restore: Vec::new(),
+        trust_all: false,
+    };
+    let auto_approve = crate::ui::widgets::ai_panel::AutoApproveView {
+        mode: crate::persist::settings::ApprovalMode::Ask,
+        classifier_on: true,
+        classifier: crate::state::classifier::ClassifierState::Ready(
+            crate::state::classifier::SchemaSource::BuiltIn,
+        ),
+    };
     let mut cache = HighlightCache::new(512, Box::new(SyntectHighlighter::new(dark)));
     let h = harness(dark, move |ui| {
         let mut diff_actions = Vec::new();
@@ -704,10 +822,9 @@ fn ai_detail_pane(
                 theme: theme::Theme::Dark,
                 system_dark: dark,
                 ai_configured: true,
-                #[cfg(unix)]
-                local_checkout: None,
-                #[cfg(unix)]
+                local_checkout: Some(&checkout),
                 repo_ai: None,
+                auto_approve: Some(&auto_approve),
             },
         );
     });
@@ -787,6 +904,8 @@ fn ai_inline_draft(dark: bool, name: &str) {
                 local_checkout: None,
                 #[cfg(unix)]
                 repo_ai: None,
+                #[cfg(unix)]
+                auto_approve: None,
             },
         );
     });
@@ -845,6 +964,8 @@ fn ai_checkout_dialog(dark: bool, name: &str) {
                 local_checkout: None,
                 #[cfg(unix)]
                 repo_ai: None,
+                #[cfg(unix)]
+                auto_approve: None,
             },
         );
         ai_dialogs::render(
@@ -895,6 +1016,8 @@ fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
             vec!["Link a local folder for github.com/acme/widgets.".to_string()]
         },
         change_blocked: None,
+        restore: Vec::new(),
+        trust_all: false,
     };
     let repo = RepoAiSettings {
         repo: "github.com/acme/widgets".to_string(),
@@ -927,6 +1050,7 @@ fn ai_local_checkout(dark: bool, name: &str, linked: bool, missing: bool) {
                 ai_configured: true,
                 local_checkout: Some(&vm),
                 repo_ai: Some(&repo),
+                auto_approve: None,
             },
         );
     });
@@ -1104,6 +1228,7 @@ fn shots() {
             let scopes_for_dialog = scopes_ai.clone();
             let scopes_for_models = scopes_ai.clone();
             let scopes_for_model_dialog = scopes_ai.clone();
+            let scopes_for_auto_approve = scopes_ai.clone();
             let h = harness_sized(dark, SIZE, move |ui| {
                 pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -1248,6 +1373,48 @@ fn shots() {
                 );
             });
             save_after(h, &format!("settings-ai-model-dialog-{t}"), 8);
+
+            // The Auto-approve dialog over the AI tab, with a failed classifier
+            // download so the status line and Retry show.
+            let mut auto_approve = SettingsWindowState::default();
+            auto_approve.open_with(&ai_settings);
+            auto_approve.tab = SettingsTab::Ai;
+            auto_approve.set_classifier_state(crate::state::classifier::ClassifierState::Failed(
+                "network unreachable".to_owned(),
+            ));
+            auto_approve
+                .ai_tab
+                .edit_auto_approve(&ai_settings.ai, &auto_approve.classifier_state);
+            let mut list = pr_list_state();
+            let mut form = pr_list::PrListForm::default();
+            let settings_for_shot = ai_settings.clone();
+            let keys_for_shot = ai_shot_keys();
+            let h = harness_sized(dark, SIZE, move |ui| {
+                pr_list::render_title_bar(ui, &mut Vec::new(), &mut Vec::new());
+                egui::CentralPanel::default().show(ui, |ui| {
+                    pr_list::render(
+                        ui,
+                        &mut list,
+                        &mut form,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        "2026-10-20T00:00:00Z",
+                    );
+                });
+                settings_window::render(
+                    ui.ctx(),
+                    &mut auto_approve,
+                    Some(AccountInfo {
+                        login: "sercand",
+                        host: "github.com",
+                        scopes: &scopes_for_auto_approve,
+                    }),
+                    &settings_for_shot.ai,
+                    &keys_for_shot,
+                    &mut Vec::new(),
+                );
+            });
+            save_after(h, &format!("settings-ai-auto-approve-dialog-{t}"), 8);
         }
     }
 }
@@ -1301,6 +1468,8 @@ fn ai_tab_keeps_the_right_pane_at_its_splitter_width() {
                     local_checkout: None,
                     #[cfg(unix)]
                     repo_ai: None,
+                    #[cfg(unix)]
+                    auto_approve: None,
                 },
             );
             *w.borrow_mut() = state.right_pane;

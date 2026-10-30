@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::ai::agent::{AgentControl, AgentSpec, AgentStop, FinishCheck, run_agent};
+use crate::ai::approval_setup::SharedApproval;
 use crate::ai::context::load_repo_context;
 use crate::ai::events::{PipelineEvent, StageKind, StageStatus};
 use crate::ai::incremental::{IncrementalScope, commits_since, incremental_files};
@@ -90,6 +91,9 @@ pub struct PipelineInputs {
     pub mode: RunMode,
     /// Why `bash` is unavailable (spec §8.2); see [`StageInputs`].
     pub bash_disabled: Option<String>,
+    /// The run's bash approval settings, built by the caller so it can hand
+    /// the run new ones when the user saves them.
+    pub approval: Arc<SharedApproval>,
 }
 
 /// Where one review group is in the scheduler.
@@ -587,6 +591,23 @@ impl Ctl {
         self.state().groups.len()
     }
 
+    /// Groups still waiting for a reviewer.
+    fn pending_group_count(&self) -> usize {
+        self.state()
+            .groups
+            .iter()
+            .filter(|slot| slot.state == GroupState::Pending)
+            .count()
+    }
+
+    /// Announce how many agents `stage` will run.
+    fn plan(&self, stage: StageKind, agents: usize) {
+        let _ = self.events.send(PipelineEvent::StagePlanned {
+            stage,
+            agents: u32::try_from(agents).unwrap_or(u32::MAX),
+        });
+    }
+
     /// Mark every still-pending group skipped (budget or cancel).
     fn skip_pending(&self) {
         let mut state = self.state();
@@ -751,6 +772,9 @@ pub fn start_pipeline(
             assigned: Arc::new(Vec::new()),
             spawner: None,
             prepare: None,
+            // One setup per run, so the classifier's cache spans the run and
+            // every agent (the scout, reviewers, chat) shares it.
+            approval: inputs.approval.clone(),
         },
         llm: inputs.llm.clone(),
         ctl: ctl.unregistered_ctl(),
@@ -999,7 +1023,9 @@ async fn orchestrate(
         }
     };
     ctl.stage(StageKind::Scout, StageStatus::Done);
-    let _ = tx.send(PipelineEvent::BriefReady);
+    let _ = tx.send(PipelineEvent::BriefReady {
+        brief: Box::new(brief.clone()),
+    });
     ctl.register_groups(&brief.groups);
     if let Some(changed) = &changed {
         // Groups no changed file touches were reviewed in the previous run:
@@ -1017,6 +1043,7 @@ async fn orchestrate(
     // 2. Reviewers, skim groups first then by risk, under the parallel cap.
     if !budget_hit {
         ctl.stage(StageKind::Review, StageStatus::Started);
+        ctl.plan(StageKind::Review, ctl.pending_group_count());
         budget_hit = review_pass(&base, &ctl, &brief).await;
         if ctl.cancel.is_cancelled() {
             ctl.stage(
@@ -1043,11 +1070,18 @@ async fn orchestrate(
     // worth challenging (spec §5.4).
     if !budget_hit {
         ctl.stage(StageKind::Challenge, StageStatus::Started);
-        for idx in 0..ctl.group_count() {
-            let (group, state) = ctl.group_snapshot(idx);
-            if state != GroupState::Done || !needs_challenge(&group, &run.findings()) {
-                continue;
-            }
+        // A challenger only adds findings to its own group, so which groups
+        // need one is known before the first starts.
+        let findings = run.findings();
+        let challenged: Vec<Group> = (0..ctl.group_count())
+            .map(|idx| ctl.group_snapshot(idx))
+            .filter(|(group, state)| {
+                *state == GroupState::Done && needs_challenge(group, &findings)
+            })
+            .map(|(group, _)| group)
+            .collect();
+        ctl.plan(StageKind::Challenge, challenged.len());
+        for group in challenged {
             let agent = AgentRef {
                 id: next_agent_id(),
                 role: AgentRole::Challenger,
@@ -1097,7 +1131,23 @@ async fn orchestrate(
     // 4. Dedupe, then one verifier per path batch (spec §5.5).
     if !budget_hit {
         ctl.stage(StageKind::Verify, StageStatus::Started);
-        for batch in verifier_batches(&run.findings()) {
+        let batches = verifier_batches(&run.findings());
+        ctl.plan(StageKind::Verify, batches.len());
+        // Batches are per path, so verifiers never share a finding; they run
+        // under their own parallel cap. Once the budget is spent no new one
+        // starts, and the running ones finish.
+        let sem = Arc::new(Semaphore::new(
+            base.settings.max_parallel_verifiers.max(1) as usize
+        ));
+        let over_budget = Arc::new(AtomicBool::new(false));
+        let mut running = tokio::task::JoinSet::new();
+        for batch in batches {
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            if over_budget.load(Ordering::SeqCst) || ctl.cancel.is_cancelled() {
+                break;
+            }
             let path = batch[0].anchor.path().to_string();
             let agent = AgentRef {
                 id: next_agent_id(),
@@ -1114,15 +1164,22 @@ async fn orchestrate(
                 agent: agent.clone(),
                 group: None,
             });
-            let outcome = run_verifier(&inputs, &agent, batch).await;
-            let over = agent_finished(&ctl, &tally, &agent, stop_of(&outcome));
-            if over {
-                budget_hit = true;
-                break;
+            let (ctl, over_budget) = (ctl.clone(), over_budget.clone());
+            running.spawn(async move {
+                let outcome = run_verifier(&inputs, &agent, batch).await;
+                if agent_finished(&ctl, &tally, &agent, stop_of(&outcome)) {
+                    over_budget.store(true, Ordering::SeqCst);
+                }
+                drop(permit);
+            });
+        }
+        while let Some(joined) = running.join_next().await {
+            if let Err(error) = joined {
+                tracing::warn!(%error, "a verifier task panicked");
             }
-            if ctl.cancel.is_cancelled() {
-                break;
-            }
+        }
+        if over_budget.load(Ordering::SeqCst) {
+            budget_hit = true;
         }
         if ctl.cancel.is_cancelled() {
             ctl.stage(

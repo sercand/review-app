@@ -751,11 +751,34 @@ impl PrSession {
                 if prefill_review(&mut self.pending, self.ai.draft.as_ref()) {
                     self.save_pending_draft();
                 }
-                Vec::new()
+                release_orphaned_keeps(self)
+            }
+            // The chat's bulk keep / drop, applied like the user's own.
+            #[cfg(unix)]
+            Event::AiPipeline {
+                session,
+                event: crate::ai::events::PipelineEvent::TriageRequested { keep, drop },
+            } if *session == self.id => {
+                let done = triage(self, keep, drop, Instant::now());
+                let mut text = format!(
+                    "From the chat: kept {}, dropped {}.",
+                    done.kept, done.dropped
+                );
+                if let Some(why) = &done.failed {
+                    text.push_str(&format!(" Keeping stopped: {why}"));
+                }
+                self.ai
+                    .timeline
+                    .push(crate::state::ai_review::TimelineEntry::Notice { text });
+                done.commands
+            }
+            #[cfg(unix)]
+            Event::AiFindings { session, .. } if *session == self.id => {
+                self.ai.apply(event);
+                release_orphaned_keeps(self)
             }
             #[cfg(unix)]
             Event::AiCheckoutPlanned { session, .. }
-            | Event::AiFindings { session, .. }
             | Event::AiCheckoutFailed { session, .. }
             | Event::AiCheckoutHeld { session, .. }
             | Event::AiNotice { session, .. }
@@ -1508,14 +1531,20 @@ impl PrSession {
         self.composer.body.push('\n');
     }
 
-    /// Drop a pending comment from the review.
-    pub fn delete_pending(&mut self, local_id: u64, now: Instant) {
+    /// Drop a pending comment from the review. A kept AI finding the
+    /// comment came from goes back to a draft, so it shows again with Keep
+    /// and Drop (and the chat sees it as a draft); the returned commands
+    /// record that in the store.
+    pub fn delete_pending(&mut self, local_id: u64, now: Instant) -> Vec<Command> {
         self.pending.delete(local_id);
         #[cfg(unix)]
-        unlink_pending_finding(self, local_id);
+        let commands = release_kept(self, |finding| finding.pending_local_id == Some(local_id));
+        #[cfg(not(unix))]
+        let commands = Vec::new();
         self.rebuild_rows();
         self.mark_session_dirty(now);
         self.save_pending_draft();
+        commands
     }
 
     /// Re-open the composer with a pending comment's anchor and text
@@ -1566,11 +1595,18 @@ impl PrSession {
 
     /// Drop the whole draft — in memory and in the session file (the panel
     /// has already asked the reviewer to confirm).
-    pub fn discard_pending_review(&mut self, now: Instant) {
+    pub fn discard_pending_review(&mut self, now: Instant) -> Vec<Command> {
+        // Everything kept was in the draft (as a comment or in the summary
+        // body), so all of it goes back to drafts.
+        #[cfg(unix)]
+        let commands = release_kept(self, |_| true);
+        #[cfg(not(unix))]
+        let commands = Vec::new();
         self.pending.clear();
         self.rebuild_rows();
         self.mark_session_dirty(now);
         self.save_pending_draft();
+        commands
     }
 
     /// Snapshot the live composer into the persisted draft field, marking the
@@ -1771,9 +1807,19 @@ pub fn keep_draft(session: &mut PrSession, id: i64) -> Result<KeepResult, String
         .get(&id)
         .ok_or_else(|| format!("finding #{id} is not loaded"))?
         .clone();
+    // Evidence links are permalinks to the commit the draft is pinned to.
+    let blob_base = session.diff_head_sha.as_ref().map(|sha| {
+        format!(
+            "{}/{}/{}/blob/{sha}",
+            crate::github::client::endpoints_for(&session.host).web,
+            session.repo.owner,
+            session.repo.name
+        )
+    });
+    let evidence = crate::ai::review::evidence_markdown(&finding.evidence, blob_base.as_deref());
     match &finding.anchor {
         crate::ai::review::FindingAnchor::Line(anchor) => {
-            let body = crate::ai::review::kept_body(finding.severity, &finding.body);
+            let body = crate::ai::review::kept_body(finding.severity, &finding.body, &evidence);
             match add_pending(session, anchor.clone(), body) {
                 Ok(local_id) => Ok(KeepResult {
                     pending_local_id: Some(local_id),
@@ -1784,7 +1830,10 @@ pub fn keep_draft(session: &mut PrSession, id: i64) -> Result<KeepResult, String
             }
         }
         crate::ai::review::FindingAnchor::Summary { path } => {
-            let body = format!("\n\n**{path}:** {} — {}", finding.title, finding.body);
+            let body = format!(
+                "\n\n**{path}:** {} — {}{evidence}",
+                finding.title, finding.body
+            );
             session.pending.body.push_str(&body);
             session.mark_session_dirty(Instant::now());
             session.save_pending_draft();
@@ -1885,6 +1934,155 @@ pub fn ai_attach_command(session: &PrSession) -> Command {
         session: session.id,
         key: pr_key(session),
     }
+}
+
+/// What a bulk keep / drop did.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct Triage {
+    /// The store commands recording the new states.
+    pub commands: Vec<Command>,
+    /// How many findings were kept.
+    pub kept: usize,
+    /// How many were dropped.
+    pub dropped: usize,
+    /// Why keeping stopped early (the draft is pinned to another commit).
+    pub failed: Option<String>,
+}
+
+/// The draft findings of `severity`, in id order: the targets of "keep all
+/// bugs" or "drop all nits".
+#[cfg(unix)]
+pub fn draft_ids(session: &PrSession, severity: crate::ai::review::Severity) -> Vec<i64> {
+    use crate::ai::review::FindingState;
+
+    session
+        .ai
+        .findings
+        .values()
+        .filter(|f| f.state == FindingState::Draft && f.severity == severity)
+        .map(|f| f.id)
+        .collect()
+}
+
+/// Keep the draft findings in `keep` and drop those in `drop`, exactly as
+/// their Keep and Drop buttons would, one by one. Findings that are not
+/// drafts are left alone. Keeping stops at the first failure (a draft
+/// pinned to another commit fails every keep the same way).
+#[cfg(unix)]
+pub fn triage(session: &mut PrSession, keep: &[i64], drop: &[i64], now: Instant) -> Triage {
+    use crate::ai::review::FindingState;
+
+    let is_draft = |session: &PrSession, id: &i64| {
+        session
+            .ai
+            .findings
+            .get(id)
+            .is_some_and(|f| f.state == FindingState::Draft)
+    };
+    let key = pr_key(session);
+    let mut out = Triage::default();
+    for id in keep {
+        if !is_draft(session, id) {
+            continue;
+        }
+        match keep_draft(session, *id) {
+            Ok(kept) => {
+                if let Some(finding) = session.ai.findings.get_mut(id) {
+                    finding.state = FindingState::Kept;
+                    finding.pending_local_id = kept.pending_local_id;
+                }
+                out.kept += 1;
+                out.commands.push(Command::AiFindingState {
+                    session: session.id,
+                    key: key.clone(),
+                    id: *id,
+                    state: FindingState::Kept,
+                    pending_local_id: kept.pending_local_id,
+                });
+            }
+            Err(why) => {
+                out.failed = Some(why);
+                break;
+            }
+        }
+    }
+    for id in drop {
+        if !is_draft(session, id) {
+            continue;
+        }
+        if let Some(finding) = session.ai.findings.get_mut(id) {
+            finding.state = FindingState::DroppedByUser;
+        }
+        out.dropped += 1;
+        out.commands.push(Command::AiFindingState {
+            session: session.id,
+            key: key.clone(),
+            id: *id,
+            state: FindingState::DroppedByUser,
+            pending_local_id: None,
+        });
+    }
+    session.rebuild_rows();
+    session.mark_session_dirty(now);
+    out
+}
+
+/// Move the kept findings `which` selects back to drafts, unlinked, and
+/// return the store commands that record it.
+#[cfg(unix)]
+fn release_kept(
+    session: &mut PrSession,
+    which: impl Fn(&crate::ai::review::Finding) -> bool,
+) -> Vec<Command> {
+    use crate::ai::review::FindingState;
+
+    let key = pr_key(session);
+    let mut commands = Vec::new();
+    for finding in session.ai.findings.values_mut() {
+        if finding.state != FindingState::Kept || !which(finding) {
+            continue;
+        }
+        finding.state = FindingState::Draft;
+        finding.pending_local_id = None;
+        commands.push(Command::AiFindingState {
+            session: session.id,
+            key: key.clone(),
+            id: finding.id,
+            state: FindingState::Draft,
+            pending_local_id: None,
+        });
+    }
+    if !commands.is_empty() {
+        session.rebuild_rows();
+    }
+    commands
+}
+
+/// Kept line findings whose pending comment is no longer in the draft
+/// (deleted by an older build, or the draft was replaced) go back to
+/// drafts, so the store and the chat never call a finding kept that the
+/// review will not post. A finding unlinked by an edit in the composer
+/// (`pending_local_id: None`) is left alone: its text is on its way back
+/// into the draft. Skipped while the draft on disk could not be read, since
+/// its comments are then unknown.
+#[cfg(unix)]
+fn release_orphaned_keeps(session: &mut PrSession) -> Vec<Command> {
+    if session.raw_draft.is_some() {
+        return Vec::new();
+    }
+    let present: BTreeSet<u64> = session
+        .pending
+        .comments
+        .iter()
+        .map(|comment| comment.local_id)
+        .collect();
+    release_kept(session, |finding| {
+        matches!(finding.anchor, crate::ai::review::FindingAnchor::Line(_))
+            && finding
+                .pending_local_id
+                .is_some_and(|id| !present.contains(&id))
+    })
 }
 
 /// Forget a deleted pending comment on any Kept AI finding that referenced
@@ -3288,13 +3486,24 @@ mod tests {
         finding.state = FindingState::Kept;
         finding.pending_local_id = kept.pending_local_id;
 
-        s.delete_pending(local_id, Instant::now());
+        let commands = s.delete_pending(local_id, Instant::now());
 
         assert!(s.pending.comments.is_empty());
         assert_eq!(
             s.ai.findings[&1].state,
-            FindingState::Kept,
-            "deleting the comment does not undo the keep"
+            FindingState::Draft,
+            "deleting the comment undoes the keep: the finding is a draft again"
+        );
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::AiFindingState {
+                    id: 1,
+                    state: FindingState::Draft,
+                    ..
+                }]
+            ),
+            "the store hears it, so the chat sees a draft: {commands:?}"
         );
         assert_eq!(
             s.ai.findings[&1].pending_local_id, None,
@@ -3313,7 +3522,7 @@ mod tests {
         let commands = on_review_submitted(&mut s, review(ReviewState::Commented));
         assert_eq!(
             s.ai.findings[&1].state,
-            FindingState::Kept,
+            FindingState::Draft,
             "the reused id does not falsely mark the old finding Posted"
         );
         assert!(
@@ -4020,6 +4229,145 @@ mod tests {
         (s, dir)
     }
 
+    /// Findings loaded as kept whose comment is gone from the draft (an
+    /// older build deleted it) go back to drafts; one whose comment is
+    /// still there stays kept.
+    #[test]
+    #[cfg(unix)]
+    fn kept_findings_without_their_comment_become_drafts_on_load() {
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let present = add_pending(&mut s, line_anchor("a.rs", 1), "**Bug:** x".into()).unwrap();
+        let kept = |id, link| {
+            let mut f = ai_finding(
+                id,
+                FindingAnchor::Line(line_anchor("a.rs", 1)),
+                Severity::Bug,
+                FindingState::Kept,
+                "t",
+                "b",
+            );
+            f.pending_local_id = Some(link);
+            f
+        };
+        let commands = s.on_event(&Event::AiFindings {
+            session: s.id,
+            findings: vec![kept(1, present), kept(2, present + 7)],
+            coverage: vec![],
+        });
+        assert_eq!(s.ai.findings[&1].state, FindingState::Kept);
+        assert_eq!(s.ai.findings[&2].state, FindingState::Draft);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::AiFindingState {
+                    id: 2,
+                    state: FindingState::Draft,
+                    ..
+                }]
+            ),
+            "{commands:?}"
+        );
+    }
+
+    /// A bulk triage keeps and drops drafts like their buttons, leaves
+    /// other states alone, and a chat request lands the same way with a
+    /// notice in the AI tab.
+    #[test]
+    #[cfg(unix)]
+    fn triage_keeps_and_drops_drafts_only() {
+        use crate::ai::events::PipelineEvent;
+        use crate::ai::review::{FindingAnchor, FindingState, Severity};
+        use crate::state::ai_review::TimelineEntry;
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        for (id, severity, state) in [
+            (1, Severity::Bug, FindingState::Draft),
+            (2, Severity::Nit, FindingState::Draft),
+            (3, Severity::Nit, FindingState::Posted),
+            (4, Severity::Risk, FindingState::Draft),
+        ] {
+            s.ai.findings.insert(
+                id,
+                ai_finding(
+                    id,
+                    FindingAnchor::Line(line_anchor("a.rs", 1)),
+                    severity,
+                    state,
+                    "t",
+                    "b",
+                ),
+            );
+        }
+        assert_eq!(draft_ids(&s, Severity::Nit), [2]);
+        let done = triage(&mut s, &[1], &[2, 3], Instant::now());
+        assert_eq!((done.kept, done.dropped), (1, 1));
+        assert_eq!(done.commands.len(), 2);
+        assert_eq!(s.ai.findings[&1].state, FindingState::Kept);
+        assert_eq!(
+            s.pending.comments.len(),
+            1,
+            "the kept bug is a pending comment"
+        );
+        assert_eq!(s.ai.findings[&2].state, FindingState::DroppedByUser);
+        assert_eq!(
+            s.ai.findings[&3].state,
+            FindingState::Posted,
+            "only drafts change"
+        );
+
+        let commands = s.on_event(&Event::AiPipeline {
+            session: s.id,
+            event: PipelineEvent::TriageRequested {
+                keep: vec![],
+                drop: vec![4],
+            },
+        });
+        assert_eq!(commands.len(), 1);
+        assert_eq!(s.ai.findings[&4].state, FindingState::DroppedByUser);
+        assert!(matches!(
+            s.ai.timeline.last(),
+            Some(TimelineEntry::Notice { text }) if text.contains("dropped 1")
+        ));
+    }
+
+    /// A kept draft's evidence goes into the comment as permalinks to the
+    /// commit the draft is pinned to.
+    #[test]
+    #[cfg(unix)]
+    fn keep_links_the_evidence_at_the_pinned_commit() {
+        use crate::ai::review::{Evidence, FindingAnchor, FindingState, Severity};
+        use crate::test_support::ai_finding;
+
+        let (mut s, _dir) = clean_session(&[("a.rs", PATCH)]);
+        let mut finding = ai_finding(
+            1,
+            FindingAnchor::Line(line_anchor("a.rs", 1)),
+            Severity::Risk,
+            FindingState::Draft,
+            "t",
+            "body",
+        );
+        finding.evidence = vec![Evidence {
+            path: "src/dev ice.rs".into(),
+            line: Some(806),
+            note: "flush\nfirst".into(),
+        }];
+        s.ai.findings.insert(1, finding);
+        keep_draft(&mut s, 1).expect("kept");
+        let web = crate::github::client::endpoints_for(&s.host).web;
+        assert_eq!(
+            s.pending.comments[0].body,
+            format!(
+                "**Risk:** body\n\n**Evidence**\n- [`src/dev ice.rs:806`]({web}/{}/{}/blob/sha1/src/dev%20ice.rs#L806): flush first",
+                s.repo.owner, s.repo.name
+            )
+        );
+    }
+
     /// Keeping a line draft puts it in the pending review, prefixed with its
     /// severity, pinned to the diff on screen (spec §12).
     #[test]
@@ -4201,7 +4549,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn snapshot_replay_prefills_the_review_once() {
-        use crate::ai::hub::AiSnapshotData;
+        use crate::ai::hub::{AiSnapshotData, RunLiveness};
         use crate::ai::stages::assemble::{ReviewDraft, Verdict};
         use crate::ai::store::RunRecord;
 
@@ -4225,6 +4573,7 @@ mod tests {
                 status: "completed".into(),
                 stop_reason: None,
             }),
+            run_liveness: RunLiveness::Stopped,
             checkout: None,
             bash_disabled: None,
             last_reviewed_sha: Some("sha1".into()),

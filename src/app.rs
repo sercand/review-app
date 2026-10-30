@@ -336,6 +336,10 @@ pub struct ReviewApp {
     palette: PaletteState,
     help_open: bool,
     settings_window: SettingsWindowState,
+    /// Whether the once-per-start classifier enable went out (first frame).
+    classifier_startup_done: bool,
+    /// Stamps `ClassifierSetEnabled` in send order (the worker may reorder).
+    classifier_seq: u64,
     settings_writer: DebouncedWriter,
     applied_theme: Option<egui::Theme>,
     settings: Settings,
@@ -444,6 +448,29 @@ fn quit_close_needs_intercept(close_requested: bool, self_triggered: bool) -> bo
     close_requested && !self_triggered
 }
 
+/// Fold [`Event::ClassifierState`] into the Settings window (`handle_event`'s
+/// arm; `ReviewApp` itself cannot be built without a window, so the arm is
+/// this function).
+fn apply_classifier_event(
+    window: &mut SettingsWindowState,
+    state: crate::state::classifier::ClassifierState,
+) {
+    window.set_classifier_state(state);
+}
+
+/// Whether the worker must be told about a settings change: the classifier
+/// was switched on or off, or it is on and its model changed (a model change
+/// while off is picked up by the next enable, which carries the model).
+fn classifier_changed(was_on: bool, on: bool, was_model: &str, model: &str) -> bool {
+    on != was_on || (on && was_model != model)
+}
+
+/// True exactly once, on the first call, and only when the classifier setting
+/// is on: the app then sends `ClassifierSetEnabled(true)`.
+fn classifier_startup_due(done: &mut bool, setting_on: bool) -> bool {
+    !std::mem::replace(done, true) && setting_on
+}
+
 /// Accept the OS folder picker's answer only while the PR it was opened for
 /// is still the open one (AI settings Task 7): a late answer for another
 /// repository is dropped rather than linking a folder behind the user's back.
@@ -549,6 +576,8 @@ impl ReviewApp {
             palette: PaletteState::default(),
             help_open: false,
             settings_window: SettingsWindowState::default(),
+            classifier_startup_done: false,
+            classifier_seq: 0,
             settings_writer: DebouncedWriter::default(),
             applied_theme: None,
             settings,
@@ -763,6 +792,10 @@ impl ReviewApp {
                 }
                 #[cfg(not(unix))]
                 let _ = (provider, result);
+            }
+            // App-global (no SessionId, never stale): Settings shows it.
+            Event::ClassifierState(state) => {
+                apply_classifier_event(&mut self.settings_window, state)
             }
             // The folder probe's answer (AI settings Task 7): matched back
             // to the repo the pick was for by token; the verdict lands in
@@ -1209,6 +1242,16 @@ impl ReviewApp {
         }
     }
 
+    /// Ask the worker to switch the classifier on or off, newest wins.
+    fn send_classifier_enabled(&mut self, enabled: bool) {
+        self.classifier_seq += 1;
+        self.worker.send(Command::ClassifierSetEnabled {
+            enabled,
+            model: self.settings.ai.auto_approve.decision_model.clone(),
+            seq: self.classifier_seq,
+        });
+    }
+
     /// Persist settings, reporting a failure as a toast.
     fn save_settings(&mut self, now: Instant) {
         if let Err(error) = self.settings.save(&self.config_dir) {
@@ -1291,6 +1334,14 @@ impl ReviewApp {
                         key,
                     });
                 }
+                SettingsAction::ClassifierDownload => {
+                    self.worker.send(Command::ClassifierDownload);
+                }
+                // Not Unix-gated, so `classifier_changed` is used everywhere;
+                // off Unix the tab that sends it does not exist.
+                SettingsAction::SaveAutoApprove(auto_approve) => {
+                    self.save_auto_approve(auto_approve, now);
+                }
                 // The AI tab is Unix-only, so these never arise elsewhere.
                 #[cfg(not(unix))]
                 SettingsAction::SaveModel { .. }
@@ -1317,6 +1368,32 @@ impl ReviewApp {
         let mut candidate = self.settings.clone();
         role.set_model(&mut candidate.ai, model);
         self.try_save_settings(candidate, now);
+    }
+
+    /// Commit the `[ai.auto_approve]` table from the AI tab's auto-approve
+    /// dialog, and tell the worker when the classifier was switched on or off
+    /// or its model changed while on.
+    fn save_auto_approve(
+        &mut self,
+        auto_approve: crate::persist::settings::AutoApproveSettings,
+        now: Instant,
+    ) {
+        let classifier_was_on = self.settings.ai.auto_approve.local_classifier;
+        let model_was = self.settings.ai.auto_approve.decision_model.clone();
+        let mut candidate = self.settings.clone();
+        candidate.ai.auto_approve = auto_approve;
+        if !self.try_save_settings(candidate, now) {
+            return;
+        }
+        let classifier_on = self.settings.ai.auto_approve.local_classifier;
+        if classifier_changed(
+            classifier_was_on,
+            classifier_on,
+            &model_was,
+            &self.settings.ai.auto_approve.decision_model,
+        ) {
+            self.send_classifier_enabled(classifier_on);
+        }
     }
 
     /// Commit one AI provider row (spec §10).
@@ -2085,6 +2162,7 @@ impl ReviewApp {
             let mut vm = crate::ui::widgets::ai_panel::local_checkout_vm(
                 &self.settings.ai,
                 &repo_key,
+                Some(session.number),
                 &session.ai,
                 &self.ai_unrestored,
                 &has_key,
@@ -2102,6 +2180,13 @@ impl ReviewApp {
             .settings
             .ai
             .repo(&session.host, &session.repo.owner, &session.repo.name);
+        // The AI tab's auto-approve chips read the current settings: they
+        // apply live to running reviews.
+        #[cfg(unix)]
+        let auto_approve = crate::ui::widgets::ai_panel::AutoApproveView::new(
+            &self.settings.ai.auto_approve,
+            &self.settings_window.classifier_state,
+        );
         let actions = pr_detail::render(
             ui,
             session,
@@ -2121,6 +2206,8 @@ impl ReviewApp {
                 local_checkout: local_checkout.as_ref(),
                 #[cfg(unix)]
                 repo_ai,
+                #[cfg(unix)]
+                auto_approve: Some(&auto_approve),
             },
         );
 
@@ -2254,10 +2341,7 @@ impl ReviewApp {
                 session.edit_pending(local_id, body);
                 Vec::new()
             }
-            ReviewAction::DeleteComment(local_id) => {
-                session.delete_pending(local_id, now);
-                Vec::new()
-            }
+            ReviewAction::DeleteComment(local_id) => session.delete_pending(local_id, now),
             ReviewAction::LocateThread(thread_id) => {
                 let anchor = session
                     .threads
@@ -2311,8 +2395,7 @@ impl ReviewApp {
                         now,
                     );
                 }
-                session.discard_pending_review(now);
-                Vec::new()
+                session.discard_pending_review(now)
             }
             ReviewAction::Submit => {
                 // Spec §13: the panel and composer disable Submit while a
@@ -2435,7 +2518,7 @@ impl ReviewApp {
     ) {
         use crate::ai::repo_link::{start_blockers, unlink_repo};
         use crate::ai::store::PrKey;
-        use crate::state::ai_review::change_blocked;
+        use crate::state::ai_review::{change_blocked, start_blocked};
         use crate::ui::widgets::{
             ai_panel::{self, AiPanelAction},
             ai_repo_dialog::RepoCommandsDialog,
@@ -2469,7 +2552,14 @@ impl ReviewApp {
                     .into_iter()
                     .next()
                     .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
-                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                    .or_else(|| {
+                        start_blocked(
+                            &session.ai,
+                            &self.ai_unrestored,
+                            &repo_key,
+                            Some(session.number),
+                        )
+                    });
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
                     return;
@@ -2497,7 +2587,14 @@ impl ReviewApp {
                     .into_iter()
                     .next()
                     .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
-                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                    .or_else(|| {
+                        start_blocked(
+                            &session.ai,
+                            &self.ai_unrestored,
+                            &repo_key,
+                            Some(session.number),
+                        )
+                    });
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
                     return;
@@ -2672,6 +2769,21 @@ impl ReviewApp {
                     Err(why) => self.toasts.push(why, now),
                 }
             }
+            AiPanelAction::Triage { severity, keep } => {
+                let ids = crate::state::pr_detail::draft_ids(session, severity);
+                let (keep_ids, drop_ids) = if keep {
+                    (ids, Vec::new())
+                } else {
+                    (Vec::new(), ids)
+                };
+                let done = crate::state::pr_detail::triage(session, &keep_ids, &drop_ids, now);
+                for command in done.commands {
+                    self.worker.send(command);
+                }
+                if let Some(why) = done.failed {
+                    self.toasts.push(why, now);
+                }
+            }
             AiPanelAction::DropSummary(id) => {
                 use crate::ai::review::FindingState;
 
@@ -2754,6 +2866,24 @@ impl ReviewApp {
                 // keeps its own (final review).
                 self.ai_row_error.take_if(|(key, _)| *key == repo_key);
                 self.save_settings(now);
+            }
+            AiPanelAction::RestoreCheckout(records) => {
+                // Reopen the recovery dialog for records the user dismissed
+                // with "Later". A dialog already open keeps precedence: the
+                // row is a second path to the same list, not a replacement.
+                if self.ai_dialog.is_none() && !records.is_empty() {
+                    self.ai_dialog =
+                        Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(records));
+                }
+            }
+            AiPanelAction::OpenAutoApprove => {
+                // Settings → AI with the auto-approve dialog open on the
+                // stored table; a save applies to running reviews.
+                self.settings_window.open_with(&self.settings);
+                self.settings_window.tab = settings_window::SettingsTab::Ai;
+                self.settings_window
+                    .ai_tab
+                    .edit_auto_approve(&self.settings.ai, &self.settings_window.classifier_state);
             }
             AiPanelAction::EditRepoCommands => {
                 // The dialog edits the repo's entry even when no folder is
@@ -2978,6 +3108,15 @@ impl ReviewApp {
                 // the app keeps its own copy for the Local checkout row in
                 // step with the dialog (AI settings Task 7).
                 self.ai_unrestored.retain(|record| record.id != id);
+                // Re-read the open PR's state once the restore lands (the
+                // worker runs commands in order): the Local checkout row's
+                // blocker and Restore… button clear when this was its
+                // checkout, and stay when it was not.
+                #[cfg(unix)]
+                if let Some(session) = &self.session {
+                    self.worker
+                        .send(crate::state::pr_detail::ai_attach_command(session));
+                }
                 // Drop the restored row from the recovery list (closing it
                 // when the last one goes), and close a Held dialog — the
                 // restore it offered is on its way and the toast reports
@@ -3069,7 +3208,9 @@ impl ReviewApp {
                 }
                 DiffAction::DeletePending { local_id } => {
                     if let Some(session) = &mut self.session {
-                        session.delete_pending(local_id, now);
+                        for command in session.delete_pending(local_id, now) {
+                            self.worker.send(command);
+                        }
                     }
                 }
                 DiffAction::EditPending { local_id } => {
@@ -3689,6 +3830,14 @@ impl eframe::App for ReviewApp {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
+        // The first frame is up: only now start the classifier download/load
+        // (never in `new`), and only if the user switched it on.
+        if classifier_startup_due(
+            &mut self.classifier_startup_done,
+            self.settings.ai.auto_approve.local_classifier,
+        ) {
+            self.send_classifier_enabled(true);
+        }
         for event in self.events.drain() {
             self.handle_event(event, now);
         }
@@ -3990,6 +4139,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(key_check_blocker(&no_provider, &keys), None);
+    }
+
+    #[test]
+    fn a_model_change_is_sent_only_while_the_classifier_is_on() {
+        assert!(classifier_changed(false, true, "a", "a"));
+        assert!(classifier_changed(true, false, "a", "a"));
+        assert!(classifier_changed(true, true, "a", "b"));
+        assert!(!classifier_changed(true, true, "a", "a"));
+        assert!(!classifier_changed(false, false, "a", "b"));
+    }
+
+    #[test]
+    fn classifier_startup_fires_once_and_only_when_on() {
+        let mut done = false;
+        assert!(classifier_startup_due(&mut done, true));
+        assert!(!classifier_startup_due(&mut done, true), "only once");
+        let mut done = false;
+        assert!(!classifier_startup_due(&mut done, false));
+        assert!(done, "the first frame is spent even when off");
+    }
+
+    #[test]
+    fn classifier_event_updates_the_settings_window_vm() {
+        use crate::state::classifier::ClassifierState;
+        let mut window = SettingsWindowState::default();
+        // An open auto-approve dialog follows the event as well.
+        #[cfg(unix)]
+        window
+            .ai_tab
+            .edit_auto_approve(&Settings::default().ai, &ClassifierState::Off);
+        apply_classifier_event(&mut window, ClassifierState::Failed("offline".into()));
+        assert_eq!(
+            window.classifier_state,
+            ClassifierState::Failed("offline".into())
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            window
+                .ai_tab
+                .auto_approve
+                .as_ref()
+                .unwrap()
+                .classifier_state,
+            ClassifierState::Failed("offline".into())
+        );
     }
 
     #[test]

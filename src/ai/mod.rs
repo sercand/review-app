@@ -5,6 +5,7 @@
 //! gated the same way.
 
 pub mod agent;
+pub mod approval_setup;
 pub mod chat;
 pub mod checklist;
 pub mod checkout;
@@ -14,6 +15,10 @@ pub mod hub;
 pub mod incremental;
 pub mod interaction;
 pub mod llm;
+/// Local shiso decision-model command classifier (Metal / CUDA); needs the
+/// `local-classifier` or `local-classifier-cuda` feature.
+#[cfg(all(unix, feature = "_classifier"))]
+pub mod local_classifier;
 pub mod model;
 pub mod pipeline;
 pub mod presets;
