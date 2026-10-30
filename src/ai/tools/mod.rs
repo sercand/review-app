@@ -230,8 +230,9 @@ pub struct ToolCx {
     /// `None` when the repo has no prepare commands configured; the tool
     /// then returns an error rather than running nothing silently.
     pub prepare: Option<Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>>,
-    /// Settings for the bash approval engine (`review_approval`).
-    pub approval: Arc<crate::ai::approval_setup::ApprovalSetup>,
+    /// Settings for the bash approval engine (`review_approval`), shared by
+    /// the run's agents and replaced when the user saves new settings.
+    pub approval: Arc<crate::ai::approval_setup::SharedApproval>,
 }
 
 impl ToolCx {

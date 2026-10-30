@@ -9,8 +9,10 @@
 //!
 //! After the run ([`SteerCtx::is_live`] is `false`), the tools that would
 //! change the pipeline answer [`FINISHED`] — the run has nothing left to
-//! steer. The reads (`pipeline_status`, `get_finding`, `get_agent_log`)
-//! keep working, so the follow-up chat can explain a finished review.
+//! steer. The reads (`pipeline_status`, `list_findings`, `get_finding`,
+//! `get_agent_log`) and `restore_finding` keep working, so the follow-up
+//! chat can explain a finished review and bring back a finding the user
+//! dropped by mistake.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolCx, ToolOutput, definition, parse};
 use crate::ai::pipeline::{GroupState, PipelineControl, PipelineStatus};
-use crate::ai::review::Finding;
+use crate::ai::review::{Finding, FindingState};
 use crate::ai::store::Store;
 use crate::ai::ui_interaction::UiInteraction;
 
@@ -230,7 +232,16 @@ pub fn tools(steer: Arc<SteerCtx>) -> Vec<Arc<dyn Tool>> {
         Arc::new(PipelineStatusTool {
             steer: steer.clone(),
         }),
+        Arc::new(ListFindings {
+            steer: steer.clone(),
+        }),
         Arc::new(GetFinding {
+            steer: steer.clone(),
+        }),
+        Arc::new(RestoreFinding {
+            steer: steer.clone(),
+        }),
+        Arc::new(TriageFindings {
             steer: steer.clone(),
         }),
         Arc::new(GetAgentLog {
@@ -283,6 +294,293 @@ impl Tool for PipelineStatusTool {
 
     async fn call(&self, _input: Value, _cx: &ToolCx) -> ToolOutput {
         ToolOutput::text(self.steer.digest())
+    }
+}
+
+/// How many findings `list_findings` prints before counting the rest.
+const MAX_LISTED_FINDINGS: usize = 200;
+
+/// `list_findings { state?, severity? }`.
+struct ListFindings {
+    steer: Arc<SteerCtx>,
+}
+
+#[derive(Deserialize)]
+struct ListFindingsInput {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ListFindings {
+    fn definition(&self) -> review_llm::Tool {
+        definition(
+            "list_findings",
+            "List this review's findings, one line each: id, severity, state, \
+             file:line and title. Filter by state (draft, kept, dropped_by_user, \
+             dropped_by_verifier, posted, addressed, still_present, outdated; \
+             'dropped' matches both dropped states) and by severity. Use it to \
+             find a finding's id before get_finding or restore_finding. \
+             'kept' means its comment is in the user's pending review.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "state": { "type": "string", "description": "Only this state." },
+                    "severity": { "type": "string", "description": "Only this severity: bug, risk, nit or question." }
+                },
+            }),
+        )
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolOutput {
+        let input: ListFindingsInput = match parse(input) {
+            Ok(input) => input,
+            Err(out) => return out,
+        };
+        let findings = match self.steer.store.finding_list(self.steer.session_id) {
+            Ok(findings) => findings,
+            Err(error) => {
+                return ToolOutput::error(format!("could not read the findings: {error}"));
+            }
+        };
+        let state = input
+            .state
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let severity = input
+            .severity
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let matching: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| match state {
+                None => true,
+                Some("dropped") => matches!(
+                    f.state,
+                    FindingState::DroppedByUser | FindingState::DroppedByVerifier
+                ),
+                Some(state) => f.state.as_str() == state,
+            })
+            .filter(|f| severity.is_none_or(|s| f.severity.as_str() == s))
+            .collect();
+        if matching.is_empty() {
+            return ToolOutput::text("no findings match");
+        }
+        let mut lines: Vec<String> = matching
+            .iter()
+            .take(MAX_LISTED_FINDINGS)
+            .map(|f| {
+                let line = match &f.anchor {
+                    crate::ai::review::FindingAnchor::Line(anchor) => format!(":{}", anchor.line),
+                    crate::ai::review::FindingAnchor::Summary { .. } => String::new(),
+                };
+                format!(
+                    "#{} [{} {}] {}{line} {}",
+                    f.id,
+                    f.severity.as_str(),
+                    f.state.as_str(),
+                    f.anchor.path(),
+                    one_line(&f.title)
+                )
+            })
+            .collect();
+        if matching.len() > MAX_LISTED_FINDINGS {
+            lines.push(format!("[{} more]", matching.len() - MAX_LISTED_FINDINGS));
+        }
+        ToolOutput::text(lines.join("\n"))
+    }
+}
+
+/// `restore_finding { id, reason }`.
+struct RestoreFinding {
+    steer: Arc<SteerCtx>,
+}
+
+#[derive(Deserialize)]
+struct RestoreInput {
+    id: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+#[async_trait::async_trait]
+impl Tool for RestoreFinding {
+    fn definition(&self) -> review_llm::Tool {
+        definition(
+            "restore_finding",
+            "Bring a dropped finding back as a draft, when the user asks for it or \
+             says it was dropped by mistake. It shows again in the diff and the AI \
+             tab with Keep and Drop; adding it to the review stays the user's \
+             choice. Works on dropped_by_user and dropped_by_verifier findings; a \
+             kept one is already in the user's pending review.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "The finding id (see list_findings)." },
+                    "reason": { "type": "string", "description": "Why it comes back, in one line." }
+                },
+                "required": ["id"],
+            }),
+        )
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolOutput {
+        let input: RestoreInput = match parse(input) {
+            Ok(input) => input,
+            Err(out) => return out,
+        };
+        let findings = match self.steer.store.finding_list(self.steer.session_id) {
+            Ok(findings) => findings,
+            Err(error) => {
+                return ToolOutput::error(format!("could not read the findings: {error}"));
+            }
+        };
+        let Some(finding) = findings.iter().find(|f| f.id == input.id) else {
+            return ToolOutput::error(format!("no finding #{} in this review", input.id));
+        };
+        match finding.state {
+            FindingState::DroppedByUser | FindingState::DroppedByVerifier => {}
+            FindingState::Draft => {
+                return ToolOutput::text(format!(
+                    "finding #{} is already a draft: it shows with Keep and Drop",
+                    input.id
+                ));
+            }
+            other => {
+                return ToolOutput::error(format!(
+                    "finding #{} is {}, not dropped; only dropped findings can be restored",
+                    input.id,
+                    other.as_str()
+                ));
+            }
+        }
+        let reason = match input.reason.trim() {
+            "" => "restored from the chat".to_string(),
+            reason => format!("restored from the chat: {}", one_line(reason)),
+        };
+        match cx
+            .run
+            .set_finding_state_and_anchor(input.id, FindingState::Draft, Some(reason), None)
+        {
+            Ok(()) => ToolOutput::text(format!(
+                "finding #{} is a draft again; the user can keep it from the diff or the AI tab",
+                input.id
+            )),
+            Err(error) => ToolOutput::error(format!("could not restore it: {error}")),
+        }
+    }
+}
+
+/// `triage_findings { keep, drop }`.
+struct TriageFindings {
+    steer: Arc<SteerCtx>,
+}
+
+#[derive(Deserialize, Default)]
+struct Selection {
+    #[serde(default)]
+    severities: Vec<String>,
+    #[serde(default)]
+    ids: Vec<i64>,
+}
+
+#[derive(Deserialize)]
+struct TriageInput {
+    #[serde(default)]
+    keep: Selection,
+    #[serde(default)]
+    drop: Selection,
+}
+
+#[async_trait::async_trait]
+impl Tool for TriageFindings {
+    fn definition(&self) -> review_llm::Tool {
+        let selection = json!({
+            "type": "object",
+            "properties": {
+                "severities": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["bug", "risk", "nit", "question"] },
+                    "description": "Every draft finding of these severities."
+                },
+                "ids": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "These finding ids."
+                }
+            }
+        });
+        definition(
+            "triage_findings",
+            "Keep or drop many draft findings at once, as the user's Keep and Drop \
+             buttons would: kept ones go into the user's pending review as comments, \
+             dropped ones are dismissed. Use it only when the user asks (\"keep all \
+             bugs, drop the nits\"). Select by severity and/or id; only drafts \
+             change, and an id in both lists is kept. The app applies it and \
+             reports the result in the AI tab.",
+            json!({
+                "type": "object",
+                "properties": { "keep": selection.clone(), "drop": selection },
+            }),
+        )
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolOutput {
+        let input: TriageInput = match parse(input) {
+            Ok(input) => input,
+            Err(out) => return out,
+        };
+        let findings = match self.steer.store.finding_list(self.steer.session_id) {
+            Ok(findings) => findings,
+            Err(error) => {
+                return ToolOutput::error(format!("could not read the findings: {error}"));
+            }
+        };
+        for severity in input.keep.severities.iter().chain(&input.drop.severities) {
+            if crate::ai::review::Severity::parse(severity).is_err() {
+                return ToolOutput::error(format!(
+                    "unknown severity {severity:?}: use bug, risk, nit or question"
+                ));
+            }
+        }
+        let pick = |sel: &Selection| -> Vec<i64> {
+            findings
+                .iter()
+                .filter(|f| f.state == FindingState::Draft)
+                .filter(|f| {
+                    sel.ids.contains(&f.id)
+                        || sel.severities.iter().any(|s| s == f.severity.as_str())
+                })
+                .map(|f| f.id)
+                .collect()
+        };
+        let keep = pick(&input.keep);
+        let drop: Vec<i64> = pick(&input.drop)
+            .into_iter()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        if keep.is_empty() && drop.is_empty() {
+            return ToolOutput::text("no draft findings match; nothing changed");
+        }
+        let list = |ids: &[i64]| {
+            ids.iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let text = format!(
+            "asked the app to keep {} ({}) and drop {} ({}); it reports the result in the AI tab",
+            keep.len(),
+            list(&keep),
+            drop.len(),
+            list(&drop)
+        );
+        cx.run.request_triage(keep, drop);
+        ToolOutput::text(text)
     }
 }
 
@@ -990,6 +1288,104 @@ mod tests {
                 out.parts
             );
         }
+    }
+
+    /// The chat finds a dropped finding with `list_findings` and brings it
+    /// back as a draft with `restore_finding`; the run announces the change
+    /// so the UI reloads it. A kept finding is not restored.
+    #[tokio::test]
+    async fn the_chat_lists_and_restores_a_dropped_finding() {
+        use crate::ai::review::{FindingAnchor, NewFinding, Severity};
+
+        let (tx, _rx) = event_channel();
+        let (run, mut events) = crate::test_support::ai_run_state_with_events();
+        let new = |title: &str| NewFinding {
+            agent: crate::ai::tools::AgentRef {
+                id: 1,
+                role: crate::ai::tools::AgentRole::Reviewer,
+                label: "g1".into(),
+            },
+            anchor: FindingAnchor::Summary {
+                path: "a.rs".into(),
+            },
+            severity: Severity::Bug,
+            title: title.into(),
+            body: "b".into(),
+            evidence: vec![crate::ai::review::Evidence {
+                path: "a.rs".into(),
+                line: Some(1),
+                note: "n".into(),
+            }],
+            checklist_item: None,
+        };
+        let dropped = run.add_finding(new("dropped one")).unwrap();
+        let kept = run.add_finding(new("kept one")).unwrap();
+        run.store()
+            .finding_set_user_state(dropped, FindingState::DroppedByUser, None)
+            .unwrap();
+        run.store()
+            .finding_set_user_state(kept, FindingState::Kept, Some(1))
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        let steer = Arc::new(SteerCtx::new(
+            None,
+            Arc::new(AtomicBool::new(false)),
+            interaction(&tx),
+            run.store().clone(),
+            run.session_id(),
+            1,
+        ));
+        let dir = crate::test_support::tempdir();
+        let mut cx = cx_in(&dir);
+        cx.run = run.clone();
+        let registry = tools(steer);
+        let tool = |name: &str| {
+            registry
+                .iter()
+                .find(|tool| tool.definition().name == name)
+                .expect("tool exists")
+                .clone()
+        };
+
+        let out = tool("list_findings")
+            .call(serde_json::json!({"state": "dropped"}), &cx)
+            .await;
+        let listed = format!("{:?}", out.parts);
+        assert!(
+            listed.contains(&format!("#{dropped} [bug dropped_by_user]")),
+            "{listed}"
+        );
+        assert!(!listed.contains("kept one"), "{listed}");
+
+        let out = tool("restore_finding")
+            .call(
+                serde_json::json!({"id": dropped, "reason": "wrongly dismissed"}),
+                &cx,
+            )
+            .await;
+        assert!(!out.is_error, "{:?}", out.parts);
+        let state = |id| {
+            run.store()
+                .finding_list(run.session_id())
+                .unwrap()
+                .into_iter()
+                .find(|f| f.id == id)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(dropped), FindingState::Draft);
+        assert_eq!(
+            events.try_recv(),
+            Ok(crate::ai::events::PipelineEvent::FindingChanged { id: dropped }),
+            "the UI hears of it"
+        );
+
+        let out = tool("restore_finding")
+            .call(serde_json::json!({"id": kept}), &cx)
+            .await;
+        assert!(out.is_error, "a kept finding is in the draft already");
+        assert_eq!(state(kept), FindingState::Kept);
     }
 
     /// A minimal [`ToolCx`] for the tools above: they answer before they

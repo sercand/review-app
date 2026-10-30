@@ -493,7 +493,7 @@ mod tests {
 
     fn classify_with(c: &Arc<dyn CommandClassifier>) -> ModelOutcome {
         c.classify(&ClassifyInput {
-            segment: "ls",
+            command: "ls",
             cwd: None,
         })
     }
@@ -1194,11 +1194,11 @@ mod tests {
         }
         let c = loader.classifier().expect("ready");
         let ls = c.classify(&ClassifyInput {
-            segment: "ls -la",
+            command: "ls -la",
             cwd: Some(Path::new("/repo")),
         });
         let rm = c.classify(&ClassifyInput {
-            segment: "rm -rf /",
+            command: "rm -rf /",
             cwd: Some(Path::new("/repo")),
         });
         eprintln!("ls -la -> {ls:?}; rm -rf / -> {rm:?}");

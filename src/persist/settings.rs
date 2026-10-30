@@ -231,6 +231,8 @@ pub struct RepoAiSettings {
 pub struct AiSettings {
     /// How many reviewers may run at once.
     pub max_parallel_reviewers: u32,
+    /// How many verifiers may run at once (one per file's findings).
+    pub max_parallel_verifiers: u32,
     /// Token budget per run; 0 means unlimited.
     pub run_token_budget: u64,
     /// Fraction of the context window that triggers compaction.
@@ -255,8 +257,10 @@ pub struct AiSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoApproveSettings {
-    /// Rule-based auto-approval; denied secret paths apply either way.
-    pub enabled: bool,
+    /// What happens to a command nothing vouched for: deny it back to the
+    /// agent (`auto`, the default), ask the user (`ask`), or run everything
+    /// (`trust`, see [`ApprovalMode::Trust`]).
+    pub mode: ApprovalMode,
     /// Consult the local command classifier for commands the rules cannot
     /// vouch for. Off until the classifier is evaluated.
     pub local_classifier: bool,
@@ -272,13 +276,114 @@ pub struct AutoApproveSettings {
     /// (`[a-z0-9._-]+`, see [`valid_decision_model`]); downloaded when the
     /// classifier is switched on.
     pub decision_model: String,
+    /// The pre-mode `enabled = false` (rules off: everything asked); read
+    /// once by [`AutoApproveSettings::migrate`], never written.
+    #[serde(rename = "enabled", skip_serializing)]
+    pub legacy_enabled: Option<bool>,
+    /// The pre-mode `dangerously_approve_all = true`; read once by
+    /// [`AutoApproveSettings::migrate`], never written.
+    #[serde(rename = "dangerously_approve_all", skip_serializing)]
+    pub legacy_approve_all: Option<bool>,
+}
+
+/// How the bash tool settles a command the rules and the classifier did not
+/// approve. Denies (secret paths) apply in `Auto` and `Ask`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Never ask: the command is refused and the agent is told why, so it
+    /// can rewrite it.
+    #[default]
+    Auto,
+    /// Ask the user.
+    Ask,
+    /// Run what the classifier did not flag: its "safe" and its unsure
+    /// answers run (the floor still holds), and the user is asked about
+    /// what it calls dangerous, what the floor holds, and everything when
+    /// no classifier answers.
+    Lenient,
     /// Full trust: every bash command runs without asking **and** the
     /// secret-path denies are bypassed — the agent may read `.env*`,
     /// `~/.ssh`, `~/.aws`, `.git/config` and this app's config folder, and
-    /// anything it reads can reach the model provider. Off by default; the
-    /// sandbox still confines writes and the agent still has no GitHub
-    /// credentials. Prepare commands (outside the sandbox) still ask.
-    pub dangerously_approve_all: bool,
+    /// anything it reads can reach the model provider. The sandbox still
+    /// confines writes and the agent still has no GitHub credentials.
+    /// Prepare commands (outside the sandbox) still ask.
+    Trust,
+}
+
+/// The auto-approve slider: one position per sensible combination of
+/// [`ApprovalMode`] and the local classifier, from asking most to checking
+/// nothing. It is a view over those two fields, not stored itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalLevel {
+    /// Read-only commands run; the user is asked about the rest.
+    AskMe,
+    /// The classifier approves what it can; the user is asked about the rest.
+    AskWhenUnsure,
+    /// The classifier approves what it can; the rest is refused back to the
+    /// agent. Nobody is asked.
+    NeverAsk,
+    /// Everything the classifier does not flag runs; the user is asked
+    /// about what it flags.
+    AskOnDanger,
+    /// Every command runs unchecked.
+    Trust,
+}
+
+impl ApprovalLevel {
+    /// Every level, slider order.
+    pub const ALL: [ApprovalLevel; 5] = [
+        ApprovalLevel::AskMe,
+        ApprovalLevel::AskWhenUnsure,
+        ApprovalLevel::NeverAsk,
+        ApprovalLevel::AskOnDanger,
+        ApprovalLevel::Trust,
+    ];
+
+    /// The level `mode` with the classifier `classifier_on` shows as.
+    /// `Auto` is "never ask" with or without the classifier: without it,
+    /// only the read-only checks approve.
+    pub fn of(mode: ApprovalMode, classifier_on: bool) -> ApprovalLevel {
+        match mode {
+            ApprovalMode::Ask if classifier_on => ApprovalLevel::AskWhenUnsure,
+            ApprovalMode::Ask => ApprovalLevel::AskMe,
+            ApprovalMode::Auto => ApprovalLevel::NeverAsk,
+            ApprovalMode::Lenient => ApprovalLevel::AskOnDanger,
+            ApprovalMode::Trust => ApprovalLevel::Trust,
+        }
+    }
+
+    /// The level `aa` is at.
+    pub fn of_settings(aa: &AutoApproveSettings) -> ApprovalLevel {
+        ApprovalLevel::of(aa.mode, aa.local_classifier)
+    }
+
+    /// The mode this level stores.
+    pub fn mode(self) -> ApprovalMode {
+        match self {
+            ApprovalLevel::AskMe | ApprovalLevel::AskWhenUnsure => ApprovalMode::Ask,
+            ApprovalLevel::NeverAsk => ApprovalMode::Auto,
+            ApprovalLevel::AskOnDanger => ApprovalMode::Lenient,
+            ApprovalLevel::Trust => ApprovalMode::Trust,
+        }
+    }
+
+    /// Whether this level consults the local classifier.
+    pub fn uses_classifier(self) -> bool {
+        matches!(
+            self,
+            ApprovalLevel::AskWhenUnsure | ApprovalLevel::NeverAsk | ApprovalLevel::AskOnDanger
+        )
+    }
+
+    /// 1 to 5, slider order.
+    pub fn number(self) -> usize {
+        ApprovalLevel::ALL
+            .iter()
+            .position(|l| *l == self)
+            .unwrap_or(0)
+            + 1
+    }
 }
 
 /// The decision model used when none is configured.
@@ -295,18 +400,36 @@ pub fn valid_decision_model(name: &str) -> bool {
 impl Default for AutoApproveSettings {
     fn default() -> AutoApproveSettings {
         AutoApproveSettings {
-            enabled: true,
+            mode: ApprovalMode::Auto,
             local_classifier: false,
             classifier_timeout_ms: 2000,
             deny_paths: Vec::new(),
             capabilities: Vec::new(),
             decision_model: DEFAULT_DECISION_MODEL.to_owned(),
-            dangerously_approve_all: false,
+            legacy_enabled: None,
+            legacy_approve_all: None,
         }
     }
 }
 
 impl AutoApproveSettings {
+    /// Folds the pre-mode switches into [`Self::mode`]: full trust stays
+    /// full trust, and rules switched off (everything asked) becomes `Ask`.
+    pub fn migrate(&mut self) {
+        let approve_all = self.legacy_approve_all.take() == Some(true);
+        let rules_off = self.legacy_enabled.take() == Some(false);
+        if approve_all {
+            self.mode = ApprovalMode::Trust;
+        } else if rules_off {
+            self.mode = ApprovalMode::Ask;
+        }
+    }
+
+    /// Full trust is on.
+    pub fn trust_all(&self) -> bool {
+        self.mode == ApprovalMode::Trust
+    }
+
     /// The classifier timeout, clamped to 50 ms ..= 5 s.
     pub fn timeout(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.classifier_timeout_ms.clamp(50, 5000))
@@ -317,6 +440,7 @@ impl Default for AiSettings {
     fn default() -> AiSettings {
         AiSettings {
             max_parallel_reviewers: 2,
+            max_parallel_verifiers: 4,
             run_token_budget: 0,
             context_threshold: 0.7,
             extra_env_allow: Vec::new(),
@@ -424,6 +548,7 @@ impl Settings {
 
         match toml::from_str::<Settings>(&raw) {
             Ok(mut settings) => {
+                settings.ai.auto_approve.migrate();
                 // Only the offered sizes are valid; anything else (an old
                 // file, a hand edit) loads as the default (Task 14).
                 if ![12.0, 13.0, 14.0].contains(&settings.code_font_size) {
@@ -476,15 +601,63 @@ mod tests {
         .unwrap();
         let s = Settings::load_or_default(dir.path());
         assert_eq!(s.ai.max_parallel_reviewers, 3);
-        assert!(s.ai.auto_approve.enabled);
+        assert_eq!(s.ai.auto_approve.mode, ApprovalMode::Auto);
         assert!(!s.ai.auto_approve.local_classifier);
         assert_eq!(s.ai.auto_approve.classifier_timeout_ms, 2000);
         assert!(s.ai.auto_approve.deny_paths.is_empty());
         assert!(s.ai.auto_approve.capabilities.is_empty());
-        assert!(
-            !s.ai.auto_approve.dangerously_approve_all,
-            "full trust is opt-in"
+        assert!(!s.ai.auto_approve.trust_all(), "full trust is opt-in");
+    }
+
+    #[test]
+    fn approval_levels_round_trip_through_mode_and_classifier() {
+        for level in ApprovalLevel::ALL {
+            assert_eq!(
+                ApprovalLevel::of(level.mode(), level.uses_classifier()),
+                level,
+                "{level:?}"
+            );
+        }
+        // A never-ask setting without the classifier is still "never ask".
+        assert_eq!(
+            ApprovalLevel::of(ApprovalMode::Auto, false),
+            ApprovalLevel::NeverAsk
         );
+        assert_eq!(
+            ApprovalLevel::of_settings(&AutoApproveSettings::default()),
+            ApprovalLevel::NeverAsk
+        );
+    }
+
+    #[test]
+    fn pre_mode_switches_migrate() {
+        let load = |toml: &str| {
+            let dir = tempdir();
+            std::fs::write(dir.path().join("settings.toml"), toml).unwrap();
+            Settings::load_or_default(dir.path()).ai.auto_approve
+        };
+        let trust = load("[ai.auto_approve]\nenabled = false\ndangerously_approve_all = true\n");
+        assert_eq!(trust.mode, ApprovalMode::Trust);
+        assert_eq!(trust.legacy_enabled, None);
+        assert_eq!(trust.legacy_approve_all, None);
+        let ask = load("[ai.auto_approve]\nenabled = false\n");
+        assert_eq!(ask.mode, ApprovalMode::Ask);
+        let auto = load("[ai.auto_approve]\nenabled = true\ndangerously_approve_all = false\n");
+        assert_eq!(auto.mode, ApprovalMode::Auto);
+        assert_eq!(
+            load("[ai.auto_approve]\nmode = \"ask\"\n").mode,
+            ApprovalMode::Ask
+        );
+
+        // Saved files carry only the mode.
+        let dir = tempdir();
+        let mut s = Settings::default();
+        s.ai.auto_approve.mode = ApprovalMode::Trust;
+        s.save(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(raw.contains("mode = \"trust\""), "{raw}");
+        assert!(!raw.contains("dangerously_approve_all"), "{raw}");
+        assert!(!raw.contains("enabled"), "{raw}");
     }
 
     #[test]
@@ -492,13 +665,13 @@ mod tests {
         let dir = tempdir();
         let mut s = Settings::default();
         s.ai.auto_approve = AutoApproveSettings {
-            enabled: false,
+            mode: ApprovalMode::Trust,
             local_classifier: true,
             classifier_timeout_ms: 1234,
             deny_paths: vec!["secrets".into()],
             capabilities: vec!["git:add".into(), "cargo:local".into()],
             decision_model: "d1-7b".into(),
-            dangerously_approve_all: true,
+            ..AutoApproveSettings::default()
         };
         s.save(dir.path()).unwrap();
         let back = Settings::load_or_default(dir.path());

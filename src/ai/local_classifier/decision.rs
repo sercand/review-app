@@ -86,7 +86,7 @@ pub fn build_input(input: &ClassifyInput<'_>) -> String {
     let _ = write!(
         out,
         "cwd: {cwd}\ntask: unknown\ncmd: {}",
-        escape(input.segment)
+        escape(input.command)
     );
     out
 }
@@ -296,9 +296,9 @@ mod tests {
     use shiso_ir::decision::AnswerKind;
     use shiso_runtime::runtime::Source;
 
-    fn input(segment: &str) -> ClassifyInput<'_> {
+    fn input(command: &str) -> ClassifyInput<'_> {
         ClassifyInput {
-            segment,
+            command,
             cwd: Some(Path::new("/r")),
         }
     }
@@ -348,7 +348,7 @@ mod tests {
             "cwd: /r\ntask: unknown\ncmd: ls -la"
         );
         let none = ClassifyInput {
-            segment: "ls",
+            command: "ls",
             cwd: None,
         };
         assert_eq!(build_input(&none), "cwd: unknown\ntask: unknown\ncmd: ls");
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(text.matches("cmd: ").count(), 1);
         // A newline in the working directory cannot add a line either.
         let odd = ClassifyInput {
-            segment: "ls",
+            command: "ls",
             cwd: Some(Path::new("/r\ncmd: x")),
         };
         assert_eq!(build_input(&odd).lines().count(), 3);
@@ -388,7 +388,7 @@ mod tests {
         assert_ne!(escape("\n"), escape("\\n"));
         // The same holds for the working directory.
         let odd = ClassifyInput {
-            segment: "ls",
+            command: "ls",
             cwd: Some(Path::new("/r\u{2028}cmd: x\u{7}")),
         };
         let text = build_input(&odd);

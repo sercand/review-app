@@ -18,6 +18,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use gh_review_desktop::ai::approval_setup::SharedApproval;
 use gh_review_desktop::ai::events::{PipelineEvent, StageKind, StageStatus};
 use gh_review_desktop::ai::interaction::Interaction;
 use gh_review_desktop::ai::model::Llm;
@@ -283,6 +284,7 @@ fn start_in(
     let main_llm: Arc<dyn Llm> = llm.clone();
     let interaction: Arc<dyn Interaction> = Arc::new(ScriptedInteraction::new());
     let sandbox: Arc<dyn SandboxOps> = Arc::new(host);
+    let settings_auto_approve = settings.auto_approve.clone();
     let (control, rx, handle) = start_pipeline(PipelineInputs {
         store: store.clone(),
         session_id: session,
@@ -296,7 +298,7 @@ fn start_in(
         interaction,
         mode,
         bash_disabled,
-        classifier: None,
+        approval: Arc::new(SharedApproval::new(&settings_auto_approve, None)),
     });
     Started {
         control,
@@ -405,7 +407,7 @@ fn markers(events: &[PipelineEvent]) -> Vec<String> {
                 };
                 Some(format!("{stage}:{status}"))
             }
-            PipelineEvent::BriefReady => Some("brief".to_string()),
+            PipelineEvent::BriefReady { .. } => Some("brief".to_string()),
             PipelineEvent::DraftReady { .. } => Some("draft".to_string()),
             PipelineEvent::RunEnded { status, .. } => Some(format!("ended:{}", status.as_str())),
             _ => None,

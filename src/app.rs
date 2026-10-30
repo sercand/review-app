@@ -2179,6 +2179,13 @@ impl ReviewApp {
             .settings
             .ai
             .repo(&session.host, &session.repo.owner, &session.repo.name);
+        // The AI tab's auto-approve chips read the current settings: they
+        // apply live to running reviews.
+        #[cfg(unix)]
+        let auto_approve = crate::ui::widgets::ai_panel::AutoApproveView::new(
+            &self.settings.ai.auto_approve,
+            &self.settings_window.classifier_state,
+        );
         let actions = pr_detail::render(
             ui,
             session,
@@ -2198,6 +2205,8 @@ impl ReviewApp {
                 local_checkout: local_checkout.as_ref(),
                 #[cfg(unix)]
                 repo_ai,
+                #[cfg(unix)]
+                auto_approve: Some(&auto_approve),
             },
         );
 
@@ -2331,10 +2340,7 @@ impl ReviewApp {
                 session.edit_pending(local_id, body);
                 Vec::new()
             }
-            ReviewAction::DeleteComment(local_id) => {
-                session.delete_pending(local_id, now);
-                Vec::new()
-            }
+            ReviewAction::DeleteComment(local_id) => session.delete_pending(local_id, now),
             ReviewAction::LocateThread(thread_id) => {
                 let anchor = session
                     .threads
@@ -2388,8 +2394,7 @@ impl ReviewApp {
                         now,
                     );
                 }
-                session.discard_pending_review(now);
-                Vec::new()
+                session.discard_pending_review(now)
             }
             ReviewAction::Submit => {
                 // Spec §13: the panel and composer disable Submit while a
@@ -2749,6 +2754,21 @@ impl ReviewApp {
                     Err(why) => self.toasts.push(why, now),
                 }
             }
+            AiPanelAction::Triage { severity, keep } => {
+                let ids = crate::state::pr_detail::draft_ids(session, severity);
+                let (keep_ids, drop_ids) = if keep {
+                    (ids, Vec::new())
+                } else {
+                    (Vec::new(), ids)
+                };
+                let done = crate::state::pr_detail::triage(session, &keep_ids, &drop_ids, now);
+                for command in done.commands {
+                    self.worker.send(command);
+                }
+                if let Some(why) = done.failed {
+                    self.toasts.push(why, now);
+                }
+            }
             AiPanelAction::DropSummary(id) => {
                 use crate::ai::review::FindingState;
 
@@ -2840,6 +2860,15 @@ impl ReviewApp {
                     self.ai_dialog =
                         Some(crate::ui::widgets::ai_dialogs::AiDialog::Recovery(records));
                 }
+            }
+            AiPanelAction::OpenAutoApprove => {
+                // Settings → AI with the auto-approve dialog open on the
+                // stored table; a save applies to running reviews.
+                self.settings_window.open_with(&self.settings);
+                self.settings_window.tab = settings_window::SettingsTab::Ai;
+                self.settings_window
+                    .ai_tab
+                    .edit_auto_approve(&self.settings.ai, &self.settings_window.classifier_state);
             }
             AiPanelAction::EditRepoCommands => {
                 // The dialog edits the repo's entry even when no folder is
@@ -3164,7 +3193,9 @@ impl ReviewApp {
                 }
                 DiffAction::DeletePending { local_id } => {
                     if let Some(session) = &mut self.session {
-                        session.delete_pending(local_id, now);
+                        for command in session.delete_pending(local_id, now) {
+                            self.worker.send(command);
+                        }
                     }
                 }
                 DiffAction::EditPending { local_id } => {

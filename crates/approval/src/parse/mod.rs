@@ -3,6 +3,7 @@
 //! [`parse`] fails closed. Anything tree-sitter flags as `ERROR`/`MISSING`, and
 //! any node kind the walker has no explicit rule for, is a [`Bail`].
 
+mod vars;
 mod walk;
 mod words;
 

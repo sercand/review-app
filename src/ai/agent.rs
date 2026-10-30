@@ -228,7 +228,7 @@ pub async fn run_agent(
         let mut finish_ok = false;
         let mut results = Vec::with_capacity(calls.len());
         for (id, name, input) in &calls {
-            let summary = input.to_string().chars().take(120).collect();
+            let summary = tool_call_summary(name, input);
             let _ = events.send(PipelineEvent::ToolCall {
                 agent: agent.clone(),
                 name: name.clone(),
@@ -463,6 +463,29 @@ fn elide_if_needed(model: &ModelSettings, threshold: f64, system: &str, messages
     }
 }
 
+/// Tools whose input is an agent's result (its summary, verdicts, review
+/// draft, re-checked states): the UI shows them as cards, so they travel
+/// whole, up to [`MAX_RESULT_SUMMARY`] chars.
+const RESULT_TOOLS: &[&str] = &[
+    "done",
+    "submit_verdicts",
+    "submit_review_draft",
+    "submit_prior_states",
+];
+
+/// The longest result-tool input a [`PipelineEvent::ToolCall`] carries.
+const MAX_RESULT_SUMMARY: usize = 16_000;
+
+/// What a [`PipelineEvent::ToolCall`] carries of `input`: the first 120
+/// chars, or a result tool's whole input.
+fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
+    let cap = if RESULT_TOOLS.contains(&name) {
+        MAX_RESULT_SUMMARY
+    } else {
+        120
+    };
+    input.to_string().chars().take(cap).collect()
+}
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

@@ -66,10 +66,52 @@ impl Severity {
     }
 }
 
-/// The comment body a kept line finding carries: its severity, then the text
-/// (spec §12, Task 5).
-pub fn kept_body(severity: Severity, body: &str) -> String {
-    format!("**{}:** {body}", severity.label())
+/// The comment body a kept line finding carries: its severity, then the
+/// text, then its evidence ([`evidence_markdown`]) (spec §12, Task 5).
+pub fn kept_body(severity: Severity, body: &str, evidence: &str) -> String {
+    format!("**{}:** {body}{evidence}", severity.label())
+}
+
+/// `evidence` as a Markdown list to append to a comment: each entry links to
+/// its file and line at one commit (a GitHub permalink, so the link keeps
+/// pointing at the code the finding was about after the branch moves).
+/// `blob_base` is `{web}/{owner}/{repo}/blob/{sha}`; without it, or for a
+/// path that is not inside the repository, the entry is plain text. Empty
+/// evidence gives an empty string.
+pub fn evidence_markdown(evidence: &[Evidence], blob_base: Option<&str>) -> String {
+    if evidence.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\n**Evidence**\n");
+    for e in evidence {
+        let path = e.path.trim().trim_start_matches("./");
+        let label = match e.line {
+            Some(line) => format!("{path}:{line}"),
+            None => path.to_string(),
+        };
+        let inside = !path.is_empty()
+            && !path.starts_with('/')
+            && !path.starts_with('~')
+            && !path.split('/').any(|c| c == "..");
+        let entry = match blob_base {
+            Some(base) if inside => {
+                let anchor = e.line.map(|l| format!("#L{l}")).unwrap_or_default();
+                format!(
+                    "[`{label}`]({base}/{}{anchor})",
+                    crate::github::blobs::encode_path(path)
+                )
+            }
+            _ => format!("`{label}`"),
+        };
+        let note = e.note.split_whitespace().collect::<Vec<_>>().join(" ");
+        if note.is_empty() {
+            out.push_str(&format!("- {entry}\n"));
+        } else {
+            out.push_str(&format!("- {entry}: {note}\n"));
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// What became of a finding, in the spec §11 spelling.
@@ -411,6 +453,14 @@ impl RunState {
         Ok(())
     }
 
+    /// Ask the app to keep and drop these findings (the chat's
+    /// `triage_findings`); the app applies it to the pending review.
+    pub fn request_triage(&self, keep: Vec<i64>, drop: Vec<i64>) {
+        let _ = self
+            .events
+            .send(PipelineEvent::TriageRequested { keep, drop });
+    }
+
     /// Move finding `id` to a lower `severity`, keeping it a
     /// [`FindingState::Draft`] and recording why (the verifier's downgrade,
     /// spec §5.5).
@@ -441,16 +491,17 @@ impl RunState {
         self.cache().findings.clone()
     }
 
-    /// Announce what the local command classifier said about the agent's
-    /// last tool call (`bash` is the only tool that asks). Emitted only when
-    /// the classifier was consulted; the UI badges the tool line.
-    pub fn classifier_note(
+    /// Announce how the agent's last `bash` call was decided, and what the
+    /// local classifier said about it when it was consulted.
+    pub fn command_decided(
         &self,
         agent: &AgentRef,
-        note: review_approval::model_stage::ClassifierNote,
+        decision: crate::ai::events::CommandDecision,
+        note: Option<review_approval::model_stage::ClassifierNote>,
     ) {
-        let _ = self.events.send(PipelineEvent::ClassifierNote {
+        let _ = self.events.send(PipelineEvent::CommandDecided {
             agent: agent.clone(),
+            decision,
             note,
         });
     }
@@ -652,6 +703,34 @@ mod tests {
                 item: "empty-input".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn evidence_links_inside_the_repo_and_quotes_the_rest() {
+        let e = |path: &str, line| Evidence {
+            path: path.into(),
+            line,
+            note: "why".into(),
+        };
+        let evidence = [
+            e("./a/b.rs", Some(3)),
+            e("README.md", None),
+            e("/etc/hosts", Some(1)),
+            e("../x.rs", None),
+        ];
+        assert_eq!(
+            evidence_markdown(&evidence, Some("https://github.com/o/r/blob/abc")),
+            "\n\n**Evidence**\n\
+             - [`a/b.rs:3`](https://github.com/o/r/blob/abc/a/b.rs#L3): why\n\
+             - [`README.md`](https://github.com/o/r/blob/abc/README.md): why\n\
+             - `/etc/hosts:1`: why\n\
+             - `../x.rs`: why"
+        );
+        assert_eq!(
+            evidence_markdown(&evidence[..1], None),
+            "\n\n**Evidence**\n- `a/b.rs:3`: why"
+        );
+        assert_eq!(evidence_markdown(&[], Some("x")), "");
     }
 
     #[test]

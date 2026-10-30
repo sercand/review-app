@@ -1,7 +1,7 @@
 # macOS release
 
 ```sh
-scripts/macos/archive.sh    # universal, signed .app inside an .xcarchive
+scripts/macos/archive.sh    # arm64, signed .app inside an .xcarchive
 scripts/macos/notarize.sh   # notarize, staple, and build the .dmg / .zip
 ```
 
@@ -16,7 +16,7 @@ only when the user turns the classifier on. Metal needs no entitlement.
 - A **Developer ID Application** certificate for team `8SWC36YF9N` in the login
   keychain. To sign with another team, set `TEAM_ID`, or set `SIGN_IDENTITY` to
   the certificate's full name.
-- Both Rust targets: `rustup target add aarch64-apple-darwin x86_64-apple-darwin`.
+- The Rust target: `rustup target add aarch64-apple-darwin`.
 - Notarization credentials, saved as a keychain profile (create the
   app-specific password at appleid.apple.com):
 

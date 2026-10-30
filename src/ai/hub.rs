@@ -27,6 +27,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::ai::approval_setup::SharedApproval;
 use crate::ai::chat::{self, ChatHandle, ChatSetup};
 
 use crate::ai::checkout::{
@@ -315,6 +316,8 @@ pub struct RunHandle {
     sandbox: Option<Weak<dyn SandboxOps>>,
     /// The run's agent-owned temp dir, removed when the run closes.
     tmp_dir: Option<PathBuf>,
+    /// The run's bash approval settings, updated by [`AiHub::set_settings`].
+    approval: Option<Arc<SharedApproval>>,
 }
 
 impl RunHandle {
@@ -348,6 +351,7 @@ impl RunHandle {
             pipeline: None,
             sandbox: None,
             tmp_dir: None,
+            approval: None,
         }
     }
 }
@@ -659,30 +663,32 @@ impl AiHub {
         }
     }
 
-    /// The classifier a run starting now gets: with the setting on, a
-    /// [`LiveClassifier`] that asks the provider (looked up lazily, it may not
-    /// exist yet) on every call, so the model is used as soon as it is ready
-    /// and not at all once the setting goes off. With the setting off at run
-    /// start the run gets none, and keeps none if it is switched on later.
-    fn run_classifier(
-        &self,
-        settings: &AiSettings,
-    ) -> Option<Arc<dyn review_approval::model_stage::CommandClassifier>> {
-        if !settings.auto_approve.local_classifier {
-            return None;
-        }
-        Some(Arc::new(LiveClassifier {
+    /// The classifier a run starting now holds: a [`LiveClassifier`] that
+    /// asks the provider (looked up lazily, it may not exist yet) on every
+    /// call, so the model is used as soon as it is ready and not at all while
+    /// the setting is off. The run's [`SharedApproval`] consults it only
+    /// while `local_classifier` is on, which a settings save can change
+    /// mid-run.
+    fn run_classifier(&self) -> Arc<dyn review_approval::model_stage::CommandClassifier> {
+        Arc::new(LiveClassifier {
             provider: self.classifier.clone(),
             enabled: self.classifier_enabled.clone(),
             generation: self.classifier_generation.clone(),
-        }))
+        })
     }
 
     /// Replace the AI settings every later run reads (the app calls this at
     /// startup and whenever the user saves them).
+    /// Live runs follow the new `[ai.auto_approve]` from their next command
+    /// on; the sandbox each was launched with stays as it is.
     pub fn set_settings(&self, settings: AiSettings) {
         self.classifier_enabled
             .store(settings.auto_approve.local_classifier, Ordering::SeqCst);
+        for run in self.runs.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            if let Some(approval) = &run.approval {
+                approval.apply(&settings.auto_approve);
+            }
+        }
         *self.settings.write().unwrap_or_else(|e| e.into_inner()) = settings;
     }
 
@@ -1121,7 +1127,7 @@ impl AiHub {
         let extra_write = repo_settings.extra_write_paths.clone();
         let extra_deny = repo_settings.extra_deny_read.clone();
         let app_config = config_root();
-        let trust_all = settings.auto_approve.dangerously_approve_all;
+        let trust_all = settings.auto_approve.trust_all();
         let tmp_for_sandbox = tmp_dir.clone();
         let sandbox_build = tokio::task::spawn_blocking(move || {
             let home = home.ok_or_else(|| "HOME is not set".to_string())?;
@@ -1240,13 +1246,16 @@ impl AiHub {
             repo_settings.prepare.clone(),
         );
         let elide_threshold = f64::from(settings.context_threshold);
-        let classifier = self.run_classifier(&settings);
+        let approval = Arc::new(SharedApproval::new(
+            &settings.auto_approve,
+            Some(self.run_classifier()),
+        ));
         #[cfg(test)]
         {
             *self
                 .run_classifier_seen
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(classifier.clone());
+                .unwrap_or_else(|e| e.into_inner()) = Some(approval.current().classifier.clone());
         }
         let (control, mut rx, pipeline) = start_pipeline(PipelineInputs {
             store: self.store.clone(),
@@ -1261,7 +1270,7 @@ impl AiHub {
             interaction: interaction.clone() as Arc<dyn Interaction>,
             mode,
             bash_disabled: bash_disabled.clone(),
-            classifier,
+            approval: approval.clone(),
         });
         if let Err(error) = self.store.checkout_set_state(rec.id, CheckoutState::Active) {
             tracing::warn!(%error, "ai hub: marking the checkout active failed");
@@ -1317,6 +1326,7 @@ impl AiHub {
                 pipeline: Some(pipeline),
                 sandbox: Some(sandbox_weak),
                 tmp_dir: Some(tmp_dir),
+                approval: Some(approval),
             },
         );
 
@@ -1553,6 +1563,7 @@ impl AiHub {
                         pipeline: run.pipeline.take(),
                         sandbox: run.sandbox.clone(),
                         tmp_dir: run.tmp_dir.clone(),
+                        approval: run.approval.clone(),
                     }))
                 }
                 None => None,
@@ -2048,7 +2059,7 @@ mod tests {
 
     fn classify(c: &Arc<dyn review_approval::model_stage::CommandClassifier>) -> ModelOutcome {
         c.classify(&review_approval::model_stage::ClassifyInput {
-            segment: "pr -t x",
+            command: "pr -t x",
             cwd: None,
         })
     }
@@ -2056,17 +2067,16 @@ mod tests {
     use review_approval::model_stage::ModelOutcome;
 
     #[test]
-    fn run_gets_a_live_classifier_only_when_the_setting_is_on() {
+    fn run_consults_the_classifier_only_while_the_setting_is_on() {
         let provider = Arc::new(FakeProvider::default());
         let hub = hub_with(&provider);
-        assert!(
-            hub.run_classifier(&settings_with_classifier(false))
-                .is_none()
+        let off = SharedApproval::new(
+            &settings_with_classifier(false).auto_approve,
+            Some(hub.run_classifier()),
         );
-        assert!(
-            hub.run_classifier(&settings_with_classifier(true))
-                .is_some()
-        );
+        assert!(off.current().classifier.is_none());
+        off.apply(&settings_with_classifier(true).auto_approve);
+        assert!(off.current().classifier.is_some(), "switched on mid-run");
     }
 
     #[test]
@@ -2074,7 +2084,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
         let hub = hub_with(&provider);
         hub.set_settings(settings_with_classifier(true));
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         // Still loading: no model, and nothing is called.
         assert_eq!(classify(&live), ModelOutcome::Unavailable);
         assert_eq!(provider.classify_calls.load(Ordering::SeqCst), 0);
@@ -2090,7 +2100,7 @@ mod tests {
         provider.ready.store(true, Ordering::SeqCst);
         let hub = hub_with(&provider);
         hub.set_settings(settings_with_classifier(true));
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         assert_eq!(classify(&live), ModelOutcome::Safe);
         // Settings saved with the checkbox off.
         hub.set_settings(settings_with_classifier(false));
@@ -2107,7 +2117,7 @@ mod tests {
     fn live_classifier_is_inactive_when_off_so_cached_outcomes_are_ignored() {
         let provider = Arc::new(FakeProvider::default());
         let hub = hub_with(&provider);
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         hub.classifier_request(true, "d1-3b", 1);
         assert!(live.active());
         hub.classifier_request(false, "d1-3b", 2);
@@ -2116,31 +2126,32 @@ mod tests {
 
     #[test]
     fn a_cached_safe_stops_applying_when_the_model_is_switched_off_mid_run() {
-        use review_approval::model_stage::{DecisionCache, ModelPolicy};
-        use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+        use review_approval::model_stage::{DecisionCache, ModelStage, decide};
+        use review_approval::{ApprovalConfig, Verdict};
         let provider = Arc::new(FakeProvider::default());
         provider.ready.store(true, Ordering::SeqCst);
         let hub = hub_with(&provider);
         hub.classifier_request(true, "d1-3b", 1);
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         let cache = DecisionCache::new();
         let verdict = |cmd: &str| {
-            let policy = ModelPolicy {
+            let model = ModelStage {
                 classifier: live.as_ref(),
                 cache: &cache,
-                deadline: None,
-                trace: None,
+                ask_new: true,
+                run_unsure: false,
             };
-            let extra: [&dyn SegmentPolicy; 1] = [&policy];
-            classify(
+            decide(
                 cmd,
                 &ApprovalConfig {
                     allowed: &[],
                     deny_paths: &[],
                     cwd: None,
-                    extra: &extra,
+                    extra: &[],
                 },
+                Some(&model),
             )
+            .0
         };
         let cmd = "/usr/bin/pr -t file.txt";
         assert!(matches!(verdict(cmd), Verdict::Run { .. }));
@@ -2151,31 +2162,32 @@ mod tests {
 
     #[test]
     fn a_cached_safe_from_the_old_model_does_not_outlive_a_model_switch() {
-        use review_approval::model_stage::{DecisionCache, ModelPolicy};
-        use review_approval::{ApprovalConfig, SegmentPolicy, Verdict, classify};
+        use review_approval::model_stage::{DecisionCache, ModelStage, decide};
+        use review_approval::{ApprovalConfig, Verdict};
         let provider = Arc::new(FakeProvider::default());
         provider.ready.store(true, Ordering::SeqCst);
         let hub = hub_with(&provider);
         hub.classifier_request(true, "d1-3b", 1);
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         let cache = DecisionCache::new();
         let verdict = |cmd: &str| {
-            let policy = ModelPolicy {
+            let model = ModelStage {
                 classifier: live.as_ref(),
                 cache: &cache,
-                deadline: None,
-                trace: None,
+                ask_new: true,
+                run_unsure: false,
             };
-            let extra: [&dyn SegmentPolicy; 1] = [&policy];
-            classify(
+            decide(
                 cmd,
                 &ApprovalConfig {
                     allowed: &[],
                     deny_paths: &[],
                     cwd: None,
-                    extra: &extra,
+                    extra: &[],
                 },
+                Some(&model),
             )
+            .0
         };
         let cmd = "/usr/bin/pr -t file.txt";
         assert!(matches!(verdict(cmd), Verdict::Run { .. }));
@@ -2195,7 +2207,7 @@ mod tests {
     fn a_run_started_before_the_provider_exists_still_gets_the_model_later() {
         let hub = plain_hub();
         hub.set_settings(settings_with_classifier(true));
-        let live = hub.run_classifier(&settings_with_classifier(true)).unwrap();
+        let live = hub.run_classifier();
         assert_eq!(
             classify(&live),
             ModelOutcome::Unavailable,
@@ -2345,7 +2357,16 @@ mod tests {
             status: crate::ai::events::RunStatus::Completed,
             stop_reason: None,
         }));
-        assert!(!pipeline_changes_findings(&PipelineEvent::BriefReady));
+        assert!(!pipeline_changes_findings(&PipelineEvent::BriefReady {
+            brief: Box::new(crate::ai::stages::scout::Brief {
+                intent: String::new(),
+                description_matches: true,
+                unexplained: vec![],
+                groups: vec![],
+                suggested_commands: vec![],
+                suggested_prepare: vec![],
+            }),
+        }));
     }
 
     // --- fixtures: the checkout.rs git repo, the ai_pipeline snapshot ---

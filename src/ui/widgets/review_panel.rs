@@ -367,8 +367,24 @@ pub fn render(
     pending: &mut PendingReview,
     actions: &mut Vec<ReviewAction>,
 ) {
-    let p = theme::palette_of(ui);
     ui.set_width(380.0);
+    // A long summary (the assembler's pre-fill) or many comments must not
+    // push the verdicts and Submit off the screen: the popover scrolls.
+    let max_height = (ui.ctx().viewport_rect().height() - 120.0).max(240.0);
+    egui::ScrollArea::vertical()
+        .id_salt("review-popover-scroll")
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| render_body(ui, vm, pending, actions));
+}
+
+fn render_body(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    pending: &mut PendingReview,
+    actions: &mut Vec<ReviewAction>,
+) {
+    let p = theme::palette_of(ui);
     ui.strong("Finish your review");
     if vm.github {
         ui.colored_label(
@@ -385,12 +401,20 @@ pub fn render(
         ui.label(RichText::new(suggested.clone()).color(p.muted));
     }
 
-    let body_response = ui.add(
-        egui::TextEdit::multiline(&mut pending.body)
-            .hint_text("Leave a summary (optional for Approve)")
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
+    // The summary scrolls inside its own box, so the verdicts stay close.
+    let body_response = egui::ScrollArea::vertical()
+        .id_salt("review-summary-scroll")
+        .max_height(260.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut pending.body)
+                    .hint_text("Leave a summary (optional for Approve)")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            )
+        })
+        .inner;
     // The edit wrote straight into `pending.body`; report the change so the
     // app persists the draft.
     if body_response.changed() {
@@ -803,6 +827,42 @@ mod tests {
         });
         assert!(actions.is_empty(), "an untouched panel emits no actions");
         assert!(!opened, "an untouched banner opens nothing");
+    }
+
+    /// A very long summary scrolls inside its box: the verdict cards stay
+    /// on screen and clickable.
+    #[test]
+    fn a_long_summary_keeps_the_verdicts_reachable() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut pending = PendingReview::default();
+        pending.set_body((0..200).map(|i| format!("line {i}\n")).collect());
+        let vm = review_panel_vm(&inputs(&pending));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size([420.0, 700.0])
+            .with_context_setup(|ctx| ctx.set_fonts(crate::ui::fonts::font_definitions()))
+            .build_ui_state(
+                move |ui, (pending, actions): &mut (PendingReview, Vec<ReviewAction>)| {
+                    render(ui, &vm, pending, actions)
+                },
+                (pending, Vec::new()),
+            );
+        harness.run();
+        let comment = harness.get_by_label("Comment").rect();
+        assert!(
+            comment.bottom() < 700.0,
+            "the verdicts are pushed off: {comment:?}"
+        );
+        harness.get_by_label("Approve").click();
+        harness.run();
+        assert!(
+            harness
+                .state()
+                .1
+                .contains(&ReviewAction::SetEvent(ReviewEvent::Approve)),
+            "{:?}",
+            harness.state().1
+        );
     }
 
     #[test]

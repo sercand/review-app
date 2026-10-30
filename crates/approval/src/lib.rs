@@ -5,9 +5,9 @@
 //! closed: anything it cannot account for is a [`model::Bail`].
 
 pub mod engine;
+pub mod floor;
 pub mod model;
 pub mod model_stage;
-pub mod never_approve;
 pub mod parse;
 pub mod policies;
 pub mod policy;
@@ -45,7 +45,8 @@ pub struct ApprovalConfig<'a> {
     pub deny_paths: &'a [String],
     /// Working directory for `mkdir_cwd`; None disables path-relative rules.
     pub cwd: Option<&'a Path>,
-    /// Extra policies consulted after the rules (the model stage plugs in here).
+    /// Extra policies consulted after the built-in rules (opt-in
+    /// capabilities).
     pub extra: &'a [&'a dyn SegmentPolicy],
 }
 
@@ -87,13 +88,6 @@ pub fn classify(command: &str, cfg: &ApprovalConfig<'_>) -> Verdict {
         Decision::Approve { source } => Verdict::Run { source },
         Decision::Defer => Verdict::Ask {
             reason: describe(reason.as_ref(), "not in the allowed commands"),
-        },
-        // The local classifier only advises: its deny is an ask with a warning.
-        Decision::Deny { source } if source == engine::ML_NAME => Verdict::Ask {
-            reason: format!(
-                "the local classifier flagged this command as dangerous: {}",
-                reason.as_ref().map_or_else(String::new, |r| r.to_string())
-            ),
         },
         Decision::Deny { .. } => Verdict::Deny {
             reason: describe(reason.as_ref(), "denied by a deny rule (protected path)"),

@@ -124,7 +124,11 @@ fn redirect_targets() {
 
 #[test]
 fn substitutions_and_heredocs_always_ask() {
-    asks("ls \"$(pwd)\"", &[]); // double quotes still expand
+    asks("ls \"$(date)\"", &[]); // double quotes still expand
+    asks("ls \"$(pwd; date)\"", &[]);
+    // The two substitutions that only print a directory are accepted.
+    runs("ls \"$(pwd)\"", &[]);
+    runs("cd \"$(git rev-parse --show-toplevel)/src\" && ls", &[]);
     asks("wc -l <<EOF\nx\nEOF", &[]);
     asks("ls a; echo `date`", &[]);
     runs("grep '$(' file", &[]); // single quotes are literal

@@ -1,0 +1,124 @@
+# Adversarial commands the floor (crates/approval/src/floor.rs) leaves to the
+# local classifier: each runs a program from the checkout, or a tool the
+# floor does not know, the same way `cargo test` or `make` does. A model
+# "safe" runs them; the sandbox keeps them out of .git and the secret paths,
+# but not off the network. `floor_holds_everything_else` fails when a
+# dangerous or adversarial command outside this list gets past the floor, so
+# a line is added here only as a reviewed decision.
+numactl ./x
+numactl --cpunodebind=0 ./evil
+perf stat ./evil
+perf record -o /tmp/p ./evil
+setarch x86_64 ./evil
+setarch -R scripts/evil
+faketime 2020-01-01 scripts/evil
+faketime '2020-01-01 00:00:00' ./evil
+ssh-agent ./evil
+dbus-run-session ./evil
+tclsh evil.tcl
+m4 evil.m4
+ts-node x.ts
+tsx x.ts
+pwsh x.ps1
+powershell x.ps1
+julia x.jl
+meson setup b
+meson compile -C b
+sbt run
+mix run
+mix test
+dotnet run
+dotnet test
+node-18 x.js
+node18 x.js
+python3.12 x.py
+ruby_3 x.rb
+Python.EXE x.py
+pwsh.exe x.ps1
+scripts/evil
+./scripts/evil
+../evil
+../../bin/evil --check
+tools/lint --fix
+build/tool
+target/debug/tool
+node_modules/.bin/evil
+vendor/bin/evil
+mytool ./evil.sh
+mytool scripts/evil.sh
+mytool --config=./evil.toml
+mytool ../evil
+parallel ::: ./evil
+script -c ./evil /dev/null
+flock /tmp/l ./evil
+strace ./evil
+valgrind ./evil
+hyperfine ./evil
+entr ./evil
+watchexec ./evil
+arch -x86_64 ./evil
+caffeinate ./evil
+nice ./evil
+timeout 5 ./evil
+time ./evil
+ionice ./evil
+chrt 1 ./evil
+taskset 1 ./evil
+stdbuf -o0 ./evil
+env FOO=bar ./evil
+timeout --foreground 5 ./evil
+cargo test -- --exec ./evil
+npm test --scripts-prepend-node-path=./evil
+pytest -p evil
+node --require ./evil.js x
+bun run x.ts
+mytool -c./evil.toml
+mytool -I./evil
+mytool -I../evil
+mytool -Idir/evil
+mytool mkfs.ext4
+mytool '. evil.sh'
+mytool 'x;. evil.sh'
+mytool 'x&&. evil.sh'
+mytool 'x|. evil.sh'
+mytool $'x\n. evil.sh'
+mytool 'x;\. evil.sh'
+mytool "x;'.' evil.sh"
+mytool 'x;"." evil.sh'
+mytool 'x;.${IFS}evil.sh'
+mytool 'x;.$IFS evil.sh'
+mytool < ./evil.sh
+mytool < scripts/evil.sh
+mytool < 'a;b'
+eslint .
+prettier --check .
+stylelint src
+rubocop
+mypy .
+pylint src
+flake8
+black --check .
+ruff check .
+isort --check .
+pyright
+tsc --noEmit
+webpack --mode production
+vite build
+rollup -c
+esbuild src/x.ts
+babel src
+nx test
+turbo run test
+lerna run build
+karma start
+playwright test
+cypress run
+terragrunt plan
+kustomize build .
+ansible all -m ping
+ansible-playbook site.yml
+vagrant up
+pre-commit run -a
+husky install
+lint-staged
+ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && ls -la src && numactl ./evil

@@ -3,12 +3,17 @@
 //! `value` is the word after quote removal and backslash resolution; `dynamic`
 //! is true when the real value is only known at run time (a `$` expansion or an
 //! unquoted brace expansion). Globs are not dynamic: they cannot change the
-//! shape of argv0 or a flag. Command/process substitution and arithmetic
-//! expansion are bails, never words.
+//! shape of argv0 or a flag. Process substitution, arithmetic expansion and
+//! command substitution are bails, never words, except for the two
+//! substitutions [`allowed_substitution`] accepts.
+//!
+//! A `$NAME` whose value [`Vars`] knows is replaced by that value and is not
+//! dynamic.
 
 use tree_sitter::Node;
 
 use super::unsupported;
+use super::vars::{Vars, is_name};
 use crate::model::Bail;
 
 /// Node kinds [`word_value`] understands (besides the container kinds below).
@@ -36,7 +41,7 @@ pub(super) fn text<'a>(node: Node, src: &'a str) -> Result<&'a str, Bail> {
     src.get(node.byte_range()).ok_or(Bail::Syntax)
 }
 
-pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
+pub(super) fn word_value(node: Node, src: &str, vars: &Vars) -> Result<(String, bool), Bail> {
     match node.kind() {
         // A word/number with children hides a substitution (`10#$(cmd)`).
         "word" | "number" if node.named_child_count() > 0 => {
@@ -71,11 +76,18 @@ pub(super) fn word_value(node: Node, src: &str) -> Result<(String, bool), Bail> 
         }
         "simple_expansion" | "expansion" => {
             check_expansion(node, src)?;
+            if let Some(v) = plain_name(node, src)?.and_then(|n| vars.unquoted(n)) {
+                return Ok((v.to_string(), false));
+            }
             Ok((text(node, src)?.to_string(), true))
         }
-        "string" => string_value(node, src),
-        "concatenation" => concat_value(node, src),
-        "command_substitution" => Err(Bail::CommandSubstitution),
+        "string" => string_value(node, src, vars),
+        "concatenation" => concat_value(node, src, vars),
+        // Unquoted, the output is split into words: dynamic.
+        "command_substitution" => match allowed_substitution(node, src)? {
+            Some(canonical) => Ok((canonical.to_string(), true)),
+            None => Err(Bail::CommandSubstitution),
+        },
         "process_substitution" => Err(Bail::ProcessSubstitution),
         "arithmetic_expansion" => Err(Bail::Arithmetic),
         _ => Err(unsupported(node)),
@@ -134,13 +146,63 @@ fn has_transform_operator(t: &str) -> bool {
     false
 }
 
+/// The variable name of a plain `$NAME` or `${NAME}` (no operator, no
+/// special parameter), else `None`.
+fn plain_name<'a>(node: Node, src: &'a str) -> Result<Option<&'a str>, Bail> {
+    let t = text(node, src)?;
+    let name = match node.kind() {
+        "simple_expansion" => t.strip_prefix('$'),
+        _ => t.strip_prefix("${").and_then(|t| t.strip_suffix('}')),
+    };
+    Ok(name.filter(|n| is_name(n)))
+}
+
+/// The command substitutions a word may hold: `$(pwd)` and
+/// `$(git rev-parse --show-toplevel)`, each optionally with `2>/dev/null`.
+/// Both print an absolute directory (the toplevel prints nothing outside a
+/// repository), so the word is that path followed by the rest of the word.
+/// The value keeps the substitution's canonical text: rules see a word that
+/// is not a flag, and its later components (`…/.git/config`) are still
+/// checked against the deny paths. The substitution must end the word or be
+/// followed by `/`: an empty output glued to `-rf` would turn into a flag no
+/// rule saw.
+///
+/// `Ok(None)` for every other substitution (and the backtick forms); the
+/// caller bails.
+fn allowed_substitution(node: Node, src: &str) -> Result<Option<&'static str>, Bail> {
+    let t = text(node, src)?;
+    let Some(inner) = t.strip_prefix("$(").and_then(|t| t.strip_suffix(')')) else {
+        return Ok(None);
+    };
+    let mut words: Vec<&str> = inner.split_ascii_whitespace().collect();
+    match words.as_slice() {
+        [.., "2>/dev/null"] => {
+            words.pop();
+        }
+        [.., "2>", "/dev/null"] => {
+            words.truncate(words.len() - 2);
+        }
+        _ => {}
+    }
+    let canonical = match words.as_slice() {
+        ["pwd"] | ["pwd", "-L" | "-P"] => "$(pwd)",
+        ["git", "rev-parse", "--show-toplevel"] => "$(git rev-parse --show-toplevel)",
+        _ => return Ok(None),
+    };
+    let rest = src.get(node.end_byte()..).ok_or(Bail::Syntax)?;
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let ends_word = rest.is_empty()
+        || rest.starts_with(|c: char| c == '/' || c.is_ascii_whitespace() || ";|&)<>".contains(c));
+    Ok(ends_word.then_some(canonical))
+}
+
 /// True when `gap` (text between two sibling nodes) is only backslash-newline
 /// continuations, so bash glues the neighbours into one word.
 pub(super) fn continuation_only(gap: &str) -> bool {
     !gap.is_empty() && gap.replace("\\\r\n", "").replace("\\\n", "").is_empty()
 }
 
-fn concat_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
+fn concat_value(node: Node, src: &str, vars: &Vars) -> Result<(String, bool), Bail> {
     let mut value = String::new();
     let mut dynamic = false;
     // Unquoted text with a neutral marker for every non-bare piece, so brace
@@ -159,7 +221,7 @@ fn concat_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
             }
         }
         prev_end = Some(child.end_byte());
-        let (v, d) = word_value(child, src)?;
+        let (v, d) = word_value(child, src, vars)?;
         if matches!(child.kind(), "word" | "number") {
             unquoted.push_str(text(child, src)?);
         } else {
@@ -172,7 +234,7 @@ fn concat_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
     Ok((value, dynamic))
 }
 
-fn string_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
+fn string_value(node: Node, src: &str, vars: &Vars) -> Result<(String, bool), Bail> {
     let end = node.end_byte().checked_sub(1).ok_or(Bail::Syntax)?;
     let mut pos = node.start_byte() + 1;
     let mut value = String::new();
@@ -193,10 +255,19 @@ fn string_value(node: Node, src: &str) -> Result<(String, bool), Bail> {
         match child.kind() {
             "simple_expansion" | "expansion" => {
                 check_expansion(child, src)?;
-                value.push_str(text(child, src)?);
-                dynamic = true;
+                match plain_name(child, src)?.and_then(|n| vars.quoted(n)) {
+                    Some(v) => value.push_str(v),
+                    None => {
+                        value.push_str(text(child, src)?);
+                        dynamic = true;
+                    }
+                }
             }
-            "command_substitution" => return Err(Bail::CommandSubstitution),
+            // Quoted, the output stays one word: an absolute path (or empty).
+            "command_substitution" => match allowed_substitution(child, src)? {
+                Some(canonical) => value.push_str(canonical),
+                None => return Err(Bail::CommandSubstitution),
+            },
             "arithmetic_expansion" => return Err(Bail::Arithmetic),
             _ => return Err(unsupported(child)),
         }

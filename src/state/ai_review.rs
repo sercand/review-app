@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use crate::ai::checkout::{CheckoutPlan, RestoreOutcome};
+pub use crate::ai::events::CommandDecision;
 use crate::ai::events::{PipelineEvent, RunStatus, StageKind, StageStatus};
 use crate::ai::hub::{AiSnapshotData, AiTimelineEntry, ChatEvent, RunLiveness};
 use crate::ai::review::{
@@ -32,10 +33,10 @@ use crate::ai::ui_interaction::ApprovalKind;
 use crate::runtime::Event;
 pub use review_approval::model_stage::ClassifierNote;
 
-/// One tool line inside an agent's timeline entry. `note` is the local
-/// classifier's verdict, set when it was consulted for the call; a rule
-/// approval or a classifier-less run leaves it `None`.
-#[derive(Clone, Debug, PartialEq)]
+/// One tool line inside an agent's timeline entry. `decision` says who let a
+/// `bash` call run or why it did not; `note` is the local classifier's
+/// verdict, set when it was consulted for the call.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolLine {
     /// The tool name.
     pub name: String,
@@ -43,13 +44,15 @@ pub struct ToolLine {
     pub summary: String,
     /// The classifier's verdict, when it was asked.
     pub note: Option<ClassifierNote>,
+    /// How a `bash` call was decided, once it was.
+    pub decision: Option<CommandDecision>,
 }
 
 /// The tab's badge text for a classifier verdict.
 pub fn classifier_note_text(note: ClassifierNote) -> &'static str {
     match note {
         ClassifierNote::Approved => "classifier: safe",
-        ClassifierNote::Blocked => "classifier: safe, but a rule requires approval",
+        ClassifierNote::Overruled => "classifier: safe, overruled",
         ClassifierNote::NeedsApproval => "classifier: needs approval",
         ClassifierNote::Dangerous => "classifier: flagged dangerous",
         ClassifierNote::Unavailable => "classifier: unavailable",
@@ -159,6 +162,8 @@ pub enum TimelineEntry {
         /// What the local classifier said about a `bash` call; `None` when
         /// it was not consulted (every non-bash tool, and bash without one).
         note: Option<ClassifierNote>,
+        /// How a `bash` call was decided, once it was.
+        decision: Option<CommandDecision>,
     },
     /// A notice the app produced: a cancelled or budget-stopped run, the
     /// unsandboxed shell, a stash conflict.
@@ -214,6 +219,12 @@ pub struct AiReviewState {
     pub show_dropped: bool,
     /// The head the last completed review ran against (spec §5.8).
     pub last_reviewed_sha: Option<String>,
+    /// How many agents each stage announced it would run
+    /// ([`PipelineEvent::StagePlanned`]); live runs only.
+    pub planned: Vec<(crate::ai::events::StageKind, u32)>,
+    /// The scout's brief, shown in place of its `submit_brief` call: from
+    /// the run's `BriefReady`, or the stored one when the tab loads.
+    pub brief: Option<crate::ai::stages::scout::Brief>,
     /// The scout's suggested commands awaiting the tab's "Add to settings"
     /// action (spec §4 step 1), read from the snapshot's stored brief. The
     /// scout only fills them when the repo has no configured commands.
@@ -221,6 +232,21 @@ pub struct AiReviewState {
     /// The inline editor of one AI draft: the finding id and its buffer.
     /// UI-local; cleared when a snapshot replaces the findings.
     pub edit: Option<(i64, String)>,
+    /// The `bash` lines in the order their decisions landed, oldest first:
+    /// the tab's command log lists them newest first. Rebuilt timelines
+    /// (snapshots) carry no decisions, so a snapshot clears it.
+    pub decided: Vec<CommandRef>,
+}
+
+/// Where one decided `bash` call sits in [`AiReviewState::timeline`]: the
+/// entry index, and the tool index inside an [`TimelineEntry::Agent`]
+/// entry (`None` for a [`TimelineEntry::ChatTool`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandRef {
+    /// The timeline index.
+    pub entry: usize,
+    /// The tool index inside an agent entry; `None` for a chat tool.
+    pub tool: Option<usize>,
 }
 
 /// The scout's build/test/lint suggestions for a repo with no configured
@@ -415,6 +441,7 @@ impl AiReviewState {
                     name: name.clone(),
                     summary: summary.clone(),
                     note: None,
+                    decision: None,
                 });
                 // Later text is a new bubble, not a continuation.
                 self.chat_reply_open = false;
@@ -574,6 +601,10 @@ impl AiReviewState {
         self.checkout = snap.checkout.clone();
         self.last_reviewed_sha = snap.last_reviewed_sha.clone();
         self.suggestions = brief_suggestions(snap.brief.as_deref());
+        self.brief = snap
+            .brief
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok());
         // The snapshot replays the latest run's draft and usage (spec §10.3):
         // a run that finished while the user was on another PR loses its
         // `DraftReady` to the stale-event rule, and this is the second path
@@ -585,11 +616,18 @@ impl AiReviewState {
         self.restore_decision = None;
         self.edit = None;
         self.chat_reply_open = false;
+        self.decided.clear();
     }
 
     /// Fold one forwarded pipeline event in.
     fn apply_pipeline(&mut self, ev: &PipelineEvent) {
         match ev {
+            PipelineEvent::StagePlanned { stage, agents } => {
+                match self.planned.iter_mut().find(|(seen, _)| seen == stage) {
+                    Some((_, n)) => *n = *agents,
+                    None => self.planned.push((*stage, *agents)),
+                }
+            }
             PipelineEvent::Stage { stage, status } => {
                 self.timeline.push(TimelineEntry::Stage {
                     stage: *stage,
@@ -630,25 +668,36 @@ impl AiReviewState {
                     tools.push(ToolLine {
                         name: name.clone(),
                         summary: summary.clone(),
-                        note: None,
+                        ..ToolLine::default()
                     });
                 }
             }
-            PipelineEvent::ClassifierNote { agent, note } => {
-                // The note is announced while the tool call is being
-                // decided, so it lands on the tool line that was added last.
+            PipelineEvent::CommandDecided {
+                agent,
+                decision,
+                note,
+            } => {
+                // The decision is announced while the tool call is being
+                // settled, so it lands on the tool line that was added last.
                 // The chat agent's bash calls arrive here too (the tool
-                // context is the run's); they badge the chat's tool line.
+                // context is the run's); they mark the chat's tool line.
                 if agent.role == AgentRole::Chat {
-                    if let Some(TimelineEntry::ChatTool { note: slot, .. }) = self
-                        .timeline
-                        .iter_mut()
-                        .rev()
-                        .find(|entry| {
-                            matches!(entry, TimelineEntry::ChatTool { name, .. } if name == "bash")
-                        })
+                    let found = self.timeline.iter().rposition(|entry| {
+                        matches!(entry, TimelineEntry::ChatTool { name, .. } if name == "bash")
+                    });
+                    if let Some(index) = found
+                        && let TimelineEntry::ChatTool {
+                            note: note_slot,
+                            decision: decision_slot,
+                            ..
+                        } = &mut self.timeline[index]
                     {
-                        *slot = Some(*note);
+                        *note_slot = *note;
+                        *decision_slot = Some(decision.clone());
+                        self.note_decided(CommandRef {
+                            entry: index,
+                            tool: None,
+                        });
                     }
                 } else {
                     let index = self.ensure_agent_entry(agent);
@@ -656,7 +705,13 @@ impl AiReviewState {
                         && let Some(last) = tools.last_mut()
                         && last.name == "bash"
                     {
-                        last.note = Some(*note);
+                        last.note = *note;
+                        last.decision = Some(decision.clone());
+                        let tool = tools.len() - 1;
+                        self.note_decided(CommandRef {
+                            entry: index,
+                            tool: Some(tool),
+                        });
                     }
                 }
             }
@@ -683,9 +738,10 @@ impl AiReviewState {
             // The full finding and coverage rows arrive with the
             // [`Event::AiFindings`] that follows; the card already exists
             // from `FindingAdded`.
-            PipelineEvent::FindingChanged { .. }
-            | PipelineEvent::Coverage { .. }
-            | PipelineEvent::BriefReady => {}
+            PipelineEvent::FindingChanged { .. } | PipelineEvent::Coverage { .. } => {}
+            // Applied by the PR session, which owns the pending review.
+            PipelineEvent::TriageRequested { .. } => {}
+            PipelineEvent::BriefReady { brief } => self.brief = Some((**brief).clone()),
             PipelineEvent::RunEnded {
                 status,
                 stop_reason,
@@ -713,6 +769,13 @@ impl AiReviewState {
                 };
             }
         }
+    }
+
+    /// Record that the line at `at` was decided (once: a re-announced
+    /// decision moves it to the newest place).
+    fn note_decided(&mut self, at: CommandRef) {
+        self.decided.retain(|seen| *seen != at);
+        self.decided.push(at);
     }
 
     /// The index of `agent`'s timeline entry, creating an empty one at the
@@ -862,7 +925,7 @@ fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
                     tools.push(ToolLine {
                         name,
                         summary,
-                        note: None,
+                        ..ToolLine::default()
                     });
                 }
                 _ => {}
@@ -935,7 +998,7 @@ fn summarize_input(input: &str) -> String {
 }
 
 /// Which stage's progress an agent role counts toward.
-fn agent_stage(role: AgentRole) -> Option<StageKind> {
+pub(crate) fn agent_stage(role: AgentRole) -> Option<StageKind> {
     match role {
         AgentRole::Scout => Some(StageKind::Scout),
         AgentRole::Reviewer => Some(StageKind::Review),
@@ -948,7 +1011,7 @@ fn agent_stage(role: AgentRole) -> Option<StageKind> {
 }
 
 /// Pipeline execution order, the order the strip shows (spec §6).
-fn stage_order(stage: StageKind) -> u8 {
+pub(crate) fn stage_order(stage: StageKind) -> u8 {
     match stage {
         StageKind::PriorCheck => 0,
         StageKind::Scout => 1,
@@ -1217,6 +1280,7 @@ mod tests {
                     name: "read_file".to_string(),
                     summary: "src/a.rs".to_string(),
                     note: None,
+                    decision: None,
                 }],
                 text: "Hello".to_string(),
                 stop: Some("finished".to_string()),
@@ -1303,8 +1367,75 @@ mod tests {
     /// The classifier's verdict badges the bash tool line it was consulted
     /// for — the agent's own line, or the chat's — and nothing else: lines
     /// the rules settled alone, and non-bash tools, stay bare.
+    /// Decisions are remembered in the order they landed, for the command
+    /// log; a snapshot (whose timeline carries no decisions) clears them.
     #[test]
-    fn classifier_notes_badge_the_last_bash_line() {
+    fn decided_lines_are_recorded_in_order() {
+        let mut st = AiReviewState::default();
+        let bash = |agent: AgentRef, command: &str| {
+            pipeline(PipelineEvent::ToolCall {
+                agent,
+                name: "bash".to_string(),
+                summary: format!("{{\"command\":\"{command}\"}}"),
+            })
+        };
+        let decided = |agent: AgentRef| {
+            pipeline(PipelineEvent::CommandDecided {
+                agent,
+                decision: CommandDecision::Classifier,
+                note: None,
+            })
+        };
+        st.apply(&bash(reviewer(), "ls"));
+        st.apply(&decided(reviewer()));
+        st.apply(&Event::AiChat {
+            session: SESSION,
+            event: ChatEvent::ToolCall {
+                name: "bash".to_string(),
+                summary: "{\"command\":\"pwd\"}".to_string(),
+            },
+        });
+        st.apply(&decided(crate::ai::chat::chat_agent()));
+        st.apply(&bash(reviewer(), "wc -l a"));
+        st.apply(&decided(reviewer()));
+        assert_eq!(
+            st.decided,
+            vec![
+                CommandRef {
+                    entry: 0,
+                    tool: Some(0)
+                },
+                CommandRef {
+                    entry: 1,
+                    tool: None
+                },
+                CommandRef {
+                    entry: 0,
+                    tool: Some(1)
+                },
+            ]
+        );
+        st.apply(&Event::AiSnapshot {
+            session: SESSION,
+            snapshot: AiSnapshotData {
+                findings: Vec::new(),
+                coverage: Vec::new(),
+                timeline: Vec::new(),
+                brief: None,
+                run: None,
+                run_liveness: RunLiveness::Stopped,
+                checkout: None,
+                bash_disabled: None,
+                last_reviewed_sha: None,
+                draft: None,
+                usage: (0, 0),
+            },
+        });
+        assert!(st.decided.is_empty());
+    }
+
+    #[test]
+    fn command_decisions_mark_the_last_bash_line() {
         use review_approval::model_stage::ClassifierNote;
 
         let mut st = AiReviewState::default();
@@ -1313,26 +1444,35 @@ mod tests {
             name: "bash".to_string(),
             summary: "{\"command\":\"rm x\"}".to_string(),
         }));
-        st.apply(&pipeline(PipelineEvent::ClassifierNote {
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
             agent: reviewer(),
-            note: ClassifierNote::Blocked,
+            decision: CommandDecision::AutoDenied {
+                reason: "rm x: not in the allowed commands".to_string(),
+            },
+            note: Some(ClassifierNote::NeedsApproval),
         }));
         st.apply(&pipeline(PipelineEvent::ToolCall {
             agent: reviewer(),
             name: "read_file".to_string(),
             summary: "src/a.rs".to_string(),
         }));
-        st.apply(&pipeline(PipelineEvent::ClassifierNote {
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
             agent: reviewer(),
-            note: ClassifierNote::Dangerous,
+            decision: CommandDecision::Classifier,
+            note: Some(ClassifierNote::Dangerous),
         }));
         let TimelineEntry::Agent { tools, .. } = &st.timeline[0] else {
             panic!("agent entry");
         };
-        assert_eq!(tools[0].note, Some(ClassifierNote::Blocked));
+        assert_eq!(tools[0].note, Some(ClassifierNote::NeedsApproval));
+        assert!(matches!(
+            tools[0].decision,
+            Some(CommandDecision::AutoDenied { .. })
+        ));
         assert_eq!(
-            tools[1].note, None,
-            "the read_file line gets no badge: bash is the only tool that asks"
+            (&tools[1].note, &tools[1].decision),
+            (&None, &None),
+            "the read_file line gets no badge: bash is the only tool that is decided"
         );
 
         // The chat agent's bash call badges the chat's tool line, not a
@@ -1345,14 +1485,16 @@ mod tests {
                 summary: "{\"command\":\"ls\"}".to_string(),
             },
         });
-        st.apply(&pipeline(PipelineEvent::ClassifierNote {
+        st.apply(&pipeline(PipelineEvent::CommandDecided {
             agent: crate::ai::chat::chat_agent(),
-            note: ClassifierNote::Approved,
+            decision: CommandDecision::Classifier,
+            note: Some(ClassifierNote::Approved),
         }));
-        let TimelineEntry::ChatTool { note, .. } = &st.timeline[0] else {
+        let TimelineEntry::ChatTool { note, decision, .. } = &st.timeline[0] else {
             panic!("chat tool entry, got {:?}", st.timeline);
         };
         assert_eq!(*note, Some(ClassifierNote::Approved));
+        assert_eq!(*decision, Some(CommandDecision::Classifier));
         assert_eq!(st.timeline.len(), 1, "no phantom agent entry");
     }
 
@@ -1420,6 +1562,7 @@ mod tests {
                     name: "get_finding".to_string(),
                     summary: "{\"id\":3}".to_string(),
                     note: None,
+                    decision: None,
                 },
                 TimelineEntry::ChatReply {
                     text: "See finding #3.".to_string()

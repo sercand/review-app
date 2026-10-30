@@ -42,7 +42,7 @@ pub const ALL_BUILTIN: &[&Policy] = &[
 // ─── argument helpers ───────────────────────────────────────────────────────
 
 /// `-abc` → `abc`. `None` for `-`, `--long`, and non-flags.
-fn short_cluster(t: &str) -> Option<&str> {
+pub(crate) fn short_cluster(t: &str) -> Option<&str> {
     if t.len() > 1 && t.starts_with('-') && !t.starts_with("--") {
         Some(&t[1..])
     } else {
@@ -52,7 +52,7 @@ fn short_cluster(t: &str) -> Option<&str> {
 
 /// Whether `t` is `--name`, `--name=value`, or an abbreviation of it
 /// (`getopt_long` and git accept unambiguous prefixes such as `--outp`).
-fn long_is(t: &str, name: &str) -> bool {
+pub(crate) fn long_is(t: &str, name: &str) -> bool {
     let Some(rest) = t.strip_prefix("--") else {
         return false;
     };
@@ -336,9 +336,17 @@ fn read_only_checked(bin: &str, seg: &Segment) -> bool {
         "zstdcat" => flags("o", &["output", "rm"], &[], false),
         // Final review I3(b): recursion and the switches that reach hidden,
         // ignored or untracked files (`.env*`) make a search ask; the plain
-        // forms (`rg KEY`, `grep KEY file`) still run. `ack` is not approved:
-        // it searches dotfiles by default.
-        "grep" | "egrep" | "fgrep" => grep_does_not_recurse(seg),
+        // forms (`rg KEY`, `grep KEY file`) and recursion that cannot reach
+        // a secret (`grep -r KEY --include=*.rs src`) still run. `ack` is not
+        // approved: it searches dotfiles by default.
+        // A search pointed into `.git` reads `.git/config`, which only the
+        // deny paths protect, and they match `.git/config`, not `.git`.
+        "grep" | "egrep" | "fgrep" | "rg" | "ag"
+            if search_operands(seg).iter().any(|p| has_git_component(p)) =>
+        {
+            false
+        }
+        "grep" | "egrep" | "fgrep" => grep_safe(seg),
         "rg" => flags(
             "u.",
             &[
@@ -449,33 +457,183 @@ const XXD_VALUE_FLAGS: &[&str] = &[
     "-name",
 ];
 
-/// `grep` without `-r`/`-R`/`--recursive`/`-d`/`--directories` (any `-d`
-/// value is refused; `recurse` is the one that matters). Run-time words are
-/// not inspected, as before: a pattern or path is usually one.
-fn grep_does_not_recurse(seg: &Segment) -> bool {
-    const LONG: &[&str] = &["recursive", "dereference-recursive", "directories"];
-    for (i, t) in seg.argv.iter().enumerate().skip(1) {
-        if seg.is_dynamic(i) {
+/// `grep` options whose value is the next word (or glued to a short one).
+const GREP_SHORT_VALUE: &str = "efmABCD";
+const GREP_LONG_VALUE: &[&str] = &[
+    "regexp",
+    "file",
+    "max-count",
+    "after-context",
+    "before-context",
+    "context",
+    "include",
+    "exclude",
+    "exclude-dir",
+    "exclude-from",
+    "label",
+    "binary-files",
+    "devices",
+    "group-separator",
+];
+
+/// `grep` that reads only what it is pointed at, or recurses in a way that
+/// cannot reach a secret.
+///
+/// Without recursion any form runs (run-time words are not inspected: a
+/// pattern or path is usually one; the deny paths check the operands).
+/// `-R`/`--dereference-recursive` and BSD `-S`/`-O` (follow symlinks a PR
+/// may commit) and `-d`/`--directories` never run. `-r`/`--recursive` runs
+/// only when
+///
+/// - every `--include` glob is `*.ext` (and there is one): only files with
+///   that extension are read, never `.git/config`, `.env` or a key, and
+///   `-r` does not follow symlinks below its operands; or
+/// - every operand names a file by its extension (`src/lib.rs`), so the
+///   recursion reads that one file. A directory named like a file, or a
+///   committed symlink with such a name, reads what `cat` of it would.
+///
+/// Every word must be literal for either: the operands are what matters.
+fn grep_safe(seg: &Segment) -> bool {
+    let argv = &seg.argv;
+    let mut recursive = false;
+    let mut pattern_given = false;
+    let mut includes: Vec<&str> = Vec::new();
+    let mut operands: Vec<&str> = Vec::new();
+    let mut operands_only = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let t = argv[i].as_str();
+        i += 1;
+        if seg.is_dynamic(i - 1) {
+            // Not inspected: rejected below when the search recurses.
+            continue;
+        }
+        if operands_only || !t.starts_with('-') || t == "-" {
+            operands.push(t);
             continue;
         }
         if t == "--" {
-            break;
+            operands_only = true;
+            continue;
         }
-        if LONG.iter().any(|l| long_is(t, l)) {
-            return false;
+        if t.starts_with("--") {
+            if long_is(t, "dereference-recursive") || long_is(t, "directories") {
+                return false;
+            }
+            if long_is(t, "recursive") {
+                recursive = true;
+                continue;
+            }
+            let Some(name) = GREP_LONG_VALUE.iter().find(|l| long_is(t, l)) else {
+                continue;
+            };
+            let value = match t.split_once('=') {
+                Some((_, v)) => v,
+                None => {
+                    i += 1;
+                    argv.get(i - 1).map_or("", String::as_str)
+                }
+            };
+            match *name {
+                "include" => includes.push(value),
+                "regexp" | "file" => pattern_given = true,
+                _ => {}
+            }
+            continue;
         }
-        if short_cluster(t).is_some_and(|c| c.contains(['r', 'R', 'd'])) {
-            return false;
+        for (k, c) in t.char_indices().skip(1) {
+            match c {
+                // BSD grep: `-S`/`-O` follow symlinks below the operands.
+                'R' | 'd' | 'S' | 'O' => return false,
+                'r' => recursive = true,
+                _ if GREP_SHORT_VALUE.contains(c) => {
+                    pattern_given |= matches!(c, 'e' | 'f');
+                    if t.len() == k + 1 {
+                        i += 1;
+                    }
+                    break;
+                }
+                _ => {}
+            }
         }
     }
-    true
+    if !recursive {
+        return true;
+    }
+    if seg.has_dynamic() {
+        return false;
+    }
+    let files = if pattern_given {
+        &operands[..]
+    } else {
+        operands.get(1..).unwrap_or(&[])
+    };
+    (!includes.is_empty() && includes.iter().all(|g| is_extension_glob(g)))
+        || (!files.is_empty() && files.iter().all(|f| names_a_file(f)))
+}
+
+/// The words of a `grep`/`rg`/`ag` invocation that may be paths to search:
+/// every non-option word except the first one, which is the pattern unless
+/// `-e`/`-f`/`--regexp`/`--file` might have given it (any short cluster
+/// with an `e` or `f` counts, so all words are kept). An option's separate
+/// value can land here too; that only makes the callers stricter.
+pub(crate) fn search_operands(seg: &Segment) -> Vec<&str> {
+    let words = || seg.argv.iter().skip(1).map(String::as_str);
+    let pattern_given = words().any(|w| {
+        short_cluster(w).is_some_and(|c| c.contains(['e', 'f']))
+            || long_is(w, "regexp")
+            || long_is(w, "file")
+    });
+    let mut operands_only = false;
+    let mut out = Vec::new();
+    for w in words() {
+        if !operands_only && w == "--" {
+            operands_only = true;
+        } else if operands_only || !w.starts_with('-') || w == "-" {
+            out.push(w);
+        }
+    }
+    if !pattern_given && !out.is_empty() {
+        out.remove(0);
+    }
+    out
+}
+
+/// Whether `path` goes through a `.git` directory (`.git`, `a/.git/x`).
+pub(crate) fn has_git_component(path: &str) -> bool {
+    path.split('/').any(|c| c.eq_ignore_ascii_case(".git"))
+}
+
+/// `*.ext`: a star, a dot and a plain extension (letters, digits, `_`).
+fn is_extension_glob(glob: &str) -> bool {
+    glob.strip_prefix("*.").is_some_and(is_plain_extension)
+}
+
+fn is_plain_extension(ext: &str) -> bool {
+    (1..=16).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A path whose last component looks like a file (`stem.ext`, not hidden)
+/// and that goes through no hidden directory (`.git/…`).
+fn names_a_file(path: &str) -> bool {
+    let mut components = path.split('/').filter(|c| !c.is_empty() && *c != ".");
+    let Some(last) = path.rsplit('/').next() else {
+        return false;
+    };
+    let Some((stem, ext)) = last.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem.starts_with('.')
+        && is_plain_extension(ext)
+        && components.all(|c| c == ".." || !c.starts_with('.'))
 }
 
 /// `awk [-F fs] [-v var=val] 'program' [file…]` where the program neither
-/// runs commands nor writes: no `system`, no `getline`, no indirect call,
-/// and nothing after the first `print` that could be a `>` redirect or a
-/// `|` pipe. Program files (`-f`) and gawk extensions are not inspected,
-/// so they are not approved.
+/// runs commands, writes nor reads anything but its operands (see
+/// [`awk_program_safe`]). Program files (`-f`), `-e` and every other option
+/// (gawk's `--profile`, `--dump-variables` and `-o` write files, `-l`/`-i`
+/// load code) are not approved. Every word must be literal.
 fn awk_safe(seg: &Segment) -> bool {
     if seg.has_dynamic() {
         return false;
@@ -501,24 +659,142 @@ fn awk_safe(seg: &Segment) -> bool {
     argv.get(i).is_some_and(|p| awk_program_safe(p))
 }
 
+/// Words that make an awk program run a command, read a file or variable it
+/// was not given, or change which files it reads: matched anywhere in the
+/// program text (inside strings too, which only makes it ask).
+const AWK_FORBIDDEN: &[&str] = &[
+    "system", "getline", "close", "ENVIRON", "PROCINFO", "ARGV", "ARGC", "@",
+];
+
+/// An awk program that only computes and prints to stdout:
+///
+/// - none of [`AWK_FORBIDDEN`] (`@` is gawk's indirect call and `@load`);
+///   `fflush` only as `fflush()`;
+/// - no `|` outside strings and regexes except in `||` (a pipe to or from a
+///   command, `|&` coprocesses);
+/// - no `>` in a `print`/`printf` statement outside parentheses (an output
+///   redirect, `>>` too); comparisons elsewhere (`NR>=5`) are fine.
+///
+/// Strings, regex literals and comments are skipped by a small tokenizer.
+/// Whatever it cannot follow (an unterminated string or regex) is refused.
 fn awk_program_safe(p: &str) -> bool {
-    if p.contains("system") || p.contains("getline") || p.contains('@') {
+    if AWK_FORBIDDEN.iter().any(|w| p.contains(w)) || !awk_fflush_bare(p) {
         return false;
     }
-    let Some(start) = p.find("print") else {
-        return true;
-    };
-    let tail = &p.as_bytes()[start..];
-    for (k, &b) in tail.iter().enumerate() {
-        if b == b'>' {
-            return false;
+    let b = p.as_bytes();
+    let mut i = 0;
+    let mut parens = 0usize;
+    // Paren depth at which the current print statement started.
+    let mut print_at: Option<usize> = None;
+    // Whether a `/` here would start a regex (no operand before it).
+    let mut regex_ok = true;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            b'\\' if b.get(i + 1) == Some(&b'\n') => {
+                i += 2;
+                continue;
+            }
+            b'#' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'"' => {
+                if !awk_skip_quoted(b, &mut i, b'"') {
+                    return false;
+                }
+                regex_ok = false;
+                continue;
+            }
+            b'/' if regex_ok => {
+                if !awk_skip_quoted(b, &mut i, b'/') {
+                    return false;
+                }
+                regex_ok = false;
+                continue;
+            }
+            b'|' => {
+                if b.get(i + 1) != Some(&b'|') {
+                    return false;
+                }
+                i += 2;
+                regex_ok = true;
+                continue;
+            }
+            b'>' if print_at == Some(parens) => return false,
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b';' | b'\n' | b'{' | b'}' if print_at.is_some_and(|at| parens <= at) => {
+                print_at = None;
+            }
+            _ => {}
         }
-        let doubled = (k > 0 && tail[k - 1] == b'|') || tail.get(k + 1) == Some(&b'|');
-        if b == b'|' && !doubled {
-            return false;
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            let word = &p[start..i];
+            if word == "print" || word == "printf" {
+                print_at = Some(parens);
+            }
+            // After a keyword a `/` starts a regex; after a name it divides.
+            regex_ok = matches!(
+                word,
+                "print" | "printf" | "return" | "in" | "case" | "if" | "while" | "do" | "else"
+            );
+            continue;
         }
+        if c.is_ascii_digit() {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                i += 1;
+            }
+            regex_ok = false;
+            continue;
+        }
+        // A regex may start only where awk expects an operand after one of
+        // these; anywhere else (`n++ / 2`, `a[i] / 2`) `/` divides. Taking a
+        // regex for a division only looks at more text, never less.
+        regex_ok = matches!(
+            c,
+            b'(' | b',' | b'{' | b'}' | b';' | b'\n' | b'!' | b'~' | b'=' | b'?' | b':' | b'&'
+        );
+        i += 1;
     }
     true
+}
+
+/// Advance past a `"…"` string or `/…/` regex starting at `b[*i]`. `false`
+/// when it does not end on the same line.
+fn awk_skip_quoted(b: &[u8], i: &mut usize, end: u8) -> bool {
+    *i += 1;
+    while *i < b.len() {
+        match b[*i] {
+            b'\\' => *i += 2,
+            b'\n' => return false,
+            c if c == end => {
+                *i += 1;
+                return true;
+            }
+            _ => *i += 1,
+        }
+    }
+    false
+}
+
+/// Every `fflush` is `fflush()`: with an argument it names a command pipe.
+fn awk_fflush_bare(p: &str) -> bool {
+    p.match_indices("fflush").all(|(at, w)| {
+        let rest = p[at + w.len()..].trim_start();
+        rest.strip_prefix('(')
+            .is_some_and(|r| r.trim_start().starts_with(')'))
+    })
 }
 
 /// `sed` without in-place editing or a script file, whose script uses only
@@ -1555,6 +1831,137 @@ mod tests {
         let p: &[&Policy] = &[&READ_ONLY];
         assert!(approves("awk '{print $2}' f.txt", p));
         assert!(approves("awk -F: '{print $1}' /etc/passwd", p));
+        for cmd in [
+            "awk 'NR>=2725 && NR<=2740' Cargo.lock",
+            r#"awk -v p=shiso-models '$0=="name = \""p"\""{f=1} f&&/^\]/{print; f=0} f' Cargo.lock"#,
+            "awk '/a|b/ {print $1}' f",
+            "awk '{print ($1 > 2)}' f",
+            "awk '$3 > 10 {n++} END {print n}' f",
+            "awk '{s += $1} END {printf \"%d\\n\", s}' f",
+            "awk 'BEGIN{x = 4 / 2; print x}'",
+            "awk '{n++ / 2} END {fflush()}' f",
+            "awk '# a > b | c\n{print}' f",
+            "gawk '{print}' f",
+            "mawk -F, -vOFS=: '{print $1, $2}' f",
+        ] {
+            assert!(approves(cmd, p), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_awk_rejects_commands_writes_and_extra_input() {
+        let p: &[&Policy] = &[&READ_ONLY];
+        for cmd in [
+            "awk 'BEGIN{system(\"curl x\")}'",
+            "awk '{print > \"f\"}'",
+            "awk '{print >> \"f\"}' x",
+            "awk '{printf \"%s\", $0 > \"/dev/stderr\"}' x",
+            "awk '{print (1) > \"f\"}' x",
+            // Unparenthesized, `>` in a print is a redirect, not a comparison.
+            "awk '{print $1 > 2 ? \"x\" : \"y\"}' f",
+            "awk '{print | \"sh\"}' x",
+            "awk '{print |& \"sh\"}' x",
+            "awk 'BEGIN{\"date\" | getline d}'",
+            "awk 'BEGIN{getline l < \".git/config\"}'",
+            "awk 'BEGIN{ARGV[1]=\".gi\" \"t/config\"; ARGC=2} {print}'",
+            "awk 'BEGIN{print ENVIRON[\"HOME\"]}'",
+            "awk 'BEGIN{close(\"x\")}'",
+            "awk 'BEGIN{fflush(\"cmd\")}'",
+            "awk 'BEGIN{f=\"system\"; @f(\"id\")}'",
+            "awk '@load \"x\"'",
+            "awk 'BEGIN{print PROCINFO[\"pid\"]}'",
+            // A division taken for a regex must not hide a redirect.
+            "awk '{n++ / 2; print n > \"out\"; x = 1 / 3}' f",
+            "awk '{a[1] / 2; print n > \"out\"; x = 1 / 3}' f",
+            // An unterminated string or regex.
+            "awk '{print \"x}' f",
+            "awk '/x {print}' f",
+            "awk -f prog.awk f",
+            "awk -e '{print}' f",
+            "gawk --profile '{print}' f",
+            "gawk -o '{print}' f",
+            "awk -v \"x=$HOME\" '{print x}' f",
+        ] {
+            assert!(defers(cmd, p), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_sed_print_forms() {
+        let p: &[&Policy] = &[&READ_ONLY];
+        for cmd in [
+            "sed -n 400,800p align.rs",
+            "sed -n '1,5p;10p' f",
+            "sed -n -e 1p -e '$p' f",
+            "sed -n '$=' f",
+            "sed -n '5{p;q}' f",
+            "sed 10q f",
+        ] {
+            assert!(approves(cmd, p), "{cmd}");
+        }
+        for cmd in [
+            "sed -n '1w /tmp/x' f",
+            "sed -n '1W /tmp/x' f",
+            "sed -e 's/x/y/e' f",
+            "sed 's/x/y/w out' f",
+            "sed -n '1r /etc/passwd' f",
+            "sed -n '1R f2' f",
+            "sed -n '1e id' f",
+            "sed -i -n 1p f",
+            "sed --in-place 1p f",
+            "sed -f script.sed f",
+            "sed -n \"$X\" f",
+        ] {
+            assert!(defers(cmd, p), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn read_only_grep_recursion() {
+        let p: &[&Policy] = &[&READ_ONLY];
+        for cmd in [
+            r#"grep -rn "fn resample\|linspace" crates/ --include=*.rs"#,
+            "grep -r --include='*.rs' --include=*.toml KEY .",
+            "grep -rn --include *.md KEY docs",
+            r#"grep -rn "pub use\|pub mod" crates/a/src/lib.rs"#,
+            "grep -r -e KEY src/main.rs ../b/c.toml",
+            "grep --recursive KEY a.rs",
+            "grep -n KEY src",
+            "egrep -rl 'a|b' --include=*.py .",
+        ] {
+            assert!(approves(cmd, p), "{cmd}");
+        }
+        for cmd in [
+            "grep -rn foo src",
+            "grep -r KEY .",
+            "grep -r KEY",
+            "grep -r --include=* KEY .",
+            "grep -r --include=config KEY .",
+            "grep -r --include='*.rs' --include=*config KEY .",
+            "grep -R --include=*.rs KEY .",
+            "grep --dereference-recursive --include=*.rs KEY .",
+            "grep -rS --include=*.rs KEY .",
+            "grep -d recurse KEY .",
+            "grep --directories=recurse KEY .",
+            "grep -r KEY .git/HEAD.rs",
+            "grep -r KEY .env.rs",
+            "grep -r KEY src/",
+            "grep -r KEY Makefile",
+            "grep -r KEY $DIR/a.rs",
+            "grep -r --include=$G KEY .",
+            // Into `.git`, recursive or not, any search tool.
+            "grep -r --include=*.rs KEY .git",
+            "grep url .git/HEAD",
+            "rg url .git",
+            "rg url ./.git/",
+            "rg -e url sub/.git",
+            "ag url .git",
+        ] {
+            assert!(defers(cmd, p), "{cmd}");
+        }
+        // `.git` as the pattern is fine.
+        assert!(approves("rg -n .git src", p));
+        assert!(approves("grep -n .git README.md", p));
     }
 
     #[test]

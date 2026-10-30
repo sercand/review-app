@@ -336,7 +336,11 @@ fn bail_table() {
         ("a && (b)", Bail::Subshell),
         ("{ a; }", Bail::BraceGroup),
         ("if a; then b; fi", Bail::CompoundCommand),
-        ("for i in a; do b; done", Bail::CompoundCommand),
+        // Only `for NAME in literal…` is unrolled (see `for_loop_*` below).
+        ("for i; do b; done", Bail::CompoundCommand),
+        ("for i in $x; do b; done", Bail::CompoundCommand),
+        ("for ((i=0; i<3; i++)); do b; done", Bail::CompoundCommand),
+        ("select i in a b; do b; done", Bail::CompoundCommand),
         ("while a; do b; done", Bail::CompoundCommand),
         ("until a; do b; done", Bail::CompoundCommand),
         ("case a in b) c;; esac", Bail::CompoundCommand),
@@ -478,5 +482,183 @@ fn parameter_transformation_operators_bail() {
         "echo ${#x}",
     ] {
         assert!(parse(src).is_ok(), "{src:?}");
+    }
+}
+
+fn dynamic(src: &str) -> Vec<Vec<bool>> {
+    parse(src)
+        .unwrap_or_else(|b| panic!("{src:?} bailed: {b:?}"))
+        .into_iter()
+        .map(|s| s.dynamic)
+        .collect()
+}
+
+#[test]
+fn literal_assignment_is_substituted_later() {
+    let src = "N=crates/x; grep -n f $N/a.rs \"$N/b.rs\" ${N}/c \"${N}\"";
+    assert_eq!(
+        argv(src),
+        vec![
+            vec![],
+            strs(&[
+                "grep",
+                "-n",
+                "f",
+                "crates/x/a.rs",
+                "crates/x/b.rs",
+                "crates/x/c",
+                "crates/x"
+            ])
+        ]
+    );
+    assert!(dynamic(src)[1].iter().all(|d| !d));
+    // Several on one line, and one built from another.
+    assert_eq!(argv("A=a B=b; C=$A/$B; ls $C")[2], strs(&["ls", "a/b"]));
+    // Quoted values keep their spaces; unquoted, they would split: dynamic.
+    let src = "N='a b'; ls \"$N\" $N";
+    assert_eq!(argv(src)[1][1], "a b");
+    assert_eq!(dynamic(src)[1], vec![false, false, true]);
+    // Glob characters and empty values stay dynamic unquoted.
+    assert_eq!(
+        dynamic("N='*.rs'; ls $N \"$N\"")[1],
+        vec![false, true, false]
+    );
+    assert_eq!(dynamic("N=; ls $N")[1], vec![false, true]);
+}
+
+#[test]
+fn unknown_or_uncertain_variables_stay_dynamic() {
+    for src in [
+        // Never assigned here: the persistent shell may hold anything.
+        "ls $N",
+        // A prefix assignment only reaches that one command.
+        "N=x true; ls $N",
+        // Run-time, appended, indexed or tilde values.
+        "N=$HOME; ls $N",
+        "N=a; N+=b; ls $N",
+        "N=a; N[1]=b; ls $N",
+        "N=~/x; ls $N",
+        "N='$HOME'; ls $N",
+        // May not have run: after `||`, in a pipeline, or past a `&&` chain.
+        "false || N=a; ls $N",
+        "N=a | ls $N",
+        "true && N=a; ls $N",
+        "true && N=a || ls $N",
+        "N=a || ls $N",
+        "! N=a; ls $N",
+        // Builtins that can assign anything.
+        "N=a; read N; ls $N",
+        "N=a; eval x; ls $N",
+        "N=a; printf -v N x; ls $N",
+        "N=a; command read N; ls $N",
+        "N=a; time read N; ls $N",
+        "N=a; $CMD; ls $N",
+        "N=a; . ./f; ls $N",
+        // A prefix on a special builtin persists in POSIX mode.
+        "N=a; N=b export X; ls $N",
+        // Variables bash changes by itself.
+        "PWD=/a; cd /b; ls $PWD",
+        "RANDOM=1; ls $RANDOM",
+        // Operators and special parameters are not plain names.
+        "N=a; ls ${N:-b} ${#N} $1 $@",
+    ] {
+        let segs = parse(src).unwrap_or_else(|b| panic!("{src:?} bailed: {b:?}"));
+        let last = segs.last().unwrap();
+        assert!(last.has_dynamic(), "{src:?}: {:?}", last.argv);
+    }
+    // Inside a `&&` chain the assignment is certain for what follows it.
+    assert_eq!(argv("N=a && ls $N")[1], strs(&["ls", "a"]));
+    assert_eq!(argv("cd x && N=a && ls $N")[2], strs(&["ls", "a"]));
+}
+
+#[test]
+fn allowed_command_substitutions() {
+    let segs = parse("cd \"$(git rev-parse --show-toplevel)\"").unwrap();
+    assert_eq!(segs[0].argv[1], "$(git rev-parse --show-toplevel)");
+    assert!(!segs[0].has_dynamic());
+    let segs =
+        parse("cat \"$(git rev-parse --show-toplevel 2>/dev/null)/a/b\" \"$(pwd)\"/c").unwrap();
+    assert_eq!(
+        segs[0].argv,
+        strs(&["cat", "$(git rev-parse --show-toplevel)/a/b", "$(pwd)/c"])
+    );
+    assert!(!segs[0].has_dynamic());
+    // Unquoted, the output is split: dynamic, but no bail.
+    assert_eq!(dynamic("cd $(pwd)/x")[0], vec![false, true]);
+    assert_eq!(
+        dynamic("cd $(git rev-parse --show-toplevel)")[0],
+        vec![false, true]
+    );
+    for src in [
+        "cd \"$(curl x)\"",
+        "cd \"$(git rev-parse --git-dir)\"",
+        "cd \"$(pwd; curl x)\"",
+        "cd `pwd`",
+        "X=$(curl x); echo $X",
+        // Glued to more text, an empty output would change the word.
+        "ls \"$(git rev-parse --show-toplevel)\"-rf",
+        "ls \"$(git rev-parse --show-toplevel)x\"",
+    ] {
+        assert_eq!(parse(src), Err(Bail::CommandSubstitution), "{src:?}");
+    }
+    // A redirect target with a substitution is refused, quoted or not.
+    assert!(parse("ls > \"$(pwd)/x\"").is_err());
+}
+
+#[test]
+fn for_loop_over_literal_words_is_unrolled() {
+    let src = "for p in a 'b c'; do echo \"== $p\"; grep -n $p f | head; done | head";
+    assert_eq!(
+        argv(src),
+        vec![
+            vec![],
+            strs(&["echo", "== a"]),
+            strs(&["grep", "-n", "a", "f"]),
+            strs(&["head"]),
+            vec![],
+            strs(&["echo", "== b c"]),
+            // Unquoted, `b c` would split: dynamic.
+            strs(&["grep", "-n", "$p", "f"]),
+            strs(&["head"]),
+            strs(&["head"]),
+        ]
+    );
+    let segs = parse(src).unwrap();
+    assert_eq!(segs[0].assigns, vec![("p".to_string(), "a".to_string())]);
+    assert_eq!(segs[4].assigns, vec![("p".to_string(), "b c".to_string())]);
+    assert!(segs[6].is_dynamic(2));
+    // Newlines instead of `;`, nested once, a redirect on the loop.
+    assert_eq!(
+        argv("for x in a b\ndo\n  for y in 1; do ls $x/$y; done\ndone 2>/dev/null")
+            .into_iter()
+            .filter(|a| !a.is_empty())
+            .collect::<Vec<_>>(),
+        vec![strs(&["ls", "a/1"]), strs(&["ls", "b/1"])]
+    );
+    // After the loop the variable (and what the body set) is unknown.
+    let last = |src: &str| parse(src).unwrap().pop().unwrap();
+    assert!(last("for p in a; do N=b; done; ls $p $N").is_dynamic(1));
+    assert!(last("for p in a; do N=b; done; ls $p $N").is_dynamic(2));
+    assert!(last("N=x; for p in a; do N=b; done; ls $N").is_dynamic(1));
+}
+
+#[test]
+fn for_loop_limits() {
+    let nested3 = "for a in 1; do for b in 2; do for c in 3; do ls; done; done; done";
+    assert_eq!(parse(nested3), Err(Bail::CompoundCommand));
+    let many = format!("for a in {}; do ls; done", vec!["w"; 33].join(" "));
+    assert_eq!(parse(&many), Err(Bail::CompoundCommand));
+    let ok = format!("for a in {}; do ls; done", vec!["w"; 32].join(" "));
+    assert!(parse(&ok).is_ok());
+    for src in [
+        "for f in $(ls); do cat $f; done",
+        "for f in *.rs; do cat $f; done",
+        "for f in ~/x; do cat $f; done",
+        "for f in {a,b}; do cat $f; done",
+        "for f in \"$X\"; do cat $f; done",
+        "for f in a; do cat $f & done",
+        "for f in a; do while x; do y; done; done",
+    ] {
+        assert!(parse(src).is_err(), "{src:?} must bail");
     }
 }

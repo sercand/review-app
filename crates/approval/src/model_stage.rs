@@ -1,22 +1,27 @@
-//! The optional local-classifier stage: one more [`SegmentPolicy`], named
-//! `"ml"`, consulted only for segments no rule vouched for.
+//! The optional local-classifier stage, consulted for a whole command the
+//! rules did not approve (spec: model stage).
 //!
-//! Fail closed: a classifier that panics or reports `Unavailable` leaves the
-//! segment exactly as the engine would have it with no classifier. A model
-//! `Safe` approves only what [`model_may_approve`] allows, and a model
-//! `Dangerous` is a deny the engine turns into an ask with a warning.
+//! The model sees the command exactly as the agent wrote it, constructs the
+//! parser gives up on included. `Safe` runs the command unless it is one of
+//! the few shapes in [`crate::floor`] (inline code, environment swaps,
+//! deletes, state-changing git, network, installers); `Dangerous` and
+//! `NeedsApproval` leave it to the mode (refused or asked). Deny rules run
+//! first, so a command touching a secret path never reaches the model. Fail closed: a classifier that panics or reports
+//! `Unavailable` leaves the command exactly as it would be with no
+//! classifier.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
 
-use crate::model::Segment;
-use crate::never_approve::model_may_approve;
-use crate::policy::{PolicyVerdict, SegmentPolicy};
+use crate::floor::floor_reason;
+use crate::{ApprovalConfig, Verdict, classify};
 
-/// What the classifier thinks of one segment.
+/// `Verdict::Run.source` for a command the model approved.
+pub const MODEL_SOURCE: &str = "classifier";
+
+/// What the classifier thinks of one command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelOutcome {
     Safe,
@@ -28,82 +33,43 @@ pub enum ModelOutcome {
 /// What a classifier is asked about.
 #[derive(Clone, Copy, Debug)]
 pub struct ClassifyInput<'a> {
-    /// argv joined by single spaces.
-    pub segment: &'a str,
+    /// The command as the agent wrote it, trimmed.
+    pub command: &'a str,
     /// The working directory the command runs in, when known.
     pub cwd: Option<&'a Path>,
 }
 
-/// What the model stage concluded about one command, as shown to the user.
-///
-/// Recorded per consulted segment, then aggregated by the caller into one
-/// note per command. A note exists only when the model was actually asked:
-/// commands the rules vouched for on their own show nothing.
+/// What the model said about one command, as shown to the user. A note
+/// exists only when the model was actually asked: commands the rules
+/// decided on their own show nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassifierNote {
-    /// Every segment the model saw it approved, and the command ran.
+    /// The model approved the command, and it ran.
     Approved,
-    /// The model approved a segment, but a never-auto-run rule (a listed
-    /// binary, a repo path) still had the last word; the command asked.
-    Blocked,
-    /// The model abstained; the command asked.
+    /// The model approved the command, but it is a kind a model's "safe"
+    /// never runs ([`crate::floor`]).
+    Overruled,
+    /// The model abstained.
     NeedsApproval,
-    /// The model flagged the command; the command asked with a warning.
+    /// The model flagged the command.
     Dangerous,
     /// The model was asked but could not answer (busy, timed out, failed).
     Unavailable,
 }
 
-/// Per-segment [`ClassifierNote`]s of one command, filled by [`ModelPolicy`]
-/// while the engine consults it, read by the caller afterwards.
-#[derive(Default)]
-pub struct ClassifierTrace {
-    notes: Mutex<Vec<ClassifierNote>>,
-}
-
-impl ClassifierTrace {
-    pub fn new() -> ClassifierTrace {
-        ClassifierTrace::default()
-    }
-
-    fn push(&self, note: ClassifierNote) {
-        self.notes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(note);
-    }
-
-    /// What was recorded, in order.
-    pub fn notes(&self) -> Vec<ClassifierNote> {
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// The single note for the command: the most informative segment wins,
-    /// and a command that ran is approved whatever the segments said along
-    /// the way (they cannot disagree with a `Run`: the model is the last
-    /// policy, and anything it withheld asks).
-    pub fn note(&self, ran: bool) -> Option<ClassifierNote> {
-        let notes = self.notes();
-        if notes.is_empty() {
-            return None;
-        }
-        let has = |note| notes.contains(&note);
-        if ran {
-            Some(ClassifierNote::Approved)
-        } else if has(ClassifierNote::Dangerous) {
-            Some(ClassifierNote::Dangerous)
-        } else if has(ClassifierNote::Blocked) {
-            Some(ClassifierNote::Blocked)
-        } else if has(ClassifierNote::NeedsApproval) {
-            Some(ClassifierNote::NeedsApproval)
-        } else {
-            Some(ClassifierNote::Unavailable)
+impl From<ModelOutcome> for ClassifierNote {
+    fn from(outcome: ModelOutcome) -> ClassifierNote {
+        match outcome {
+            ModelOutcome::Safe => ClassifierNote::Approved,
+            ModelOutcome::NeedsApproval => ClassifierNote::NeedsApproval,
+            ModelOutcome::Dangerous => ClassifierNote::Dangerous,
+            ModelOutcome::Unavailable => ClassifierNote::Unavailable,
         }
     }
 }
 
 pub trait CommandClassifier: Send + Sync {
-    /// `input.segment` is argv joined by single spaces. The caller enforces the
+    /// `input.command` is the whole command line. The caller enforces the
     /// timeout, but it can only stop waiting, not stop the call: an
     /// implementation must return `Unavailable` promptly when it is busy
     /// (use `try_lock`, never queue behind another call), must never block
@@ -128,7 +94,7 @@ pub trait CommandClassifier: Send + Sync {
 /// Most entries held; the cache is emptied when a new key arrives at the cap.
 const CACHE_CAP: usize = 4096;
 
-/// Outcomes by (working directory, segment text), shared between threads.
+/// Outcomes by (working directory, command text), shared between threads.
 type CacheKey = (Option<PathBuf>, String);
 
 #[derive(Default)]
@@ -162,15 +128,15 @@ impl DecisionCache {
         }
     }
 
-    pub fn get(&self, cwd: Option<&Path>, segment: &str) -> Option<ModelOutcome> {
+    pub fn get(&self, cwd: Option<&Path>, command: &str) -> Option<ModelOutcome> {
         self.lock()
             .entries
-            .get(&(cwd.map(Path::to_path_buf), segment.to_string()))
+            .get(&(cwd.map(Path::to_path_buf), command.to_string()))
             .copied()
     }
 
-    pub fn put(&self, cwd: Option<&Path>, segment: String, v: ModelOutcome) {
-        let k = (cwd.map(Path::to_path_buf), segment);
+    pub fn put(&self, cwd: Option<&Path>, command: String, v: ModelOutcome) {
+        let k = (cwd.map(Path::to_path_buf), command);
         let mut state = self.lock();
         if state.entries.len() >= CACHE_CAP && !state.entries.contains_key(&k) {
             state.entries.clear();
@@ -179,87 +145,105 @@ impl DecisionCache {
     }
 }
 
-pub struct ModelPolicy<'a> {
+/// Ask `classifier` about `command` (trimmed), through `cache`.
+///
+/// Returns `None` when the model must not be used now (switched off) or
+/// `ask_new` is false and nothing is cached: that is a skip, not an answer.
+/// `Unavailable` (still loading, a transient failure, a panic) is returned
+/// but never cached, so the next command retries.
+pub fn consult(
+    classifier: &dyn CommandClassifier,
+    cache: &DecisionCache,
+    command: &str,
+    cwd: Option<&Path>,
+    ask_new: bool,
+) -> Option<ModelOutcome> {
+    let command = command.trim();
+    if command.is_empty() || !classifier.active() {
+        return None;
+    }
+    cache.sync_generation(classifier.generation());
+    if let Some(outcome) = cache.get(cwd, command) {
+        return Some(outcome);
+    }
+    if !ask_new {
+        return None;
+    }
+    let input = ClassifyInput { command, cwd };
+    let outcome = catch_unwind(AssertUnwindSafe(|| classifier.classify(&input)))
+        .unwrap_or(ModelOutcome::Unavailable);
+    if outcome != ModelOutcome::Unavailable {
+        cache.put(cwd, command.to_string(), outcome);
+    }
+    Some(outcome)
+}
+
+/// The model for one [`decide`] call.
+pub struct ModelStage<'a> {
     pub classifier: &'a dyn CommandClassifier,
     pub cache: &'a DecisionCache,
-    /// When set, a segment not already cached is not sent to the classifier
-    /// once this instant has passed (the caller's timeout for the whole
-    /// command), so one slow call is the last for that command.
-    pub deadline: Option<Instant>,
-    /// Where to record what the model said about each segment, so the
-    /// caller can show the user the classifier's verdict for the command.
-    /// `None` records nothing.
-    pub trace: Option<&'a ClassifierTrace>,
+    /// `false` once the caller's time for this command is up: only a cached
+    /// outcome applies, no new call is made.
+    pub ask_new: bool,
+    /// Run a command the model is unsure about (`NeedsApproval`) as if it
+    /// had said `Safe`; the floor still applies. `Unavailable` never runs.
+    pub run_unsure: bool,
 }
 
-impl SegmentPolicy for ModelPolicy<'_> {
-    fn name(&self) -> &'static str {
-        crate::engine::ML_NAME
-    }
-
-    fn verify(&self, seg: &Segment, cwd: Option<&Path>) -> Option<PolicyVerdict> {
-        if seg.argv.is_empty() || !self.classifier.active() {
-            return None;
-        }
-        self.cache.sync_generation(self.classifier.generation());
-        let key = seg.argv.join(" ");
-        let outcome = match self.cache.get(cwd, &key) {
-            Some(o) => o,
-            None => {
-                if self.deadline.is_some_and(|d| Instant::now() >= d) {
-                    // Past the caller's deadline nothing more is asked of
-                    // the model; that is a skip, not an answer, so it is
-                    // not recorded.
-                    return None;
-                }
-                let input = ClassifyInput { segment: &key, cwd };
-                match catch_unwind(AssertUnwindSafe(|| self.classifier.classify(&input))) {
-                    // Unavailable (still loading, transient timeout) is not
-                    // cached, so the next call retries.
-                    Ok(o) => {
-                        if o != ModelOutcome::Unavailable {
-                            self.cache.put(cwd, key, o);
-                        }
-                        o
-                    }
-                    // A panic counts as unavailable and is not cached either.
-                    Err(_) => ModelOutcome::Unavailable,
-                }
+/// [`classify`], then the model for a command the rules did not settle.
+///
+/// A `Run` or `Deny` from the rules is final and the model is not asked. An
+/// `Ask` (including a command the parser gave up on) goes to the model as
+/// one whole line: `Safe` runs it unless [`floor_reason`] names a reason
+/// not to, `Dangerous` asks with a warning, and `NeedsApproval` or no
+/// answer keep the rules' reason. The note is what the model said, when it
+/// was asked.
+pub fn decide(
+    command: &str,
+    cfg: &ApprovalConfig<'_>,
+    model: Option<&ModelStage<'_>>,
+) -> (Verdict, Option<ClassifierNote>) {
+    let verdict = classify(command, cfg);
+    let (Verdict::Ask { reason }, Some(model)) = (&verdict, model) else {
+        return (verdict, None);
+    };
+    let Some(outcome) = consult(
+        model.classifier,
+        model.cache,
+        command,
+        cfg.cwd,
+        model.ask_new,
+    ) else {
+        return (verdict, None);
+    };
+    let verdict = match outcome {
+        ModelOutcome::NeedsApproval if model.run_unsure => match floor_reason(command, cfg) {
+            None => Verdict::Run {
+                source: MODEL_SOURCE,
+            },
+            Some(floor) => Verdict::Ask {
+                reason: format!("the classifier was unsure, and the floor holds it: {floor}"),
+            },
+        },
+        ModelOutcome::Safe => match floor_reason(command, cfg) {
+            None => Verdict::Run {
+                source: MODEL_SOURCE,
+            },
+            Some(floor) => {
+                return (
+                    Verdict::Ask {
+                        reason: format!(
+                            "the classifier said safe, but the floor holds it: {floor}"
+                        ),
+                    },
+                    Some(ClassifierNote::Overruled),
+                );
             }
-        };
-        match outcome {
-            ModelOutcome::Safe => {
-                if model_may_approve(seg) {
-                    self.record(ClassifierNote::Approved);
-                    Some(PolicyVerdict::Approve)
-                } else {
-                    // The model vouched, but a never-auto-run rule may not
-                    // hand it out silently; the user still sees the model's
-                    // opinion next to the ask.
-                    self.record(ClassifierNote::Blocked);
-                    None
-                }
-            }
-            ModelOutcome::Dangerous => {
-                self.record(ClassifierNote::Dangerous);
-                Some(PolicyVerdict::Deny)
-            }
-            ModelOutcome::NeedsApproval => {
-                self.record(ClassifierNote::NeedsApproval);
-                None
-            }
-            ModelOutcome::Unavailable => {
-                self.record(ClassifierNote::Unavailable);
-                None
-            }
-        }
-    }
-}
-
-impl ModelPolicy<'_> {
-    fn record(&self, note: ClassifierNote) {
-        if let Some(trace) = self.trace {
-            trace.push(note);
-        }
-    }
+        },
+        ModelOutcome::Dangerous => Verdict::Ask {
+            reason: format!("the local classifier flagged this command as dangerous ({reason})"),
+        },
+        ModelOutcome::NeedsApproval | ModelOutcome::Unavailable => verdict,
+    };
+    (verdict, Some(outcome.into()))
 }

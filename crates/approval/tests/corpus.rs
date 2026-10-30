@@ -69,6 +69,50 @@ fn allowed_bail(src: &str, bail: &Bail) -> Option<&'static str> {
     }
 }
 
+/// Intentional acceptances: constructs da bails on that we parse on purpose.
+/// Returns the reason, or `None` when the acceptance is not documented.
+fn allowed_accept(src: &str) -> Option<&'static str> {
+    let rest = without_directory_substitutions(src);
+    if rest != src && !expect_bail(&rest) {
+        return Some("`$(pwd)` / `$(git rev-parse --show-toplevel)` print a directory: accepted");
+    }
+    let words = src
+        .trim_start()
+        .strip_prefix("for ")
+        .and_then(|s| s.split_once(" in "))
+        .and_then(|(_, s)| s.split_once("do"))
+        .map(|(words, _)| words);
+    if words.is_some_and(|w| !w.contains(['$', '`', '*', '?', '[', '{', '~'])) {
+        return Some("`for NAME in literal…; do …; done` is unrolled");
+    }
+    None
+}
+
+/// `src` with every `$(pwd)` / `$(git rev-parse --show-toplevel)` replaced
+/// by a plain word.
+fn without_directory_substitutions(src: &str) -> String {
+    let mut out = String::new();
+    let mut rest = src;
+    while let Some(at) = rest.find("$(") {
+        let Some(len) = rest[at..].find(')') else {
+            break;
+        };
+        let inner: Vec<&str> = rest[at + 2..at + len].split_whitespace().collect();
+        out.push_str(&rest[..at]);
+        if matches!(
+            inner.as_slice(),
+            ["pwd"] | ["git", "rev-parse", "--show-toplevel"]
+        ) {
+            out.push_str("DIR");
+        } else {
+            out.push_str(&rest[at..=at + len]);
+        }
+        rest = &rest[at + len + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Inspect the raw input bash and decide whether a correct parser must
 /// return `Err(Bail::*)`. Respects single-quote state (nothing inside
 /// `'...'` triggers anything). Inside double quotes: `$( ` and backticks
@@ -365,12 +409,18 @@ fn corpus_differential() {
             let must_bail = expect_bail(&c.input);
             match (parse(&c.input), must_bail) {
                 (Ok(_), false) | (Err(_), true) => ok += 1,
-                (Ok(segs), true) => failures.push(format!(
-                    "[{label}/{}] da expects a bail, got Ok({} segs) for {:?}",
-                    c.name,
-                    segs.len(),
-                    c.input
-                )),
+                (Ok(segs), true) => match allowed_accept(&c.input) {
+                    Some(reason) => {
+                        *allowed.entry(reason).or_default() += 1;
+                        ok += 1;
+                    }
+                    None => failures.push(format!(
+                        "[{label}/{}] da expects a bail, got Ok({} segs) for {:?}",
+                        c.name,
+                        segs.len(),
+                        c.input
+                    )),
+                },
                 (Err(e), false) => match allowed_bail(&c.input, &e) {
                     Some(reason) => {
                         *allowed.entry(reason).or_default() += 1;
@@ -391,12 +441,18 @@ fn corpus_differential() {
             let must_bail = expect_bail(&c.input);
             match (parse(&c.input), must_bail) {
                 (Err(_), true) | (Ok(_), false) => ok += 1,
-                (Ok(segs), true) => failures.push(format!(
-                    "[{label}/{}] must bail, got Ok({} segs) for {:?}",
-                    c.name,
-                    segs.len(),
-                    c.input
-                )),
+                (Ok(segs), true) => match allowed_accept(&c.input) {
+                    Some(reason) => {
+                        *allowed.entry(reason).or_default() += 1;
+                        ok += 1;
+                    }
+                    None => failures.push(format!(
+                        "[{label}/{}] must bail, got Ok({} segs) for {:?}",
+                        c.name,
+                        segs.len(),
+                        c.input
+                    )),
+                },
                 (Err(e), false) => match allowed_bail(&c.input, &e) {
                     Some(reason) => {
                         *allowed.entry(reason).or_default() += 1;
