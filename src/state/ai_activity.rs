@@ -126,6 +126,34 @@ pub fn tool_brief_parts(name: &str, summary: &str) -> String {
     if name == "bash" {
         return command_text(summary);
     }
+    // Result tools read as what they did, never as their JSON.
+    let parsed = serde_json::from_str::<serde_json::Value>(summary).ok();
+    let count = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+    };
+    match name {
+        "submit_brief" => return "filed the brief".to_string(),
+        "submit_review_draft" => return "wrote the review draft".to_string(),
+        "submit_verdicts" => {
+            return match count("verdicts") {
+                Some(n) => format!("verdicts on {n} finding{}", if n == 1 { "" } else { "s" }),
+                None => "submitted verdicts".to_string(),
+            };
+        }
+        "submit_prior_states" => return "re-checked earlier findings".to_string(),
+        "done" => {
+            return parsed
+                .as_ref()
+                .and_then(|v| v.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| "finished".to_string(), |s| s.to_string());
+        }
+        _ => {}
+    }
     let values = serde_json::from_str::<serde_json::Value>(summary)
         .ok()
         .and_then(|value| match value {

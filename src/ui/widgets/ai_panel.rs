@@ -30,8 +30,8 @@ use crate::state::ai_activity::{
     self, AgentStatus, CommandRow, DecisionCounts, LogFilter, Step, StepState,
 };
 use crate::state::ai_review::{
-    AiPhase, AiReviewState, ClassifierNote, CommandDecision, TimelineEntry, change_blocked,
-    classifier_note_text, unrestored_for_repo,
+    AiPhase, AiReviewState, ClassifierNote, CommandDecision, HELD_BY_THIS_PR, TimelineEntry,
+    change_blocked_for, classifier_note_text, unrestored_for_repo,
 };
 use crate::state::classifier::{self, ClassifierState};
 use crate::ui::components::{self, Tone};
@@ -190,6 +190,7 @@ pub struct PanelInputs<'a> {
 pub fn local_checkout_vm(
     ai: &AiSettings,
     repo_key: &str,
+    pr_number: Option<u64>,
     ai_state: &AiReviewState,
     unrestored: &[CheckoutRecord],
     has_key: &dyn Fn(&str) -> bool,
@@ -211,7 +212,7 @@ pub fn local_checkout_vm(
         status,
         error,
         blockers: start_blockers(ai, repo_key, has_key),
-        change_blocked: change_blocked(ai_state, unrestored, repo_key),
+        change_blocked: change_blocked_for(ai_state, unrestored, repo_key, pr_number),
         restore: unrestored_for_repo(ai_state, unrestored, repo_key),
         trust_all: ai.auto_approve.trust_all(),
     }
@@ -915,6 +916,12 @@ fn blocked_line(
     actions: &mut Vec<AiPanelAction>,
 ) {
     let p = theme::palette_of(ui);
+    // The PR's own checkout is expected while its review is open: a quiet
+    // note, no Restore.
+    if reason == HELD_BY_THIS_PR {
+        ui.label(RichText::new(reason).size(11.5).color(p.muted));
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         ui.colored_label(p.pending, reason);
         // The recovery dialog dismissed with "Later", reopened from here.
@@ -1529,11 +1536,21 @@ fn render_agents(ui: &mut egui::Ui, st: &AiReviewState, view: &mut PanelView) {
             ui.horizontal(|ui| {
                 let (glyph, color) = status_glyph(p, &row.status);
                 ui.label(RichText::new(glyph.to_string()).color(color).size(13.0));
+                // Capped so a long verifier path never runs over the counts.
+                let title_width = ui.available_width() * 0.55;
                 toggle |= ui
-                    .add(
-                        egui::Button::new(RichText::new(&row.title).font(fonts::semibold(12.5)))
-                            .frame(false),
-                    )
+                    .scope(|ui| {
+                        ui.set_max_width(title_width);
+                        ui.add(
+                            egui::Button::new(
+                                RichText::new(&row.title).font(fonts::semibold(12.5)),
+                            )
+                            .frame(false)
+                            .truncate(),
+                        )
+                        .on_hover_text(&row.title)
+                    })
+                    .inner
                     .clicked();
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let chevron = if open {
@@ -1642,9 +1659,10 @@ fn render_agent_detail(ui: &mut egui::Ui, st: &AiReviewState, entry: usize, view
                         let brief = if line.name == "bash" {
                             ai_activity::command_text(&line.summary)
                         } else {
-                            ai_activity::tool_brief(line)
+                            let brief = ai_activity::tool_brief(line);
+                            brief
                                 .strip_prefix(&line.name)
-                                .unwrap_or_default()
+                                .unwrap_or(&brief)
                                 .trim()
                                 .to_string()
                         };
@@ -1978,33 +1996,34 @@ fn render_findings_section(
     view: &mut PanelView,
     actions: &mut Vec<AiPanelAction>,
 ) {
-    let ids: Vec<i64> = st
-        .timeline
-        .iter()
-        .filter_map(|entry| match entry {
-            TimelineEntry::Finding { id } => Some(*id),
-            _ => None,
-        })
+    use crate::ai::review::FindingState;
+
+    // From the findings themselves, not the live `FindingAdded` entries, so
+    // a reopened tab lists them too.
+    let mut listed: Vec<&crate::ai::review::Finding> = st
+        .findings
+        .values()
+        .filter(|f| show_dropped || f.state != FindingState::DroppedByVerifier)
         .collect();
+    listed.sort_by_key(|f| f.id);
     let p = theme::palette_of(ui);
-    if !ids.is_empty() && section(ui, view, "findings", "FINDINGS SO FAR", ids.len()) {
-        for id in ids {
-            let finding = st.findings.get(&id);
-            let mut label = format!("Finding #{id}");
-            if let Some(finding) = finding {
-                label = format!("{label} · {}", finding.title);
-            }
-            let color = finding.map_or(p.muted, |finding| severity_color(p, finding.severity));
+    if !listed.is_empty() && section(ui, view, "findings", "FINDINGS", listed.len()) {
+        for finding in listed {
+            let label = format!(
+                "#{} · {} · {}",
+                finding.id,
+                finding.title,
+                finding.state.as_str().replace('_', " ")
+            );
+            let color = match finding.state {
+                FindingState::DroppedByUser | FindingState::DroppedByVerifier => p.faint,
+                _ => severity_color(p, finding.severity),
+            };
             // Truncate: a long finding title must not widen the pane.
             let button =
                 egui::Button::new(RichText::new(label.clone()).color(color).size(11.5)).truncate();
-            let button = if finding.is_some() {
-                ui.add(button).on_hover_text(label)
-            } else {
-                ui.add(button)
-            };
-            if button.clicked() {
-                actions.push(AiPanelAction::JumpToFinding(id));
+            if ui.add(button).on_hover_text(label).clicked() {
+                actions.push(AiPanelAction::JumpToFinding(finding.id));
             }
         }
     }

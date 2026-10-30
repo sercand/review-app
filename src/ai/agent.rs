@@ -478,7 +478,7 @@ const MAX_RESULT_SUMMARY: usize = 16_000;
 
 /// What a [`PipelineEvent::ToolCall`] carries of `input`: the first 120
 /// chars, or a result tool's whole input.
-fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
+pub(crate) fn tool_call_summary(name: &str, input: &serde_json::Value) -> String {
     let cap = if RESULT_TOOLS.contains(&name) {
         MAX_RESULT_SUMMARY
     } else {

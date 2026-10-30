@@ -368,14 +368,13 @@ pub fn render(
     actions: &mut Vec<ReviewAction>,
 ) {
     ui.set_width(380.0);
-    // A long summary (the assembler's pre-fill) or many comments must not
-    // push the verdicts and Submit off the screen: the popover scrolls.
-    let max_height = (ui.ctx().viewport_rect().height() - 120.0).max(240.0);
-    egui::ScrollArea::vertical()
-        .id_salt("review-popover-scroll")
-        .max_height(max_height)
-        .auto_shrink([false, true])
-        .show(ui, |ui| render_body(ui, vm, pending, actions));
+    render_body(ui, vm, pending, actions);
+}
+
+/// The summary box's height: what the window leaves after the verdicts, the
+/// comment list and the footer, which always stay on screen.
+fn summary_max_height(ui: &egui::Ui) -> f32 {
+    (ui.ctx().viewport_rect().height() - 460.0).clamp(100.0, 400.0)
 }
 
 fn render_body(
@@ -401,10 +400,11 @@ fn render_body(
         ui.label(RichText::new(suggested.clone()).color(p.muted));
     }
 
-    // The summary scrolls inside its own box, so the verdicts stay close.
+    // Only the summary and the comment list scroll: a long summary (the
+    // assembler's pre-fill) never pushes the verdicts or Submit away.
     let body_response = egui::ScrollArea::vertical()
         .id_salt("review-summary-scroll")
-        .max_height(260.0)
+        .max_height(summary_max_height(ui))
         .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.add(
@@ -489,6 +489,26 @@ fn render_body(
         }
     }
 
+    egui::ScrollArea::vertical()
+        .id_salt("review-comments-scroll")
+        .max_height(180.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| comment_lists(ui, vm, pending, actions));
+    if let Some(reason) = vm.blocked_reason {
+        ui.colored_label(p.pending, reason);
+    }
+    footer(ui, vm, actions, &owned_ids);
+}
+
+/// The comments on GitHub and the pending ones, each row jumping to its
+/// place in the diff.
+fn comment_lists(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    pending: &PendingReview,
+    actions: &mut Vec<ReviewAction>,
+) {
+    let p = theme::palette_of(ui);
     if !vm.github_items.is_empty() {
         ui.label(format!("{} comments on GitHub", vm.github_items.len()));
         for item in &vm.github_items {
@@ -513,10 +533,6 @@ fn render_body(
             }
         }
     }
-    if let Some(reason) = vm.blocked_reason {
-        ui.colored_label(p.pending, reason);
-    }
-
     if vm.pending_count > 0 {
         ui.label(format!("{} pending comments", vm.pending_count));
         for item in pending_items(pending) {
@@ -541,7 +557,16 @@ fn render_body(
             }
         }
     }
+}
 
+/// Submit, Discard (with its confirmation) and the scoped ⌘↵ shortcut.
+fn footer(
+    ui: &mut egui::Ui,
+    vm: &ReviewPanelVm,
+    actions: &mut Vec<ReviewAction>,
+    owned_ids: &[egui::Id],
+) {
+    let p = theme::palette_of(ui);
     ui.separator();
     if confirm_discard(ui) {
         ui.horizontal(|ui| {
@@ -592,7 +617,7 @@ fn render_body(
     // any other field) can never submit the review by accident.
     let focused = ui.ctx().memory(|m| m.focused());
     let submit_shortcut = ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter))
-        && submit_shortcut_allowed(focused, &owned_ids);
+        && submit_shortcut_allowed(focused, owned_ids);
     if submit_shortcut && vm.submit_enabled {
         actions.push(ReviewAction::Submit);
     }
@@ -853,6 +878,8 @@ mod tests {
             comment.bottom() < 700.0,
             "the verdicts are pushed off: {comment:?}"
         );
+        let submit = harness.get_by_label_contains("Submit review").rect();
+        assert!(submit.bottom() < 700.0, "Submit is pushed off: {submit:?}");
         harness.get_by_label("Approve").click();
         harness.run();
         assert!(

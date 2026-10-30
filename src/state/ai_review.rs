@@ -591,6 +591,18 @@ impl AiReviewState {
     fn apply_snapshot(&mut self, snap: &AiSnapshotData) {
         self.phase = snapshot_phase(snap);
         self.timeline = timeline_from_transcript(&snap.timeline);
+        // The transcript has no stop rows: with nothing running behind the
+        // snapshot, every agent in it has ended.
+        if !matches!(self.phase, AiPhase::Running | AiPhase::Paused) {
+            for entry in &mut self.timeline {
+                if let TimelineEntry::Agent {
+                    stop: stop @ None, ..
+                } = entry
+                {
+                    *stop = Some("finished".to_string());
+                }
+            }
+        }
         if let Some(reason) = &snap.bash_disabled {
             self.timeline.push(TimelineEntry::Notice {
                 text: format!("the agent shell is unsandboxed: {reason}"),
@@ -888,40 +900,87 @@ fn snapshot_phase(snap: &AiSnapshotData) -> AiPhase {
     }
 }
 
-/// Rebuild the timeline from the stored transcript (spec §10.3): assistant
-/// turns contribute their text and tool calls to a per-agent entry. User
-/// rows are task prompts and tool results, nothing the tab shows.
+/// Rebuild the timeline from the stored transcript (spec §10.3), so a
+/// reopened tab reads like the live one: assistant turns contribute their
+/// text and tool calls to a per-agent entry (reviewers and challengers
+/// under their group, as `AgentStarted` names them), and the chat's rows
+/// become chat bubbles and tool lines, never an agent row. Tool inputs are
+/// cut like [`PipelineEvent::ToolCall`]'s, so result tools stay whole for
+/// their cards. Other user rows are task prompts and tool results.
 fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
     let mut out: Vec<TimelineEntry> = Vec::new();
     for row in rows {
-        if row.role != "assistant" {
-            continue;
-        }
         let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&row.content_json) else {
             continue;
         };
+        let kind = |block: &serde_json::Value| {
+            block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let block_text = |block: &serde_json::Value| {
+            block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let tool_line = |block: &serde_json::Value| {
+            let name = block
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let summary = block
+                .get("input")
+                .map(|input| crate::ai::agent::tool_call_summary(&name, input))
+                .unwrap_or_default();
+            (name, summary)
+        };
+        if row.agent_id == crate::ai::chat::CHAT_LABEL {
+            for block in &blocks {
+                match (row.role.as_str(), kind(block).as_deref()) {
+                    ("user", Some("text")) => {
+                        let text = strip_chat_digest(&block_text(block));
+                        if !text.is_empty() {
+                            out.push(TimelineEntry::ChatUser { text });
+                        }
+                    }
+                    ("assistant", Some("text")) => {
+                        let text = block_text(block);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        match out.last_mut() {
+                            Some(TimelineEntry::ChatReply { text: last }) => last.push_str(&text),
+                            _ => out.push(TimelineEntry::ChatReply { text }),
+                        }
+                    }
+                    ("assistant", Some("tool_use")) => {
+                        let (name, summary) = tool_line(block);
+                        out.push(TimelineEntry::ChatTool {
+                            name,
+                            summary,
+                            note: None,
+                            decision: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if row.role != "assistant" {
+            continue;
+        }
         let mut text = String::new();
         let mut tools: Vec<ToolLine> = Vec::new();
         for block in &blocks {
-            match block.get("type").and_then(serde_json::Value::as_str) {
-                Some("text") => {
-                    text.push_str(
-                        block
-                            .get("text")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(""),
-                    );
-                }
+            match kind(block).as_deref() {
+                Some("text") => text.push_str(&block_text(block)),
                 Some("tool_use") => {
-                    let name = block
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let summary = block
-                        .get("input")
-                        .map(|input| summarize_input(&input.to_string()))
-                        .unwrap_or_default();
+                    let (name, summary) = tool_line(block);
                     tools.push(ToolLine {
                         name,
                         summary,
@@ -940,9 +999,17 @@ fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
         {
             Some(index) => index,
             None => {
+                let agent = agent_ref_from_label(&row.agent_id);
+                let group = match agent.role {
+                    AgentRole::Reviewer | AgentRole::Challenger => row
+                        .agent_id
+                        .split_once(':')
+                        .map(|(_, group)| group.to_string()),
+                    _ => None,
+                };
                 out.push(TimelineEntry::Agent {
-                    agent: agent_ref_from_label(&row.agent_id),
-                    group: None,
+                    agent,
+                    group,
                     tools: Vec::new(),
                     text: String::new(),
                     stop: None,
@@ -961,6 +1028,25 @@ fn timeline_from_transcript(rows: &[AiTimelineEntry]) -> Vec<TimelineEntry> {
         }
     }
     out
+}
+
+/// A stored chat user turn without the status digest the app put before it
+/// ([`crate::ai::tools::steer::SteerCtx::digest`], "## Run status" up to its
+/// "open questions" line).
+fn strip_chat_digest(stored: &str) -> String {
+    if !stored.starts_with("## Run status") {
+        return stored.trim().to_string();
+    }
+    match stored.find("\nopen questions:") {
+        Some(at) => {
+            let rest = &stored[at + 1..];
+            rest.split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim()
+                .to_string()
+        }
+        None => String::new(),
+    }
 }
 
 /// The transcript stores agents by their pipeline label (spec §9.2):
@@ -984,17 +1070,6 @@ fn agent_ref_from_label(label: &str) -> AgentRef {
         role,
         label: label.to_string(),
     }
-}
-
-/// A tool input summary, cut like [`PipelineEvent::ToolCall`]'s.
-fn summarize_input(input: &str) -> String {
-    const MAX: usize = 120;
-    let count = input.chars().count();
-    if count <= MAX {
-        return input.to_string();
-    }
-    let cut: String = input.chars().take(MAX).collect();
-    format!("{cut}…")
 }
 
 /// Which stage's progress an agent role counts toward.
@@ -1058,6 +1133,43 @@ pub fn change_blocked(
     unrestored: &[CheckoutRecord],
     repo_key: &str,
 ) -> Option<String> {
+    change_blocked_for(ai_state, unrestored, repo_key, None)
+}
+
+/// The note shown while the open PR's own checkout holds the folder.
+pub const HELD_BY_THIS_PR: &str =
+    "The folder is on this pull request's checkout; Finish puts your branch back.";
+
+/// [`change_blocked`] seen from PR `pr_number`: a checkout that PR itself
+/// holds still blocks a folder change (its restore needs the folder), but
+/// is named as this PR's own, not as a stray to restore.
+pub fn change_blocked_for(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+    pr_number: Option<u64>,
+) -> Option<String> {
+    if let Some(reason) = start_blocked(ai_state, unrestored, repo_key, pr_number) {
+        return Some(reason);
+    }
+    ai_state
+        .checkout
+        .iter()
+        .chain(unrestored)
+        .any(|record| unrestored_holds_repo(record, repo_key))
+        .then(|| HELD_BY_THIS_PR.to_string())
+}
+
+/// What stops a review of PR `pr_number` from starting: a live run, or an
+/// unrestored checkout of a *different* PR in the repo. The PR's own held
+/// checkout does not: `plan_checkout` reuses it (a re-review after Keep or
+/// a restart). With `pr_number: None` every record counts.
+pub fn start_blocked(
+    ai_state: &AiReviewState,
+    unrestored: &[CheckoutRecord],
+    repo_key: &str,
+    pr_number: Option<u64>,
+) -> Option<String> {
     if matches!(
         ai_state.phase,
         AiPhase::Planning
@@ -1075,6 +1187,7 @@ pub fn change_blocked(
         .checkout
         .iter()
         .chain(unrestored)
+        .filter(|record| pr_number != Some(record.pr_number))
         .any(|record| unrestored_holds_repo(record, repo_key))
         .then(|| {
             "This repository has an unrestored AI checkout — restore it before changing the folder or starting a review."
@@ -1678,6 +1791,69 @@ mod tests {
         );
     }
 
+    /// A reopened tab reads like the live one: the chat's rows become
+    /// bubbles and tool lines without the status digest, reviewers carry
+    /// their group, and result tools keep their whole input for the cards.
+    #[test]
+    fn the_transcript_rebuilds_chat_groups_and_results() {
+        let row = |agent: &str, role: &str, content: serde_json::Value| AiTimelineEntry {
+            agent_id: agent.into(),
+            role: role.into(),
+            content_json: content.to_string(),
+        };
+        let long = "x".repeat(400);
+        let rows = vec![
+            row(
+                "reviewer:g2",
+                "assistant",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "1", "name": "done", "input": {"summary": long}}
+                ]),
+            ),
+            row(
+                "chat",
+                "user",
+                serde_json::json!([
+                    {"type": "text", "text": "## Run status\n\nstate: finished\nopen questions: none\n\n\nbring #97 back"}
+                ]),
+            ),
+            row(
+                "chat",
+                "assistant",
+                serde_json::json!([
+                    {"type": "tool_use", "id": "2", "name": "list_findings", "input": {}},
+                    {"type": "text", "text": "Done."}
+                ]),
+            ),
+        ];
+        let timeline = timeline_from_transcript(&rows);
+        assert!(
+            matches!(
+                &timeline[0],
+                TimelineEntry::Agent { group: Some(g), tools, .. }
+                    if g == "g2" && tools[0].summary.contains(&long)
+            ),
+            "{timeline:?}"
+        );
+        assert_eq!(
+            timeline[1..],
+            [
+                TimelineEntry::ChatUser {
+                    text: "bring #97 back".into()
+                },
+                TimelineEntry::ChatTool {
+                    name: "list_findings".into(),
+                    summary: "{}".into(),
+                    note: None,
+                    decision: None,
+                },
+                TimelineEntry::ChatReply {
+                    text: "Done.".into()
+                },
+            ]
+        );
+    }
+
     #[test]
     fn can_continue_only_when_head_moved_and_not_running() {
         let mut st = AiReviewState::default();
@@ -1788,7 +1964,7 @@ mod tests {
                     group: None,
                     tools: Vec::new(),
                     text: "scouting done".to_string(),
-                    stop: None,
+                    stop: Some("finished".to_string()),
                 },
                 TimelineEntry::Notice {
                     text: "the agent shell is unsandboxed: no bwrap".to_string(),
@@ -2248,6 +2424,26 @@ mod tests {
     /// Changing or unlinking the repo's folder is blocked while a run for
     /// it is live or a checkout of it awaits its restore — the restore
     /// logic depends on the path (spec: AI settings, Unlink / Change).
+    /// The PR's own held checkout never blocks its review from starting
+    /// and reads as a quiet note; another PR's still blocks both.
+    #[test]
+    fn the_prs_own_checkout_does_not_block_its_review() {
+        let st = AiReviewState::default();
+        let held = [checkout_record()];
+        let key = "github.com/o/r";
+        assert_eq!(start_blocked(&st, &held, key, Some(7)), None);
+        assert_eq!(
+            change_blocked_for(&st, &held, key, Some(7)).as_deref(),
+            Some(HELD_BY_THIS_PR),
+            "a folder change still waits for the restore"
+        );
+        assert!(start_blocked(&st, &held, key, Some(8)).is_some());
+        assert_ne!(
+            change_blocked_for(&st, &held, key, Some(8)).as_deref(),
+            Some(HELD_BY_THIS_PR)
+        );
+    }
+
     #[test]
     fn change_blocked_while_a_run_is_live_or_unrestored() {
         let key = "github.com/acme/widgets";

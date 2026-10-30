@@ -1402,7 +1402,10 @@ mod tests {
             })
         );
         let out = tool("triage_findings")
-            .call(serde_json::json!({"drop": {"severities": ["blocker"]}}), &cx)
+            .call(
+                serde_json::json!({"drop": {"severities": ["blocker"]}}),
+                &cx,
+            )
             .await;
         assert!(out.is_error, "an unknown severity is refused");
     }

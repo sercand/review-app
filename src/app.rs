@@ -2162,6 +2162,7 @@ impl ReviewApp {
             let mut vm = crate::ui::widgets::ai_panel::local_checkout_vm(
                 &self.settings.ai,
                 &repo_key,
+                Some(session.number),
                 &session.ai,
                 &self.ai_unrestored,
                 &has_key,
@@ -2517,7 +2518,7 @@ impl ReviewApp {
     ) {
         use crate::ai::repo_link::{start_blockers, unlink_repo};
         use crate::ai::store::PrKey;
-        use crate::state::ai_review::change_blocked;
+        use crate::state::ai_review::{change_blocked, start_blocked};
         use crate::ui::widgets::{
             ai_panel::{self, AiPanelAction},
             ai_repo_dialog::RepoCommandsDialog,
@@ -2551,7 +2552,14 @@ impl ReviewApp {
                     .into_iter()
                     .next()
                     .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
-                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                    .or_else(|| {
+                        start_blocked(
+                            &session.ai,
+                            &self.ai_unrestored,
+                            &repo_key,
+                            Some(session.number),
+                        )
+                    });
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
                     return;
@@ -2579,7 +2587,14 @@ impl ReviewApp {
                     .into_iter()
                     .next()
                     .or_else(|| key_check_blocker(&self.settings.ai, &self.llm_keys))
-                    .or_else(|| change_blocked(&session.ai, &self.ai_unrestored, &repo_key));
+                    .or_else(|| {
+                        start_blocked(
+                            &session.ai,
+                            &self.ai_unrestored,
+                            &repo_key,
+                            Some(session.number),
+                        )
+                    });
                 if let Some(reason) = blocked {
                     self.toasts.push(reason, now);
                     return;
